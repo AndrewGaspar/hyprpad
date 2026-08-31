@@ -199,3 +199,65 @@ treat udev as a fallback only if the seat-strip variant (C.1) proves to work.**
 
 The architectural result is unchanged and independent of mechanism: hyprpad must
 run privileged, and Steam must be denied the physical node by *some* means.
+
+---
+
+## Candidate B — LIVE SUCCESS (2026-08-31, second attempt): the namespace mask denies Steam
+
+Redid the bwrap mask properly — Steam fully stopped first, masked launch tracked
+by pid, and the **actual masked client's** namespace inspected (not a leftover).
+Result: **it works.**
+
+- All five puck nodes read `1:3` (`/dev/null`) inside the masked client's mount
+  namespace (`/proc/<client>/root/dev/hidraw*`). ✓
+- **Steam held zero puck hidraw fds** — the mask stopped every `open()`. ✓
+- Steam degraded **gracefully**: `controller.txt` logged `Unable to open local
+  device: /dev/hidraw11` once per node and **stopped** — 0 new lines over the
+  next 6 s. No retry spam, no error loop, no crash. ✓
+- **hyprpad read the real device** from outside the namespace throughout (live
+  `0x42` reports). ✓
+
+**This is the Tier-1 denial the udev approach could not deliver.** Steam is
+denied the physical controller; hyprpad owns it; Steam copes cleanly.
+
+### Nuances and the remaining work
+
+1. **Steam still *enumerates* the puck** via `/sys` (visible in the namespace),
+   so it logs "Local Device Found" before failing to open. Harmless here (one
+   log line), but the node mask does not make the device *invisible* — only
+   unusable. Optionally also mask `/sys/class/hidraw/hidrawN` (and the parent
+   `/sys/.../0003:28DE:1304.*`) to hide it from enumeration entirely; not
+   required given the graceful failure.
+2. **Lizard mode stays on.** Because Steam can never open the hidraw, it cannot
+   send the exit-lizard-mode feature report — so the puck keeps emitting its
+   firmware keyboard/mouse (arrows + cursor) on its evdev nodes. With hyprpad
+   *also* driving the cursor this means double input. **The real design must
+   have hyprpad take ownership of lizard mode**: hyprpad opens the hidraw and
+   writes the disable-lizard feature report itself (it now owns the device), or
+   grabs/ignores the lizard evdev nodes. This is a new hyprpad responsibility
+   surfaced by the test.
+3. **Replug gap (unchanged):** the mask is a snapshot of node paths at launch;
+   a puck replug creates fresh `hidrawN` nodes that are unmasked until Steam
+   relaunches. Mitigation options: mask the parent USB `/sys` path, or a
+   stable-by-id bind, or re-launch Steam on hotplug. Lower priority.
+4. **Operational fragility (managed):** launching Steam under bwrap is clean
+   *if Steam is fully stopped first* (no instance-lock race). Cleanup needs the
+   whole session/process-group killed — `--die-with-parent` leaves
+   double-forked grandchildren (webhelper, any Wine) orphaned; kill by session
+   id / process group, not just the bwrap pid.
+
+### W12 conclusion
+
+**Mechanism chosen: the bwrap mount-namespace mask.** It denies Steam the puck
+without root, without fighting logind's ACL (the udev dead-end), and Steam
+tolerates it gracefully. hyprpad reads the real device unaffected. The
+productionization work is: (a) a clean "launch Steam masked" wrapper that stops
+any existing Steam first and manages the process group; (b) hyprpad taking
+ownership of lizard mode so the firmware kbd/mouse doesn't fight the daemon;
+(c) optionally hiding the device from `/sys` enumeration; (d) replug handling.
+The earlier architectural finding stands — hyprpad owns the device and emits a
+focus-gated virtual controller — but note this path does **not** require hyprpad
+to run as root: the mask is unprivileged, and hyprpad reads the device via the
+normal session `uaccess` ACL (which the udev investigation showed is
+unavoidable anyway). That simplifies the daemon: **no privileged system service
+required** — a user daemon plus a masked-Steam launcher suffices.
