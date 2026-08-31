@@ -235,7 +235,11 @@ clone imitates it.
 
 ### W13 — Deck port (L, later)
 
-Constraints to carry now: no tower-specific assumptions in W4's classifier
+Constraints to carry now: **audit every always-on daemon for GPU/wakeup pins
+on battery hardware** — voxtype's Vulkan mode held a persistent NVIDIA
+context from the idle daemon, pinning the dGPU active (caught and reverted to
+CPU on the laptop, 2026-08-31); hyprsc itself must never hold a GPU or
+busy-poll. no tower-specific assumptions in W4's classifier
 (internal-vs-external connector is the Deck signal); hyprsc's evdev path
 must handle the Deck's built-in controller (hid-steam, kernel ≥7.3); W11's
 posture decision diverges (portable device → keep strong secrets); embedded
