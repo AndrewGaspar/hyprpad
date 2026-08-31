@@ -169,6 +169,25 @@ The complete *hold-guide-and-flick-the-stick* gesture is therefore recoverable
 from the passive stream alone — modifier state and analog axes in the same
 frames.
 
+## The raw stream flows with Steam dead
+
+Verified 2026-08-31 (with the owner's permission to cycle Steam): after a clean
+`steam -shutdown`, with **no process holding any puck hidraw node**, report
+`0x42` continued to flow on `hidraw7` at **269 Hz** — the same stream, same
+format, same rate as with Steam running.
+
+Lizard mode therefore governs only what the *evdev keyboard/mouse* interfaces
+emit; the vendor gamepad report is always on. Consequences:
+
+- hyprsc behaves identically pre-Steam, post-Steam, at a lock screen, in a
+  cold-boot userspace — no mode switching, no Steam dependency, no
+  initialization handshake needed to read input.
+- The passive tap needs no awareness of Steam's lifecycle at all; Steam starting
+  or stopping changes nothing about the read path.
+- On Steam exit the virtual X360 pad disappears and all five hidraw nodes are
+  released; on restart Steam re-grabs all five. Concurrent reading was
+  unaffected throughout.
+
 ## Steam's reaction to the guide button
 
 Established by direct observation (2026-08-30), and decisive for the
