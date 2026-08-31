@@ -11,10 +11,12 @@ use crate::config::{Action, Config, CursorConfig, ScrollConfig, ScrollMode, Work
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gesture::{GestureEngine, GestureEvent};
 use crate::hypr::{Hypr, HyprEvent};
+use crate::keyboard::VirtualKeyboard;
 use crate::osk::{OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -125,6 +127,21 @@ pub fn run() -> std::io::Result<()> {
     // Left-pad scroll shares the cursor's One Euro/hysteresis smoothing knobs.
     let mut scroll = ScrollState::new(config.scroll(), config.cursor());
 
+    // Bare-button keyboard: buttons pressed without the guide modifier emit raw
+    // keys (the D-pad acts as arrow keys by default). Degrades gracefully —
+    // without it, bare-button bindings are simply inert.
+    let mut keyboard = match VirtualKeyboard::new() {
+        Ok(k) => {
+            eprintln!("hyprpad: virtual keyboard ready (bare D-pad drives the arrow keys)");
+            Some(k)
+        }
+        Err(e) => {
+            eprintln!("warning: no virtual keyboard ({e}); bare-button bindings disabled");
+            None
+        }
+    };
+    let mut button_keys = ButtonKeys::new();
+
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
     let mut arbiter = Arbiter::new();
@@ -225,6 +242,13 @@ pub fn run() -> std::io::Result<()> {
                     drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), now);
                     drive_scroll(ptr, &frame, &mut scroll, engine.guide_active(), arbiter.suppressed(), now);
                 }
+                // Bare-button bindings (D-pad -> arrows by default). Gated OFF on
+                // the guide layer (so guide+dpad stays a chord), while the OSK
+                // owns the pads, and in a focused game (there the D-pad reaches
+                // the game via the virtual controller) — mirroring `drive_cursor`.
+                let buttons_active =
+                    !engine.guide_active() && !osk.is_active() && !arbiter.suppressed();
+                drive_buttons(&mut keyboard, &frame, config.buttons(), &mut button_keys, buttons_active);
                 prev_frame = frame;
             }
         }
@@ -517,6 +541,73 @@ fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: boo
     (0.0, dy)
 }
 
+/// Cross-frame state for the bare-button keyboard bindings: the evdev keycodes
+/// currently held down, keyed by the controller button holding each. Kept so a
+/// gate change (the guide/OSK layer opening, or a game taking focus, while a
+/// button is held) releases the key cleanly instead of leaving it stuck down.
+struct ButtonKeys {
+    held: HashMap<report::Button, u16>,
+}
+
+impl ButtonKeys {
+    fn new() -> ButtonKeys {
+        ButtonKeys { held: HashMap::new() }
+    }
+
+    /// Reconcile the desired key state against what is held, returning the
+    /// `(code, pressed)` events to emit and updating the held set. Pure (no
+    /// I/O), so the gating and release-on-state-change logic is unit-testable.
+    ///
+    /// When `active` is false (guide/OSK/suppressed), every held key is
+    /// released. Otherwise each bound button that is physically down but not yet
+    /// held presses its key, and each held key whose button lifted releases.
+    /// Releases are emitted before presses.
+    fn reconcile<F: Fn(report::Button) -> bool>(
+        &mut self,
+        bindings: &HashMap<report::Button, u16>,
+        pressed: F,
+        active: bool,
+    ) -> Vec<(u16, bool)> {
+        let mut events = Vec::new();
+        // Release anything that should no longer be held: the gate closed or the
+        // button lifted.
+        self.held.retain(|&btn, &mut code| {
+            let keep = active && pressed(btn);
+            if !keep {
+                events.push((code, false));
+            }
+            keep
+        });
+        // Press bound buttons that are down but not yet held — only when open.
+        if active {
+            for (&btn, &code) in bindings {
+                if pressed(btn) && !self.held.contains_key(&btn) {
+                    events.push((code, true));
+                    self.held.insert(btn, code);
+                }
+            }
+        }
+        events
+    }
+}
+
+/// Drive the bare-button keyboard for a single frame: press each bound button's
+/// key on its down edge and release it on its up edge, subject to `active` (the
+/// guide/OSK/suppressed gate, mirroring [`drive_cursor`]). A missing keyboard
+/// (uinput unavailable) makes this a no-op.
+fn drive_buttons(
+    kbd: &mut Option<VirtualKeyboard>,
+    frame: &report::Frame,
+    bindings: &HashMap<report::Button, u16>,
+    st: &mut ButtonKeys,
+    active: bool,
+) {
+    let Some(kbd) = kbd.as_mut() else { return };
+    for (code, pressed) in st.reconcile(bindings, |b| frame.pressed(b), active) {
+        kbd.key(code, pressed);
+    }
+}
+
 /// Whether to take ownership of the puck's lizard mode. Enabled by the
 /// `own_lizard` config flag (`[daemon]` section) or the `HYPRPAD_OWN_LIZARD`
 /// environment variable. The env var wins when set to a truthy value
@@ -740,6 +831,9 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
         Action::Dispatch(payload) => hypr.dispatch_raw(payload).map(|_| ()),
         // Handled in `handle_gesture` against the OSK handle, never reaches here.
         Action::ToggleKeyboard { .. } => Ok(()),
+        // Bare-button keys are emitted by `drive_buttons` against the virtual
+        // keyboard, not dispatched here; a `key` bound to a guide chord no-ops.
+        Action::Key(_) => Ok(()),
         Action::None => Ok(()),
     }
 }
@@ -840,5 +934,51 @@ mod tests {
         // sentinel into the dead channel.
         forward_reports(rrx, itx);
         drop(rtx);
+    }
+
+    #[test]
+    fn bare_button_presses_on_down_and_releases_on_up() {
+        use report::Button::*;
+        let bindings = HashMap::from([(DpadUp, 103u16), (DpadDown, 108u16)]);
+        let mut st = ButtonKeys::new();
+        // DpadUp goes down while active: press KEY_UP, nothing for the unpressed
+        // DpadDown.
+        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
+        // Held and still down next frame: no repeated event (the kernel repeats).
+        assert!(st.reconcile(&bindings, |b| b == DpadUp, true).is_empty());
+        // Lifts: release KEY_UP, held set empties.
+        assert_eq!(st.reconcile(&bindings, |_| false, true), vec![(103, false)]);
+        assert!(st.held.is_empty());
+    }
+
+    #[test]
+    fn bare_button_gate_off_releases_and_suppresses() {
+        use report::Button::*;
+        let bindings = HashMap::from([(DpadUp, 103u16)]);
+        let mut st = ButtonKeys::new();
+        // Press while active.
+        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
+        // The gate closes (guide/OSK/game) while the D-pad is still held: the key
+        // is released cleanly rather than left stuck down.
+        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, false), vec![(103, false)]);
+        assert!(st.held.is_empty());
+        // Still held but gated off: no new press (the chord/game gets it instead).
+        assert!(st.reconcile(&bindings, |b| b == DpadUp, false).is_empty());
+        // Gate reopens while still held: re-press so the arrow resumes.
+        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
+    }
+
+    #[test]
+    fn bare_button_unbound_ignored_and_multiple_tracked() {
+        use report::Button::*;
+        let bindings = HashMap::from([(DpadUp, 103u16), (DpadLeft, 105u16)]);
+        let mut st = ButtonKeys::new();
+        // An unbound button (A) produces nothing.
+        assert!(st.reconcile(&bindings, |b| b == A, true).is_empty());
+        // Two bound buttons down at once: both press (HashMap order is arbitrary).
+        let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, true);
+        ev.sort();
+        assert_eq!(ev, vec![(103, true), (105, true)]);
+        assert_eq!(st.held.len(), 2);
     }
 }
