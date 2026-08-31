@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# W12 experiment: launch Steam with the Steam Controller puck's hidraw nodes
+# masked out of its mount namespace (bwrap, no root). Steam keeps everything
+# else: GPU nodes, /dev/input (generic pads), /dev/uinput, other hidraw.
+#
+# Masking binds /dev/null over each current puck node: opens succeed but
+# report descriptors/ioctls fail, so Steam should treat the device as absent.
+# Known gap: nodes created by a puck REPLUG appear unmasked until Steam
+# restarts (shared devtmpfs).
+set -euo pipefail
+
+MASKS=()
+for h in /sys/class/hidraw/hidraw*; do
+    uevent="$h/device/uevent"
+    [ -r "$uevent" ] || continue
+    if /usr/bin/grep -q "28DE" "$uevent" && /usr/bin/grep -qi "1304" "$uevent"; then
+        dev="/dev/$(basename "$h")"
+        MASKS+=(--dev-bind /dev/null "$dev")
+    fi
+done
+
+echo "masking ${#MASKS[@]} args ($((${#MASKS[@]} / 3)) puck nodes)" >&2
+
+exec bwrap \
+    --bind / / \
+    --dev-bind /dev /dev \
+    "${MASKS[@]}" \
+    --die-with-parent \
+    steam "$@"
