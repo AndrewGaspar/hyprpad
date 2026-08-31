@@ -33,3 +33,22 @@ window management, and workspaces simultaneously, while Steam holds the same
 physical device undisturbed. W2 is feature-complete (remaining: full-Unicode
 keyboard into native Wayland apps — the uinput path is ASCII/XWayland-correct,
 the Unicode/native path is deferred to the W10 OSK).
+
+## Lizard-mode ownership (2026-08-31)
+
+The W12 follow-on — hyprpad disabling the puck's firmware kbd/mouse itself, so a
+masked Steam's inability to do so doesn't leave lizard fighting the daemon.
+Verified live with Steam closed (so firmware lizard mode was ON):
+
+| Step | Lizard evdev (event20/21) |
+|---|---|
+| Lizard on (Steam closed), pad moved | **2274 events** (REL_X/REL_Y mouse motion) |
+| After `HYPRPAD_OWN_LIZARD=1` disable, pad moved | **0 events** |
+| Raw `0x42` stream, same moment | **alive** (pad bytes changing) — controller not asleep |
+
+So `disable_lizard_mode()` (kernel-faithful `CLEAR_DIGITAL_MAPPINGS` +
+`SET_SETTINGS_VALUES` lizard=0/watchdog=0) genuinely silences the firmware
+keyboard/mouse, and it **persists after the daemon exits** because the
+revert-watchdog is also disabled. The write succeeds on an awake device
+(the agent's earlier EPIPE was purely the sleeping-controller case). This is
+the missing piece for the masked-Steam design: hyprpad owns lizard mode.
