@@ -20,3 +20,5 @@ Analyse with:
 zcat sc2-guide-button-isolated.jsonl.gz > /tmp/c.jsonl
 ../tools/sc2-capture.py analyse /tmp/c.jsonl
 ```
+
+| `sc2-combined-lizard-correlation.jsonl.gz` | 227 s, Steam closed. Simultaneous hidraw `0x42` + lizard-mode evdev capture with a guided one-control-at-a-time script. The capture that completed the button map, decoded the analog layout (b6-b29), proved the IMU region is Steam-gated, and confirmed the lizard-mode vocabulary. Produced by `../tools/sc2-combined-capture.py`. |

@@ -110,39 +110,99 @@ Measured over a 210-second capture, 55 205 reports:
 A 250 Hz nominal poll with tight jitter — ample for chord and gesture detection;
 a 40 ms gesture window is ten samples.
 
-### Layout
+### Layout — fully decoded (2026-08-31, Steam closed, lizard-mode cross-correlation)
 
-| Bytes | Content |
+Established by a combined capture (`tools/sc2-combined-capture.py`) reading the
+raw hidraw stream and the lizard-mode evdev nodes simultaneously, with a guided
+one-control-at-a-time script. Lizard-mode key events provided ground truth for
+several buttons; both earlier captures agree everywhere they overlap.
+
+| Bytes | Content | Encoding |
+|---|---|---|
+| `b0` | report ID | `0x42` |
+| `b1` | sequence counter | u8, wraps |
+| `b2`–`b5` | buttons + touch flags | bitfields, table below |
+| `b6`–`b7` | **L2 trigger** | u16 LE, 0…32767 |
+| `b8`–`b9` | **R2 trigger** | u16 LE, 0…32767 |
+| `b10`–`b11` | **Left stick X** | i16 LE, ±32767, +X = right |
+| `b12`–`b13` | **Left stick Y** | i16 LE, +Y = up |
+| `b14`–`b15` | **Right stick X** | i16 LE |
+| `b16`–`b17` | **Right stick Y** | i16 LE |
+| `b18`–`b19` | **Left pad X** | i16 LE touch coords, 0 untouched |
+| `b20`–`b21` | **Left pad Y** | i16 LE, +Y = up |
+| `b22`–`b23` | **Left pad force** | u16 LE, 0…~12550, spikes on click |
+| `b24`–`b25` | **Right pad X** | i16 LE |
+| `b26`–`b27` | **Right pad Y** | i16 LE |
+| `b28`–`b29` | **Right pad force** | u16 LE |
+| `b30`–`b53` | **IMU** | streams **only when enabled** (Steam sends a feature report); with Steam closed this region is byte-for-byte constant across an entire capture |
+
+Stick idle offsets are small but nonzero (±~400 counts) — apply a deadzone.
+
+> The IMU discovery corrects the first capture's reading: with Steam running,
+> `b30`–`b45` stream gyro/orientation continuously, which was mistaken for
+> stick/pad data. Sticks and pads actually live at `b10`–`b29`.
+
+### Button map — complete
+
+| Byte.bit | Mask | Control | Evidence |
+|---|---|---|---|
+| `b2.0` | 0x01 | **A** | + lizard `KEY_ENTER` same 10 ms |
+| `b2.1` | 0x02 | **B** | + lizard `KEY_ESC` |
+| `b2.2` | 0x04 | **X** | isolated press (no lizard output) |
+| `b2.3` | 0x08 | **Y** | isolated press (no lizard output) |
+| `b2.4` | 0x10 | **Quick Access (…)** | 3/3 isolated (earlier) + isolated here |
+| `b2.5` | 0x20 | **R3** (right-stick click) | isolated + accidental repeat during stick circle |
+| `b2.6` | 0x40 | **Menu/Start** | + lizard `KEY_ESC` |
+| `b2.7` | 0x80 | **R4 grip** | consistent across both sessions |
+| `b3.0` | 0x01 | **R5 grip** | consistent across both sessions |
+| `b3.1` | 0x02 | **R1 bumper** | position in script, both sessions |
+| `b3.2` | 0x04 | **D-pad DOWN** | + lizard `KEY_DOWN` (twice — user pressed an extra Down, both captured) |
+| `b3.3` | 0x08 | **D-pad RIGHT** | + lizard `KEY_RIGHT` |
+| `b3.4` | 0x10 | **D-pad LEFT** | + lizard `KEY_LEFT` |
+| `b3.5` | 0x20 | **D-pad UP** | + lizard `KEY_UP` |
+| `b3.6` | 0x40 | **View/Select** | + lizard `KEY_TAB` |
+| `b3.7` | 0x80 | **L3** (left-stick click) | isolated |
+| `b4.0` | 0x01 | **Steam/Guide** | 3/3 isolated (earlier) + isolated here |
+| `b4.1` | 0x02 | **L4 grip** | both sessions |
+| `b4.2` | 0x04 | **L5 grip** | both sessions |
+| `b4.3` | 0x08 | **L1 bumper** | both sessions |
+| `b4.4` | 0x10 | capacitive (right-side grip/stick touch)* | fires on hand contact |
+| `b4.5` | 0x20 | **Right pad touch** | touch-without-click window |
+| `b4.6` | 0x40 | **Right pad click** | + lizard `BTN_LEFT` |
+| `b4.7` | 0x80 | **R2 full press** | at end of slow analog pull; + lizard `BTN_LEFT` |
+| `b5.0` | 0x01 | capacitive (left-stick touch)* | recurs during left-stick work |
+| `b5.1` | 0x02 | **Left pad touch** | touch-without-click window |
+| `b5.2` | 0x04 | **Left pad click** | force channel spikes simultaneously |
+| `b5.3` | 0x08 | **L2 full press** | + lizard `BTN_RIGHT` |
+| `b5.4` | 0x10 | capacitive* | fires on grip/pickup |
+| `b5.5` | 0x20 | capacitive* | fires on grip/pickup |
+
+\* The four capacitive bits (`b4.4`, `b5.0`, `b5.4`, `b5.5`) all fire on hand
+contact and during pickup; individual assignment (left/right grip sense vs
+stick capacitive touch) is tentative — they were never isolated one at a time.
+Functionally they matter as a class ("hands on controller"), which is enough
+for hyprsc.
+
+### Lizard-mode output map (Steam closed) — the initramfs vocabulary
+
+Confirmed live from the puck's `if02` evdev pair (`event20` mouse, `event21`
+keyboard), all other interface slots silent:
+
+| Control | Lizard output |
 |---|---|
-| `b0` | report ID, `0x42` |
-| `b1`–`b4` | frame counter (little-endian; `b1` increments every report) |
-| `b2`–`b5` | **button bitfields** — see below |
-| `b10`–`b17` | motion (four `int16` values, changing continuously at rest — gyro/orientation) |
-| `b18`–`b29` | additional motion / touch, active during trackpad use |
-| `b30`–`b45` | stick and trackpad positions, capacitive data |
+| A / B | `KEY_ENTER` / `KEY_ESC` |
+| D-pad | arrow keys |
+| Menu/Start | `KEY_ESC` |
+| View/Select | `KEY_TAB` |
+| L2 full / R2 full | `BTN_RIGHT` / `BTN_LEFT` |
+| Right pad | mouse motion (`REL_X/Y`); click = `BTN_LEFT` |
+| Left pad | scroll (`REL_WHEEL`/`REL_HWHEEL` + hi-res); click = nothing |
+| X, Y, bumpers, grips, sticks, QAM, Steam | **nothing** |
 
-> **Note.** `b1`–`b4` serve double duty: `b1` is a fast-incrementing counter,
-> while `b2`–`b5` carry buttons. The counter appears to be narrower than the
-> four bytes initially suggest. Treat the exact counter width as unconfirmed.
-
-### Confirmed button bits
-
-Established by a targeted capture: three isolated presses of a single control,
-in isolation, producing exactly three rising edges on one bit.
-
-| Control | Byte | Bit | Mask | Confidence |
-|---|---|---|---|---|
-| **Steam / Guide** | `b4` | 0 | `0x01` | **Confirmed** — 3/3 isolated presses at 12.32 s, 14.98 s, 18.21 s |
-| **Quick Access (`…`)** | `b2` | 4 | `0x10` | **Confirmed** — 3/3 isolated presses at 27.16 s, 27.73 s, 28.36 s |
-| A, B, X, Y | `b2` | 0,1,2,3 | `0x01`–`0x08` | High — pressed in order, twice, in both capture passes |
-| D-pad (4 directions) | `b3` | 2,3,4,5 | — | High as a group; individual direction↔bit mapping **not** pinned down |
-| Bumpers | `b4`.3 and `b3`.1 | | | Medium — consistent position in both passes |
-| Grips / Start / Select | `b2`.6,`b2`.7, `b3`.0,`b3`.6, `b4`.1,`b4`.2 | | | Low individually — a cluster of seven unique bits in the right time window, not separated |
-| Capacitive / grip sense | `b4`.4, `b5`.0, `b5`.4, `b5`.5 | | | High as a class — these toggle on hand contact with no button press, and bracket deliberate presses |
-
-The unconfirmed rows are honest gaps, not guesses to build on. Pinning them down
-is a matter of running `sc2-capture.py capture` once per control; see
-[07 — Open questions](07-open-questions.md).
+Key repeat is firmware-driven (~30 Hz autorepeat after ~250 ms). This confirms
+the initramfs plan's premise directly on hardware: the boot-time vocabulary is
+arrows/Enter/Esc/Tab plus a mouse — no letters
+([research/initramfs-unlock.md](research/initramfs-unlock.md)).
 
 ### Guide-button timing
 

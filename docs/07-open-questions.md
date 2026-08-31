@@ -35,9 +35,14 @@ parser, so `hyprctl keyword windowrule` is rejected — the rule must go in the
 config file. This machine's Hyprland config is Lua-generated, so the edit belongs
 in `hyprland.lua`, not the generated `.conf`.
 
-## Q2 — The rest of the `0x42` button map
+## Q2 — The rest of the `0x42` button map  **ANSWERED 2026-08-31**
 
-[03](03-hardware-findings.md#confirmed-button-bits) confirms the Steam button
+Fully mapped via a combined hidraw+lizard-evdev capture with Steam closed —
+see [03](03-hardware-findings.md#button-map--complete). Only the four
+capacitive bits remain individually unassigned (they matter as a class).
+Original text follows.
+
+[03](03-hardware-findings.md) confirms the Steam button
 (`b4` bit 0) and Quick Access (`b2` bit 4) unambiguously, and has high confidence
 on A/B/X/Y. The D-pad direction-to-bit mapping, the individual grip buttons,
 Start/Select and the bumper assignments are **not** pinned down — the guided
@@ -49,12 +54,13 @@ isolated presses each — the method that produced the two confirmed rows. Rough
 fifteen minutes of button pressing. Cross-check against SDL3's
 `SDL_hidapi_steam*` sources, which already decode this device.
 
-## Q3 — Axis encoding in `b30`–`b45`
+## Q3 — Axis encoding  **ANSWERED 2026-08-31**
 
-Sticks, trackpads and capacitive touch all live in this range, and it was only
-established that they *move independently* during a guide hold, not how they are
-encoded. Endianness, signedness, resolution, and which pair belongs to which
-control are all open. Probably `int16` little-endian pairs, unverified.
+Answered, with a correction: sticks/pads live at `b10`–`b29` (i16/u16 LE,
+±32767 sticks, u16 triggers and pad force), and `b30`+ is the **IMU**, which
+streams only when enabled by a feature report (Steam does this; frozen
+otherwise). Full table in
+[03](03-hardware-findings.md#layout--fully-decoded-2026-08-31-steam-closed-lizard-mode-cross-correlation).
 
 **How to answer.** Capture single-axis motion — push the right stick fully right,
 release, fully left — and correlate. SDL3 again is the reference.
@@ -141,7 +147,14 @@ living-room tower: GPU (NVIDIA assumed), monitor/TV EDID and HDR capabilities,
 USB topology for the puck, BIOS wake-from-USB behaviour, boot chain (Limine +
 UKI assumed to match the laptop since both run Omarchy).
 
-## Q12 — Lizard mode in the initramfs
+## Q12 — Lizard mode in the initramfs  **HALF-ANSWERED**
+
+*2026-08-31: the userspace half is confirmed on hardware — with Steam closed,
+lizard mode is live and emits exactly the arrows/Enter/Esc/Tab + mouse
+vocabulary the initramfs plan assumes
+([03](03-hardware-findings.md#lizard-mode-output-map-steam-closed--the-initramfs-vocabulary)).
+Remaining: confirm the same at an actual LUKS prompt (a reboot).*
+
 
 The controller's lizard mode presents a standard HID boot keyboard
 (dpad→arrows, A→Enter, B→Esc). If that interface enumerates during early boot,
