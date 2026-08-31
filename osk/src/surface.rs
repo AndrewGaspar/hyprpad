@@ -33,7 +33,8 @@
 
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 
-use crate::layout::{LayoutMode, PanelRole};
+use crate::layout::{Keyboard, LayoutEngine, LayoutMode, PanelRole};
+use crate::theme::Geom;
 
 /// The one layer tier the OSK ever uses.
 pub const LAYER: Layer = Layer::Overlay;
@@ -43,77 +44,82 @@ pub const INTERACTIVITY: KeyboardInteractivity = KeyboardInteractivity::None;
 /// `hyprctl layers` identification.
 pub const NAMESPACE: &str = "hyprpad-osk";
 
-// Thickness heuristics (kickoff). Final ergonomics — especially the side
-// columns — are DEFERRED (see README / osk-technology.md §4).
-const DEFAULT_OUT_W: u32 = 1920;
-const DEFAULT_OUT_H: u32 = 1080;
-
-fn bottom_height(out_h: u32) -> u32 {
-    let h = if out_h == 0 { DEFAULT_OUT_H } else { out_h };
-    ((h as f32 * 0.34) as u32).clamp(240, 520)
-}
-
-fn column_width(out_w: u32) -> u32 {
-    let w = if out_w == 0 { DEFAULT_OUT_W } else { out_w };
-    ((w as f32 * 0.22) as u32).clamp(220, 480)
-}
-
 /// The anchoring + sizing + exclusive-zone spec for one layer surface.
 #[derive(Clone, Copy, Debug)]
 pub struct PanelSpec {
     pub role: PanelRole,
     pub anchor: Anchor,
-    /// Requested width; `0` means "span the anchored axis" (compositor fills in
-    /// the real width in its configure).
+    /// Requested width in px — the panel's **content size** (only as wide as the
+    /// keys need). Always non-zero now: the surface is sized to content, never
+    /// spanned across the screen.
     pub width: u32,
-    /// Requested height; `0` means "span".
+    /// Requested height in px — the panel's content size. Always non-zero.
     pub height: u32,
     /// Exclusive zone in px along the anchored edge. `>0` reflows workspace
     /// content; `0` floats over it (osk-technology.md §2.3 / task Mode A vs B).
+    /// Bottom mode reserves the surface's *height*; a side column reserves its
+    /// *width*.
     pub exclusive_zone: i32,
 }
 
-/// Compute the panel spec(s) for a show request.
+/// Compute the panel spec(s) for a show request. Every panel is **sized to
+/// content** — its `width`/`height` come from
+/// [`LayoutEngine::content_size`] over `keyboard` + `geom`, a pure function of
+/// the key grid and the theme's geometry tokens (never the screen size).
 ///
-/// * [`LayoutMode::BottomDeck`] → **one** panel anchored bottom, spanning the
-///   full width, reserving `bottom_height` px (reflow) or `0` (overlay).
-/// * [`LayoutMode::SideSplit`] → **two** panels, one anchored to each vertical
-///   edge, each spanning full height and reserving `column_width` px. Two
-///   surfaces (not one full-width surface with a transparent hole) because an
-///   exclusive zone is a single scalar along one edge — you cannot carve a gap
-///   in the middle of one surface, so genuine centre reflow *requires* an
-///   independent exclusive zone on each edge. The cost is two surfaces to keep
-///   in sync; the benefit is real two-sided reflow and each thumb owning its
-///   own physical surface.
-pub fn panels_for(mode: LayoutMode, reflow: bool, out_w: u32, out_h: u32) -> Vec<PanelSpec> {
+/// The docking uses a **single-edge anchor** so the compositor centres the
+/// surface on the perpendicular axis:
+///
+/// * [`LayoutMode::BottomDeck`] → **one** panel anchored to the bottom edge
+///   only, so it is centred horizontally on the bottom (a narrow, content-wide
+///   deck rather than a full-width bar). Reflow reserves its *height* as the
+///   bottom exclusive zone; overlay reserves `0`.
+/// * [`LayoutMode::SideSplit`] → **two** panels, each anchored to one vertical
+///   edge only, so each is docked to its edge and centred *vertically* (a short
+///   content-tall column rather than a full-height rail). Reflow reserves each
+///   column's *width* as its edge's exclusive zone. Two surfaces (not one with a
+///   transparent hole) because an exclusive zone is a single scalar along one
+///   edge — you cannot carve a gap in the middle of one surface, so genuine
+///   centre reflow *requires* an independent exclusive zone on each edge. The
+///   cost is two surfaces to keep in sync; the benefit is real two-sided reflow
+///   and each thumb owning its own physical surface.
+pub fn panels_for(mode: LayoutMode, reflow: bool, keyboard: &Keyboard, geom: &Geom) -> Vec<PanelSpec> {
+    let eng = LayoutEngine::new(keyboard, mode);
+    let size = |role: PanelRole| {
+        let (w, h) = eng.content_size(role, geom);
+        (w.ceil() as u32, h.ceil() as u32)
+    };
     match mode {
         LayoutMode::BottomDeck => {
-            let h = bottom_height(out_h);
+            let (w, h) = size(PanelRole::Bottom);
             vec![PanelSpec {
                 role: PanelRole::Bottom,
-                anchor: Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                width: 0,
+                // Bottom edge only → centred horizontally on the bottom anchor.
+                anchor: Anchor::BOTTOM,
+                width: w,
                 height: h,
                 exclusive_zone: if reflow { h as i32 } else { 0 },
             }]
         }
         LayoutMode::SideSplit => {
-            let w = column_width(out_w);
-            let ez = if reflow { w as i32 } else { 0 };
+            let (lw, lh) = size(PanelRole::LeftColumn);
+            let (rw, rh) = size(PanelRole::RightColumn);
             vec![
                 PanelSpec {
                     role: PanelRole::LeftColumn,
-                    anchor: Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
-                    width: w,
-                    height: 0,
-                    exclusive_zone: ez,
+                    // Left edge only → docked left, centred vertically.
+                    anchor: Anchor::LEFT,
+                    width: lw,
+                    height: lh,
+                    exclusive_zone: if reflow { lw as i32 } else { 0 },
                 },
                 PanelSpec {
                     role: PanelRole::RightColumn,
-                    anchor: Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
-                    width: w,
-                    height: 0,
-                    exclusive_zone: ez,
+                    // Right edge only → docked right, centred vertically.
+                    anchor: Anchor::RIGHT,
+                    width: rw,
+                    height: rh,
+                    exclusive_zone: if reflow { rw as i32 } else { 0 },
                 },
             ]
         }
@@ -123,41 +129,61 @@ pub fn panels_for(mode: LayoutMode, reflow: bool, out_w: u32, out_h: u32) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
+
+    fn kb() -> Keyboard {
+        Keyboard::qwerty()
+    }
+    fn geom() -> Geom {
+        Theme::default().geom
+    }
 
     #[test]
-    fn bottom_deck_is_one_bottom_anchored_panel() {
-        let p = panels_for(LayoutMode::BottomDeck, true, 1920, 1080);
+    fn bottom_deck_is_one_bottom_centered_content_sized_panel() {
+        let p = panels_for(LayoutMode::BottomDeck, true, &kb(), &geom());
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].role, PanelRole::Bottom);
+        // Bottom edge only → compositor centres it horizontally.
         assert!(p[0].anchor.contains(Anchor::BOTTOM));
-        assert!(p[0].anchor.contains(Anchor::LEFT | Anchor::RIGHT));
+        assert!(!p[0].anchor.contains(Anchor::LEFT));
+        assert!(!p[0].anchor.contains(Anchor::RIGHT));
         assert!(!p[0].anchor.contains(Anchor::TOP));
-        // Reflow reserves the panel height.
+        // Content-sized: a fixed, non-zero width far below a 2048 screen.
+        assert!(p[0].width > 0 && p[0].height > 0);
+        assert!(p[0].width < 1600, "bottom width {} should be content-sized", p[0].width);
+        // Reflow reserves the panel HEIGHT (bottom exclusive zone).
         assert_eq!(p[0].exclusive_zone, p[0].height as i32);
-        assert!(p[0].exclusive_zone > 0);
     }
 
     #[test]
     fn overlay_mode_sets_zero_exclusive_zone() {
-        let p = panels_for(LayoutMode::BottomDeck, false, 1920, 1080);
+        let p = panels_for(LayoutMode::BottomDeck, false, &kb(), &geom());
         assert_eq!(p[0].exclusive_zone, 0);
         // Same surface/anchor as reflow — only the zone differs.
         assert!(p[0].anchor.contains(Anchor::BOTTOM));
+        assert!(p[0].width > 0 && p[0].height > 0);
     }
 
     #[test]
-    fn side_split_is_two_opposite_edge_columns() {
-        let p = panels_for(LayoutMode::SideSplit, true, 1920, 1080);
+    fn side_split_is_two_opposite_edge_content_sized_columns() {
+        let full_h: u32 = 1254; // this machine's usable height; columns must be shorter
+        let p = panels_for(LayoutMode::SideSplit, true, &kb(), &geom());
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].role, PanelRole::LeftColumn);
         assert!(p[0].anchor.contains(Anchor::LEFT));
         assert!(!p[0].anchor.contains(Anchor::RIGHT));
+        // Single vertical edge → NOT stretched top-to-bottom; centred vertically.
+        assert!(!p[0].anchor.contains(Anchor::TOP));
+        assert!(!p[0].anchor.contains(Anchor::BOTTOM));
         assert_eq!(p[1].role, PanelRole::RightColumn);
         assert!(p[1].anchor.contains(Anchor::RIGHT));
         assert!(!p[1].anchor.contains(Anchor::LEFT));
-        // Both columns reserve their width on their own edge → centre reflow.
-        assert!(p[0].exclusive_zone > 0 && p[0].exclusive_zone == p[1].exclusive_zone);
-        assert!(p[0].anchor.contains(Anchor::TOP | Anchor::BOTTOM));
+        // Each column reserves its own WIDTH on its own edge → centre reflow.
+        assert_eq!(p[0].exclusive_zone, p[0].width as i32);
+        assert_eq!(p[1].exclusive_zone, p[1].width as i32);
+        // Content-tall, not full-height.
+        assert!(p[0].height < full_h && p[1].height < full_h);
+        assert!(p[0].width > 0 && p[1].width > 0);
     }
 
     #[test]

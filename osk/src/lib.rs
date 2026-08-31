@@ -17,6 +17,11 @@
 //! * [`surface`] — the layer-shell anchoring / exclusive-zone policy. Bakes in
 //!   the non-negotiable rules: OVERLAY tier only, destroy-on-dismiss, stable
 //!   namespace for the `no_screen_share` / `above_lock` layer rules.
+//! * [`theme`] — the theming foundation: the colour + geometry + font token
+//!   table ([`theme::Theme`]) the draw path reads from, and the
+//!   [`theme::ThemeSource`] seam (built-in / TOML file / Omarchy) that decides
+//!   where those tokens come from. Size-to-content geometry is derived from
+//!   [`theme::Geom`], never from the screen size.
 //! * [`render`] — a small CPU renderer drawing keys + labels into an shm buffer.
 //! * [`output`] — the uinput keyboard (real evdev keycodes → types everywhere,
 //!   XWayland included; adapted from the parent crate's proven `src/output.rs`).
@@ -31,3 +36,4 @@ pub mod layout;
 pub mod output;
 pub mod render;
 pub mod surface;
+pub mod theme;

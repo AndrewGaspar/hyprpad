@@ -27,6 +27,8 @@
 //! The keycodes and the grid come from osk-technology.md §4.6 (code-verified
 //! against the shipped Steam Deck OSK bundle).
 
+use crate::theme::Geom;
+
 /// Which hand — and therefore which trackpad — owns a key.
 ///
 /// This is the ergonomic pivot of the whole model. In [`LayoutMode::SideSplit`]
@@ -289,24 +291,13 @@ impl<'k> LayoutEngine<'k> {
         LayoutEngine { keyboard, mode }
     }
 
-    /// Place all keys that belong in `panel` into a `panel_w` x `panel_h` area.
-    ///
-    /// The algorithm is identical for every panel — group by grid row, lay each
-    /// row out left-to-right weighted by [`Key::units`], normalise to the panel
-    /// width. Because a side-split column only *contains* its hand's keys
-    /// (see [`PanelRole::holds`]), the very same routine yields the full grid
-    /// for [`PanelRole::Bottom`] and a hand-local sub-grid for a column. That is
-    /// the whole trick: one placement routine, three panels, two modes.
-    pub fn place(&self, panel: PanelRole, panel_w: f32, panel_h: f32) -> Vec<PlacedKey> {
-        let pad = 2.0_f32; // gap between keys, px. §4.9 item 11 wants gap:0 for
-                           // haptics; a hairline gap here is a kickoff legibility
-                           // choice, TODO revisit with real theming (§4.7).
-        let rows = self.keyboard.rows();
-        let row_h = panel_h / rows as f32;
-
-        let mut placed = Vec::new();
-        for row in 0..rows {
-            // Keys of this row that live in this panel, in model order.
+    /// The rows this panel actually holds, each as `(row, key indices, total
+    /// units)`, in draw order. Empty rows are dropped. Shared by
+    /// [`Self::content_size`] and [`Self::place`] so sizing and placement can
+    /// never disagree.
+    fn panel_rows(&self, panel: PanelRole) -> Vec<(u8, Vec<usize>, f32)> {
+        let mut out = Vec::new();
+        for row in 0..self.keyboard.rows() {
             let indices: Vec<usize> = self
                 .keyboard
                 .keys
@@ -319,31 +310,93 @@ impl<'k> LayoutEngine<'k> {
                 continue;
             }
             let total_units: f32 = indices.iter().map(|&i| self.keyboard.keys[i].units).sum();
-            let unit_w = panel_w / total_units;
+            out.push((row, indices, total_units));
+        }
+        out
+    }
 
-            let mut x = 0.0_f32;
-            let y = row as f32 * row_h;
-            for &i in &indices {
-                let w = self.keyboard.keys[i].units * unit_w;
+    /// The **content-sized** pixel dimensions of `panel` for the given geometry
+    /// tokens — the whole size-to-content mechanism. The surface is only as big
+    /// as the keys need, derived purely from [`Geom`] and the key grid, **never**
+    /// from the screen size.
+    ///
+    /// A key of `u` units is `u*key_size + (u-1)*gap` px wide (it absorbs the
+    /// gaps a run of unit-keys would have had), and rows are separated by `gap`,
+    /// which collapses a row's width to a clean function of its total units:
+    ///
+    /// ```text
+    /// row_w   = key_size*total_units + gap*(total_units - 1)
+    /// content_w = max row_w over the panel's rows
+    /// content_h = key_size*n_rows    + gap*(n_rows    - 1)
+    /// panel     = (content_w, content_h) + 2*margin on each axis
+    /// ```
+    pub fn content_size(&self, panel: PanelRole, g: &Geom) -> (f32, f32) {
+        let rows = self.panel_rows(panel);
+        if rows.is_empty() {
+            return (2.0 * g.margin, 2.0 * g.margin);
+        }
+        let n_rows = rows.len() as f32;
+        let max_units = rows.iter().map(|(_, _, u)| *u).fold(0.0_f32, f32::max);
+        let content_w = g.key_size * max_units + g.gap * (max_units - 1.0);
+        let content_h = g.key_size * n_rows + g.gap * (n_rows - 1.0);
+        (content_w + 2.0 * g.margin, content_h + 2.0 * g.margin)
+    }
+
+    /// Place all keys that belong in `panel` at **absolute** pixel rectangles
+    /// sized by `g` (not stretched to a panel size). Each row is centred
+    /// horizontally within the content width, so the placement exactly fills the
+    /// [`Self::content_size`] box: keys span `[margin, panel_w-margin]` on the
+    /// widest row and `[margin, panel_h-margin]` vertically.
+    ///
+    /// The algorithm is identical for every panel — group by grid row, lay each
+    /// row out left-to-right weighted by [`Key::units`]. Because a side-split
+    /// column only *contains* its hand's keys (see [`PanelRole::holds`]), the
+    /// very same routine yields the full grid for [`PanelRole::Bottom`] and a
+    /// hand-local sub-grid for a column. One placement routine, three panels,
+    /// two modes.
+    pub fn place(&self, panel: PanelRole, g: &Geom) -> Vec<PlacedKey> {
+        let rows = self.panel_rows(panel);
+        let (content_w, _) = {
+            let (w, h) = self.content_size(panel, g);
+            (w - 2.0 * g.margin, h - 2.0 * g.margin)
+        };
+
+        let key_w = |units: f32| units * g.key_size + (units - 1.0) * g.gap;
+
+        let mut placed = Vec::new();
+        for (ord, (_, indices, total_units)) in rows.iter().enumerate() {
+            let row_w = key_w(*total_units);
+            // Centre this row within the content width.
+            let mut x = g.margin + (content_w - row_w) / 2.0;
+            let y = g.margin + ord as f32 * (g.key_size + g.gap);
+            for &i in indices {
+                let w = key_w(self.keyboard.keys[i].units);
                 placed.push(PlacedKey {
                     key: i,
-                    rect: Rect { x: x + pad, y: y + pad, w: w - 2.0 * pad, h: row_h - 2.0 * pad },
+                    rect: Rect { x, y, w, h: g.key_size },
                 });
-                x += w;
+                x += w + g.gap;
             }
         }
         placed
     }
 
-    /// The trackpad region for `pad` within a panel of the given size, as a
-    /// fraction rect (osk-technology.md §4.1/§4.9 item 1).
+    /// The trackpad region for `pad` within `panel`, as an absolute pixel rect
+    /// over the panel's **content size** (osk-technology.md §4.1/§4.9 item 1).
+    ///
+    /// This is the load-bearing half of the `[-1,1] -> key` contract: the region
+    /// is expressed as a fraction of the (now content-sized) panel, so a pad's
+    /// full normalized range still spans exactly the keys after the surface
+    /// shrinks — the fractions are unchanged, only the panel got smaller.
     ///
     /// * [`LayoutMode::BottomDeck`]: left pad = leftmost 55%, right pad =
-    ///   rightmost 55% (10% overlap band in the middle).
+    ///   rightmost 55% (10% overlap band in the middle) — together they cover
+    ///   the full width, so every key is reachable by at least one pad.
     /// * [`LayoutMode::SideSplit`]: each pad owns its whole column panel, so
     ///   the region is the full panel — the split already put each hand on its
     ///   own surface, giving each thumb its own physical side.
-    pub fn trackpad_region(&self, pad: Pad, panel: PanelRole, w: f32, h: f32) -> Rect {
+    pub fn trackpad_region(&self, pad: Pad, panel: PanelRole, g: &Geom) -> Rect {
+        let (w, h) = self.content_size(panel, g);
         match self.mode {
             LayoutMode::BottomDeck => match pad {
                 Pad::Left => Rect { x: 0.0, y: 0.0, w: 0.55 * w, h },
@@ -378,8 +431,12 @@ impl<'k> LayoutEngine<'k> {
     /// `scale` is "Trackpad Sensitivity": a gain applied *before* clamping, so
     /// it expands reach, not cursor speed. This is pure absolute position —
     /// no velocity, no accumulator.
-    pub fn map_cursor(&self, pad: Pad, panel: PanelRole, size: (f32, f32), pos: (f32, f32), scale: f32) -> (f32, f32) {
-        let region = self.trackpad_region(pad, panel, size.0, size.1);
+    ///
+    /// The mapping targets the panel's content-sized [`Self::trackpad_region`],
+    /// so it and [`Self::place`] always agree regardless of what the compositor
+    /// reports for the surface — preserving the `[-1,1] -> key` contract.
+    pub fn map_cursor(&self, pad: Pad, panel: PanelRole, g: &Geom, pos: (f32, f32), scale: f32) -> (f32, f32) {
+        let region = self.trackpad_region(pad, panel, g);
         let t = 0.5 * (1.0 + (pos.0 * scale).clamp(-1.0, 1.0));
         let o = 0.5 * (1.0 - (pos.1 * scale).clamp(-1.0, 1.0));
         (region.x + region.w * t, region.y + region.h * o)
@@ -427,12 +484,17 @@ mod tests {
         assert_eq!(hand("n"), Hand::Right);
     }
 
+    fn geom() -> Geom {
+        crate::theme::Theme::default().geom
+    }
+
     #[test]
     fn side_split_columns_partition_by_hand() {
         let kb = Keyboard::qwerty();
+        let g = geom();
         let eng = LayoutEngine::new(&kb, LayoutMode::SideSplit);
-        let left = eng.place(PanelRole::LeftColumn, 400.0, 800.0);
-        let right = eng.place(PanelRole::RightColumn, 400.0, 800.0);
+        let left = eng.place(PanelRole::LeftColumn, &g);
+        let right = eng.place(PanelRole::RightColumn, &g);
         let has = |placed: &[PlacedKey], label: &str| {
             placed.iter().any(|p| kb.keys[p.key].label == label)
         };
@@ -446,37 +508,102 @@ mod tests {
     }
 
     #[test]
-    fn bottom_deck_places_every_key_in_one_panel() {
+    fn keys_are_roughly_square_and_content_sized() {
         let kb = Keyboard::qwerty();
+        let g = geom();
         let eng = LayoutEngine::new(&kb, LayoutMode::BottomDeck);
-        let placed = eng.place(PanelRole::Bottom, 1280.0, 360.0);
-        assert_eq!(placed.len(), kb.keys.len());
-        // Keys stay inside the panel bounds.
+        let placed = eng.place(PanelRole::Bottom, &g);
+        // A 1-unit character keycap is exactly key_size x key_size (square).
+        let a = placed.iter().find(|p| kb.keys[p.key].label == "a").unwrap();
+        assert!((a.rect.w - g.key_size).abs() < 0.001);
+        assert!((a.rect.h - g.key_size).abs() < 0.001);
+
+        // The panel is content-sized: its width is far below a full 2048 screen,
+        // and every key sits inside the computed content box (with margin).
+        let (pw, ph) = eng.content_size(PanelRole::Bottom, &g);
+        assert!(pw < 1600.0, "bottom content width {pw} should be well under screen width");
         for p in &placed {
-            assert!(p.rect.x >= 0.0 && p.rect.x + p.rect.w <= 1280.0 + 0.5);
-            assert!(p.rect.y >= 0.0 && p.rect.y + p.rect.h <= 360.0 + 0.5);
+            assert!(p.rect.x >= g.margin - 0.5 && p.rect.x + p.rect.w <= pw - g.margin + 0.5);
+            assert!(p.rect.y >= g.margin - 0.5 && p.rect.y + p.rect.h <= ph - g.margin + 0.5);
         }
     }
 
     #[test]
     fn cursor_maps_absolute_center_and_extents() {
         let kb = Keyboard::qwerty();
+        let g = geom();
         let eng = LayoutEngine::new(&kb, LayoutMode::BottomDeck);
+        let (w, h) = eng.content_size(PanelRole::Bottom, &g);
         // Centre of the pad (0,0) → centre of the left region.
-        let (x, y) = eng.map_cursor(Pad::Left, PanelRole::Bottom, (1000.0, 400.0), (0.0, 0.0), 1.0);
-        assert!((x - 0.5 * 0.55 * 1000.0).abs() < 0.01);
-        assert!((y - 200.0).abs() < 0.01);
+        let (x, y) = eng.map_cursor(Pad::Left, PanelRole::Bottom, &g, (0.0, 0.0), 1.0);
+        assert!((x - 0.5 * 0.55 * w).abs() < 0.01);
+        assert!((y - 0.5 * h).abs() < 0.01);
         // Full right/up deflection → far corner of the region (Y inverted).
-        let (x2, y2) = eng.map_cursor(Pad::Left, PanelRole::Bottom, (1000.0, 400.0), (1.0, 1.0), 1.0);
-        assert!((x2 - 0.55 * 1000.0).abs() < 0.01);
+        let (x2, y2) = eng.map_cursor(Pad::Left, PanelRole::Bottom, &g, (1.0, 1.0), 1.0);
+        assert!((x2 - 0.55 * w).abs() < 0.01);
         assert!(y2.abs() < 0.01);
+    }
+
+    /// The CRITICAL contract (task): after resizing/re-centering the key area,
+    /// a pad's full `[-1,1]` normalized range must still map onto its key
+    /// cluster — every key remains reachable by the appropriate pad.
+    ///
+    /// * Split mode: each pad owns its whole column, so *every* key centre in
+    ///   that column must be inside the pad's reachable rect.
+    /// * Bottom mode: the left pad covers the leftmost 55% and the right pad the
+    ///   rightmost 55% (the §4.1 geometry, with the 10% overlap band), and their
+    ///   union must cover *every* key centre so nothing is unreachable.
+    #[test]
+    fn pad_range_covers_the_key_cluster_after_resize() {
+        let kb = Keyboard::qwerty();
+        let g = geom();
+
+        // Reachable rect for a pad = the four normalized corners mapped in.
+        let reach = |eng: &LayoutEngine, pad: Pad, panel: PanelRole| -> Rect {
+            let c = |nx: f32, ny: f32| eng.map_cursor(pad, panel, &g, (nx, ny), 1.0);
+            let pts = [c(-1.0, -1.0), c(1.0, -1.0), c(-1.0, 1.0), c(1.0, 1.0)];
+            let minx = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+            let maxx = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+            let miny = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+            let maxy = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+            Rect { x: minx, y: miny, w: maxx - minx, h: maxy - miny }
+        };
+        let center = |p: &PlacedKey| (p.rect.x + p.rect.w / 2.0, p.rect.y + p.rect.h / 2.0);
+
+        // --- Split: every key centre in a column is reachable by its pad. -----
+        let eng = LayoutEngine::new(&kb, LayoutMode::SideSplit);
+        for (pad, panel) in [(Pad::Left, PanelRole::LeftColumn), (Pad::Right, PanelRole::RightColumn)] {
+            let r = reach(&eng, pad, panel);
+            for p in eng.place(panel, &g) {
+                let (cx, cy) = center(&p);
+                assert!(r.contains(cx, cy), "split {:?} unreachable by {:?}", kb.keys[p.key].label, pad);
+            }
+        }
+
+        // --- Bottom: 55%/55% regions, and their UNION covers every key. -------
+        let eng = LayoutEngine::new(&kb, LayoutMode::BottomDeck);
+        let (w, _) = eng.content_size(PanelRole::Bottom, &g);
+        let rl = reach(&eng, Pad::Left, PanelRole::Bottom);
+        let rr = reach(&eng, Pad::Right, PanelRole::Bottom);
+        // The §4.1 region geometry survived the resize.
+        assert!((rl.x).abs() < 0.01 && (rl.w - 0.55 * w).abs() < 0.5, "left pad != leftmost 55%");
+        assert!((rr.x - 0.45 * w).abs() < 0.5 && (rr.x + rr.w - w).abs() < 0.5, "right pad != rightmost 55%");
+        for p in eng.place(PanelRole::Bottom, &g) {
+            let (cx, cy) = center(&p);
+            assert!(
+                rl.contains(cx, cy) || rr.contains(cx, cy),
+                "bottom key {:?} centre unreachable by either pad",
+                kb.keys[p.key].label
+            );
+        }
     }
 
     #[test]
     fn hit_test_finds_the_key_under_a_point() {
         let kb = Keyboard::qwerty();
+        let g = geom();
         let eng = LayoutEngine::new(&kb, LayoutMode::BottomDeck);
-        let placed = eng.place(PanelRole::Bottom, 1000.0, 400.0);
+        let placed = eng.place(PanelRole::Bottom, &g);
         let first = placed[0];
         let cx = first.rect.x + first.rect.w / 2.0;
         let cy = first.rect.y + first.rect.h / 2.0;
