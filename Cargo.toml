@@ -7,6 +7,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/AndrewGaspar/hyprsc"
 
 [dependencies]
+# Output side (W2). The input/gesture/IPC core stays dependency-free; these are
+# the crate's first real dependencies, justified by the two injection backends:
+#   * wayland-client + wayland-protocols-wlr  -> zwlr_virtual_pointer_v1 (cursor)
+#   * libc                                    -> hand-rolled uinput keyboard
+# `dlopen` binds libwayland-client.so at runtime, so no link-time dev package
+# is required. See docs/research/osk-technology.md and docs/07-open-questions.md
+# Q14 for why the keyboard is uinput (works into XWayland) rather than vkbd-v1.
+wayland-client = { version = "0.31", features = ["dlopen"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
 
 [profile.release]
 lto = true
