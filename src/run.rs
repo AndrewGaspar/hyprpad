@@ -46,6 +46,17 @@ pub fn run() -> std::io::Result<()> {
     };
     eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
 
+    // Lizard-mode ownership (opt-in). Off by default so we never fight an
+    // unmasked Steam that is managing lizard mode itself
+    // (docs/experiments/w12-device-denial.md). When enabled, a background thread
+    // disables the puck's firmware keyboard/mouse emulation and re-sends
+    // periodically to re-cover it across reconnects. It degrades gracefully:
+    // failures log a warning and never take the daemon down.
+    if lizard_ownership_enabled(&config) {
+        eprintln!("hyprpad: lizard-mode ownership on; taking over the puck's firmware kbd/mouse");
+        std::thread::spawn(crate::lizard::own_lizard_loop);
+    }
+
     // Merge both event sources into one channel so the loop stays single-owner.
     let (tx, rx) = mpsc::channel::<Input>();
 
@@ -183,6 +194,21 @@ fn drive_cursor(
     if want_down != st.left_down {
         ptr.button(PointerButton::Left, want_down);
         st.left_down = want_down;
+    }
+}
+
+/// Whether to take ownership of the puck's lizard mode. Enabled by the
+/// `own_lizard` config flag (`[daemon]` section) or the `HYPRPAD_OWN_LIZARD`
+/// environment variable. The env var wins when set to a truthy value
+/// (`1`/`true`/`yes`/`on`); an empty or falsey value forces it off, so it can
+/// override a config that turned it on. Default off.
+fn lizard_ownership_enabled(config: &Config) -> bool {
+    match std::env::var("HYPRPAD_OWN_LIZARD") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => config.own_lizard(),
     }
 }
 

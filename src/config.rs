@@ -196,6 +196,12 @@ fn parse_button(s: &str) -> Result<report::Button, String> {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     bindings: HashMap<GestureKey, Action>,
+    /// Whether hyprpad should take ownership of the puck's lizard mode and keep
+    /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
+    /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
+    /// never fight an unmasked Steam that is managing lizard mode itself
+    /// (docs/experiments/w12-device-denial.md).
+    own_lizard: bool,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -214,6 +220,7 @@ impl Config {
     /// Parse a config from the TOML dialect described in the module docs.
     pub fn from_toml_str(s: &str) -> Result<Config, String> {
         let mut bindings = HashMap::new();
+        let mut own_lizard = false;
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -225,19 +232,37 @@ impl Config {
                 section = inner.trim().to_ascii_lowercase();
                 continue;
             }
-            if !section.is_empty() && section != "bindings" {
-                return Err(format!("line {lineno}: unknown section [{section}]"));
-            }
             let (k, v) = line
                 .split_once('=')
                 .ok_or_else(|| format!("line {lineno}: expected 'key = value'"))?;
-            let key = GestureKey::parse(&unquote(k))
-                .map_err(|e| format!("line {lineno}: {e}"))?;
-            let action = Action::parse(&unquote(v))
-                .map_err(|e| format!("line {lineno}: {e}"))?;
-            bindings.insert(key, action);
+            match section.as_str() {
+                // A leading, header-less block is treated as bindings, as before.
+                "" | "bindings" => {
+                    let key = GestureKey::parse(&unquote(k))
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    let action = Action::parse(&unquote(v))
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    bindings.insert(key, action);
+                }
+                // Daemon-wide settings (not gesture bindings).
+                "daemon" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    match key.as_str() {
+                        "own_lizard" => {
+                            own_lizard = parse_bool(&unquote(v))
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [daemon] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
+                _ => return Err(format!("line {lineno}: unknown section [{section}]")),
+            }
         }
-        Ok(Config { bindings })
+        Ok(Config { bindings, own_lizard })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -301,6 +326,23 @@ impl Config {
     /// Whether there are no bindings.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
+    }
+
+    /// Whether hyprpad should take ownership of the puck's lizard mode
+    /// ([`crate::lizard`]). Configured by `own_lizard` in the `[daemon]`
+    /// section; default `false`.
+    pub fn own_lizard(&self) -> bool {
+        self.own_lizard
+    }
+}
+
+/// Parse a boolean config value: `true`/`false`, `1`/`0`, `yes`/`no`,
+/// `on`/`off` (case-insensitive).
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!("expected a boolean (true/false), got '{other}'")),
     }
 }
 
@@ -575,6 +617,39 @@ mod tests {
     #[test]
     fn default_config_is_nonempty() {
         assert!(!Config::load_default().is_empty());
+    }
+
+    #[test]
+    fn own_lizard_defaults_off_and_parses() {
+        // Default (and built-in default config) leaves ownership off.
+        assert!(!Config::load_default().own_lizard());
+        assert!(!Config::from_toml_str("[bindings]\n\"guide+a\" = \"fullscreen\"\n")
+            .unwrap()
+            .own_lizard());
+
+        // Explicit enable in the [daemon] section, bindings still parse.
+        let c = Config::from_toml_str(
+            "[daemon]\nown_lizard = true\n[bindings]\n\"guide+a\" = \"fullscreen\"\n",
+        )
+        .unwrap();
+        assert!(c.own_lizard());
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // Accepted spellings and explicit false.
+        assert!(Config::from_toml_str("[daemon]\nown_lizard = on\n").unwrap().own_lizard());
+        assert!(Config::from_toml_str("[daemon]\nown_lizard = 1\n").unwrap().own_lizard());
+        assert!(!Config::from_toml_str("[daemon]\nown_lizard = false\n").unwrap().own_lizard());
+
+        // Bad value and unknown setting are reported, not silently ignored.
+        assert!(Config::from_toml_str("[daemon]\nown_lizard = maybe\n")
+            .unwrap_err()
+            .contains("boolean"));
+        assert!(Config::from_toml_str("[daemon]\nnope = true\n")
+            .unwrap_err()
+            .contains("unknown [daemon] setting"));
     }
 
     #[test]
