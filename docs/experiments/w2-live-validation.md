@@ -52,3 +52,20 @@ keyboard/mouse, and it **persists after the daemon exits** because the
 revert-watchdog is also disabled. The write succeeds on an awake device
 (the agent's earlier EPIPE was purely the sleeping-controller case). This is
 the missing piece for the masked-Steam design: hyprpad owns lizard mode.
+
+## Dual-trackpad typing — end-to-end, confirmed by real use (2026-08-31)
+
+**The owner typed a full message to me using the OSK**, dual-trackpad, into a
+focused terminal. That exercises the entire stack live: passive hidraw tap →
+`GestureEngine` (Guide+Y chord) → `Action::ToggleKeyboard` → `OskHandle` spawns
+and shows `hyprpad-osk` → both trackpads drive the two on-screen cursors
+(`cursor L|R`) → pad click-down → `commit L|R` → the OSK's uinput keyboard →
+characters into the focused app. Steam was closed (no guide-chord collision),
+lizard-mode ownership on (firmware kbd/mouse disabled so the pads only drive the
+OSK), OSK rendered with the new square-key `hyprpad-dark` theme (72px keys,
+size-to-content).
+
+This is the dogfooding milestone: the controller drives Hyprland AND types,
+usably, from a passive tap — the whole project thesis, in a real user's hands.
+Remaining polish: cursor damping (jitter while held steady — One Euro Filter,
+in progress per docs/research/pointer-damping.md).
