@@ -29,6 +29,8 @@ cargo clippy --release
 hyprpad-osk
 # or drive it from stdin (handy for scripting / the live test)
 printf 'show bottom\ntype hello world\nhide\nquit\n' | hyprpad-osk --stdin
+# drive the two pad cursors, toggle shift, and type "!" via the shifted 1 key:
+printf 'show bottom\ncursor L -0.45 0.15\ncursor R 0.45 0.15\nshift stuck\nlayer symbols\nquit\n' | hyprpad-osk --stdin
 ```
 
 The hyprpad daemon will eventually drive the socket, forwarding the controller's
@@ -102,24 +104,43 @@ exclusive zone on each edge.
 **Reflow vs overlay** is an orthogonal axis: `reflow` sets an exclusive zone so
 Hyprland shrinks the tiled area (the pan-up / side-squeeze feel); `overlay` sets
 a zero exclusive zone to float over a fullscreen game. Both always use the
-OVERLAY layer tier.
+OVERLAY layer tier. **Overlay/float is the default**; reflow is opt-in. The
+policy is live-toggleable without losing shift/layer state — from the control
+channel (`reflow on|off`) or the on-screen `Push`/`Float` meta key — by
+destroying and recreating the surface(s) with the flipped exclusive zone (in
+split mode the same toggle governs both columns' zones together).
 
 ### Control-channel vocabulary
 
 Line-based, designed with the **dual-trackpad future** in mind (§4.1/§4.5):
 
 ```
-show <bottom|split> [reflow|overlay]   create + render the surface(s)
+show <bottom|split> [reflow|overlay]   create + render the surface(s); OVERLAY is the default
 hide                                    DESTROY the surface(s) — never unmap
 cursor <L|R> <nx> <ny>                  pad absolute position, each axis in [-1,1]
 commit <L|R>                            commit the key under that pad's cursor (click-down)
+shift <off|oneshot|stuck|on>            set the shift/caps state (on = stuck / caps-lock)
+layer <base|symbols|toggle>             switch the base QWERTY ↔ numeric/symbols page
+reflow <on|off>                         displace (on, exclusive zone) vs overlay/float (off)
 key <keycode>                           commit a raw evdev keycode directly
 type <text>                             type an ASCII string
 quit                                    exit
 ```
 
-`cursor`/`commit` already speak the per-pad model the daemon will forward, even
-though this kickoff drives a subset of their behaviour.
+`cursor`/`commit` speak the per-pad model the daemon forwards. `commit` respects
+the live shift state, so `shift stuck` (or committing the on-screen Shift/Caps
+key) then `commit`-ing `1` types `!`. `shift`, `layer`, and `reflow` let the
+daemon drive/persist state the keyboard can also toggle from its own meta keys
+(`?123`/`ABC` = layer, `Push`/`Float` = reflow). `display <overlay|displace>` is
+accepted as an alias for `reflow`.
+
+**Overlay is the default** now: a bare `show bottom` floats over content (zero
+exclusive zone); pass `reflow` — or send `reflow on`, or press the on-screen
+`Push` key — to reserve an exclusive zone and displace/reflow the workspace.
+
+Bursts of lines written together (e.g. two `cursor` lines in one write) are all
+processed on the same wakeup on **both** transports — stdin is set non-blocking
+and drained in full — so the two pad cursors never lag a step behind.
 
 ## Done / Stubbed / Deferred — mapped to `osk-technology.md`
 
@@ -146,19 +167,45 @@ though this kickoff drives a subset of their behaviour.
 - **Absolute dual-trackpad cursor mapping + hit-testing** scaffold (§4.1 formula:
   `p = 0.5(1 ± clamp(v·scale, -1, 1))`, absolute, no accumulator) wired to
   `cursor`/`commit`.
+- **Visible per-pad cursor sprites + per-pad key highlight** (§4.1/§4.5). Each
+  `cursor <L|R>` draws that pad's cursor sprite (a `cursor_size`-diameter disc:
+  pad-coloured body, `cursor_stroke` contrast halo + aim dot) at its mapped
+  position and highlights the key under it in the pad's colour — **both pads at
+  once** (left blue, right orange). Live-verified: two cursors on the bottom
+  panel simultaneously, each over its highlighted key.
+- **Shift / Caps state `{Off, OneShot, Stuck}`** (§4.6) with **visible
+  indication and case-correct legends**. Tapping Shift cycles
+  `Off→OneShot→Stuck→Off`; Caps (and `L3`) toggles `Off↔Stuck`; a one-shot
+  clears after one character. When active the Shift/Caps keys fill with the
+  `shift_active` token and every legend switches to its shifted glyph (letters
+  uppercase, `1`→`!`, …); the committed keycode always matches the drawn glyph.
+  Live-verified: `shift stuck` → uppercase + shifted number row + lit Shift/Caps.
+- **Numeric / symbols layer** (§4.6 "Layers") — a second key set (`Keyboard::
+  symbols()`) reached via the `?123`/`ABC` meta key or `layer <base|symbols|
+  toggle>`. It mirrors the base grid geometry exactly, so switching never resizes
+  a surface; digits + the fuller punctuation set live here (some via
+  `Key::force_shift`, e.g. `!`/`{` commit their shifted glyph directly). The full
+  shifted QWERTY symbol set (`! @ # … ~`) is also reachable on the base layer via
+  Shift. Live-verified: symbols page renders in both modes with the toggle key.
+- **Overlay-by-default + live reflow toggle** (task; §2.3). Bare `show` floats
+  (zero exclusive zone); `reflow on|off` / the `Push`/`Float` meta key recreates
+  the surface(s) with the flipped zone, preserving shift/layer. Split mode
+  toggles both columns together.
+- **Meta key commits**: `?123`/`ABC` (layer), `Push`/`Float` (reflow), and the
+  arrow keys (real keycodes 105/106) now act on commit.
 
 ### Stubbed (structure in place, behaviour minimal)
 
 - **Mode B render** — geometry/anchoring correct; keycap render is basic, final
   ergonomics deferred (§4).
-- **Shift / Caps state** — simple toggle + one-shot-ish clear; the full §4.6
-  bitfield (`Off/OneShot/Stuck/Held`, caps interplay, physical chording) is not
-  implemented.
-- **Concurrent per-source highlights** (§4.5) — the renderer already takes a list
-  of `Highlight{LeftPad,RightPad,Focus}` (up to three at once), but only the two
-  pad cursors are driven; no d-pad focus cursor yet.
-- **Meta / layer keys** (`?123`, arrows, emoji) — present in the model, commit is
-  a no-op (§4.6 "Layers").
+- **`Held` shift bit / physical chording** (§4.6) — the `{Off, OneShot, Stuck}`
+  states are implemented; the `Held` bit (a physical shift held during a chord)
+  has no analogue in this discrete-commit model and is not tracked.
+- **Concurrent per-source highlights** (§4.5) — the two pad highlights + cursors
+  are driven; the third `Highlight{Focus}` source (a d-pad/stick focus cursor)
+  is wired through the renderer but not yet driven.
+- **Emoji / close meta keys** — present in the model with `keycode 0`; commit is
+  a no-op (§4.6 "Layers"). Layer/reflow/arrow meta keys DO act (see Done).
 
 ### Deferred (clear TODOs → research section)
 
@@ -166,6 +213,13 @@ though this kickoff drives a subset of their behaviour.
   key→gap (§4.3 / §4.9 item 3).
 - **Commit-on-click-down nuances**: extended-character popups commit on up / open
   at 450 ms; backspace auto-repeat 450→200 ms; rollover (§4.2/§4.6).
+- **Long-press extended-character popups** (§4.6 — keys carry `extended_keys`, a
+  450 ms hold opens an accent/variant row addressable by either pad). Not
+  implemented: the input model here is discrete commits with no hold timer, and
+  the uinput backend is ASCII/US-only so most accented variants can't be emitted
+  anyway. The reachability need it targeted is instead met by the numeric/symbols
+  layer + Shift, which together cover the full ASCII punctuation set. TODO when a
+  hold timer + a Unicode-capable backend (`zwp_virtual_keyboard_v1`, below) land.
 - **`gamescope_input_method` second injection backend** for nested games —
   `set_string`/`set_action` + `commit(serial)` over `$GAMESCOPE_WAYLAND_DISPLAY`
   (§2.5); the keymap-swap route is dead through gamescope.

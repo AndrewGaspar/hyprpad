@@ -62,9 +62,108 @@ pub enum KeyRole {
     Enter,
     Tab,
     Space,
-    /// A meta key with no direct evdev keycode — layer switch, emoji, arrows,
-    /// close, etc. Behaviour deferred (osk-technology.md §4.6 "Layers").
+    /// Switch the whole keyboard between the base QWERTY layer and the
+    /// numeric/symbols layer (the Deck's `?123` / `ABC` meta, osk-technology.md
+    /// §4.6 "Layers"). Committing it flips [`Layer`].
+    LayerToggle,
+    /// Toggle the panel between *overlay* (float over content, zero exclusive
+    /// zone) and *displace* (reserve an exclusive zone so content reflows).
+    /// Committing it recreates the surface(s) with the flipped policy.
+    DisplayToggle,
+    /// A meta key that either taps its raw evdev `keycode` (e.g. the arrow keys,
+    /// codes 105/106) or is inert when `keycode == 0` (emoji/close — deferred,
+    /// osk-technology.md §4.6 "Layers").
     Meta,
+}
+
+/// The Shift/Caps state machine (the subset of osk-technology.md §4.6's
+/// `{Off, OneShot, Stuck, Held}` bitfield this native OSK implements). Held
+/// (physical chording) has no analogue here — every input is a discrete commit
+/// — so the model is a three-state enum:
+///
+/// * [`ShiftState::Off`] — unshifted.
+/// * [`ShiftState::OneShot`] — the *next* character is shifted, then it clears
+///   (what tapping a Shift key arms).
+/// * [`ShiftState::Stuck`] — shift stays on until toggled off (Caps Lock, or
+///   cycling a Shift key once more).
+///
+/// A single boolean [`ShiftState::is_active`] drives BOTH the drawn legends and
+/// the committed keycode, so the letter shown on a key is always the character
+/// it types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShiftState {
+    #[default]
+    Off,
+    OneShot,
+    Stuck,
+}
+
+impl ShiftState {
+    /// Is a shift level currently in effect (so letters draw/commit uppercase and
+    /// symbol keys their shifted glyph)?
+    pub fn is_active(self) -> bool {
+        !matches!(self, ShiftState::Off)
+    }
+
+    /// Is the *locked* (Caps) level in effect — used to light the Caps key
+    /// specifically, distinct from a one-shot Shift.
+    pub fn caps_active(self) -> bool {
+        matches!(self, ShiftState::Stuck)
+    }
+
+    /// The state after committing one character: a one-shot clears, everything
+    /// else persists (osk-technology.md §4.6 "after any character, OneShot→Off").
+    pub fn after_char(self) -> ShiftState {
+        match self {
+            ShiftState::OneShot => ShiftState::Off,
+            other => other,
+        }
+    }
+
+    /// Tapping a Shift key cycles `Off → OneShot → Stuck → Off` (§4.6).
+    pub fn cycle_shift(self) -> ShiftState {
+        match self {
+            ShiftState::Off => ShiftState::OneShot,
+            ShiftState::OneShot => ShiftState::Stuck,
+            ShiftState::Stuck => ShiftState::Off,
+        }
+    }
+
+    /// Tapping Caps (or L3) toggles `Off ↔ Stuck` (§4.6).
+    pub fn toggle_caps(self) -> ShiftState {
+        match self {
+            ShiftState::Stuck => ShiftState::Off,
+            _ => ShiftState::Stuck,
+        }
+    }
+}
+
+/// Which key layer is active: the base QWERTY page or the numeric/symbols page
+/// (the Deck's `?123`, osk-technology.md §4.6 "Layers"). Both are built from the
+/// same [`Key`] model and share the exact same grid geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Layer {
+    #[default]
+    Base,
+    Symbols,
+}
+
+impl Layer {
+    /// The other layer — what a [`KeyRole::LayerToggle`] switches to.
+    pub fn toggled(self) -> Layer {
+        match self {
+            Layer::Base => Layer::Symbols,
+            Layer::Symbols => Layer::Base,
+        }
+    }
+
+    /// Build the [`Keyboard`] key set for this layer.
+    pub fn keyboard(self) -> Keyboard {
+        match self {
+            Layer::Base => Keyboard::qwerty(),
+            Layer::Symbols => Keyboard::symbols(),
+        }
+    }
 }
 
 /// One key in the model: label + evdev keycode + grid placement + hand.
@@ -85,11 +184,35 @@ pub struct Key {
     /// Width in key-units (1.0 = a normal letter key). Wider keys (Backspace,
     /// Enter, Space, Shift) use >1.0; matches the Deck grid proportions loosely.
     pub units: f32,
+    /// Emit this key's keycode with **Shift held regardless of the live shift
+    /// state**. Used by the numeric/symbols layer ([`Keyboard::symbols`]) so a
+    /// key labelled `!` commits `!` directly (KEY_1 + Shift) without the user
+    /// toggling Shift. Always `false` on the base QWERTY layer.
+    pub force_shift: bool,
 }
 
 impl Key {
+    /// A base-layer character key: `keycode` unshifted, `shifted` glyph when
+    /// Shift/Caps is active.
     const fn c(label: &'static str, shifted: &'static str, keycode: u16, hand: Hand, row: u8) -> Key {
-        Key { label, shifted: Some(shifted), keycode, role: KeyRole::Char, hand, row, units: 1.0 }
+        Key { label, shifted: Some(shifted), keycode, role: KeyRole::Char, hand, row, units: 1.0, force_shift: false }
+    }
+
+    /// A symbols-layer character key: commits the literal `label` glyph, holding
+    /// Shift iff `force_shift`. Its legend never changes with the shift state.
+    const fn sym(label: &'static str, keycode: u16, force_shift: bool, hand: Hand, row: u8) -> Key {
+        Key { label, shifted: None, keycode, role: KeyRole::Char, hand, row, units: 1.0, force_shift }
+    }
+
+    /// The legend to draw given whether Shift/Caps is currently active. Falls
+    /// back to the unshifted `label` for keys with no distinct shifted glyph, so
+    /// the drawn legend always matches what [`crate::app`] will commit.
+    pub fn display_label(&self, shift_active: bool) -> &'static str {
+        if shift_active {
+            self.shifted.unwrap_or(self.label)
+        } else {
+            self.label
+        }
     }
 }
 
@@ -137,10 +260,10 @@ impl Keyboard {
         keys.push(Key::c("0", ")", 11, Right, 0));
         keys.push(Key::c("-", "_", 12, Right, 0));
         keys.push(Key::c("=", "+", 13, Right, 0));
-        keys.push(Key { label: "Bksp", shifted: None, keycode: 14, role: Backspace, hand: Right, row: 0, units: 1.8 });
+        keys.push(Key { label: "Bksp", shifted: None, keycode: 14, role: Backspace, hand: Right, row: 0, units: 1.8, force_shift: false });
 
         // --- row 1: QWERTY top -------------------------------------------------
-        keys.push(Key { label: "Tab", shifted: None, keycode: 15, role: Tab, hand: Left, row: 1, units: 1.5 });
+        keys.push(Key { label: "Tab", shifted: None, keycode: 15, role: Tab, hand: Left, row: 1, units: 1.5, force_shift: false });
         keys.push(Key::c("q", "Q", 16, Left, 1));
         keys.push(Key::c("w", "W", 17, Left, 1));
         keys.push(Key::c("e", "E", 18, Left, 1));
@@ -156,7 +279,7 @@ impl Keyboard {
         keys.push(Key::c("\\", "|", 43, Right, 1));
 
         // --- row 2: home row ---------------------------------------------------
-        keys.push(Key { label: "Caps", shifted: None, keycode: 58, role: Caps, hand: Left, row: 2, units: 1.8 });
+        keys.push(Key { label: "Caps", shifted: None, keycode: 58, role: Caps, hand: Left, row: 2, units: 1.8, force_shift: false });
         keys.push(Key::c("a", "A", 30, Left, 2));
         keys.push(Key::c("s", "S", 31, Left, 2));
         keys.push(Key::c("d", "D", 32, Left, 2));
@@ -168,10 +291,10 @@ impl Keyboard {
         keys.push(Key::c("l", "L", 38, Right, 2));
         keys.push(Key::c(";", ":", 39, Right, 2));
         keys.push(Key::c("'", "\"", 40, Right, 2));
-        keys.push(Key { label: "Enter", shifted: None, keycode: 28, role: Enter, hand: Right, row: 2, units: 1.8 });
+        keys.push(Key { label: "Enter", shifted: None, keycode: 28, role: Enter, hand: Right, row: 2, units: 1.8, force_shift: false });
 
         // --- row 3: bottom row -------------------------------------------------
-        keys.push(Key { label: "Shift", shifted: None, keycode: 42, role: Shift, hand: Left, row: 3, units: 2.2 });
+        keys.push(Key { label: "Shift", shifted: None, keycode: 42, role: Shift, hand: Left, row: 3, units: 2.2, force_shift: false });
         keys.push(Key::c("z", "Z", 44, Left, 3));
         keys.push(Key::c("x", "X", 45, Left, 3));
         keys.push(Key::c("c", "C", 46, Left, 3));
@@ -182,16 +305,107 @@ impl Keyboard {
         keys.push(Key::c(",", "<", 51, Right, 3));
         keys.push(Key::c(".", ">", 52, Right, 3));
         keys.push(Key::c("/", "?", 53, Right, 3));
-        keys.push(Key { label: "Shift", shifted: None, keycode: 54, role: Shift, hand: Right, row: 3, units: 2.2 });
+        keys.push(Key { label: "Shift", shifted: None, keycode: 54, role: Shift, hand: Right, row: 3, units: 2.2, force_shift: false });
 
-        // --- row 4: meta / space row (partial; §4.6 "Layers"/arrows) ----------
-        // Meta keys (layer switch, emoji, etc.) are stubbed with keycode 0.
-        keys.push(Key { label: "?123", shifted: None, keycode: 0, role: Meta, hand: Left, row: 4, units: 2.0 });
-        keys.push(Key { label: "Space", shifted: None, keycode: 57, role: Space, hand: Hand::Either, row: 4, units: 6.0 });
-        keys.push(Key { label: "<", shifted: None, keycode: 105, role: Meta, hand: Right, row: 4, units: 1.0 }); // KEY_LEFT
-        keys.push(Key { label: ">", shifted: None, keycode: 106, role: Meta, hand: Right, row: 4, units: 1.0 }); // KEY_RIGHT
+        // --- row 4: meta / space row -------------------------------------------
+        // `?123` switches to the symbols layer; `Push`/`Float` toggles the
+        // overlay↔displace surface policy live; the arrows tap real keycodes.
+        Self::push_meta_row(&mut keys, "?123");
 
         Keyboard { keys }
+    }
+
+    /// The numeric / symbols layer — the Deck's `?123` page (osk-technology.md
+    /// §4.6 "Layers"). It **mirrors the QWERTY grid shape exactly** (same rows,
+    /// hands, units, and special keys) so its content size is identical and a
+    /// layer switch never has to resize or recreate a surface. Only the
+    /// character keys differ: digits and the fuller punctuation set, with
+    /// [`Key::force_shift`] on the glyphs that need Shift held (so e.g. `!`
+    /// commits directly without toggling Shift).
+    #[allow(clippy::vec_init_then_push)]
+    pub fn symbols() -> Keyboard {
+        use Hand::{Left, Right};
+        use KeyRole::*;
+
+        let mut keys = Vec::new();
+
+        // --- row 0: the shifted number-row symbols, committed directly ---------
+        keys.push(Key::sym("~", 41, true, Left, 0));
+        keys.push(Key::sym("!", 2, true, Left, 0));
+        keys.push(Key::sym("@", 3, true, Left, 0));
+        keys.push(Key::sym("#", 4, true, Left, 0));
+        keys.push(Key::sym("$", 5, true, Left, 0));
+        keys.push(Key::sym("%", 6, true, Left, 0));
+        keys.push(Key::sym("^", 7, true, Right, 0));
+        keys.push(Key::sym("&", 8, true, Right, 0));
+        keys.push(Key::sym("*", 9, true, Right, 0));
+        keys.push(Key::sym("(", 10, true, Right, 0));
+        keys.push(Key::sym(")", 11, true, Right, 0));
+        keys.push(Key::sym("_", 12, true, Right, 0));
+        keys.push(Key::sym("+", 13, true, Right, 0));
+        keys.push(Key { label: "Bksp", shifted: None, keycode: 14, role: Backspace, hand: Right, row: 0, units: 1.8, force_shift: false });
+
+        // --- row 1: the digits, unshifted, plus brackets ----------------------
+        keys.push(Key { label: "Tab", shifted: None, keycode: 15, role: Tab, hand: Left, row: 1, units: 1.5, force_shift: false });
+        keys.push(Key::sym("1", 2, false, Left, 1));
+        keys.push(Key::sym("2", 3, false, Left, 1));
+        keys.push(Key::sym("3", 4, false, Left, 1));
+        keys.push(Key::sym("4", 5, false, Left, 1));
+        keys.push(Key::sym("5", 6, false, Left, 1));
+        keys.push(Key::sym("6", 7, false, Right, 1));
+        keys.push(Key::sym("7", 8, false, Right, 1));
+        keys.push(Key::sym("8", 9, false, Right, 1));
+        keys.push(Key::sym("9", 10, false, Right, 1));
+        keys.push(Key::sym("0", 11, false, Right, 1));
+        keys.push(Key::sym("[", 26, false, Right, 1));
+        keys.push(Key::sym("]", 27, false, Right, 1));
+        keys.push(Key::sym("\\", 43, false, Right, 1));
+
+        // --- row 2: assorted punctuation --------------------------------------
+        keys.push(Key { label: "Caps", shifted: None, keycode: 58, role: Caps, hand: Left, row: 2, units: 1.8, force_shift: false });
+        keys.push(Key::sym("-", 12, false, Left, 2));
+        keys.push(Key::sym("=", 13, false, Left, 2));
+        keys.push(Key::sym("{", 26, true, Left, 2));
+        keys.push(Key::sym("}", 27, true, Left, 2));
+        keys.push(Key::sym("|", 43, true, Left, 2));
+        keys.push(Key::sym(";", 39, false, Right, 2));
+        keys.push(Key::sym(":", 39, true, Right, 2));
+        keys.push(Key::sym("'", 40, false, Right, 2));
+        keys.push(Key::sym("\"", 40, true, Right, 2));
+        keys.push(Key::sym("`", 41, false, Right, 2));
+        keys.push(Key { label: "Enter", shifted: None, keycode: 28, role: Enter, hand: Right, row: 2, units: 1.8, force_shift: false });
+
+        // --- row 3: more punctuation ------------------------------------------
+        keys.push(Key { label: "Shift", shifted: None, keycode: 42, role: Shift, hand: Left, row: 3, units: 2.2, force_shift: false });
+        keys.push(Key::sym("<", 51, true, Left, 3));
+        keys.push(Key::sym(">", 52, true, Left, 3));
+        keys.push(Key::sym(",", 51, false, Left, 3));
+        keys.push(Key::sym(".", 52, false, Left, 3));
+        keys.push(Key::sym("/", 53, false, Right, 3));
+        keys.push(Key::sym("?", 53, true, Right, 3));
+        keys.push(Key::sym("*", 9, true, Right, 3));
+        keys.push(Key::sym("&", 8, true, Right, 3));
+        keys.push(Key::sym("=", 13, false, Right, 3));
+        keys.push(Key { label: "Shift", shifted: None, keycode: 54, role: Shift, hand: Right, row: 3, units: 2.2, force_shift: false });
+
+        // --- row 4: same meta / space row, with `ABC` back to the base layer ---
+        Self::push_meta_row(&mut keys, "ABC");
+
+        Keyboard { keys }
+    }
+
+    /// Push the shared row-4 meta/space row: a [`KeyRole::LayerToggle`] labelled
+    /// `switch` (`?123` on the base layer, `ABC` on the symbols layer), the
+    /// space bar, a [`KeyRole::DisplayToggle`], and the two arrow keys. Kept
+    /// identical across layers so both layers (and both presentation modes)
+    /// share the exact same row geometry.
+    fn push_meta_row(keys: &mut Vec<Key>, switch: &'static str) {
+        keys.push(Key { label: switch, shifted: None, keycode: 0, role: KeyRole::LayerToggle, hand: Hand::Left, row: 4, units: 2.0, force_shift: false });
+        keys.push(Key { label: "Space", shifted: None, keycode: 57, role: KeyRole::Space, hand: Hand::Either, row: 4, units: 6.0, force_shift: false });
+        // Label is drawn dynamically from the live reflow state (Push/Float).
+        keys.push(Key { label: "Push", shifted: None, keycode: 0, role: KeyRole::DisplayToggle, hand: Hand::Right, row: 4, units: 1.5, force_shift: false });
+        keys.push(Key { label: "<", shifted: None, keycode: 105, role: KeyRole::Meta, hand: Hand::Right, row: 4, units: 1.0, force_shift: false }); // KEY_LEFT
+        keys.push(Key { label: ">", shifted: None, keycode: 106, role: KeyRole::Meta, hand: Hand::Right, row: 4, units: 1.0, force_shift: false }); // KEY_RIGHT
     }
 
     /// The number of grid rows in the model (0..=`rows()-1`).
@@ -596,6 +810,74 @@ mod tests {
                 kb.keys[p.key].label
             );
         }
+    }
+
+    #[test]
+    fn shift_state_machine_matches_the_deck_model() {
+        // Tapping Shift cycles Off -> OneShot -> Stuck -> Off (§4.6).
+        assert_eq!(ShiftState::Off.cycle_shift(), ShiftState::OneShot);
+        assert_eq!(ShiftState::OneShot.cycle_shift(), ShiftState::Stuck);
+        assert_eq!(ShiftState::Stuck.cycle_shift(), ShiftState::Off);
+        // Caps toggles Off <-> Stuck.
+        assert_eq!(ShiftState::Off.toggle_caps(), ShiftState::Stuck);
+        assert_eq!(ShiftState::Stuck.toggle_caps(), ShiftState::Off);
+        assert_eq!(ShiftState::OneShot.toggle_caps(), ShiftState::Stuck);
+        // A one-shot clears after one character; stuck/off persist.
+        assert_eq!(ShiftState::OneShot.after_char(), ShiftState::Off);
+        assert_eq!(ShiftState::Stuck.after_char(), ShiftState::Stuck);
+        assert_eq!(ShiftState::Off.after_char(), ShiftState::Off);
+        // is_active drives legends+commit; caps_active lights the Caps key only.
+        assert!(!ShiftState::Off.is_active() && ShiftState::OneShot.is_active() && ShiftState::Stuck.is_active());
+        assert!(!ShiftState::OneShot.caps_active() && ShiftState::Stuck.caps_active());
+    }
+
+    #[test]
+    fn display_label_follows_shift_and_matches_commit() {
+        let kb = Keyboard::qwerty();
+        let key = |label: &str| kb.keys.iter().find(|k| k.label == label).unwrap();
+        // Letters uppercase, the "1" key shows its shifted "!" — the glyph the
+        // shifted commit (KEY_1 + Shift) actually produces. THIS is the "!" fix.
+        assert_eq!(key("q").display_label(false), "q");
+        assert_eq!(key("q").display_label(true), "Q");
+        assert_eq!(key("1").display_label(false), "1");
+        assert_eq!(key("1").display_label(true), "!");
+        assert_eq!(key("1").keycode, 2); // KEY_1 -> "!" when Shift is held
+        // Keys with no shifted glyph keep their label under shift.
+        assert_eq!(key("Space").display_label(true), "Space");
+    }
+
+    #[test]
+    fn symbols_layer_mirrors_base_grid_geometry() {
+        // The whole point of mirroring the grid: a layer switch never resizes a
+        // surface, because both layers have identical content sizes in every
+        // panel and mode.
+        let base = Keyboard::qwerty();
+        let sym = Keyboard::symbols();
+        let g = geom();
+        for (mode, panel) in [
+            (LayoutMode::BottomDeck, PanelRole::Bottom),
+            (LayoutMode::SideSplit, PanelRole::LeftColumn),
+            (LayoutMode::SideSplit, PanelRole::RightColumn),
+        ] {
+            let sb = LayoutEngine::new(&base, mode).content_size(panel, &g);
+            let ss = LayoutEngine::new(&sym, mode).content_size(panel, &g);
+            assert!((sb.0 - ss.0).abs() < 0.001 && (sb.1 - ss.1).abs() < 0.001, "layer geometry differs in {mode:?}/{panel:?}");
+        }
+        // The symbols page reaches the rarer glyphs, some via a forced shift.
+        let bang = sym.keys.iter().find(|k| k.label == "!").unwrap();
+        assert!(bang.force_shift && bang.keycode == 2);
+        assert!(sym.keys.iter().any(|k| k.label == "{" && k.force_shift));
+        assert!(sym.keys.iter().any(|k| k.label == "1" && !k.force_shift));
+    }
+
+    #[test]
+    fn both_layers_carry_the_layer_and_display_toggles() {
+        for kb in [Keyboard::qwerty(), Keyboard::symbols()] {
+            assert!(kb.keys.iter().any(|k| k.role == KeyRole::LayerToggle));
+            assert!(kb.keys.iter().any(|k| k.role == KeyRole::DisplayToggle));
+        }
+        assert_eq!(Layer::Base.toggled(), Layer::Symbols);
+        assert_eq!(Layer::Symbols.toggled(), Layer::Base);
     }
 
     #[test]

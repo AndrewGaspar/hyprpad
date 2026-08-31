@@ -13,11 +13,14 @@
 //! ```text
 //! show <layout> [reflow|overlay]   # create the surface(s) and render
 //!     layout ∈ { bottom, split }
-//!     reflow  (default) → set an exclusive zone so workspace content reflows
-//!     overlay           → zero exclusive zone, for typing over a fullscreen game
+//!     overlay (default) → zero exclusive zone, float over content
+//!     reflow            → set an exclusive zone so workspace content reflows
 //! hide                             # DESTROY the surface(s) — never just unmap
 //! cursor <L|R> <nx> <ny>           # pad absolute position, each axis in [-1,1]
 //! commit <L|R>                     # commit the key under that pad's cursor (click-down)
+//! shift <off|oneshot|stuck|on>     # set the shift/caps state directly (on = stuck/caps)
+//! layer <base|symbols|toggle>      # switch the base QWERTY ↔ numeric/symbols page
+//! reflow <on|off>                  # displace (on) vs overlay/float (off); recreates surfaces
 //! key <keycode>                    # commit a raw evdev keycode directly (test/daemon)
 //! type <text…>                     # type an ASCII string (test helper)
 //! quit                             # exit the process
@@ -26,18 +29,19 @@
 //! Unknown or malformed lines are reported on the reply channel and ignored;
 //! one bad line never desyncs the stream.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use crate::layout::{LayoutMode, Pad};
+use crate::layout::{Layer, LayoutMode, Pad, ShiftState};
 
 /// A parsed control command.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Create the surface(s) for `mode` and render. `reflow` chooses the
-    /// exclusive-zone behaviour (see [`crate::surface`]).
+    /// exclusive-zone behaviour (see [`crate::surface`]); it defaults to `false`
+    /// (overlay/float) when the `show` line does not say `reflow`.
     Show { mode: LayoutMode, reflow: bool },
     /// Destroy the surface(s) (osk-technology.md §2.3 — never hide).
     Hide,
@@ -45,6 +49,13 @@ pub enum Command {
     Cursor { pad: Pad, nx: f32, ny: f32 },
     /// Commit the key currently under `pad`'s cursor (trackpad click-down).
     Commit { pad: Pad },
+    /// Set the shift/caps state directly so the daemon can drive it.
+    Shift { state: ShiftState },
+    /// Switch the active key layer. `None` means toggle to the other layer.
+    Layer { target: Option<Layer> },
+    /// Switch the surface policy: `true` = displace (exclusive zone), `false` =
+    /// overlay/float. Recreates the live surface(s) with the flipped policy.
+    Reflow { on: bool },
     /// Commit a raw evdev keycode directly.
     Key { keycode: u16 },
     /// Type an ASCII string.
@@ -69,9 +80,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 Some(other) => return Err(format!("unknown layout '{other}' (want bottom|split)")),
                 None => return Err("show needs a layout: bottom|split".into()),
             };
+            // Overlay/float is the default now; `reflow` is the opt-in.
             let reflow = match parts.next() {
-                None | Some("reflow") => true,
-                Some("overlay") => false,
+                None | Some("overlay") => false,
+                Some("reflow") => true,
                 Some(other) => return Err(format!("unknown presentation '{other}' (want reflow|overlay)")),
             };
             Ok(Command::Show { mode, reflow })
@@ -86,6 +98,34 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Cursor { pad, nx, ny })
         }
         "commit" => Ok(Command::Commit { pad: parse_pad(rest.split_whitespace().next())? }),
+        "shift" => {
+            let state = match rest.split_whitespace().next() {
+                Some("off") | None => ShiftState::Off,
+                Some("oneshot") | Some("one") => ShiftState::OneShot,
+                // `on`/`caps`/`stuck` all mean the locked level.
+                Some("stuck") | Some("on") | Some("caps") => ShiftState::Stuck,
+                Some(other) => return Err(format!("bad shift '{other}' (want off|oneshot|stuck|on)")),
+            };
+            Ok(Command::Shift { state })
+        }
+        "layer" => {
+            let target = match rest.split_whitespace().next() {
+                Some("base") | Some("abc") | Some("qwerty") => Some(Layer::Base),
+                Some("symbols") | Some("sym") | Some("123") | Some("?123") => Some(Layer::Symbols),
+                Some("toggle") | None => None,
+                Some(other) => return Err(format!("bad layer '{other}' (want base|symbols|toggle)")),
+            };
+            Ok(Command::Layer { target })
+        }
+        "reflow" | "display" => {
+            let on = match rest.split_whitespace().next() {
+                Some("on") | Some("displace") => true,
+                Some("off") | Some("overlay") | Some("float") => false,
+                Some(other) => return Err(format!("bad reflow '{other}' (want on|off / displace|overlay)")),
+                None => return Err("reflow needs on|off".into()),
+            };
+            Ok(Command::Reflow { on })
+        }
         "key" => {
             let kc: u16 = rest.parse().map_err(|_| format!("bad keycode '{rest}'"))?;
             Ok(Command::Key { keycode: kc })
@@ -112,16 +152,22 @@ fn parse_f32(tok: Option<&str>, name: &str) -> Result<f32, String> {
 
 /// The transport the control channel listens on.
 pub enum Channel {
-    /// Read commands line-by-line from stdin.
-    Stdin(BufReader<std::io::Stdin>),
+    /// Read commands from stdin (fd 0). The fd is put in non-blocking mode so a
+    /// whole burst of lines is drained per poll wakeup; `leftover` carries a
+    /// partial trailing line between reads.
+    Stdin { leftover: String },
     /// Accept one client at a time on a unix socket; read lines from it.
     Socket { listener: UnixListener, path: PathBuf, client: Option<BufReader<UnixStream>> },
 }
 
 impl Channel {
-    /// Open a stdin channel.
+    /// Open a stdin channel. stdin is switched to non-blocking so [`Self::drain`]
+    /// can pull *every* buffered line each wakeup rather than one line per poll
+    /// — the latter lags command bursts (e.g. two `cursor` lines in one write),
+    /// which would leave the second pad's cursor a step behind.
     pub fn stdin() -> Channel {
-        Channel::Stdin(BufReader::new(std::io::stdin()))
+        set_nonblocking(libc::STDIN_FILENO);
+        Channel::Stdin { leftover: String::new() }
     }
 
     /// Bind the unix socket at `$XDG_RUNTIME_DIR/hyprpad-osk.sock`, removing any
@@ -139,7 +185,7 @@ impl Channel {
     /// socket channel this is the listener plus the current client, if any.
     pub fn poll_fds(&self) -> Vec<RawFd> {
         match self {
-            Channel::Stdin(_) => vec![libc::STDIN_FILENO],
+            Channel::Stdin { .. } => vec![libc::STDIN_FILENO],
             Channel::Socket { listener, client, .. } => {
                 let mut v = vec![listener.as_raw_fd()];
                 if let Some(c) = client {
@@ -158,16 +204,44 @@ impl Channel {
     /// and skipped.
     pub fn drain(&mut self, mut sink: impl FnMut(Command)) -> std::io::Result<bool> {
         match self {
-            Channel::Stdin(reader) => {
-                // stdin is line-buffered here; read all currently-ready lines.
-                // A single read_line may block only if the fd was reported
-                // readable, which the caller guarantees before calling.
-                let mut line = String::new();
-                let n = reader.read_line(&mut line)?;
-                if n == 0 {
-                    return Ok(false); // EOF
+            Channel::Stdin { leftover } => {
+                // Drain every byte the kernel has for us (non-blocking), so a
+                // multi-line burst is fully processed this wakeup instead of one
+                // line per poll (extra lines would otherwise sit unseen in a
+                // userspace buffer that `poll` cannot observe).
+                let mut hung_up = false;
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe {
+                        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
+                    if n < 0 {
+                        let e = std::io::Error::last_os_error();
+                        match e.kind() {
+                            std::io::ErrorKind::WouldBlock => break,
+                            std::io::ErrorKind::Interrupted => continue,
+                            _ => return Err(e),
+                        }
+                    } else if n == 0 {
+                        hung_up = true; // EOF
+                        break;
+                    } else {
+                        leftover.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                    }
                 }
-                dispatch_line(&line, &mut sink, &mut |e| eprintln!("hyprpad-osk: {e}"));
+                // Dispatch each complete line; keep any partial remainder.
+                while let Some(pos) = leftover.find('\n') {
+                    let line: String = leftover.drain(..=pos).collect();
+                    dispatch_line(&line, &mut sink, &mut |e| eprintln!("hyprpad-osk: {e}"));
+                }
+                if hung_up {
+                    // Flush a final unterminated line, then signal EOF.
+                    if !leftover.trim().is_empty() {
+                        let last = std::mem::take(leftover);
+                        dispatch_line(&last, &mut sink, &mut |e| eprintln!("hyprpad-osk: {e}"));
+                    }
+                    return Ok(false);
+                }
                 Ok(true)
             }
             Channel::Socket { listener, client, .. } => {
@@ -226,6 +300,28 @@ impl Channel {
     }
 }
 
+/// Put a raw fd into non-blocking mode (best-effort). Used for stdin so the
+/// poll loop can drain it without blocking.
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Clear non-blocking mode on `fd` (best-effort) — the inverse of
+/// [`set_nonblocking`], used to leave stdin as we found it on exit.
+fn clear_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+}
+
 fn dispatch_line(line: &str, sink: &mut impl FnMut(Command), on_err: &mut impl FnMut(String)) {
     let line = line.trim();
     if line.is_empty() {
@@ -239,8 +335,13 @@ fn dispatch_line(line: &str, sink: &mut impl FnMut(Command), on_err: &mut impl F
 
 impl Drop for Channel {
     fn drop(&mut self) {
-        if let Channel::Socket { path, .. } = self {
-            let _ = std::fs::remove_file(path);
+        match self {
+            Channel::Socket { path, .. } => {
+                let _ = std::fs::remove_file(path);
+            }
+            // Restore stdin to blocking so exiting doesn't leave a shared
+            // terminal's fd 0 non-blocking (which would trip up the parent shell).
+            Channel::Stdin { .. } => clear_nonblocking(libc::STDIN_FILENO),
         }
     }
 }
@@ -251,10 +352,27 @@ mod tests {
 
     #[test]
     fn parses_show_variants() {
-        assert_eq!(parse("show bottom"), Ok(Command::Show { mode: LayoutMode::BottomDeck, reflow: true }));
+        // Overlay/float is the default now; reflow is the explicit opt-in.
+        assert_eq!(parse("show bottom"), Ok(Command::Show { mode: LayoutMode::BottomDeck, reflow: false }));
         assert_eq!(parse("show bottom overlay"), Ok(Command::Show { mode: LayoutMode::BottomDeck, reflow: false }));
+        assert_eq!(parse("show bottom reflow"), Ok(Command::Show { mode: LayoutMode::BottomDeck, reflow: true }));
         assert_eq!(parse("show split reflow"), Ok(Command::Show { mode: LayoutMode::SideSplit, reflow: true }));
         assert!(parse("show sideways").is_err());
+    }
+
+    #[test]
+    fn parses_shift_layer_reflow() {
+        assert_eq!(parse("shift oneshot"), Ok(Command::Shift { state: ShiftState::OneShot }));
+        assert_eq!(parse("shift on"), Ok(Command::Shift { state: ShiftState::Stuck }));
+        assert_eq!(parse("shift off"), Ok(Command::Shift { state: ShiftState::Off }));
+        assert!(parse("shift sideways").is_err());
+        assert_eq!(parse("layer symbols"), Ok(Command::Layer { target: Some(Layer::Symbols) }));
+        assert_eq!(parse("layer base"), Ok(Command::Layer { target: Some(Layer::Base) }));
+        assert_eq!(parse("layer toggle"), Ok(Command::Layer { target: None }));
+        assert_eq!(parse("reflow on"), Ok(Command::Reflow { on: true }));
+        assert_eq!(parse("reflow off"), Ok(Command::Reflow { on: false }));
+        assert_eq!(parse("display overlay"), Ok(Command::Reflow { on: false }));
+        assert!(parse("reflow maybe").is_err());
     }
 
     #[test]

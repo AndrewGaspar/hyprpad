@@ -72,6 +72,14 @@ pub struct Colors {
     pub focus: Color,
     /// Pressed / just-committed key accent (`.Touched`).
     pub pressed: Color,
+    /// The contrasting outline/halo of the per-pad trackpad **cursor sprite**
+    /// (the Deck's `--key-pointer-stroke-color`, §4.1). The sprite's *body* is
+    /// the per-pad `pointer_*` colour; this stroke keeps it legible even when it
+    /// sits over a same-hued hover highlight.
+    pub cursor_stroke: Color,
+    /// Active Shift / Caps indicator — the fill a Shift or Caps key takes while
+    /// its state is engaged (the Deck's `.ShiftActive` / `.ToggleOn`, §4.6).
+    pub shift_active: Color,
 }
 
 /// Geometry tokens. These are what make the surface **size-to-content**: the
@@ -91,6 +99,9 @@ pub struct Geom {
     pub corner: f32,
     /// Keycap border stroke width, in px.
     pub border_width: f32,
+    /// Diameter, in px, of the per-pad trackpad cursor sprite (the Deck's
+    /// ~30x30 pointer, §4.1). The renderer draws a filled disc of this size.
+    pub cursor_size: f32,
 }
 
 /// Font tokens. The kickoff renderer uses an embedded 8x8 bitmap font, so the
@@ -131,6 +142,8 @@ impl Default for Theme {
                 pointer_right: Color(0xFF_C8_5A_2E), // right pad (orange)
                 focus: Color(0xFF_3C_A0_5A),         // d-pad focus (green)
                 pressed: Color(0xFF_D0_B0_50),       // committed accent (amber)
+                cursor_stroke: Color(0xF0_F2_F4_F8), // near-white cursor halo
+                shift_active: Color(0xFF_D8_5A_9E),  // shift/caps engaged (magenta)
             },
             geom: Geom {
                 key_size: 72.0,
@@ -138,6 +151,7 @@ impl Default for Theme {
                 margin: 14.0,
                 corner: 8.0,
                 border_width: 1.0,
+                cursor_size: 30.0,
             },
             font: FontSpec { scale_max: 3 },
         }
@@ -265,6 +279,8 @@ fn apply_token(theme: &mut Theme, section: &str, key: &str, val: &str, lineno: u
                 "pointer_right" => theme.colors.pointer_right = c,
                 "focus" => theme.colors.focus = c,
                 "pressed" => theme.colors.pressed = c,
+                "cursor_stroke" => theme.colors.cursor_stroke = c,
+                "shift_active" => theme.colors.shift_active = c,
                 _ => eprintln!("hyprpad-osk: theme.toml:{lineno}: unknown colors.{key}, ignored"),
             }
         }
@@ -276,6 +292,7 @@ fn apply_token(theme: &mut Theme, section: &str, key: &str, val: &str, lineno: u
                 "margin" => theme.geom.margin = n.max(0.0),
                 "corner" => theme.geom.corner = n.max(0.0),
                 "border_width" => theme.geom.border_width = n.max(0.0),
+                "cursor_size" => theme.geom.cursor_size = n.max(4.0),
                 _ => eprintln!("hyprpad-osk: theme.toml:{lineno}: unknown geometry.{key}, ignored"),
             }
         }

@@ -35,9 +35,9 @@ use wayland_client::{
 };
 
 use crate::control::{Channel, Command};
-use crate::layout::{Keyboard, KeyRole, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey};
+use crate::layout::{Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, ShiftState};
 use crate::output::VirtualKeyboard;
-use crate::render::{self, Canvas, Highlight, HighlightKind};
+use crate::render::{self, Canvas, Chrome, Cursor, Highlight, HighlightKind};
 use crate::surface;
 use crate::theme::Theme;
 
@@ -52,6 +52,8 @@ struct PanelSurface {
     configured: bool,
     placed: Vec<PlacedKey>,
     highlights: Vec<Highlight>,
+    /// The trackpad cursor sprite(s) to draw on this panel (per-pad, §4.5).
+    cursors: Vec<Cursor>,
     /// Kept alive so the compositor can read the committed buffer.
     buffer: Option<Buffer>,
 }
@@ -65,11 +67,19 @@ pub struct Osk {
     shm: Shm,
     pool: SlotPool,
 
+    /// The key set for the currently active [`Layer`]. Rebuilt on a layer
+    /// switch (both layers share geometry, so no surface resize is needed).
     keyboard: Keyboard,
+    /// Which key layer (`Base` QWERTY or `Symbols`) `keyboard` currently holds.
+    layer: Layer,
     /// The active theme: every colour and every geometry token the draw path and
     /// the size-to-content computation read from.
     theme: Theme,
     mode: LayoutMode,
+    /// Current surface policy: `true` = displace (exclusive zone), `false` =
+    /// overlay/float (the default). Toggled from the keyboard or the control
+    /// channel by recreating the surface(s).
+    reflow: bool,
     /// Best-known output logical size (kept for future clamping / diagnostics;
     /// the panels are content-sized from the theme, not the screen).
     output_size: (u32, u32),
@@ -86,9 +96,15 @@ pub struct Osk {
     // Concurrent per-pad focus (osk-technology.md §4.5): both live at once.
     left_focus: Option<usize>,
     right_focus: Option<usize>,
-    // Minimal shift/caps state; full §4.6 bitfield (OneShot/Stuck/Held) DEFERRED.
-    shift: bool,
-    caps: bool,
+    // Each pad's last absolute normalized position (input) and the panel-local
+    // pixel point it maps to (for drawing the cursor sprite). Kept per pad so
+    // both cursors stay live at once and survive a re-place (§4.1/§4.5).
+    left_norm: Option<(f32, f32)>,
+    right_norm: Option<(f32, f32)>,
+    left_px: Option<(f32, f32)>,
+    right_px: Option<(f32, f32)>,
+    // Shift/caps state machine ({Off, OneShot, Stuck}, osk-technology.md §4.6).
+    shift: ShiftState,
     trackpad_scale: f32,
 
     pub exit: bool,
@@ -119,16 +135,21 @@ impl Osk {
             layer_shell,
             shm,
             pool,
-            keyboard: Keyboard::qwerty(),
+            keyboard: Layer::Base.keyboard(),
+            layer: Layer::Base,
             theme,
             mode: LayoutMode::BottomDeck,
+            reflow: false,
             output_size: (0, 0),
             panels: Vec::new(),
             vkbd: None,
             left_focus: None,
             right_focus: None,
-            shift: false,
-            caps: false,
+            left_norm: None,
+            right_norm: None,
+            left_px: None,
+            right_px: None,
+            shift: ShiftState::Off,
             trackpad_scale: 1.0,
             exit: false,
         };
@@ -204,7 +225,10 @@ impl Osk {
             Command::Show { mode, reflow } => self.show(mode, reflow, qh),
             Command::Hide => self.hide(),
             Command::Cursor { pad, nx, ny } => self.update_cursor(pad, nx, ny),
-            Command::Commit { pad } => self.commit(pad),
+            Command::Commit { pad } => self.commit(pad, qh),
+            Command::Shift { state } => self.set_shift(state),
+            Command::Layer { target } => self.set_layer(target.unwrap_or_else(|| self.layer.toggled())),
+            Command::Reflow { on } => self.set_reflow(on, qh),
             Command::Key { keycode } => self.type_keycode(keycode),
             Command::Type { text } => self.type_str(&text),
             Command::Quit => self.exit = true,
@@ -212,9 +236,12 @@ impl Osk {
     }
 
     /// Create the layer surface(s) for `mode`, destroying any currently shown.
+    /// Preserves the shift and layer state (so a display/policy toggle re-shows
+    /// without losing them); only the per-pad cursors reset.
     fn show(&mut self, mode: LayoutMode, reflow: bool, qh: &QueueHandle<Self>) {
         self.hide(); // destroy first — never stack surfaces
         self.mode = mode;
+        self.reflow = reflow;
         let specs = surface::panels_for(mode, reflow, &self.keyboard, &self.theme.geom);
         for spec in specs {
             let wl_surface = self.compositor.create_surface(qh);
@@ -238,15 +265,16 @@ impl Osk {
                 configured: false,
                 placed: Vec::new(),
                 highlights: Vec::new(),
+                cursors: Vec::new(),
                 buffer: None,
             });
         }
-        self.left_focus = None;
-        self.right_focus = None;
+        self.reset_pad_state();
         eprintln!(
-            "hyprpad-osk: show mode={:?} reflow={} panels={}",
+            "hyprpad-osk: show mode={:?} reflow={} layer={:?} panels={}",
             mode,
             reflow,
+            self.layer,
             self.panels.len()
         );
     }
@@ -259,8 +287,17 @@ impl Osk {
             eprintln!("hyprpad-osk: hide (destroying {} surface(s))", self.panels.len());
         }
         self.panels.clear();
+        self.reset_pad_state();
+    }
+
+    /// Clear both pads' focus and cursor state (on show/hide/layer swap).
+    fn reset_pad_state(&mut self) {
         self.left_focus = None;
         self.right_focus = None;
+        self.left_norm = None;
+        self.right_norm = None;
+        self.left_px = None;
+        self.right_px = None;
     }
 
     /// The panel a pad addresses in the current mode.
@@ -273,11 +310,33 @@ impl Osk {
         self.panels.iter().position(|p| p.role == want && p.configured)
     }
 
-    /// Move a pad's absolute cursor, hit-test the key under it, update the
-    /// highlight, and redraw (osk-technology.md §4.1). The haptic tick on
-    /// key-crossing (§4.3) is DEFERRED.
+    /// Move a pad's absolute cursor: record its position, hit-test the key under
+    /// it, refresh the highlight + the visible cursor sprite, and redraw
+    /// (osk-technology.md §4.1). The haptic tick on key-crossing (§4.3) is
+    /// DEFERRED.
     fn update_cursor(&mut self, pad: Pad, nx: f32, ny: f32) {
-        let Some(idx) = self.panel_for_pad(pad) else { return };
+        match pad {
+            Pad::Left => self.left_norm = Some((nx, ny)),
+            Pad::Right => self.right_norm = Some((nx, ny)),
+        }
+        self.recompute_pad(pad);
+        self.rebuild_highlights();
+        self.rebuild_cursors();
+        self.redraw_all();
+    }
+
+    /// (Re)derive a pad's focused key and cursor pixel point from its last
+    /// normalized position against the current placement. Called on every cursor
+    /// move and after any re-place (layer switch / configure), so a moved pad
+    /// stays correct even when the key set under it changed.
+    fn recompute_pad(&mut self, pad: Pad) {
+        let norm = match pad {
+            Pad::Left => self.left_norm,
+            Pad::Right => self.right_norm,
+        };
+        let (Some((nx, ny)), Some(idx)) = (norm, self.panel_for_pad(pad)) else {
+            return;
+        };
         let (w, h) = self.panels[idx].size;
         if w == 0 || h == 0 {
             return;
@@ -288,37 +347,58 @@ impl Osk {
         let hit = LayoutEngine::hit_test(&self.panels[idx].placed, px, py)
             .map(|i| self.panels[idx].placed[i].key);
         match pad {
-            Pad::Left => self.left_focus = hit,
-            Pad::Right => self.right_focus = hit,
+            Pad::Left => {
+                self.left_focus = hit;
+                self.left_px = Some((px, py));
+            }
+            Pad::Right => {
+                self.right_focus = hit;
+                self.right_px = Some((px, py));
+            }
         }
-        self.rebuild_highlights();
-        self.redraw_all();
     }
 
     /// Commit the key under `pad`'s cursor (trackpad click-down, §4.2).
-    fn commit(&mut self, pad: Pad) {
+    fn commit(&mut self, pad: Pad, qh: &QueueHandle<Self>) {
         let focus = match pad {
             Pad::Left => self.left_focus,
             Pad::Right => self.right_focus,
         };
         let Some(k) = focus else { return };
-        self.commit_key_index(k);
+        self.commit_key_index(k, qh);
     }
 
-    fn commit_key_index(&mut self, k: usize) {
+    fn commit_key_index(&mut self, k: usize, qh: &QueueHandle<Self>) {
         let key = self.keyboard.keys[k].clone();
         match key.role {
             KeyRole::Shift => {
-                self.shift = !self.shift; // one-shot-ish; full bitfield DEFERRED
+                self.shift = self.shift.cycle_shift(); // Off→OneShot→Stuck→Off (§4.6)
             }
             KeyRole::Caps => {
-                self.caps = !self.caps;
+                self.shift = self.shift.toggle_caps(); // Off↔Stuck (§4.6)
             }
-            KeyRole::Meta => { /* layer switch / emoji etc. — DEFERRED (§4.6) */ }
+            KeyRole::LayerToggle => {
+                self.set_layer(self.layer.toggled());
+                return; // set_layer re-places + redraws
+            }
+            KeyRole::DisplayToggle => {
+                self.set_reflow(!self.reflow, qh);
+                return; // set_reflow recreates the surface(s)
+            }
+            KeyRole::Meta => {
+                // Arrows and other meta keys with a real keycode tap it; keycode
+                // 0 (emoji/close) stays inert (§4.6, deferred).
+                if key.keycode != 0 {
+                    self.tap(key.keycode, false);
+                }
+            }
             KeyRole::Char => {
-                let shift = self.shift || self.caps;
+                // A single boolean drives both the drawn legend and the output,
+                // so the committed character matches what the key shows. A
+                // symbols-layer key can force shift (e.g. `!` from KEY_1).
+                let shift = self.shift.is_active() || key.force_shift;
                 self.tap(key.keycode, shift);
-                self.shift = false; // one-shot clears after a character
+                self.shift = self.shift.after_char(); // one-shot clears
             }
             KeyRole::Backspace | KeyRole::Enter | KeyRole::Tab | KeyRole::Space => {
                 self.tap(key.keycode, false);
@@ -329,8 +409,7 @@ impl Osk {
     }
 
     fn type_keycode(&mut self, keycode: u16) {
-        let shift = self.shift || self.caps;
-        self.tap(keycode, shift);
+        self.tap(keycode, self.shift.is_active());
     }
 
     fn type_str(&mut self, text: &str) {
@@ -381,10 +460,89 @@ impl Osk {
         }
     }
 
-    fn redraw_all(&mut self) {
-        for i in 0..self.panels.len() {
-            draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[i]);
+    /// Recompute each panel's cursor-sprite list from the per-pad pixel points.
+    /// A pad's cursor is drawn on whichever panel that pad addresses in the
+    /// current mode (both on the bottom panel for `BottomDeck`; one per column
+    /// for `SideSplit`), so up to two cursors are live at once (§4.5).
+    fn rebuild_cursors(&mut self) {
+        for p in &mut self.panels {
+            p.cursors.clear();
         }
+        for (pad, pos, kind) in [
+            (Pad::Left, self.left_px, HighlightKind::LeftPad),
+            (Pad::Right, self.right_px, HighlightKind::RightPad),
+        ] {
+            if let (Some((x, y)), Some(idx)) = (pos, self.panel_for_pad(pad)) {
+                self.panels[idx].cursors.push(Cursor { x, y, kind });
+            }
+        }
+    }
+
+    /// Set the shift/caps state directly (control channel) and redraw so the
+    /// legends and the Shift/Caps indicator update.
+    fn set_shift(&mut self, state: ShiftState) {
+        self.shift = state;
+        self.redraw_all();
+    }
+
+    /// Switch the active key layer. Rebuilds `keyboard` for the new layer,
+    /// re-places every live panel (the layers share geometry, so no resize), and
+    /// re-derives each pad's focus/cursor against the new keys, then redraws.
+    fn set_layer(&mut self, layer: Layer) {
+        if self.layer == layer {
+            return;
+        }
+        self.layer = layer;
+        self.keyboard = layer.keyboard();
+        for i in 0..self.panels.len() {
+            if !self.panels[i].configured {
+                continue;
+            }
+            let role = self.panels[i].role;
+            let placed = {
+                let eng = LayoutEngine::new(&self.keyboard, self.mode);
+                eng.place(role, &self.theme.geom)
+            };
+            self.panels[i].placed = placed;
+        }
+        // Indices changed with the key set; re-derive focus/cursor from the
+        // stored pad positions.
+        self.left_focus = None;
+        self.right_focus = None;
+        self.recompute_pad(Pad::Left);
+        self.recompute_pad(Pad::Right);
+        self.rebuild_highlights();
+        self.rebuild_cursors();
+        self.redraw_all();
+        eprintln!("hyprpad-osk: layer -> {:?}", self.layer);
+    }
+
+    /// Switch the surface policy (overlay/float ↔ displace). Recreates the live
+    /// surface(s) with the flipped exclusive zone, preserving the shift and
+    /// layer state (only the transient cursors reset).
+    fn set_reflow(&mut self, reflow: bool, qh: &QueueHandle<Self>) {
+        if self.panels.is_empty() {
+            self.reflow = reflow; // nothing shown yet; the next `show` will use it
+            return;
+        }
+        if self.reflow == reflow {
+            return;
+        }
+        let mode = self.mode;
+        self.show(mode, reflow, qh); // destroy + recreate with the new zone
+        eprintln!("hyprpad-osk: reflow -> {reflow}");
+    }
+
+    fn redraw_all(&mut self) {
+        let chrome = self.chrome();
+        for i in 0..self.panels.len() {
+            draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[i], chrome);
+        }
+    }
+
+    /// The live chrome state (shift level + reflow policy) the renderer needs.
+    fn chrome(&self) -> Chrome {
+        Chrome { shift: self.shift, reflow: self.reflow }
     }
 
     /// Recompute a panel's key placement after a configure and redraw it.
@@ -411,14 +569,20 @@ impl Osk {
         };
         self.panels[idx].placed = placed;
         self.panels[idx].configured = true;
+        // A pad may already be resting over this newly-placed panel — re-derive
+        // its focus/cursor so a resize/first-configure doesn't drop it.
+        self.recompute_pad(Pad::Left);
+        self.recompute_pad(Pad::Right);
         self.rebuild_highlights();
-        draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[idx]);
+        self.rebuild_cursors();
+        let chrome = self.chrome();
+        draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[idx], chrome);
     }
 }
 
 /// Draw one panel into a fresh shm buffer and commit it. Free function so the
 /// disjoint borrows of `pool`, `theme`, `keyboard`, and one `panel` are clear.
-fn draw_panel(pool: &mut SlotPool, theme: &Theme, keyboard: &Keyboard, panel: &mut PanelSurface) {
+fn draw_panel(pool: &mut SlotPool, theme: &Theme, keyboard: &Keyboard, panel: &mut PanelSurface, chrome: Chrome) {
     if !panel.configured {
         return;
     }
@@ -435,7 +599,7 @@ fn draw_panel(pool: &mut SlotPool, theme: &Theme, keyboard: &Keyboard, panel: &m
     };
     {
         let mut canvas = Canvas::new(canvas_bytes, w, h);
-        render::draw_panel(&mut canvas, theme, &keyboard.keys, &panel.placed, &panel.highlights);
+        render::draw_panel(&mut canvas, theme, &keyboard.keys, &panel.placed, &panel.highlights, &panel.cursors, chrome);
     }
     let surface = panel.layer.wl_surface();
     surface.attach(Some(buffer.wl_buffer()), 0, 0);
