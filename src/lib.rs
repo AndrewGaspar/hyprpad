@@ -11,5 +11,6 @@ pub mod config;
 pub mod gesture;
 pub mod hidraw;
 pub mod hypr;
+pub mod output;
 pub mod report;
 pub mod run;

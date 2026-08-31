@@ -245,6 +245,37 @@ impl Config {
         Config::from_toml_str(DEFAULT_TOML).expect("built-in default config is valid")
     }
 
+    /// The path the user config is read from:
+    /// `$XDG_CONFIG_HOME/hyprsc/config.toml`, or `~/.config/hyprsc/config.toml`
+    /// when `XDG_CONFIG_HOME` is unset. Returns `None` only if neither
+    /// `XDG_CONFIG_HOME` nor `HOME` is set.
+    pub fn config_path() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(std::path::PathBuf::from(dir).join("hyprsc/config.toml"));
+        }
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        Some(std::path::PathBuf::from(home).join(".config/hyprsc/config.toml"))
+    }
+
+    /// Load the user config from [`config_path`](Self::config_path), falling
+    /// back to [`load_default`](Self::load_default) when the file is absent
+    /// (or when no config directory can be resolved).
+    ///
+    /// Returns an error only when the file is *present but malformed*, so the
+    /// caller can surface a real misconfiguration rather than silently ignoring
+    /// it.
+    pub fn load() -> Result<Config, String> {
+        let Some(path) = Config::config_path() else {
+            return Ok(Config::load_default());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Config::from_toml_str(&text)
+                .map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::load_default()),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        }
+    }
+
     /// Resolve a gesture event to its bound action, or [`Action::None`].
     ///
     /// Lifecycle events that carry no binding — `GuideEnter` and a *chorded*
@@ -544,5 +575,42 @@ mod tests {
     #[test]
     fn default_config_is_nonempty() {
         assert!(!Config::load_default().is_empty());
+    }
+
+    #[test]
+    fn load_reads_present_file_and_reports_malformed() {
+        // Point XDG_CONFIG_HOME at a unique temp dir so `load()` reads our
+        // file. No other test touches these vars, so the process-wide mutation
+        // is safe here. Save/restore to leave the environment as we found it.
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = std::env::temp_dir().join(format!("hyprsc-cfg-test-{}", std::process::id()));
+        let cfg_dir = dir.join("hyprsc");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        // Absent file -> defaults, no error.
+        let _ = std::fs::remove_file(cfg_dir.join("config.toml"));
+        assert_eq!(Config::load().unwrap().len(), Config::load_default().len());
+
+        // Present, valid file -> parsed.
+        std::fs::write(cfg_dir.join("config.toml"), "[bindings]\n\"guide+a\" = \"workspace 3\"\n")
+            .unwrap();
+        let c = Config::load().expect("valid file loads");
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::Workspace(WorkspaceTarget::Number(3))
+        );
+
+        // Present, malformed file -> error (not a silent fallback).
+        std::fs::write(cfg_dir.join("config.toml"), "[bindings]\n\"guide+nope\" = \"fullscreen\"\n")
+            .unwrap();
+        assert!(Config::load().unwrap_err().contains("unknown button"));
+
+        // Restore environment and clean up.
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
