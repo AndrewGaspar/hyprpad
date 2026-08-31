@@ -2,17 +2,38 @@
 
 Ordered by how much the answer changes the plan.
 
-## Q1 — Does Steam open Big Picture on guide *press* or on guide *release*?
+## Q1 — Does Steam act on guide press or release?  **ANSWERED**
 
-**Why it matters most.** It determines whether architecture B's hold-based chords
-can coexist with Steam, or whether every gesture flashes Big Picture. If Steam
-acts on release-after-short-press, a >300 ms hold never triggers it and the main
-weakness of the recommended design largely evaporates. If Steam acts on press,
-escalation to architecture D moves much closer.
+**Answered 2026-08-30 by direct observation: on _release_.** Steam takes focus if
+it did not have it, launches Steam if it did, and does **nothing at all** if the
+button was held longer than ~3 s.
 
-**How to answer.** No code needed. Hold the guide button for three seconds and
-watch when Big Picture appears — immediately on press, or only on release. Then
-repeat while watching `~/.steam/steam/logs/controller.txt`.
+This was the highest-stakes question and the answer is close to the best case.
+Recorded in [03](03-hardware-findings.md#steams-reaction-to-the-guide-button);
+its consequences for the plan are in
+[06](06-recommendation.md#the-guide-button-is-not-actually-a-problem).
+
+## Q1b — Does a guide chord suppress Steam's release action?
+
+Steam ships a *Guide Button Chord Layout*, so it clearly distinguishes a bare
+guide press from guide-plus-something. Unknown whether pressing another button
+during the hold cancels the on-release focus steal.
+
+**Why it matters.** If a chord already suppresses it, chorded gestures need no
+mitigation whatsoever, and the `suppressevent` window rule is only needed for
+analog-only gestures such as guide-plus-stick-flick.
+
+**How to answer.** Hold guide, tap `A`, release quickly — does Steam take focus?
+Then repeat with guide plus a right-stick flick and no button, which is the case
+most likely to *not* register as a chord.
+
+## Q1c — Does `suppressevent activatefocus` fully block the focus steal?
+
+The token is present in Hyprland 0.56.2 and the rule is the obvious fix, but it
+has not been applied and tested. Note this build uses the non-legacy config
+parser, so `hyprctl keyword windowrule` is rejected — the rule must go in the
+config file. This machine's Hyprland config is Lua-generated, so the edit belongs
+in `hyprland.lua`, not the generated `.conf`.
 
 ## Q2 — The rest of the `0x42` button map
 

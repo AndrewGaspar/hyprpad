@@ -30,6 +30,15 @@ That means the primary architecture does **not** need to grab, proxy, or hide th
 device from Steam. It observes. Steam is undisturbed, so Steam Input, per-game
 configurations and Big Picture all keep working exactly as they do today.
 
+## The second finding
+
+**Steam acts on the guide button's _release_, not its press — and ignores holds
+longer than ~3 s entirely.** So a passive daemon has the whole hold to recognise
+and dispatch a gesture, and Steam's only reaction is a trailing focus steal,
+removable with a one-line Hyprland window rule
+(`suppressevent activatefocus, match:class steam`) or by restoring focus over
+IPC. Together these mean the passive design does not have to give anything up.
+
 ## Recommendation in one paragraph
 
 Build **hyprsc** as a passive-tap userspace daemon: read the controller
@@ -37,8 +46,8 @@ read-only (`hidraw` for the Steam Controller, `evdev` for everything else),
 run a small mode machine over guide-chords and gestures, and drive the desktop
 through Hyprland's IPC socket plus the `zwlr_virtual_pointer_v1` /
 `zwp_virtual_keyboard_v1` Wayland protocols — all of which Hyprland already
-supports. Keep an **escalation hatch** (udev + `uhid` proxy) for the one thing
-passive tapping cannot do: stop Steam from *also* reacting to the guide button.
+supports. A `uhid`-proxy design remains documented as a last resort, but the
+guide-release behaviour above means it is unlikely to be needed.
 Details and the rejected alternatives are in
 [docs/06-recommendation.md](docs/06-recommendation.md).
 

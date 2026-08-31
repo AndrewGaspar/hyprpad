@@ -91,24 +91,22 @@ daemon crashes; the controller simply behaves as it does now. Full analog
 resolution at 263 Hz, so continuous gestures are expressible. Generalizes to
 other controllers through the evdev path.
 
-**Against — and this is the real cost.** A passive tap cannot suppress. Steam
-sees the guide button too, and will react to it. Concretely: *tap guide* opens
-Big Picture, and there is nothing the daemon can do about it from a read-only
-file descriptor.
+**Against.** A passive tap cannot suppress, so Steam sees the guide button too.
+This was the design's main worry, and direct observation has largely dissolved
+it: **Steam acts on guide _release_, not press**, and ignores holds longer than
+~3 s entirely ([03](03-hardware-findings.md#steams-reaction-to-the-guide-button)).
 
-Three mitigations, in increasing order of intrusiveness:
+That means there is no race — the daemon acts during the hold, Steam acts after
+it, and the only leftover is a trailing focus steal. Three ways to remove it,
+which compose:
 
-1. **Use hold, not tap.** Bind the desktop layer to *guide held past ~300 ms*.
-   The captured timings show deliberate taps under 200 ms and intentional holds
-   an order of magnitude longer
-   ([03](03-hardware-findings.md#guide-button-timing)), so the two are cleanly
-   separable *by the daemon*. Whether Steam fires Big Picture on press or on
-   release determines whether this is sufficient — **unverified**, and the single
-   most valuable next experiment ([07](07-open-questions.md)).
-2. **Neuter Steam's reaction in Steam.** Configure the Guide Button Chord Layout
-   so guide-chords do nothing Steam-side, and/or disable Big Picture on guide.
-3. **Escalate to D** for the cases that matter most, keeping B for everything
-   else.
+1. **A Hyprland window rule.** `suppressevent activatefocus, match:class steam`
+   blocks the focus steal declaratively. Config-only; token verified present in
+   0.56.2.
+2. **Focus restore over IPC.** The daemon records the focused window when a
+   gesture begins and restores it shortly after guide release. Stays entirely
+   within the passive design, needs no configuration.
+3. **Hold past 3 s** for any gesture where even a flash is unacceptable.
 
 Also against: device-specific HID decoding for the Steam Controller (bounded —
 SDL3 has already done it publicly), and the daemon must implement its own

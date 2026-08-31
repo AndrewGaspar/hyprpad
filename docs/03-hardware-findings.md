@@ -169,6 +169,39 @@ The complete *hold-guide-and-flick-the-stick* gesture is therefore recoverable
 from the passive stream alone — modifier state and analog axes in the same
 frames.
 
+## Steam's reaction to the guide button
+
+Established by direct observation (2026-08-30), and decisive for the
+architecture: **Steam acts on guide _release_, never on press.** Three branches:
+
+| Condition | Steam's reaction on release |
+|---|---|
+| Short hold, Steam window **not** focused | Steam window takes focus |
+| Short hold, Steam window **already** focused | Launches Steam |
+| **Hold longer than ~3 s** | **Nothing at all** |
+
+Three consequences, in ascending order of importance.
+
+1. **There is no race.** A passive daemon has the entire duration of the hold to
+   recognise and act on a gesture before Steam does anything. Steam's reaction is
+   a *trailing side effect*, not a competitor for the same event.
+2. **A long hold is invisible to Steam.** Anything held past ~3 s is free of
+   Steam-side consequences entirely.
+3. **The side effect is a focus steal**, which is precisely the class of thing a
+   Wayland compositor can suppress declaratively. Hyprland 0.56.2 accepts
+   `suppressevent activatefocus` as a window rule (token verified present in the
+   binary), so branch 1 is neutralisable in configuration:
+
+   ```
+   windowrule = suppressevent activatefocus, match:class steam
+   ```
+
+   Branch 2 only fires when the Steam window is already focused — which is
+   exactly when a window-manager gesture is not wanted anyway.
+
+This closes what was the recommended architecture's main weakness. See
+[06 — Recommendation](06-recommendation.md#the-guide-button-is-not-actually-a-problem).
+
 ## Other reports
 
 | ID | Length | Period | Interpretation |

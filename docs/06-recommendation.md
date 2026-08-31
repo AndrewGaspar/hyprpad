@@ -21,36 +21,60 @@ Everything else follows.
   ([03](03-hardware-findings.md#steams-handling-of-this-controller-is-broken-today)),
   so even a partial result is a net gain.
 
-## The honest weakness
+## The guide button is not actually a problem
 
-Passive tapping cannot suppress. Steam sees the guide button too. *Tap guide*
-will open Big Picture, and no read-only file descriptor can prevent that.
+The design's one real worry was that a passive tap cannot suppress, so Steam
+would also react to the guide button. Direct observation has largely dissolved
+it ([03](03-hardware-findings.md#steams-reaction-to-the-guide-button)):
 
-This is mitigated, not solved:
+> **Steam acts on guide _release_, not on press — and ignores holds longer than
+> ~3 s entirely.**
 
-1. Bind the desktop layer to **guide held past ~300 ms**. Measured deliberate
-   taps are under 200 ms; intentional holds are ~2.3 s
-   ([03](03-hardware-findings.md#guide-button-timing)). The daemon can separate
-   them cleanly.
-2. Whether that is *sufficient* depends on whether Steam opens Big Picture on
-   press or on release. **This is unverified and it is the first thing to test**
-   — see [07](07-open-questions.md). If Steam acts on release-after-short-press,
-   hold-based chords coexist with Steam for free and the weakness largely
-   evaporates. If Steam acts on press, every gesture flashes Big Picture and
-   mitigation 3 becomes necessary sooner.
-3. Escalate to D for the guide button specifically, keeping B for everything else.
+This is close to the best case. It means:
 
-Stating it plainly: **B does not fully deliver "reassign the guide button". It
-delivers "use the guide button as a modifier, with a Steam-side side effect whose
-severity is currently unknown."** D is the design that fully delivers it, at a
-cost not worth paying until Steam's own handling of this controller stabilizes.
+- **No race.** The daemon has the whole hold to recognise and dispatch a gesture.
+  Steam's reaction is a trailing side effect, not a competing consumer of the
+  same event.
+- **The side effect is only a focus steal** (Steam takes focus if it did not have
+  it; launches Steam if it did).
+- **Long holds are free.** Anything past ~3 s is invisible to Steam.
+
+Three composable mitigations, cheapest first:
+
+1. **Window rule.** `windowrule = suppressevent activatefocus, match:class steam`
+   — config-only, blocks the focus steal outright. The `activatefocus` token is
+   present in Hyprland 0.56.2. Note this build uses the non-legacy parser, so it
+   must go in the config file; `hyprctl keyword` will not take it.
+2. **Focus restore over IPC.** The daemon notes the focused window when a gesture
+   starts and restores it a beat after guide release. Entirely within the passive
+   design, no configuration required, and it also covers the "Steam was already
+   focused" branch.
+3. **Hold past 3 s** for gestures where even a flash is unacceptable — a
+   guaranteed-silent escape, though too slow for a snappy workspace flick.
+
+**Consequence for the plan: architecture D is demoted.** It was carried as an
+escalation hatch on the assumption that reassigning the guide button might
+eventually require owning the device. That now looks unlikely to be necessary.
+D remains documented in [05](05-architectures.md#d--uhid-device-proxy-full-interposition)
+as a fallback, but it should be treated as a design of last resort rather than a
+planned phase.
+
+One thing still unmeasured: whether a guide **chord** (guide plus another button)
+already suppresses Steam's release action on its own. Steam has a Guide Button
+Chord Layout, so it plainly has a concept of chords; if pressing any button
+during the hold cancels the release behaviour, mitigation 1 may be unnecessary
+for chorded gestures. See [07, Q1b](07-open-questions.md#q1b--does-a-guide-chord-suppress-steams-release-action).
 
 ## Phasing
 
 ### Phase 0 — cheap experiments, no code
 
-- Test whether Steam opens Big Picture on guide **press** or **release**
-  ([07, Q1](07-open-questions.md)). This single answer changes the plan.
+- ~~Test whether Steam acts on guide press or release.~~ **Answered:** on
+  release, and not at all past ~3 s. See above.
+- Add `windowrule = suppressevent activatefocus, match:class steam` and confirm
+  it removes the focus steal. One config line, immediately testable.
+- Test whether a guide **chord** already suppresses Steam's release action
+  ([07, Q1b](07-open-questions.md#q1b--does-a-guide-chord-suppress-steams-release-action)).
 - Try architecture A (`extest` + Steam Input Desktop Layout). An afternoon. If it
   works well enough, the scope of everything below shrinks.
 - Move to a kernel with `hid-steam` 2026 support (7.3, or `linux-mainline`). This
@@ -97,8 +121,8 @@ independently ([03](03-hardware-findings.md#the-full-gesture-is-observable)).
 
 ### Phase 4 — escalation, only if warranted
 
-If phase 0 shows Steam reacts on press, or the Big Picture interruption proves
-intolerable in use, take architecture D — but prefer doing it as an
+Only if the mitigations above prove insufficient in daily use — which now looks
+unlikely — take architecture D — but prefer doing it as an
 **InputPlumber capability map** (E) rather than a private `uhid` clone. Upstream
 plumbing beats a bespoke device emulator that has to be maintained against
 firmware and client updates.
