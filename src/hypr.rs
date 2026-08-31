@@ -148,7 +148,7 @@ impl Hypr {
     pub fn dispatch_raw(&self, payload: &str) -> io::Result<String> {
         let reply = self.request(&format!("dispatch {payload}"))?;
         if reply.starts_with("error:") {
-            return Err(io::Error::new(io::ErrorKind::Other, reply.trim().to_string()));
+            return Err(io::Error::other(reply.trim().to_string()));
         }
         Ok(reply)
     }

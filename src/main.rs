@@ -1,17 +1,17 @@
-mod hidraw;
-mod report;
-
-use report::{Button, Frame};
+use hyprsc::report::Frame;
+use hyprsc::{hidraw, run};
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("run") => run::run().unwrap_or_else(|e| { eprintln!("hyprsc: {e}"); std::process::exit(1); }),
         Some("monitor") => monitor(),
         _ => {
-            eprintln!("usage: hyprsc monitor");
+            eprintln!("usage: hyprsc <run|monitor>");
             eprintln!();
+            eprintln!("  run       drive Hyprland from the controller (gestures -> dispatch)");
             eprintln!("  monitor   decode and print controller events (passive; Steam-safe)");
             std::process::exit(2);
         }
@@ -55,7 +55,7 @@ fn monitor() {
         if tr(frame.r2) != tr(prev.r2) {
             println!("{t:9.3}  R2   {}/4", tr(frame.r2));
         }
-        if frames % 5000 == 0 {
+        if frames.is_multiple_of(5000) {
             eprintln!("[{t:9.3}] {frames} frames ({:.0} Hz)", frames as f64 / t);
         }
         std::io::stdout().flush().ok();

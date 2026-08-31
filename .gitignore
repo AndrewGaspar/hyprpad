@@ -1,3 +1,4 @@
+.claude/
 *.jsonl
 *.jsonl.snap
 __pycache__/
