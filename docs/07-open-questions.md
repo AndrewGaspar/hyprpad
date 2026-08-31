@@ -202,3 +202,39 @@ the candidate is gamescope's `ime.cpp` recipe (real character keycodes +
 interpret-bearing modifier in a generated keymap) via virtual-keyboard-v1 —
 untested. Also untested: whether vkbd-v1 with the user's *unchanged* current
 keymap reaches XWayland (would isolate keymap-change race vs vkbd itself).
+
+## Q15 — Virtual keyboard vs the lock screen  **ANSWERED 2026-08-31**
+
+Live test: session locked (Quickshell `WlSessionLock`), junk typed into the
+password field, display allowed to blank; a `wtype -k Escape` injected from an
+unprivileged shell **woke the display and cleared the field**. Session stayed
+`locked/secure` throughout. Confirms
+[session-lifecycle verdict (a)](research/session-lifecycle.md#feasibility-verdicts)
+by live injection: `zwp_virtual_keyboard_v1` events reach the lock surface,
+so both controller unlock paths (password injection, or the preferred
+`authenticate()` plugin extension) are mechanically sound.
+
+## Q16 — Nested gamescope stability on the dev laptop  **OPENED 2026-08-31**
+
+Attempting the `gamescope-type` backend validation, nested gamescope
+(`--backend wayland`) **crashed with SIGABRT on all four attempts** at hosting
+a client (foot with `--expose-wayland`, alacritty via embedded Xwayland, with
+and without `--prefer-vk-device` pinning to the AMD iGPU). Core dumps show the
+identical signature every time: the `gamescope-xwm` thread aborting via
+`XPending → _XEventsQueued → _XIOError → abort` — gamescope self-aborts when
+its embedded Xwayland connection drops. Root cause of the Xwayland-side death
+not pinned (gamescope frames unsymbolized; no debuginfod symbols).
+
+The owner observed at least one client window (Omawrite, unexplained) render
+inside a gamescope window before a crash — so clients *can* render; this is
+instability, not a hard failure. Notes:
+
+- **Corrects the research claim** in
+  [gamescope-hyprland-integration.md §2a](research/gamescope-hyprland-integration.md):
+  "verified by execution" was `-- sleep 3` — initialization only, no client
+  ever hosted.
+- Hybrid AMD+NVIDIA laptop; the known cross-GPU modifier issues make this
+  plausibly laptop-specific. **The tower (single GPU) must be tested before
+  concluding anything about W5** — but W5's risk rating rises until it is.
+- `gamescope-type` backend validation therefore remains open; retry on the
+  tower or after a gamescope update.

@@ -257,9 +257,12 @@ boots annoy enough.
 2. **Device-denial mechanism unverified** (W12). udev tag clearing, bwrap
    namespace, and cgroup paths all unproven. Mitigation: prototype all three
    in an afternoon before designing around one.
-3. **HDR triple unvalidated in the field** (W5). Mechanism verified
-   end-to-end but no known user runs Hyprland+NVIDIA+nested-gamescope-HDR.
-   Mitigation: W0 test on the tower; fallback is plain-Hyprland Proton HDR.
+3. **Nested gamescope itself needs tower validation** (W5). On the dev
+   laptop, nested gamescope SIGABRTs (xwm thread, `_XIOError` → abort) when
+   hosting clients — four for four, plausibly hybrid-GPU-specific (Q16). The
+   HDR triple is additionally unvalidated in the field. Mitigation: W0 tests
+   on the single-GPU tower; fallback for BPM is bare-XWayland windowed mode
+   with its documented caveats, and for HDR plain-Hyprland Proton HDR.
 4. **Steam moves.** #13185 fix, client updates to `controller_triton`
    handling, or a native Wayland client (CEF blocker now removed) could
    invalidate Tier 0/W12 assumptions. Mitigation: passive-tap core is
