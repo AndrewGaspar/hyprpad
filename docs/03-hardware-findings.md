@@ -259,6 +259,12 @@ architecture: **Steam acts on guide _release_, never on press.** Three branches:
 | Short hold, Steam window **already** focused | Launches Steam |
 | **Hold longer than ~3 s** | **Nothing at all** |
 
+**Addendum (2026-08-31, live test):** the release action is suppressed by
+**analog** input during the hold but not by buttons: guide+right-stick-flick →
+no reaction at all; guide+A → focus steal fires anyway; bare tap → focus steal
+(control). Analog guide-chords therefore coexist with Steam for free; button
+guide-chords need the window-rule mitigation.
+
 Three consequences, in ascending order of importance.
 
 1. **There is no race.** A passive daemon has the entire duration of the hold to

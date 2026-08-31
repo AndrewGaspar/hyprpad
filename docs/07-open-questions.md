@@ -13,19 +13,26 @@ Recorded in [03](03-hardware-findings.md#steams-reaction-to-the-guide-button);
 its consequences for the plan are in
 [06](06-recommendation.md#the-guide-button-is-not-actually-a-problem).
 
-## Q1b — Does a guide chord suppress Steam's release action?
+## Q1b — Does a guide chord suppress Steam's release action?  **ANSWERED 2026-08-31**
 
-Steam ships a *Guide Button Chord Layout*, so it clearly distinguishes a bare
-guide press from guide-plus-something. Unknown whether pressing another button
-during the hold cancels the on-release focus steal.
+Tested live with Steam running, a non-Steam window focused, three trials:
 
-**Why it matters.** If a chord already suppresses it, chorded gestures need no
-mitigation whatsoever, and the `suppressevent` window rule is only needed for
-analog-only gestures such as guide-plus-stick-flick.
+| Gesture | Steam's reaction on release |
+|---|---|
+| Guide + **A** tap (button chord) | **Focus steal fires anyway** |
+| Guide + **right-stick flick** (analog chord) | **Nothing — suppressed** |
+| Bare guide tap (control) | Focus steal (as established in Q1) |
 
-**How to answer.** Hold guide, tap `A`, release quickly — does Steam take focus?
-Then repeat with guide plus a right-stick flick and no button, which is the case
-most likely to *not* register as a chord.
+So suppression is **analog-only**: stick (and presumably trackpad) motion
+during the hold cancels Steam's release action — most plausibly because the
+Guide Chord Layout binds guide+stick to mouse emulation, marking the hold as
+"chord consumed" — while a button press during the hold does not.
+
+**Consequences:** the flagship gesture (guide + stick flick → workspace) needs
+*no* mitigation at all in the passive design. Guide + *button* chords still
+need `suppressevent activatefocus` (and Tier-0 chord emptying to silence any
+bound chord action). Recorded in
+[03](03-hardware-findings.md#steams-reaction-to-the-guide-button).
 
 ## Q1c — Does `suppressevent activatefocus` fully block the focus steal?
 
@@ -169,3 +176,11 @@ Steam's udev rule sets `power/wakeup=enabled` for all `28de` USB devices. Whethe
 a button press actually wakes the tower from s2idle/S3 depends on the USB
 controller's wake chain and BIOS settings. Test on the tower: suspend, press
 guide.
+
+## Q14 — Text-injection matrix validation  **STARTED 2026-08-31**
+
+`wtype 'héllo'` into **Omawrite** (native Wayland, `xwayland=false`): rendered
+exactly, é included — the virtual-keyboard-v1 path with the Unicode
+keymap-swap works on this stack for the native-Wayland row. Remaining rows:
+XWayland/Chromium (the worst-reported case — wtype#62 class) and nested
+gamescope (`gamescope-type`).
