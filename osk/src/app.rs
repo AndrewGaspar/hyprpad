@@ -39,6 +39,7 @@ use crate::layout::{Keyboard, KeyRole, LayoutEngine, LayoutMode, Pad, PanelRole,
 use crate::output::VirtualKeyboard;
 use crate::render::{self, Canvas, Highlight, HighlightKind};
 use crate::surface;
+use crate::theme::Theme;
 
 /// One live layer surface (a panel) plus its cached geometry and draw state.
 struct PanelSurface {
@@ -65,8 +66,12 @@ pub struct Osk {
     pool: SlotPool,
 
     keyboard: Keyboard,
+    /// The active theme: every colour and every geometry token the draw path and
+    /// the size-to-content computation read from.
+    theme: Theme,
     mode: LayoutMode,
-    /// Best-known output logical size, for choosing panel thickness.
+    /// Best-known output logical size (kept for future clamping / diagnostics;
+    /// the panels are content-sized from the theme, not the screen).
     output_size: (u32, u32),
 
     panels: Vec<PanelSurface>,
@@ -90,8 +95,9 @@ pub struct Osk {
 }
 
 impl Osk {
-    /// Connect, bind globals, and run the poll loop until `quit`/EOF.
-    pub fn run(mut channel: Channel) -> Result<(), String> {
+    /// Connect, bind globals, and run the poll loop until `quit`/EOF. `theme`
+    /// is the resolved active theme (from [`crate::theme::ThemeSource`]).
+    pub fn run(mut channel: Channel, theme: Theme) -> Result<(), String> {
         let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
         let (globals, mut event_queue) =
             registry_queue_init(&conn).map_err(|e| format!("registry init: {e}"))?;
@@ -114,6 +120,7 @@ impl Osk {
             shm,
             pool,
             keyboard: Keyboard::qwerty(),
+            theme,
             mode: LayoutMode::BottomDeck,
             output_size: (0, 0),
             panels: Vec::new(),
@@ -131,7 +138,10 @@ impl Osk {
             .roundtrip(&mut osk)
             .map_err(|e| format!("initial roundtrip: {e}"))?;
 
-        eprintln!("hyprpad-osk: ready (namespace '{}')", surface::NAMESPACE);
+        eprintln!(
+            "hyprpad-osk: ready (namespace '{}', theme '{}', key_size {}px)",
+            surface::NAMESPACE, osk.theme.name, osk.theme.geom.key_size
+        );
 
         while !osk.exit {
             // Apply queued Wayland events, then push our requests out.
@@ -205,7 +215,7 @@ impl Osk {
     fn show(&mut self, mode: LayoutMode, reflow: bool, qh: &QueueHandle<Self>) {
         self.hide(); // destroy first — never stack surfaces
         self.mode = mode;
-        let specs = surface::panels_for(mode, reflow, self.output_size.0, self.output_size.1);
+        let specs = surface::panels_for(mode, reflow, &self.keyboard, &self.theme.geom);
         for spec in specs {
             let wl_surface = self.compositor.create_surface(qh);
             let layer = self.layer_shell.create_layer_surface(
@@ -274,7 +284,7 @@ impl Osk {
         }
         let role = self.panels[idx].role;
         let eng = LayoutEngine::new(&self.keyboard, self.mode);
-        let (px, py) = eng.map_cursor(pad, role, (w as f32, h as f32), (nx, ny), self.trackpad_scale);
+        let (px, py) = eng.map_cursor(pad, role, &self.theme.geom, (nx, ny), self.trackpad_scale);
         let hit = LayoutEngine::hit_test(&self.panels[idx].placed, px, py)
             .map(|i| self.panels[idx].placed[i].key);
         match pad {
@@ -373,7 +383,7 @@ impl Osk {
 
     fn redraw_all(&mut self) {
         for i in 0..self.panels.len() {
-            draw_panel(&mut self.pool, &self.keyboard, &mut self.panels[i]);
+            draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[i]);
         }
     }
 
@@ -392,20 +402,23 @@ impl Osk {
         self.panels[idx].size = (w, h);
 
         let role = self.panels[idx].role;
+        // Placement is content-sized from the theme geometry (not stretched to
+        // the configured size), so it always agrees with the `[-1,1]` cursor
+        // mapping. In practice the configured size equals this content size.
         let placed = {
             let eng = LayoutEngine::new(&self.keyboard, self.mode);
-            eng.place(role, w as f32, h as f32)
+            eng.place(role, &self.theme.geom)
         };
         self.panels[idx].placed = placed;
         self.panels[idx].configured = true;
         self.rebuild_highlights();
-        draw_panel(&mut self.pool, &self.keyboard, &mut self.panels[idx]);
+        draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[idx]);
     }
 }
 
 /// Draw one panel into a fresh shm buffer and commit it. Free function so the
-/// disjoint borrows of `pool`, `keyboard`, and one `panel` are clear.
-fn draw_panel(pool: &mut SlotPool, keyboard: &Keyboard, panel: &mut PanelSurface) {
+/// disjoint borrows of `pool`, `theme`, `keyboard`, and one `panel` are clear.
+fn draw_panel(pool: &mut SlotPool, theme: &Theme, keyboard: &Keyboard, panel: &mut PanelSurface) {
     if !panel.configured {
         return;
     }
@@ -422,7 +435,7 @@ fn draw_panel(pool: &mut SlotPool, keyboard: &Keyboard, panel: &mut PanelSurface
     };
     {
         let mut canvas = Canvas::new(canvas_bytes, w, h);
-        render::draw_panel(&mut canvas, &keyboard.keys, &panel.placed, &panel.highlights);
+        render::draw_panel(&mut canvas, theme, &keyboard.keys, &panel.placed, &panel.highlights);
     }
     let surface = panel.layer.wl_surface();
     surface.attach(Some(buffer.wl_buffer()), 0, 0);

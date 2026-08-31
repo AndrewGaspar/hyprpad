@@ -1,47 +1,24 @@
 //! A small software renderer: draws the placed keys into an ARGB8888 shm
 //! buffer, with legible labels from an embedded 8x8 bitmap font (`font8x8`).
 //!
-//! This is deliberately un-themed and CPU-only — the kickoff needs keys that
-//! are *legible and correctly positioned*, not Deck-grade animation. The full
-//! theming model (CSS-custom-property-equivalent token table, glow/pulse
-//! animations) is DEFERRED (osk-technology.md §4.7), and the research notes CPU
-//! cairo/pango is the weak point for animated cursors — a GPU path is a later
-//! decision. The renderer takes a list of [`Highlight`]s so the structure for
-//! §4.5's concurrent per-source highlights (left pad, right pad, d-pad focus —
-//! up to three at once) is already in place, even though this kickoff drives a
-//! subset.
+//! Every colour and every dimension in the draw path comes from the active
+//! [`Theme`] ([`crate::theme`]) — there are **no hardcoded colours or sizes
+//! left here**. This is the native equivalent of the Deck's §4.7 model: a token
+//! table drives appearance, the geometry is separate and un-themeable. It is
+//! still deliberately CPU-only and un-animated — the kickoff needs keys that
+//! are *legible and correctly positioned*; glow/pulse animations and a GPU path
+//! are DEFERRED (osk-technology.md §4.7 / §8). The renderer takes a list of
+//! [`Highlight`]s so the structure for §4.5's concurrent per-source highlights
+//! (left pad, right pad, d-pad focus — up to three at once) is already in place.
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 
 use crate::layout::{Key, PlacedKey};
-
-/// ARGB colour, non-premultiplied `0xAARRGGBB`. [`Canvas`] premultiplies on
-/// write so translucent fills composite correctly on the layer surface.
-#[derive(Clone, Copy)]
-pub struct Color(pub u32);
-
-impl Color {
-    fn parts(self) -> (u32, u32, u32, u32) {
-        let a = (self.0 >> 24) & 0xff;
-        let r = (self.0 >> 16) & 0xff;
-        let g = (self.0 >> 8) & 0xff;
-        let b = self.0 & 0xff;
-        (a, r, g, b)
-    }
-}
-
-// Palette (kickoff, un-themed).
-const BG: Color = Color(0xE6_11_14_1A); // translucent dark backdrop
-const KEY_CHAR: Color = Color(0xFF_23_28_33);
-const KEY_MOD: Color = Color(0xFF_2E_25_33); // modifiers/whitespace/meta tint
-const KEY_BORDER: Color = Color(0xFF_3C_44_50);
-const KEY_LABEL: Color = Color(0xFF_E6_EA_F0);
-const HL_LEFT: Color = Color(0xFF_2E_6C_C8); // left-pad highlight (blue)
-const HL_RIGHT: Color = Color(0xFF_C8_5A_2E); // right-pad highlight (orange)
-const HL_FOCUS: Color = Color(0xFF_3C_A0_5A); // d-pad focus highlight (green)
+use crate::theme::{Color, Theme};
 
 /// Which input source a highlight comes from — mirrors osk-technology.md §4.5's
-/// three concurrent highlight sources.
+/// three concurrent highlight sources. The concrete colour is resolved from the
+/// active [`Theme`] at draw time (see [`Theme::colors`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HighlightKind {
     LeftPad,
@@ -50,11 +27,11 @@ pub enum HighlightKind {
 }
 
 impl HighlightKind {
-    fn color(self) -> Color {
+    fn color(self, theme: &Theme) -> Color {
         match self {
-            HighlightKind::LeftPad => HL_LEFT,
-            HighlightKind::RightPad => HL_RIGHT,
-            HighlightKind::Focus => HL_FOCUS,
+            HighlightKind::LeftPad => theme.colors.pointer_left,
+            HighlightKind::RightPad => theme.colors.pointer_right,
+            HighlightKind::Focus => theme.colors.focus,
         }
     }
 }
@@ -103,11 +80,37 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    fn border(&mut self, x: i32, y: i32, w: i32, h: i32, thick: i32, c: Color) {
-        self.fill_rect(x, y, w, thick, c);
-        self.fill_rect(x, y + h - thick, w, thick, c);
-        self.fill_rect(x, y, thick, h, c);
-        self.fill_rect(x + w - thick, y, thick, h, c);
+    /// Fill a rounded rectangle of corner radius `r` (px). `r <= 0` degrades to
+    /// a plain rectangle. The corner test keeps only pixels inside the quarter
+    /// circles — good enough for crisp keycaps at CPU cost.
+    fn fill_round_rect(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, c: Color) {
+        let r = r.clamp(0, w.min(h) / 2);
+        if r == 0 {
+            self.fill_rect(x, y, w, h, c);
+            return;
+        }
+        for yy in 0..h {
+            for xx in 0..w {
+                // Distance from the nearest corner centre, when in a corner box.
+                let cx = if xx < r {
+                    r - 1 - xx
+                } else if xx >= w - r {
+                    xx - (w - r)
+                } else {
+                    0
+                };
+                let cy = if yy < r {
+                    r - 1 - yy
+                } else if yy >= h - r {
+                    yy - (h - r)
+                } else {
+                    0
+                };
+                if cx * cx + cy * cy <= (r - 1) * (r - 1) || cx == 0 || cy == 0 {
+                    self.put(x + xx, y + yy, c);
+                }
+            }
+        }
     }
 
     /// Draw one glyph at integer `scale`, top-left at `(x, y)`.
@@ -126,16 +129,18 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draw `text` centred within the box `(bx, by, bw, bh)`. Picks the largest
-    /// integer glyph scale that fits both dimensions, so single-char keycaps get
-    /// big glyphs and multi-char legends ("Enter", "Space") shrink to fit.
-    fn text_centered(&mut self, text: &str, bx: i32, by: i32, bw: i32, bh: i32, c: Color) {
+    /// integer glyph scale that fits both dimensions but no larger than
+    /// `scale_max` (the font token), so single-char keycaps get big glyphs and
+    /// multi-char legends ("Enter", "Space") shrink to fit.
+    fn text_centered(&mut self, text: &str, bbox: (i32, i32, i32, i32), scale_max: i32, c: Color) {
+        let (bx, by, bw, bh) = bbox;
         let n = text.chars().count() as i32;
         if n == 0 {
             return;
         }
         let by_w = (bw - 4) / (n * 8);
         let by_h = (bh - 4) / 8;
-        let scale = by_w.min(by_h).clamp(1, 3);
+        let scale = by_w.min(by_h).clamp(1, scale_max.max(1));
         let tw = n * 8 * scale;
         let th = 8 * scale;
         let mut x = bx + (bw - tw) / 2;
@@ -147,9 +152,14 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Draw a whole panel: background, then every placed key, with any highlights.
-pub fn draw_panel(canvas: &mut Canvas, keys: &[Key], placed: &[PlacedKey], highlights: &[Highlight]) {
-    canvas.fill_rect(0, 0, canvas.w, canvas.h, BG);
+/// Draw a whole panel: themed background, then every placed key, with any
+/// highlights. All colours and dimensions are read from `theme`.
+pub fn draw_panel(canvas: &mut Canvas, theme: &Theme, keys: &[Key], placed: &[PlacedKey], highlights: &[Highlight]) {
+    let col = &theme.colors;
+    let corner = theme.geom.corner as i32;
+    let border = theme.geom.border_width.max(1.0) as i32;
+
+    canvas.fill_rect(0, 0, canvas.w, canvas.h, col.surface_bg);
 
     for pk in placed {
         let key = &keys[pk.key];
@@ -158,15 +168,18 @@ pub fn draw_panel(canvas: &mut Canvas, keys: &[Key], placed: &[PlacedKey], highl
         // Highlighted keys take their source colour; otherwise role tint.
         let hl = highlights.iter().find(|hh| hh.key == pk.key);
         let fill = match hl {
-            Some(hh) => hh.kind.color(),
+            Some(hh) => hh.kind.color(theme),
             None => match key.role {
-                crate::layout::KeyRole::Char => KEY_CHAR,
-                _ => KEY_MOD,
+                crate::layout::KeyRole::Char => col.key_fill,
+                _ => col.key_mod_fill,
             },
         };
-        canvas.fill_rect(x, y, w, h, fill);
-        canvas.border(x, y, w, h, if hl.is_some() { 2 } else { 1 }, KEY_BORDER);
-        canvas.text_centered(key.label, x, y, w, h, KEY_LABEL);
+        // Border via a rounded-rect underlay, then the fill inset by the border
+        // width — a themeable stroke that respects the corner radius.
+        let bw = if hl.is_some() { border.max(2) } else { border };
+        canvas.fill_round_rect(x, y, w, h, corner, col.key_border);
+        canvas.fill_round_rect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, (corner - bw).max(0), fill);
+        canvas.text_centered(key.label, (x, y, w, h), theme.font.scale_max, col.key_label);
     }
 }
 
