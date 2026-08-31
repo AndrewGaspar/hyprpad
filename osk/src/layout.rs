@@ -41,8 +41,9 @@ use crate::theme::Geom;
 pub enum Hand {
     Left,
     Right,
-    /// Spans both hands (e.g. the space bar); placed in whichever column the
-    /// side-split assigns spanning keys to (currently the left column's base).
+    /// Spans both hands (e.g. the space bar); the side-split duplicates these
+    /// into BOTH columns so either thumb can reach them (owner feedback: a
+    /// clickable Space on each side).
     Either,
 }
 
@@ -479,7 +480,7 @@ impl PanelRole {
         match self {
             PanelRole::Bottom => true,
             PanelRole::LeftColumn => matches!(key.hand, Hand::Left | Hand::Either),
-            PanelRole::RightColumn => key.hand == Hand::Right,
+            PanelRole::RightColumn => matches!(key.hand, Hand::Right | Hand::Either),
         }
     }
 }
@@ -717,8 +718,12 @@ mod tests {
         assert!(!has(&left, "y") && !has(&left, "p"));
         assert!(has(&right, "y") && has(&right, "p") && has(&right, "Enter"));
         assert!(!has(&right, "q") && !has(&right, "a"));
-        // Every key is placed exactly once across the two columns.
-        assert_eq!(left.len() + right.len(), kb.keys.len());
+        // Spanning (Hand::Either) keys — the space bar — are duplicated into
+        // BOTH columns so either thumb can reach them; hand-specific keys are
+        // placed exactly once.
+        assert!(has(&left, "Space") && has(&right, "Space"));
+        let either = kb.keys.iter().filter(|k| k.hand == Hand::Either).count();
+        assert_eq!(left.len() + right.len(), kb.keys.len() + either);
     }
 
     #[test]
