@@ -37,6 +37,28 @@ pub fn puck_nodes() -> std::io::Result<Vec<PathBuf>> {
     Ok(nodes.into_iter().map(|(_, p)| p).collect())
 }
 
+/// The puck's nodes if it is present *and* at least one node can be opened for
+/// reading right now, else `None`.
+///
+/// Used by the daemon's reconnect wait to decide when to re-arm the readers
+/// after the controller has gone away. A bare non-empty [`puck_nodes`] is not a
+/// strong enough signal on its own: after the controller sleeps and the device
+/// unbinds its hidraw nodes disappear, and this returns `None` until they come
+/// back and are openable again.
+pub fn puck_readable() -> Option<Vec<PathBuf>> {
+    let nodes = puck_nodes().ok()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    // A read-only open is side-effect-free (the passive tap opens the same way)
+    // and confirms the node is really back, not just lingering in /sys.
+    if nodes.iter().any(|n| fs::File::open(n).is_ok()) {
+        Some(nodes)
+    } else {
+        None
+    }
+}
+
 /// A raw report from one node.
 pub struct Report {
     pub node: PathBuf,
