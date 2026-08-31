@@ -1,0 +1,584 @@
+//! High-level gesture recognition over the decoded controller stream.
+//!
+//! [`GestureEngine`] consumes `(Frame, Instant)` pairs — one per input report,
+//! at the ~4 ms cadence measured in docs/03-hardware-findings.md — and emits
+//! [`GestureEvent`]s describing the *guide layer* the living-room vision is
+//! built on (docs/08-living-room-vision.md):
+//!
+//! - the guide (Steam) button opens a desktop layer while it is held;
+//! - buttons and stick flicks during that hold are chords, owned by the WM;
+//! - a *bare* guide tap (no chord during the hold) is reported as such so the
+//!   daemon can pass it through to Steam, whose own guide button acts on
+//!   release.
+//!
+//! Timing uses the monotonic [`Instant`] passed by the caller, never the frame
+//! counter (which is a wrapping `u8`): the engine is therefore robust to
+//! dropped and duplicate frames. All thresholds are `pub const` so they can be
+//! tuned without touching the logic.
+
+use crate::report;
+use std::time::{Duration, Instant};
+
+/// A cardinal stick-flick direction. `+Y` is up, matching [`report::Frame`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum StickDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Which analog stick a flick came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Stick {
+    Left,
+    Right,
+}
+
+/// A recognized high-level gesture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum GestureEvent {
+    /// Guide pressed: the desktop layer is now active.
+    GuideEnter,
+    /// A button was pressed while the guide was held.
+    GuideChord(report::Button),
+    /// A stick was flicked past the flick threshold while the guide was held.
+    GuideStickFlick { stick: Stick, dir: StickDir },
+    /// The guide crossed [`HOLD_THRESHOLD`] while still held. Emitted once per
+    /// hold; a signal that this is a deliberate hold, not a tap in progress.
+    ///
+    /// Not part of the minimal required set, but cheap and useful (e.g. to
+    /// reveal an on-screen layer overlay). A bare hold on its own does *not*
+    /// set `was_chorded`.
+    GuideHold,
+    /// Guide released. `was_chorded == false` means a bare tap that the daemon
+    /// should pass through to Steam; `true` means the hold carried at least one
+    /// chord or flick and was consumed by the desktop layer.
+    GuideLeave { was_chorded: bool },
+}
+
+/// How long the guide must be held to count as a deliberate hold rather than a
+/// tap. Measured taps sit under ~200 ms and deliberate holds near ~2300 ms
+/// (docs/03), so 300 ms separates them comfortably.
+pub const HOLD_THRESHOLD: Duration = Duration::from_millis(300);
+
+/// Dominant-axis deflection required to fire a flick: ~60% of the ±32767 range.
+pub const FLICK_THRESHOLD: i32 = 19_660;
+
+/// A flicked stick must fall back within this dominant-axis magnitude before
+/// another flick can fire (hysteresis). Comfortably above the idle noise floor
+/// and below [`FLICK_THRESHOLD`].
+pub const RECENTER_THRESHOLD: i32 = 8_000;
+
+/// Idle deadzone: sticks rest within ~±400 counts, so anything inside this is
+/// treated as centered (docs/03).
+pub const DEADZONE: i32 = 4_000;
+
+// The recenter band must sit at or above the idle deadzone, or a stick resting
+// at its idle offset could never re-arm. Checked at compile time.
+const _: () = assert!(RECENTER_THRESHOLD >= DEADZONE);
+
+/// Stateful recognizer. Feed every decoded frame to [`update`](Self::update).
+pub struct GestureEngine {
+    prev: report::Frame,
+    guide_active: bool,
+    guide_since: Instant,
+    was_chorded: bool,
+    hold_fired: bool,
+    /// Per-stick hysteresis: `true` means a fresh flick may fire; `false` means
+    /// the stick is still deflected from the last flick and must recenter.
+    left_armed: bool,
+    right_armed: bool,
+}
+
+impl GestureEngine {
+    /// Create an engine with no guide held and both sticks armed.
+    pub fn new() -> Self {
+        Self {
+            prev: report::Frame::default(),
+            guide_active: false,
+            guide_since: Instant::now(),
+            was_chorded: false,
+            hold_fired: false,
+            left_armed: true,
+            right_armed: true,
+        }
+    }
+
+    /// Consume one frame at time `now` and return the gestures it produced
+    /// (usually none). `now` must be monotonic across calls.
+    pub fn update(&mut self, frame: &report::Frame, now: Instant) -> Vec<GestureEvent> {
+        let mut events = Vec::new();
+        let guide_now = frame.pressed(report::Button::Steam);
+
+        // Entering the guide layer.
+        if guide_now && !self.guide_active {
+            self.guide_active = true;
+            self.guide_since = now;
+            self.was_chorded = false;
+            self.hold_fired = false;
+            // Only arm a stick that is already centered, so pressing guide with
+            // a stick already deflected does not fire a spurious flick.
+            self.left_armed = Self::centered(frame.left_stick);
+            self.right_armed = Self::centered(frame.right_stick);
+            events.push(GestureEvent::GuideEnter);
+        }
+
+        // While the guide is held: chords, flicks, and the hold threshold.
+        if guide_now {
+            for b in frame.edges_down(&self.prev) {
+                if Self::chordable(b) {
+                    events.push(GestureEvent::GuideChord(b));
+                    self.was_chorded = true;
+                }
+            }
+            for (stick, axis) in [
+                (Stick::Left, frame.left_stick),
+                (Stick::Right, frame.right_stick),
+            ] {
+                if let Some(dir) = self.flick(stick, axis) {
+                    events.push(GestureEvent::GuideStickFlick { stick, dir });
+                    self.was_chorded = true;
+                }
+            }
+            if !self.hold_fired
+                && now.saturating_duration_since(self.guide_since) >= HOLD_THRESHOLD
+            {
+                self.hold_fired = true;
+                events.push(GestureEvent::GuideHold);
+            }
+        }
+
+        // Leaving the guide layer.
+        if !guide_now && self.guide_active {
+            self.guide_active = false;
+            events.push(GestureEvent::GuideLeave {
+                was_chorded: self.was_chorded,
+            });
+        }
+
+        self.prev = *frame;
+        events
+    }
+
+    /// Whether the guide layer is currently active (guide held).
+    pub fn guide_active(&self) -> bool {
+        self.guide_active
+    }
+
+    /// Edge-triggered flick detector with hysteresis, run per stick per frame.
+    /// Returns `Some(dir)` on the frame a fresh flick crosses the threshold.
+    fn flick(&mut self, stick: Stick, (x, y): (i16, i16)) -> Option<StickDir> {
+        let ax = (x as i32).abs();
+        let ay = (y as i32).abs();
+        let dom = ax.max(ay);
+        let armed = match stick {
+            Stick::Left => &mut self.left_armed,
+            Stick::Right => &mut self.right_armed,
+        };
+        if *armed {
+            if dom >= FLICK_THRESHOLD {
+                *armed = false;
+                let dir = if ax >= ay {
+                    if x >= 0 {
+                        StickDir::Right
+                    } else {
+                        StickDir::Left
+                    }
+                } else if y >= 0 {
+                    StickDir::Up
+                } else {
+                    StickDir::Down
+                };
+                return Some(dir);
+            }
+        } else if dom <= RECENTER_THRESHOLD {
+            *armed = true;
+        }
+        None
+    }
+
+    /// A stick position counts as centered when its dominant axis is within the
+    /// recenter threshold.
+    fn centered((x, y): (i16, i16)) -> bool {
+        (x as i32).abs().max((y as i32).abs()) <= RECENTER_THRESHOLD
+    }
+
+    /// Whether a button counts as a deliberate chord. The purely capacitive
+    /// "hands on controller" bits and the pad *touch* (not click) flags fire on
+    /// contact, so they are excluded to keep `was_chorded` meaningful. `Steam`
+    /// itself is excluded so the guide press is never its own chord.
+    fn chordable(b: report::Button) -> bool {
+        use report::Button::*;
+        !matches!(
+            b,
+            Steam | Cap0 | Cap1 | Cap2 | Cap3 | PadLeftTouch | PadRightTouch
+        )
+    }
+}
+
+impl Default for GestureEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::{Button, Frame};
+    use std::time::Duration;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Find the `buttons` bit index for a `Button` using only the public
+    /// `Frame::pressed` API, so tests stay correct if the bit order changes.
+    fn bit(b: Button) -> u32 {
+        (0..32)
+            .find(|&i| {
+                Frame {
+                    buttons: 1 << i,
+                    ..Frame::default()
+                }
+                .pressed(b)
+            })
+            .expect("button has a bit")
+    }
+
+    fn frame(buttons: &[Button]) -> Frame {
+        let mut bits = 0u32;
+        for &b in buttons {
+            bits |= 1 << bit(b);
+        }
+        Frame {
+            buttons: bits,
+            ..Frame::default()
+        }
+    }
+
+    fn frame_sticks(buttons: &[Button], left: (i16, i16), right: (i16, i16)) -> Frame {
+        Frame {
+            left_stick: left,
+            right_stick: right,
+            ..frame(buttons)
+        }
+    }
+
+    #[test]
+    fn bare_tap_enters_then_leaves_unchorded() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        assert!(g.update(&frame(&[]), t).is_empty());
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(4)),
+            vec![GestureEvent::GuideEnter]
+        );
+        // Released well under the hold threshold, nothing pressed meanwhile.
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(120)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+        assert!(!g.guide_active());
+    }
+
+    #[test]
+    fn idle_stream_is_silent() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        for k in 0..10 {
+            assert!(g.update(&frame(&[]), t + ms(4 * k)).is_empty());
+        }
+    }
+
+    #[test]
+    fn guide_button_chord() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(4)),
+            vec![GestureEvent::GuideEnter]
+        );
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::BumperR1]), t + ms(8)),
+            vec![GestureEvent::GuideChord(Button::BumperR1)]
+        );
+        // Holding the same chord must not re-fire (level held, no new edge).
+        assert!(g
+            .update(&frame(&[Button::Steam, Button::BumperR1]), t + ms(12))
+            .is_empty());
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(60)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+    }
+
+    #[test]
+    fn guide_and_button_pressed_in_same_frame() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        // Guide and X arrive together in one report.
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::X]), t + ms(4)),
+            vec![
+                GestureEvent::GuideEnter,
+                GestureEvent::GuideChord(Button::X)
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_frames_do_not_repeat_a_chord() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        let f = frame(&[Button::Steam, Button::A]);
+        assert_eq!(
+            g.update(&f, t + ms(8)),
+            vec![GestureEvent::GuideChord(Button::A)]
+        );
+        // Exact duplicate report delivered again.
+        assert!(g.update(&f, t + ms(12)).is_empty());
+    }
+
+    #[test]
+    fn capacitive_and_pad_touch_are_not_chords() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        // Grabbing the controller / resting a thumb: contact-sense bits only.
+        assert!(g
+            .update(
+                &frame(&[Button::Steam, Button::Cap0, Button::PadLeftTouch]),
+                t + ms(8)
+            )
+            .is_empty());
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn pad_click_and_trigger_full_are_chords() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::TriggerR2Full]), t + ms(8)),
+            vec![GestureEvent::GuideChord(Button::TriggerR2Full)]
+        );
+    }
+
+    #[test]
+    fn stick_flick_fires_exactly_once_while_sustained() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(4)),
+            vec![GestureEvent::GuideEnter]
+        );
+        // Right stick flicked hard right.
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (25_000, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+        // Held out for many frames: no repeat.
+        for k in 3..12 {
+            assert!(g
+                .update(
+                    &frame_sticks(&[Button::Steam], (0, 0), (25_000, 0)),
+                    t + ms(4 * k),
+                )
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn flick_hysteresis_requires_recenter_before_refire() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        // First flick.
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+        // Ease off but stay outside the recenter band: still no re-fire.
+        assert!(g
+            .update(&frame_sticks(&[Button::Steam], (0, 0), (12_000, 0)), t + ms(12))
+            .is_empty());
+        // Return near center: re-arms, but re-arming itself emits nothing.
+        assert!(g
+            .update(&frame_sticks(&[Button::Steam], (0, 0), (0, 0)), t + ms(16))
+            .is_empty());
+        // Now a fresh flick fires again.
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(20)),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+    }
+
+    #[test]
+    fn flick_directions_pick_dominant_axis() {
+        let t = Instant::now();
+        let cases = [
+            ((30_000i16, 0i16), Stick::Right, StickDir::Right),
+            ((-30_000, 0), Stick::Right, StickDir::Left),
+            ((5_000, 25_000), Stick::Right, StickDir::Up),
+            ((5_000, -25_000), Stick::Right, StickDir::Down),
+        ];
+        for (right, stick, dir) in cases {
+            let mut g = GestureEngine::new();
+            g.update(&frame(&[]), t);
+            g.update(&frame(&[Button::Steam]), t + ms(4));
+            assert_eq!(
+                g.update(&frame_sticks(&[Button::Steam], (0, 0), right), t + ms(8)),
+                vec![GestureEvent::GuideStickFlick { stick, dir }],
+                "flick {right:?} should map to {dir:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn left_stick_flick_is_distinguished_from_right() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(
+                &frame_sticks(&[Button::Steam], (-30_000, 0), (0, 0)),
+                t + ms(8)
+            ),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Left,
+                dir: StickDir::Left,
+            }]
+        );
+    }
+
+    #[test]
+    fn flick_ignored_without_guide() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        // Stick slammed right, but guide not held: pure gameplay, no events.
+        assert!(g
+            .update(&frame_sticks(&[], (0, 0), (32_000, 0)), t)
+            .is_empty());
+    }
+
+    #[test]
+    fn idle_offset_does_not_flick() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        // Within the idle noise floor (~±400): no flick.
+        assert!(g
+            .update(&frame_sticks(&[Button::Steam], (400, -350), (300, 380)), t + ms(8))
+            .is_empty());
+    }
+
+    #[test]
+    fn deflected_at_enter_needs_recenter_first() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        // Stick already right, then guide pressed in that frame.
+        g.update(&frame_sticks(&[], (0, 0), (30_000, 0)), t);
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(4)),
+            vec![GestureEvent::GuideEnter],
+            "no flick should fire from a stick already deflected at guide press"
+        );
+        // Recenter, then flick counts.
+        assert!(g
+            .update(&frame_sticks(&[Button::Steam], (0, 0), (0, 0)), t + ms(8))
+            .is_empty());
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(12)),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+    }
+
+    #[test]
+    fn hold_past_threshold_fires_once() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t),
+            vec![GestureEvent::GuideEnter]
+        );
+        // Just under the threshold: nothing yet.
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(299)).is_empty());
+        // Crossing it emits GuideHold once.
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(300)),
+            vec![GestureEvent::GuideHold]
+        );
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(600)).is_empty());
+        // A bare long hold is still not a chord.
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(2300)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn hold_then_chord_reports_chorded() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(300)),
+            vec![GestureEvent::GuideHold]
+        );
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::Y]), t + ms(320)),
+            vec![GestureEvent::GuideChord(Button::Y)]
+        );
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(400)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+    }
+
+    #[test]
+    fn dropped_frames_do_not_break_timing_or_chords() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(4)),
+            vec![GestureEvent::GuideEnter]
+        );
+        // Simulate a long gap in delivered frames (dropped reports). The next
+        // frame carries a new chord and a time far past the hold threshold:
+        // both the chord and the (single) hold should surface together.
+        let e = g.update(&frame(&[Button::Steam, Button::DpadUp]), t + ms(900));
+        assert!(e.contains(&GestureEvent::GuideChord(Button::DpadUp)));
+        assert!(e.contains(&GestureEvent::GuideHold));
+    }
+}
