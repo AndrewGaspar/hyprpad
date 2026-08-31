@@ -261,3 +261,20 @@ to run as root: the mask is unprivileged, and hyprpad reads the device via the
 normal session `uaccess` ACL (which the udev investigation showed is
 unavoidable anyway). That simplifies the daemon: **no privileged system service
 required** — a user daemon plus a masked-Steam launcher suffices.
+
+---
+
+## Note: Steam's guide chords collide with hyprpad's, and masking is the fix (2026-08-31)
+
+While dogfooding the OSK bridge (default toggle `guide+y`), the controller
+powered off — `guide+y` is Steam's `controller_poweroff` chord from
+`chord_triton.vdf`. **Confirmed to be Steam software, not Triton firmware:** with
+Steam fully exited, `guide+y` does NOT power off the controller (owner-verified).
+
+So this is exactly the collision the masked-Steam design removes: under the mask,
+Steam never sees any guide chord, and hyprpad's `guide+*` bindings are
+unconflicted. Decision (owner): do NOT design hyprpad's bindings around Steam's
+unmasked chords — the masked launcher (`hyprpad-steam`) is the intended path, and
+`guide+y` stays as the OSK-toggle default. For dogfooding before masking is the
+default, either launch Steam via `hyprpad-steam` or empty Steam's Guide Button
+Chord Layout.
