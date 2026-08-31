@@ -294,6 +294,104 @@ fn normalize(v: i16) -> f64 {
     (f64::from(v) / PAD_FULL_SCALE).clamp(-1.0, 1.0)
 }
 
+/// Accumulates a finger's angular travel around the pad centre and emits one
+/// integer *tick* for every `step` radians of accumulated rotation. Positive
+/// ticks are counter-clockwise (increasing `atan2` angle); negative ticks are
+/// clockwise. This is the engine behind the circular ("radial") scroll mode; the
+/// caller maps the signed tick count to a scroll direction.
+///
+/// It handles the two hazards of turning an absolute angle into a rotation
+/// count:
+///
+/// * **the ±π wrap** — the per-frame angle delta is reduced to `(-π, π]`
+///   ([`wrap_pi`]), so a finger crossing the `atan2` branch cut (the −x axis)
+///   contributes its true small step, not a ~2π spurious jump;
+/// * **the ill-defined centre** — within `min_radius` of the pad centre the
+///   angle is meaningless, so those samples emit nothing *and* drop the
+///   reference angle, so re-emerging on the far side does not inject a spurious
+///   step. Sub-tick progress is preserved across such a dropout.
+///
+/// Feed it the *smoothed* normalized position from [`PadDamper::update`], so the
+/// angle (and hence the tick rate) is not driven by sensor jitter.
+/// [`reset`](Self::reset) clears it on touch-lift.
+#[derive(Clone, Debug)]
+pub struct AngleAccumulator {
+    /// Radians of rotation per emitted tick. Kept strictly positive.
+    step: f64,
+    /// Minimum radius (same normalized units as the fed position) for the angle
+    /// to be considered valid.
+    min_radius: f64,
+    /// Previous accepted frame's angle; `None` when unseeded or last seen near
+    /// the centre.
+    prev: Option<f64>,
+    /// Signed accumulated rotation not yet emitted as whole ticks (radians).
+    accum: f64,
+}
+
+impl AngleAccumulator {
+    /// Build an accumulator emitting one tick per `step_radians` of rotation and
+    /// ignoring samples within `min_radius` of the centre. A non-positive
+    /// `step_radians` is floored to a tiny positive value so [`update`](Self::update)
+    /// can never divide by zero (a degenerate config still behaves, just very
+    /// finely); a negative `min_radius` is clamped to `0`.
+    pub fn new(step_radians: f64, min_radius: f64) -> AngleAccumulator {
+        AngleAccumulator {
+            step: if step_radians > 0.0 { step_radians } else { f64::EPSILON },
+            min_radius: min_radius.max(0.0),
+            prev: None,
+            accum: 0.0,
+        }
+    }
+
+    /// Feed one smoothed normalized position and return the signed number of
+    /// whole ticks its rotation completed since the last call: `0` when the
+    /// finger is near the centre, unseeded, or has not yet turned a full `step`;
+    /// `> 0` counter-clockwise, `< 0` clockwise.
+    pub fn update(&mut self, x: f64, y: f64) -> i32 {
+        // Near dead-centre the angle is ill-defined: emit nothing and drop the
+        // reference so re-emergence re-seeds without a spurious delta. Keep the
+        // sub-tick accumulator so a brief dip through the centre loses no
+        // progress.
+        if (x * x + y * y).sqrt() < self.min_radius {
+            self.prev = None;
+            return 0;
+        }
+        let angle = y.atan2(x);
+        let Some(prev) = self.prev else {
+            // First valid sample only seeds the reference: no rotation yet.
+            self.prev = Some(angle);
+            return 0;
+        };
+        self.prev = Some(angle);
+        self.accum += wrap_pi(angle - prev);
+        // Emit as many whole ticks as have accumulated, truncating toward zero
+        // and carrying the sub-tick remainder to the next call.
+        let ticks = (self.accum / self.step).trunc();
+        self.accum -= ticks * self.step;
+        ticks as i32
+    }
+
+    /// Drop all state (used on touch-lift), so a re-touch starts fresh.
+    pub fn reset(&mut self) {
+        self.prev = None;
+        self.accum = 0.0;
+    }
+}
+
+/// Reduce an angle difference to the equivalent value in `(-π, π]`, so a delta
+/// that appears to leap across the `atan2` branch cut is read as the short way
+/// round. At 250 Hz a real per-frame delta is tiny, so each loop runs at most
+/// once; the loop form still does the right thing for an unusually large jump.
+fn wrap_pi(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a <= -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +579,105 @@ mod tests {
         // Leaves the margin upward: drags to input - margin.
         let out = hysteresis(0.20, &mut c, 0.05);
         assert!((out - 0.15).abs() < 1e-9, "dragged to {out}, want 0.15");
+    }
+
+    /// A point on a circle of radius `r` at `deg` degrees.
+    fn on_circle(r: f64, deg: f64) -> (f64, f64) {
+        let a = deg.to_radians();
+        (r * a.cos(), r * a.sin())
+    }
+
+    #[test]
+    fn wrap_pi_maps_into_range() {
+        assert!((wrap_pi(0.0)).abs() < 1e-12);
+        // A +350° apparent jump is really −10°.
+        assert!((wrap_pi(350f64.to_radians()) - (-10f64).to_radians()).abs() < 1e-12);
+        // A −350° apparent jump is really +10°.
+        assert!((wrap_pi((-350f64).to_radians()) - 10f64.to_radians()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn angle_accumulator_clockwise_emits_down_ticks() {
+        // Trace a clockwise arc of 90.5° at a safe radius. With a 15° step that
+        // is exactly 6 whole ticks, all negative (clockwise); never a positive.
+        let step = 15f64.to_radians();
+        let mut acc = AngleAccumulator::new(step, 0.35);
+        let mut total = 0i32;
+        let mut saw_positive = false;
+        // 0° down to −90.5° in 0.5° clockwise increments (182 samples).
+        for i in 0..=181 {
+            let deg = -(f64::from(i)) * 0.5;
+            let t = acc.update_pt(on_circle(0.5, deg));
+            if t > 0 {
+                saw_positive = true;
+            }
+            total += t;
+        }
+        assert!(!saw_positive, "clockwise motion must never emit an up-tick");
+        assert_eq!(total, -6, "90.5° / 15° = 6 down-ticks");
+    }
+
+    #[test]
+    fn angle_accumulator_handles_pi_wrap() {
+        // A counter-clockwise sweep crossing the +π branch cut (135° → 226°)
+        // must accumulate its true rotation, not a ~2π spurious jump: 91° / 15°
+        // = 6 up-ticks. Without wrap handling the crossing frame would inject a
+        // −360° step and wreck the count.
+        let step = 15f64.to_radians();
+        let mut acc = AngleAccumulator::new(step, 0.35);
+        let mut total = 0i32;
+        for i in 0..=182 {
+            let deg = 135.0 + f64::from(i) * 0.5; // 135 .. 226, crossing 180
+            total += acc.update_pt(on_circle(0.6, deg));
+        }
+        assert_eq!(total, 6, "91° CCW across the branch cut = 6 up-ticks");
+    }
+
+    #[test]
+    fn angle_accumulator_ignores_near_center() {
+        // A full rotation entirely inside min_radius emits nothing: near the
+        // dead centre the angle is ill-defined.
+        let step = 15f64.to_radians();
+        let mut acc = AngleAccumulator::new(step, 0.35);
+        let mut total = 0i32;
+        for i in 0..=360 {
+            total += acc.update_pt(on_circle(0.1, f64::from(i)));
+        }
+        assert_eq!(total, 0, "rotation near dead-centre must not scroll");
+    }
+
+    #[test]
+    fn angle_accumulator_no_jump_leaving_center() {
+        // Seeding at/near the centre then jumping out must not emit a spurious
+        // tick from the meaningless centre angle.
+        let step = 15f64.to_radians();
+        let mut acc = AngleAccumulator::new(step, 0.35);
+        assert_eq!(acc.update(0.0, 0.0), 0, "exact centre: no angle, no tick");
+        assert_eq!(acc.update(0.01, -0.02), 0, "still inside min_radius");
+        // First valid sample only seeds the reference angle: still no tick.
+        assert_eq!(acc.update_pt(on_circle(0.9, 0.0)), 0, "re-emergence seeds only");
+        // A following 16° CCW step (> the 15° step) now emits exactly one up-tick.
+        assert_eq!(acc.update_pt(on_circle(0.9, 16.0)), 1);
+    }
+
+    #[test]
+    fn angle_accumulator_reset_clears_progress() {
+        let step = 15f64.to_radians();
+        let mut acc = AngleAccumulator::new(step, 0.35);
+        // Build up ~10° of clockwise progress (below one tick), then reset.
+        acc.update_pt(on_circle(0.5, 0.0));
+        acc.update_pt(on_circle(0.5, -10.0));
+        acc.reset();
+        // Post-reset the next sample only re-seeds; a fresh 16° CW step is one
+        // down-tick, proving the pre-reset 10° did not carry over.
+        assert_eq!(acc.update_pt(on_circle(0.5, 0.0)), 0);
+        assert_eq!(acc.update_pt(on_circle(0.5, -16.0)), -1);
+    }
+
+    // Small convenience so the arc tests read as a stream of points.
+    impl AngleAccumulator {
+        fn update_pt(&mut self, p: (f64, f64)) -> i32 {
+            self.update(p.0, p.1)
+        }
     }
 }

@@ -7,8 +7,8 @@
 //! [`Arbiter`], and executes [`Action`]s via [`Hypr`].
 
 use crate::arbitrate::Arbiter;
-use crate::config::{Action, Config, CursorConfig, WorkspaceTarget};
-use crate::filter::PadDamper;
+use crate::config::{Action, Config, CursorConfig, ScrollConfig, ScrollMode, WorkspaceTarget};
+use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gesture::{GestureEngine, GestureEvent};
 use crate::hypr::{Hypr, HyprEvent};
 use crate::osk::{OskHandle, OskMode, OskPad};
@@ -102,6 +102,8 @@ pub fn run() -> std::io::Result<()> {
         }
     };
     let mut cursor = CursorState::new(config.cursor());
+    // Left-pad scroll shares the cursor's One Euro/hysteresis smoothing knobs.
+    let mut scroll = ScrollState::new(config.scroll(), config.cursor());
 
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
@@ -135,16 +137,20 @@ pub fn run() -> std::io::Result<()> {
                 }
                 if osk.is_active() {
                     // The keyboard owns both pads: route them to it, and keep the
-                    // desktop cursor released (guide/suppressed = true forces the
-                    // drop-and-forget branch of `drive_cursor`).
+                    // desktop cursor and scroll released (guide/suppressed = true
+                    // forces the drop-and-forget branch of `drive_cursor` /
+                    // `drive_scroll`).
                     route_osk(&mut osk, &frame, &prev_frame, &mut osk_route, now);
                     if let Some(ptr) = pointer.as_mut() {
                         drive_cursor(ptr, &frame, &mut cursor, true, true, now);
+                        drive_scroll(ptr, &frame, &mut scroll, true, true, now);
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
-                    // Ambient (non-guide) right-pad cursor. The guide layer and a
-                    // focused game both take the pad away from cursor duty.
+                    // Ambient (non-guide) layer: the RIGHT pad drives the cursor
+                    // and the LEFT pad drives scroll. The guide layer and a
+                    // focused game both take the pads away. Same gate for both.
                     drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), now);
+                    drive_scroll(ptr, &frame, &mut scroll, engine.guide_active(), arbiter.suppressed(), now);
                 }
                 prev_frame = frame;
             }
@@ -236,6 +242,156 @@ fn drive_cursor(
         ptr.button(PointerButton::Left, want_down);
         st.left_down = want_down;
     }
+}
+
+/// Scroll units emitted per `1.0` of normalized finger travel at `sensitivity`
+/// `1.0`, in swipe mode. A centre-to-edge swipe (Δ ≈ `1.0`) at sensitivity `1.0`
+/// emits this many continuous scroll units (~this ÷ a wheel notch of scrolling).
+/// A deliberately *tunable* starting point, like the cursor's gain.
+const SWIPE_SCROLL_REF: f64 = 120.0;
+
+/// Cross-frame state for the LEFT-trackpad scroll (the mirror of [`CursorState`]
+/// for the right pad). Carries the [`ScrollConfig`], the shared-style
+/// [`PadDamper`] smoothing, the previous smoothed position (swipe differencing),
+/// and the [`AngleAccumulator`] (circular ticking).
+struct ScrollState {
+    cfg: ScrollConfig,
+    /// Left-pad smoothing — same One Euro + hysteresis pipeline as the cursor,
+    /// built from the `[cursor]` knobs — so scrolling isn't jittery. `reset()`
+    /// on lift means a re-touch never differences across the gap.
+    damper: PadDamper,
+    /// Previous smoothed position, for the swipe mode's delta. `None` clutches
+    /// the first touched frame to zero scroll.
+    prev: Option<(f64, f64)>,
+    /// Angle→tick accumulator for the circular mode.
+    angle: AngleAccumulator,
+}
+
+impl ScrollState {
+    fn new(cfg: &ScrollConfig, cursor: &CursorConfig) -> ScrollState {
+        ScrollState {
+            cfg: *cfg,
+            damper: damper_from(cursor),
+            prev: None,
+            angle: AngleAccumulator::new(
+                cfg.circular_step_degrees.to_radians(),
+                cfg.circular_min_radius,
+            ),
+        }
+    }
+
+    /// Forget all cross-frame state (on lift or when the desktop's claim is
+    /// released), so a re-touch starts clean.
+    fn reset(&mut self) {
+        self.damper.reset();
+        self.prev = None;
+        self.angle.reset();
+    }
+
+    /// Difference the smoothed position `s` against the previous frame's, for the
+    /// swipe mode. The first frame after a reset seeds `prev` and returns
+    /// `(0, 0)` (the clutch), exactly like the cursor's relative path.
+    fn swipe_delta(&mut self, s: (f64, f64)) -> (f64, f64) {
+        let Some((px, py)) = self.prev else {
+            self.prev = Some(s);
+            return (0.0, 0.0);
+        };
+        self.prev = Some(s);
+        (s.0 - px, s.1 - py)
+    }
+}
+
+/// Drive scrolling from the LEFT trackpad for a single frame.
+///
+/// Active only on the ambient (non-guide) layer, when the arbiter is not
+/// suppressing desktop control, and while the LEFT pad is touched — the same
+/// gate as [`drive_cursor`], but for the left pad and the [`VirtualPointer::scroll`]
+/// axis instead of relative motion. Off (mode `off`, gated away, or untouched)
+/// forgets all state so a re-touch never jumps.
+fn drive_scroll(
+    ptr: &mut VirtualPointer,
+    frame: &report::Frame,
+    st: &mut ScrollState,
+    guide_active: bool,
+    suppressed: bool,
+    now: Instant,
+) {
+    // Disabled, or the desktop's claim is released (guide layer / focused game /
+    // OSK, which calls this with both flags set): drop all state and bail.
+    if st.cfg.mode == ScrollMode::Off || guide_active || suppressed {
+        st.reset();
+        return;
+    }
+    // Only while the LEFT pad is actually touched; a lift resets so a re-touch
+    // never differences across the gap (swipe) or jumps the angle (circular).
+    if !frame.pressed(report::Button::PadLeftTouch) {
+        st.reset();
+        return;
+    }
+
+    // Smooth the absolute left-pad position with the same One Euro + hysteresis
+    // damper the cursor uses, then read scroll off the *smoothed* signal — so a
+    // held-still finger (hard-zeroed by the hysteresis) neither swipes nor ticks.
+    let s = st.damper.update(frame.left_pad.x, frame.left_pad.y, now);
+    let (dx, dy) = match st.cfg.mode {
+        // Unreachable (gated above); keeps the match exhaustive without a wildcard.
+        ScrollMode::Off => (0.0, 0.0),
+        ScrollMode::Swipe => {
+            let (dnx, dny) = st.swipe_delta(s);
+            swipe_scroll(dnx, dny, st.cfg.sensitivity, st.cfg.natural, st.cfg.horizontal)
+        }
+        ScrollMode::Circular => {
+            let ticks = st.angle.update(s.0, s.1);
+            if ticks == 0 {
+                (0.0, 0.0)
+            } else {
+                circular_scroll(ticks, st.cfg.sensitivity, st.cfg.circular_step_degrees, st.cfg.natural)
+            }
+        }
+    };
+    if dx != 0.0 || dy != 0.0 {
+        ptr.scroll(dx, dy);
+    }
+}
+
+/// Map a swipe's smoothed-position delta (normalized units, pad `+Y` up) to a
+/// `(dx, dy)` continuous scroll vector, in `wl_pointer::axis` convention
+/// (`+dy` = down, `+dx` = right).
+///
+/// Base direction (`natural = false`, traditional desktop wheel): finger up
+/// scrolls up (`dy < 0`); `natural = true` inverts to the touch-screen feel
+/// (content follows the finger). Horizontal is emitted only when enabled, with
+/// the same inversion. Pure, for testability.
+fn swipe_scroll(dnx: f64, dny: f64, sensitivity: f64, natural: bool, horizontal: bool) -> (f64, f64) {
+    let gain = SWIPE_SCROLL_REF * sensitivity;
+    // Pad +Y is up; screen scroll +Y is down. Non-natural: finger up → scroll up
+    // (dy < 0), so the y sign is negated; natural flips it back.
+    let ysign = if natural { 1.0 } else { -1.0 };
+    let dy = ysign * dny * gain;
+    let dx = if horizontal {
+        // Pad +X and screen scroll +X are both rightward (no axis flip), so the
+        // non-natural sign is the opposite of y's.
+        let xsign = if natural { -1.0 } else { 1.0 };
+        xsign * dnx * gain
+    } else {
+        0.0
+    };
+    (dx, dy)
+}
+
+/// Map a signed circular tick count to a `(dx, dy)` continuous scroll vector.
+///
+/// Each tick is `step_degrees` of rotation and carries `sensitivity *
+/// step_degrees` scroll units. Base direction (`natural = false`): clockwise
+/// (negative ticks) scrolls down (`dy > 0`), counter-clockwise (positive ticks)
+/// scrolls up; `natural = true` inverts. Circular scroll is vertical only. Pure,
+/// for testability.
+fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: bool) -> (f64, f64) {
+    let per_tick = sensitivity * step_degrees;
+    // Positive ticks are CCW → up (dy < 0), so negate; natural flips it.
+    let base = -f64::from(ticks) * per_tick;
+    let dy = if natural { -base } else { base };
+    (0.0, dy)
 }
 
 /// Whether to take ownership of the puck's lizard mode. Enabled by the
@@ -462,5 +618,68 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
         // Handled in `handle_gesture` against the OSK handle, never reaches here.
         Action::ToggleKeyboard { .. } => Ok(()),
         Action::None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swipe_maps_vertical_delta_to_scroll() {
+        // Non-natural: finger up (Δny > 0) scrolls up (dy < 0), no horizontal.
+        let (dx, dy) = swipe_scroll(0.0, 0.1, 1.0, false, false);
+        assert_eq!(dx, 0.0);
+        assert!(dy < 0.0, "finger up should scroll up (dy < 0), got {dy}");
+        assert!((dy - (-0.1 * SWIPE_SCROLL_REF)).abs() < 1e-9);
+        // Finger down (Δny < 0) scrolls down (dy > 0).
+        let (_, dy_down) = swipe_scroll(0.0, -0.1, 1.0, false, false);
+        assert!(dy_down > 0.0);
+        // Sensitivity scales the magnitude linearly.
+        let (_, dy2) = swipe_scroll(0.0, 0.1, 2.0, false, false);
+        assert!((dy2 - 2.0 * dy).abs() < 1e-9);
+        // Zero delta (held-still finger, after hysteresis) produces zero scroll.
+        assert_eq!(swipe_scroll(0.0, 0.0, 1.0, false, false), (0.0, 0.0));
+    }
+
+    #[test]
+    fn swipe_natural_inverts_vertical() {
+        let (_, dy) = swipe_scroll(0.0, 0.1, 1.0, false, false);
+        let (_, dy_nat) = swipe_scroll(0.0, 0.1, 1.0, true, false);
+        assert!((dy_nat + dy).abs() < 1e-9, "natural must negate dy");
+    }
+
+    #[test]
+    fn swipe_horizontal_gated_and_inverts() {
+        // Horizontal motion is ignored unless enabled.
+        let (dx_off, _) = swipe_scroll(0.2, 0.0, 1.0, false, false);
+        assert_eq!(dx_off, 0.0);
+        // Enabled, non-natural: finger right (Δnx > 0) scrolls right (dx > 0).
+        let (dx_on, _) = swipe_scroll(0.2, 0.0, 1.0, false, true);
+        assert!(dx_on > 0.0);
+        assert!((dx_on - 0.2 * SWIPE_SCROLL_REF).abs() < 1e-9);
+        // Natural inverts horizontal too.
+        let (dx_nat, _) = swipe_scroll(0.2, 0.0, 1.0, true, true);
+        assert!((dx_nat + dx_on).abs() < 1e-9);
+    }
+
+    #[test]
+    fn circular_clockwise_scrolls_down_ccw_up() {
+        // One clockwise tick (negative) scrolls down (dy > 0) at the defaults.
+        let (dx, dy) = circular_scroll(-1, 1.0, 15.0, false);
+        assert_eq!(dx, 0.0);
+        assert!(dy > 0.0, "clockwise should scroll down (dy > 0), got {dy}");
+        assert!((dy - 15.0).abs() < 1e-9, "one 15° tick at sens 1.0 = 15 units");
+        // Counter-clockwise (positive) scrolls up.
+        let (_, dy_up) = circular_scroll(1, 1.0, 15.0, false);
+        assert!(dy_up < 0.0);
+        // Natural inverts the direction.
+        let (_, dy_nat) = circular_scroll(-1, 1.0, 15.0, true);
+        assert!(dy_nat < 0.0);
+        // Tick count and sensitivity scale the magnitude.
+        let (_, dy3) = circular_scroll(-3, 1.0, 15.0, false);
+        assert!((dy3 - 45.0).abs() < 1e-9);
+        let (_, dy_sens) = circular_scroll(-1, 2.0, 15.0, false);
+        assert!((dy_sens - 30.0).abs() < 1e-9);
     }
 }
