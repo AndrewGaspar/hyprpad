@@ -177,10 +177,28 @@ a button press actually wakes the tower from s2idle/S3 depends on the USB
 controller's wake chain and BIOS settings. Test on the tower: suspend, press
 guide.
 
-## Q14 — Text-injection matrix validation  **STARTED 2026-08-31**
+## Q14 — Text-injection matrix  **ANSWERED for three rows, 2026-08-31**
 
-`wtype 'héllo'` into **Omawrite** (native Wayland, `xwayland=false`): rendered
-exactly, é included — the virtual-keyboard-v1 path with the Unicode
-keymap-swap works on this stack for the native-Wayland row. Remaining rows:
-XWayland/Chromium (the worst-reported case — wtype#62 class) and nested
-gamescope (`gamescope-type`).
+Live results on this stack (Hyprland 0.56.2 / xorg-xwayland 24.1.13):
+
+| Target | vkbd-v1 + synthetic keymap (`wtype`) | uinput, real keycodes |
+|---|---|---|
+| Omawrite (native Wayland) | `héllo` rendered exactly | — |
+| Chromium (native Wayland) | `héllo` rendered exactly | — |
+| **Steam (XWayland)** | **`1223`** — garbled, *plain ASCII too* | **`hello` rendered exactly** |
+
+The XWayland failure is the documented fingerprint (keycodes resolved against
+a stale keymap — wtype#60/#62 class), reproduced here for both Unicode and
+plain ASCII: **wtype's synthetic-keymap approach is unusable for XWayland
+targets on this stack, wholesale.** A kernel-level uinput keyboard with real
+evdev keycodes (`KEY_H`…) works perfectly into the same field
+(`/dev/uinput` is user-accessible via Steam's udev `uaccess` rule).
+
+**Design consequence (OSK/hyprsc injection layer):** per-target backends —
+native Wayland → virtual-keyboard-v1 with keymap swap (full Unicode);
+XWayland → uinput real keycodes (ASCII, layout-bound); nested gamescope →
+`gamescope_input_method` (full Unicode). Unicode-into-XWayland remains open:
+the candidate is gamescope's `ime.cpp` recipe (real character keycodes +
+interpret-bearing modifier in a generated keymap) via virtual-keyboard-v1 —
+untested. Also untested: whether vkbd-v1 with the user's *unchanged* current
+keymap reaches XWayland (would isolate keymap-change race vs vkbd itself).
