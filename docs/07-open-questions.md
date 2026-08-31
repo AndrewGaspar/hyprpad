@@ -125,3 +125,33 @@ The input side is measured: 263 Hz, 4.00 ms median gap. Unmeasured: the
 end-to-end cost of Hyprland IPC dispatch and of `zwlr_virtual_pointer_v1`
 injection. Success criterion 1 in [06](06-recommendation.md) asserts a 100 ms
 budget without having verified it is achievable.
+
+---
+
+*The questions below were added 2026-08-31 after the scope expanded to the full
+living-room programme ([08](08-living-room-vision.md)). They concern the target
+tower, which has not yet been probed — all hardware findings above are from the
+Framework 16 development machine.*
+
+## Q11 — Tower probe
+
+Everything in [03](03-hardware-findings.md) needs re-verification on the actual
+living-room tower: GPU (NVIDIA assumed), monitor/TV EDID and HDR capabilities,
+USB topology for the puck, BIOS wake-from-USB behaviour, boot chain (Limine +
+UKI assumed to match the laptop since both run Omarchy).
+
+## Q12 — Lizard mode in the initramfs
+
+The controller's lizard mode presents a standard HID boot keyboard
+(dpad→arrows, A→Enter, B→Esc). If that interface enumerates during early boot,
+the initramfs unlock UI can be driven with zero controller-specific code in the
+initramfs. Needs: confirmation the puck's if02 keyboard is active pre-Steam at
+cold boot, and that the `keyboard` mkinitcpio hook's usbhid coverage picks it up.
+Test: at the current LUKS prompt, press dpad/A/B on the controller and observe.
+
+## Q13 — Does the puck wake the machine from suspend?
+
+Steam's udev rule sets `power/wakeup=enabled` for all `28de` USB devices. Whether
+a button press actually wakes the tower from s2idle/S3 depends on the USB
+controller's wake chain and BIOS settings. Test on the tower: suspend, press
+guide.
