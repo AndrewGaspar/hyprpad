@@ -147,3 +147,55 @@ The session user (hence Steam) is denied the physical device by construction;
 hyprsc reads it and emits a focus-gated virtual controller. The cgroup path is
 out (Candidate A); the bwrap wrapper is a fragile non-privileged fallback
 (Candidate B); this udev rule is the mechanism, pending the three live checks.
+
+### Candidate C — LIVE RESULT (2026-08-31): TAG-=uaccess FAILS to deny
+
+Ran the three live checks (sudo + Steam cycle + physical replugs). The rule's
+`GROUP="hyprsc" MODE="0660"` applied cleanly (node became `root:hyprsc 660`),
+but **denial failed**: the logind `uaccess` ACL (`user:ajg:rw-`) survived every
+attempt, including a clean replug with **Steam fully shut down and no process
+holding the node**. A session-user `open()` still succeeded throughout.
+
+Root cause, from the evidence:
+
+```
+TAGS=:uaccess:seat:      <- sticky tag set (udev database) — logind reads this
+CURRENT_TAGS=:seat:      <- current-event set — what TAG-="uaccess" cleared
+getfacl: user:ajg:rw-    <- ACL logind granted; never revoked
+loginctl seat-status: 35 puck nodes still listed under seat0
+```
+
+`TAG-="uaccess"` in a `99-` rule removes `uaccess` from the *current-event* tag
+set but NOT from the sticky `TAGS` persisted in the udev database, and
+systemd-logind (v261) grants the seat `uaccess` ACL off the sticky tag. Ordering
+after `60-steam`/`70-uaccess` doesn't help; a clean remove→add (physical replug,
+Steam absent) doesn't help. **This mechanism cannot deny the session user.**
+
+### Where Candidate C goes next (untested, deferred)
+
+Not pursued live to avoid more disruption. Ranked candidates for a future
+hands-on session:
+
+1. **Strip the `seat` tag too** (`TAG-="seat" TAG-="uaccess"`) and/or override
+   `ENV{ID_SEAT}` to a non-seat value, so logind stops managing the device as a
+   seat-uaccess device at all. Same sticky-tag risk applies — verify `TAGS` (not
+   just `CURRENT_TAGS`) actually loses the tags, else this fails identically.
+2. **`OWNER`/`GROUP`/`MODE` alone is not enough** — ACLs are additive over the
+   mode, so as long as the uaccess ACL exists the session user wins regardless
+   of `MODE`. The ACL itself must be prevented.
+3. **A logind-level override** (mask the device from logind's seat management) or
+   a `systemd`/`udev` `OPTIONS` flag — needs research into how to suppress the
+   ACL grant specifically.
+
+### Reassessment: the namespace approach (Candidate B) is now the front-runner
+
+Candidate B (bwrap mount-namespace mask) **sidesteps this entirely** — it hides
+the node inside Steam's namespace, so logind's ACL is irrelevant. Its only
+problem was operational fragility wrapping Steam's launch (the instance lock +
+pressure-vessel re-exec), which is a more tractable engineering problem than
+defeating logind's ACL. **Recommendation: pursue Candidate B (robustly this
+time — fully stop Steam, launch masked, verify the client's namespace) and
+treat udev as a fallback only if the seat-strip variant (C.1) proves to work.**
+
+The architectural result is unchanged and independent of mechanism: hyprsc must
+run privileged, and Steam must be denied the physical node by *some* means.
