@@ -1,69 +1,149 @@
 # 06 — Recommendation
 
-**Build architecture B — a passive-tap daemon into Hyprland IPC — and keep
-architecture D as an explicit escalation hatch.** Adopt F (gamescope) as the
-game-mode half. Try A once, cheaply, before writing anything.
+> **Revised 2026-08-30**, after a requirement was added: *the controller must be
+> focus-routed like any other input device — Steam should receive controller
+> input only when a Steam window or game is focused.*
+>
+> That requirement changes the answer. The earlier version of this document
+> recommended the passive tap (B) and demoted the `uhid` proxy (D) to a last
+> resort. **Passive tapping cannot satisfy focus routing**, so D is re-promoted
+> to the structural answer. The reasoning for the original call is preserved
+> below under [Why the passive tap is still the right first
+> step](#why-the-passive-tap-is-still-the-right-first-step), because it remains
+> correct for everything except suppression.
 
-## Why B
+## The constraint that decides it
 
-One property decides it: **`hidraw` is not exclusive**, verified on the target
-hardware ([03](03-hardware-findings.md#the-central-finding-concurrent-hidraw-access)).
-Everything else follows.
+`hidraw` has no suppression mechanism
+([02](02-background-linux-input.md#exclusivity-the-property-the-whole-design-hinges-on)).
+A passive reader sees everything and can prevent nothing. So long as Steam can
+*open* the device, Steam receives every report and decides for itself what to do
+with it — including while unfocused, which is exactly the complaint.
 
-- It is the only design that satisfies constraint 4 — *Steam Input is not
-  sacrificed* — trivially rather than by fighting for it. Steam is not merely
-  tolerated; it is untouched.
-- Its failure mode is degradation to the status quo. Kill the daemon and the
-  controller behaves exactly as it does today. Every device-owning design fails
-  by making the controller disappear.
-- It needs no root, no udev rules, no kernel module, and no privileged helper.
-- The status quo it must beat is *broken*
-  ([03](03-hardware-findings.md#steams-handling-of-this-controller-is-broken-today)),
-  so even a partial result is a net gain.
+"Steam behaves like any other window" therefore requires that **Steam not have
+the device**. There is no configuration of a read-only design that achieves it.
 
-## The guide button is not actually a problem
+## Tier 0 — make Steam inert without taking the device
 
-The design's one real worry was that a passive tap cannot suppress, so Steam
-would also react to the guide button. Direct observation has largely dissolved
-it ([03](03-hardware-findings.md#steams-reaction-to-the-guide-button)):
+Cheap, reversible, config-only, and worth doing first because it addresses the
+*observable* symptom in an afternoon. It does not achieve focus routing; it
+achieves "Steam does nothing when it isn't wanted", which may be close enough in
+practice.
 
-> **Steam acts on guide _release_, not on press — and ignores holds longer than
-> ~3 s entirely.**
+1. **Empty the Guide Button Chord Layout.** `chord_triton.vdf` is what fires
+   `SHOW_KEYBOARD`, `quit_application`, screenshots and the rest
+   ([03](03-hardware-findings.md#steam-treats-this-controller-as-controller_triton)).
+   Replace its bindings with `empty_binding` through the Steam UI.
+2. **Empty the Desktop Layout.** This is what maps trackpads to cursor motion and
+   triggers to clicks outside games. Unbinding it stops Steam acting on stick,
+   pad and trigger input on the desktop.
+3. **Add the window rule.**
+   `windowrule = suppressevent activatefocus, match:class steam` — stops the
+   focus steal on guide release.
 
-This is close to the best case. It means:
+With all three, Steam still holds the device and still exits lizard mode, but its
+out-of-focus behaviour is empty. hyprsc passive-taps and owns the desktop.
 
-- **No race.** The daemon has the whole hold to recognise and dispatch a gesture.
-  Steam's reaction is a trailing side effect, not a competing consumer of the
-  same event.
-- **The side effect is only a focus steal** (Steam takes focus if it did not have
-  it; launches Steam if it did).
-- **Long holds are free.** Anything past ~3 s is invisible to Steam.
+**Limits, stated plainly.** This is behavioural, not structural. Steam still owns
+the device, so a client update or a config resync can reintroduce behaviour
+without warning. Emptying the Desktop Layout also means the controller does
+nothing *in* the Steam client window when it is focused, which is a regression
+unless hyprsc covers that case. And it is not focus routing — it is
+globally-nothing, which happens to look the same from the desktop.
 
-Three composable mitigations, cheapest first:
+## Tier 1 — the structural answer
 
-1. **Window rule.** `windowrule = suppressevent activatefocus, match:class steam`
-   — config-only, blocks the focus steal outright. The `activatefocus` token is
-   present in Hyprland 0.56.2. Note this build uses the non-legacy parser, so it
-   must go in the config file; `hyprctl keyword` will not take it.
-2. **Focus restore over IPC.** The daemon notes the focused window when a gesture
-   starts and restores it a beat after guide release. Entirely within the passive
-   design, no configuration required, and it also covers the "Steam was already
-   focused" branch.
-3. **Hold past 3 s** for gestures where even a flash is unacceptable — a
-   guaranteed-silent escape, though too slow for a snappy workspace flick.
+hyprsc owns the physical device; Steam receives a virtual controller that hyprsc
+feeds **only when a Steam window or Steam game holds focus**.
 
-**Consequence for the plan: architecture D is demoted.** It was carried as an
-escalation hatch on the assumption that reassigning the guide button might
-eventually require owning the device. That now looks unlikely to be necessary.
-D remains documented in [05](05-architectures.md#d--uhid-device-proxy-full-interposition)
-as a fallback, but it should be treated as a design of last resort rather than a
-planned phase.
+```
+  physical SC2 (28de:1304)
+        │  exclusively owned — Steam cannot open it
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │  hyprsc (privileged)                         │
+  │    decode 0x42                               │
+  │    ── desktop focused ─▶ Hyprland IPC        │
+  │                          virtual pointer     │
+  │    ── Steam/game focused ─▶ forward ──┐      │
+  └───────────────────────────────────────┼──────┘
+                                          ▼
+                              virtual controller (uinput or uhid)
+                                          │
+                                          ▼
+                                    Steam / Steam Input
+```
 
-One thing still unmeasured: whether a guide **chord** (guide plus another button)
-already suppresses Steam's release action on its own. Steam has a Guide Button
-Chord Layout, so it plainly has a concept of chords; if pressing any button
-during the hold cancels the release behaviour, mitigation 1 may be unnecessary
-for chorded gestures. See [07, Q1b](07-open-questions.md#q1b--does-a-guide-chord-suppress-steams-release-action).
+### Denying Steam the device
+
+Three candidate mechanisms, none yet verified on this machine:
+
+- **udev override.** A rule ordered after Steam's `60-steam-input.rules` (which
+  grants `MODE="0660", TAG+="uaccess"` to every `28de` hidraw by vendor ID)
+  restricting the puck to root or a dedicated group. Note `uaccess` is applied by
+  logind from the tag, and the udev man page documents `TAG` as a match key and
+  `TAG+=` as an assignment — **it does not document `TAG-=`**, so clearing an
+  inherited tag needs testing rather than assuming. This implies hyprsc runs as a
+  system daemon, since any permission that lets a user-session hyprsc open the
+  node also lets user-session Steam open it.
+- **Mount namespace.** Launch Steam under `bwrap` with the puck's nodes masked.
+  Avoids root, but `hidraw` numbering is dynamic and changes on replug, so the
+  wrapper must resolve nodes at launch and cannot survive a mid-session replug.
+- **systemd device cgroup.** `DevicePolicy=` / `DeviceAllow=` on Steam's user
+  unit — Steam is launched here via `uwsm-app`, so it already has one. Clean if
+  it works, but the cgroup v2 device controller generally requires delegation and
+  may not be usable from a user unit. Unverified.
+
+### What to hand Steam
+
+| Target | Steam sees | Keeps trackpads + gyro | Effort |
+|---|---|---|---|
+| `uinput` generic pad (Xbox/DS4) | a normal gamepad | **no** | low |
+| `uhid` Steam Deck (`neptune`) clone | a Deck controller | yes | medium — InputPlumber already does this |
+| `uhid` SC2 (`triton`) clone | a Steam Controller | yes | high — and see the risk below |
+
+The generic `uinput` pad is enough for the stated need — Steam Input mapping
+modern pads onto older games works fine on a generic controller. It costs the
+trackpads and gyro *as Steam Input inputs*, which matters for games that use
+them.
+
+The `triton` clone is the most faithful and the worst bet today: Steam's
+registration path for this controller **already fails on genuine hardware**
+([03](03-hardware-findings.md#steams-handling-of-this-controller-is-broken-today)).
+A clone would have to survive a code path real hardware does not.
+
+### The upside nobody should overlook
+
+Once hyprsc owns the trackpads, it drives `zwlr_virtual_pointer_v1` directly —
+which produces a **working desktop cursor**, something Steam cannot currently
+deliver on Hyprland at all because its `XTEST` output never escapes XWayland
+([03](03-hardware-findings.md#portal-and-protocol-support)). Tier 1 does not just
+satisfy the focus-routing requirement; it fixes the trackpad.
+
+### Prefer InputPlumber if it can be made to fit
+
+InputPlumber already solves device ownership as a root daemon, ships a
+`deck-uhid` target, and has DBus intercept mode. hyprsc would shrink to a DBus
+client plus a Hyprland IPC bridge.
+
+**Unverified and important:** whether InputPlumber can prevent Steam from opening
+a `hidraw` source it manages. Its evdev sources are protected by `EVIOCGRAB`,
+which has no `hidraw` equivalent, and research did not confirm a hidraw-hiding
+mechanism. If it cannot, InputPlumber needs the same udev work as a hand-rolled
+daemon and the reuse argument weakens considerably. Also note
+[CVE-2025-66005 / CVE-2025-14338](https://security.opensuse.org/2026/01/09/inputplumber-lack-of-dbus-auth.html).
+
+## Why the passive tap is still the right first step
+
+Nothing in the original analysis was wrong except its scope. The passive tap
+remains the correct mechanism for *reading* the controller, and Tier 1 is the
+passive tap plus exclusive ownership plus a gated output. Building B first is not
+wasted work — the decoder, the mode machine, the gesture engine and the Hyprland
+IPC layer are all identical. Tier 1 adds ownership and a virtual output; it does
+not replace anything.
+
+Sequencing therefore stands: get Tier 0 in place today, build the passive daemon,
+then add ownership once the gesture layer is proven.
 
 ## Phasing
 

@@ -243,6 +243,51 @@ Two consequences for design:
 - **Do not depend on Steam's virtual pad or on Steam's desktop emulation.** Both
   are downstream of a code path that currently fails.
 
+## Steam treats this controller as `controller_triton`
+
+Steam's internal name for the 2026 Steam Controller is **`controller_triton`**
+(seen throughout `~/.steam/steam/logs/controller.txt`). Two config files in
+`~/.steam/steam/controller_base/` govern what Steam does with it outside games:
+
+**`chord_triton.vdf`** — the Guide Button Chord Layout, titled "Steam Button
+Chord Basic Configuration". Its bindings:
+
+| Chord | Action |
+|---|---|
+| guide + X | `SHOW_KEYBOARD` |
+| guide + B (long press, 2400 ms) | `quit_application` |
+| others | `SCREENSHOT`, `controller_poweroff`, `toggle_magnifier`, `gr_toggle` / `gr_clip` / `gr_marker` (game recording), `sr_enable`, `system_key_1`, `VOLUME_UP` / `VOLUME_DOWN`, `Alt-Tab`, `ESCAPE`, `RETURN`, `TAB`, `mouse_button LEFT` / `RIGHT` |
+
+This file explains a symptom observed during the guided capture in this
+document: an on-screen keyboard appearing unbidden. That was `guide + X →
+SHOW_KEYBOARD` firing from this layout.
+
+**Desktop Layout.** There is no `desktop_triton.vdf`; the controller falls back
+to `steamdesktop.vdf` / `desktop_neptune.vdf`. This is what maps trackpads to
+cursor motion and triggers to clicks outside games.
+
+### Why this matters architecturally
+
+**Steam acts on this controller globally, not when focused.** Both layouts are
+live whenever Steam is running, regardless of which window has focus. Trackpad
+motion, trigger pulls and guide chords are consumed and acted upon by an
+unfocused Steam. This is by design — Steam Input is a system-wide layer, not a
+window — and it is the behaviour that motivates
+[architecture D](05-architectures.md#d--uhid-device-proxy-full-interposition).
+
+Both files are user-editable, which makes a cheap behavioural mitigation
+possible without any architecture change; see
+[06 — Recommendation](06-recommendation.md#tier-0--make-steam-inert-without-taking-the-device).
+
+Related settings, from `localconfig.vdf` on this machine:
+
+```
+"UseSteamControllerConfig"   "2"      (Steam Input enabled)
+"SteamController_XBoxSupport" "0"
+"SteamController_PSSupport"   "2"
+"ControllerTypesUsed"  "…,controller_neptune,"   (also logs controller_triton)
+```
+
 ## Portal and protocol support
 
 Hyprland 0.56.2 exports the protocols the recommended design needs:

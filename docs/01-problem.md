@@ -15,7 +15,14 @@ lean-back session never needs a keyboard.
 4. **Steam Input is not sacrificed.** Steam's per-game controller configurations
    remain the mechanism for mapping older games to newer controllers. Whatever is
    built must sit *beside* Steam, not replace it.
-5. **Not only the Steam Controller.** The 2026 Steam Controller is the primary
+5. **The controller is focus-routed, like every other input device.** Steam
+   should get controller input when a Steam window or a Steam game is focused,
+   and not otherwise. Today Steam acts on trackpad motion, trigger pulls and
+   guide chords system-wide while unfocused — see
+   [03](03-hardware-findings.md#steam-treats-this-controller-as-controller_triton).
+   *Added after initial research; it materially changes the architecture
+   selection.*
+6. **Not only the Steam Controller.** The 2026 Steam Controller is the primary
    target, but a generic XInput/DirectInput-class pad should work too, with
    whatever subset of features it has.
 

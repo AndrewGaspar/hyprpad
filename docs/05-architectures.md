@@ -145,7 +145,7 @@ in B covers it better.
 
 ---
 
-## D — `uhid` device proxy (full interposition)
+## D — `uhid` device proxy (full interposition)  ⭐ required for focus routing
 
 Take the device away from Steam, and hand Steam a synthetic replacement.
 
@@ -185,9 +185,17 @@ this controller **already fails** on real hardware
 A synthetic clone has to survive a code path that genuine hardware does not
 currently survive. That is not a good bet to build a foundation on today.
 
-**Verdict.** The right eventual answer for the guide button specifically, and the
-right *escalation hatch* — but not the place to start, and not until Steam's own
-handling of the device stabilizes.
+**Verdict.** **The only design that satisfies focus routing.** Requirement 5 in
+[01](01-problem.md#what-is-wanted) — Steam receives controller input only when
+focused — cannot be met by any design that leaves Steam able to open the device,
+because `hidraw` offers no suppression. Steam acts on trackpads, triggers and
+guide chords globally
+([03](03-hardware-findings.md#steam-treats-this-controller-as-controller_triton)),
+and only removing its access stops that.
+
+Still not the place to *start*: the decoder, gesture engine and IPC layer are
+shared with B and should be proven there first. See
+[06 — Recommendation](06-recommendation.md#tier-1--the-structural-answer).
 
 ---
 
@@ -240,14 +248,17 @@ is a UX seam. Does nothing on its own for driving Hyprland.
 |---|---|---|---|---|---|---|
 | Custom code | none | moderate | moderate | large | moderate | none |
 | Steam Input preserved | yes | **yes** | degraded | if clone convinces | if clone convinces | yes |
-| Guide fully reassignable | no | **no** — Steam also reacts | not vs. Steam | **yes** | **yes** | n/a |
+| Guide fully reassignable | no | no — Steam also reacts | not vs. Steam | **yes** | **yes** | n/a |
+| **Focus-routed (req. 5)** | no | **no** | no | **yes** | **yes** | partial |
 | Analog / continuous gestures | no | **yes** | yes | yes | yes | n/a |
 | Needs root / udev | no | **no** | uinput only | yes | yes | no |
 | Failure mode | silent | **degrades to today** | pad disappears | pad disappears | pad disappears | n/a |
 | Works without Steam | no | **yes** | yes | yes | yes | no |
 | Generic controllers | yes | **yes** (evdev) | yes | per-device | per-device | yes |
 
-The row that decides it is **failure mode**. B is the only design whose worst
+With requirement 5 in play, the row that decides it is **focus-routed**: only D
+and E satisfy it. Absent that requirement, the row that decides it is **failure
+mode**. B is the only design whose worst
 case is "the daemon stopped and the controller behaves exactly as it does today".
 Every design that owns the device fails by taking the controller away.
 
