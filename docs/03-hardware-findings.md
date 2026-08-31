@@ -249,22 +249,53 @@ Steam's internal name for the 2026 Steam Controller is **`controller_triton`**
 (seen throughout `~/.steam/steam/logs/controller.txt`). Two config files in
 `~/.steam/steam/controller_base/` govern what Steam does with it outside games:
 
-**`chord_triton.vdf`** — the Guide Button Chord Layout, titled "Steam Button
-Chord Basic Configuration". Its bindings:
+**`desktop_neptune.vdf`** — the Desktop Layout, and the main offender. There is
+**no `desktop_triton.vdf`**; the 2026 controller falls back to the Steam Deck's
+desktop configuration (`"controller_type" "controller_neptune"`, titled "Desktop
+Configuration"). Every binding below fires on a **bare press with no modifier**,
+system-wide, while Steam is unfocused:
 
-| Chord | Action |
+| Input | Binding |
 |---|---|
-| guide + X | `SHOW_KEYBOARD` |
-| guide + B (long press, 2400 ms) | `quit_application` |
-| others | `SCREENSHOT`, `controller_poweroff`, `toggle_magnifier`, `gr_toggle` / `gr_clip` / `gr_marker` (game recording), `sr_enable`, `system_key_1`, `VOLUME_UP` / `VOLUME_DOWN`, `Alt-Tab`, `ESCAPE`, `RETURN`, `TAB`, `mouse_button LEFT` / `RIGHT` |
+| `button_x` | `controller_action SHOW_KEYBOARD` |
+| `button_a` / `button_b` / `button_y` | `key_press RETURN` / `ESCAPE` / `SPACE` |
+| dpad | arrow keys, and `xinput_button DPAD_*` |
+| `left_bumper` / `right_bumper` | `key_press LEFT_CONTROL` / `LEFT_ALT` |
+| `button_back_left` | `key_press LEFT_WINDOWS` |
+| `button_back_left_upper` | `key_press LEFT_SHIFT` |
+| `button_back_right` / `_upper` | `key_press PAGE_DOWN` / `PAGE_UP` |
+| `button_menu` | `key_press TAB`, `xinput_button select` |
+| `button_escape` | `key_press ESCAPE`; long press → `CHANGE_PRESET` |
+| trackpad `click` / `edge` | `mouse_button LEFT` / `RIGHT` / `MIDDLE` |
+| trackpad `scroll_*` | `mouse_wheel SCROLL_UP` / `SCROLL_DOWN` |
+| `button_capture` | `controller_action system_key_1` |
 
-This file explains a symptom observed during the guided capture in this
-document: an on-screen keyboard appearing unbidden. That was `guide + X →
-SHOW_KEYBOARD` firing from this layout.
+**`chord_triton.vdf`** — the Guide Button Chord Layout, "Steam Button Chord Basic
+Configuration". Requires the guide button held: guide + X → `SHOW_KEYBOARD`,
+guide + B (long, 2400 ms) → `quit_application`, plus `SCREENSHOT`,
+`controller_poweroff`, `toggle_magnifier`, game recording (`gr_toggle`,
+`gr_clip`, `gr_marker`), `VOLUME_UP` / `VOLUME_DOWN`, `Alt-Tab`.
 
-**Desktop Layout.** There is no `desktop_triton.vdf`; the controller falls back
-to `steamdesktop.vdf` / `desktop_neptune.vdf`. This is what maps trackpads to
-cursor motion and triggers to clicks outside games.
+> **Correction.** An earlier revision of this document attributed the unbidden
+> on-screen keyboard during the guided capture to `chord_triton.vdf`'s
+> guide + X binding. That was wrong: the keyboard appears on a **bare X press**,
+> confirmed by the device owner. The responsible binding is `button_x →
+> SHOW_KEYBOARD` in `desktop_neptune.vdf`, which needs no modifier at all. Both
+> files bind X to the keyboard; only the Desktop Layout does so unconditionally.
+
+### Not all of these reach a Hyprland desktop
+
+The bindings fall into three classes, which behave very differently here:
+
+| Class | Route | Reaches Hyprland? |
+|---|---|---|
+| `controller_action` (`SHOW_KEYBOARD`, `system_key_1`, `CHANGE_PRESET`) | internal to Steam | **Yes, always** — Steam acts on it directly |
+| `key_press`, `mouse_button`, `mouse_wheel` | `XTEST` | **No** — trapped inside XWayland ([see below](#portal-and-protocol-support)) |
+| `xinput_button` | Steam's `uinput` virtual pad (`28de:11ff`) | **Yes** — a real kernel input device, visible to any evdev reader |
+
+So on this system the observable damage is narrower than the table suggests, but
+it is not zero, and the two classes that *do* land are the ones a user cannot
+opt out of per-window.
 
 ### Why this matters architecturally
 

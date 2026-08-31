@@ -30,19 +30,30 @@ Cheap, reversible, config-only, and worth doing first because it addresses the
 achieves "Steam does nothing when it isn't wanted", which may be close enough in
 practice.
 
-1. **Empty the Guide Button Chord Layout.** `chord_triton.vdf` is what fires
-   `SHOW_KEYBOARD`, `quit_application`, screenshots and the rest
+1. **Empty the Desktop Layout — this is the main offender.** The 2026 controller
+   has no `desktop_triton.vdf` and falls back to the Steam Deck's
+   `desktop_neptune.vdf`, which binds *bare* presses system-wide: X →
+   `SHOW_KEYBOARD`, A/B/Y → Return/Escape/Space, dpad → arrows, bumpers →
+   Ctrl/Alt, a grip → `LEFT_WINDOWS`, trackpad click → mouse buttons
    ([03](03-hardware-findings.md#steam-treats-this-controller-as-controller_triton)).
-   Replace its bindings with `empty_binding` through the Steam UI.
-2. **Empty the Desktop Layout.** This is what maps trackpads to cursor motion and
-   triggers to clicks outside games. Unbinding it stops Steam acting on stick,
-   pad and trigger input on the desktop.
+   No modifier is involved. Unbinding this removes most of the problem.
+2. **Empty the Guide Button Chord Layout.** `chord_triton.vdf` adds guide-held
+   chords on top: `quit_application`, `SCREENSHOT`, `controller_poweroff`,
+   `toggle_magnifier`, game recording, volume, Alt-Tab.
 3. **Add the window rule.**
    `windowrule = suppressevent activatefocus, match:class steam` — stops the
    focus steal on guide release.
 
 With all three, Steam still holds the device and still exits lizard mode, but its
-out-of-focus behaviour is empty. hyprsc passive-taps and owns the desktop.
+out-of-focus behaviour is empty.
+
+Note that only some of these bindings currently reach the desktop anyway:
+`key_press` and `mouse_button` go through `XTEST` and are trapped in XWayland,
+while `controller_action` (the on-screen keyboard) and `xinput_button` (Steam's
+virtual pad) do land
+([03](03-hardware-findings.md#not-all-of-these-reach-a-hyprland-desktop)). Tier 0
+is therefore cheaper *and* less complete than it looks — but the bindings it
+removes are precisely the ones that currently get through. hyprsc passive-taps and owns the desktop.
 
 **Limits, stated plainly.** This is behavioural, not structural. Steam still owns
 the device, so a client update or a config resync can reintroduce behaviour
