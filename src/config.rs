@@ -257,6 +257,90 @@ impl Default for CursorConfig {
     }
 }
 
+/// Which left-trackpad scroll behaviour is active (the `[scroll] mode` knob).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollMode {
+    /// Left pad does not scroll (the right pad still drives the cursor).
+    Off,
+    /// Vertical (and optionally horizontal) finger movement maps to scroll:
+    /// the smoothed left-pad position is differenced into a continuous scroll.
+    Swipe,
+    /// Steam-Deck-style radial scroll: the finger's angle around the pad centre
+    /// is accumulated and emits one scroll tick every `circular_step_degrees`.
+    Circular,
+}
+
+impl ScrollMode {
+    /// Parse a `mode` value: `swipe`/`vertical`, `circular`/`radial`/`wheel`,
+    /// or `off`/`none`/`disabled`.
+    pub fn parse(s: &str) -> Result<ScrollMode, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Ok(ScrollMode::Off),
+            "swipe" | "vertical" | "linear" => Ok(ScrollMode::Swipe),
+            "circular" | "radial" | "wheel" => Ok(ScrollMode::Circular),
+            other => Err(format!(
+                "unknown scroll mode '{other}' (want swipe|circular|off)"
+            )),
+        }
+    }
+}
+
+/// Left-trackpad scroll knobs (the `[scroll]` config section).
+///
+/// The LEFT pad drives scrolling on the ambient (desktop) layer while the RIGHT
+/// pad keeps driving the cursor. Two modes are offered — a linear vertical
+/// [`Swipe`](ScrollMode::Swipe) and a radial [`Circular`](ScrollMode::Circular)
+/// (Steam-Deck-style). The left-pad position is smoothed by the same
+/// [`crate::filter::PadDamper`] (One Euro + hysteresis) that steadies the
+/// cursor — sharing the `[cursor]` smoothing knobs — before either mode reads
+/// it, so scrolling is not jittery.
+///
+/// Like [`CursorConfig`], these defaults are deliberately *tunable starting
+/// points*, not tuned values; the exact feel wants measuring on-device.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollConfig {
+    /// Which behaviour is active. Default [`ScrollMode::Circular`] — the radial
+    /// scroll is the signature Steam-Deck feel and lets you scroll indefinitely
+    /// with a continuous motion (no lift-and-repeat). Set `mode = swipe` for the
+    /// more familiar linear swipe, or `mode = off` to disable.
+    pub mode: ScrollMode,
+    /// Scroll gain. Its unit depends on the mode (both sane near `1.0`):
+    /// - swipe: scroll units per normalized unit of finger travel (a
+    ///   centre-to-edge swipe is `1.0`), scaled by [`SWIPE_SCROLL_REF`].
+    ///   [SWIPE_SCROLL_REF]: crate::run
+    /// - circular: scroll units per *degree* of rotation, so each emitted tick
+    ///   carries `sensitivity * circular_step_degrees` units (≈ one wheel notch
+    ///   at the defaults). Default `1.0`.
+    pub sensitivity: f64,
+    /// Invert the scroll direction. Default `false` (traditional desktop-wheel
+    /// direction; `true` gives the touch-screen "content follows the finger"
+    /// feel). Applies to both modes.
+    pub natural: bool,
+    /// Swipe only: also map left/right finger motion to horizontal scroll.
+    /// Default `false` (vertical scroll only, the least surprising behaviour).
+    pub horizontal: bool,
+    /// Circular only: degrees of rotation per emitted scroll tick. Smaller =
+    /// finer/faster ticking. Default `15.0` (≈ the Deck's radial granularity).
+    pub circular_step_degrees: f64,
+    /// Circular only: minimum radius (normalized, pad edge ≈ `1.0` per axis) for
+    /// the angle to count. Inside it the angle is ill-defined, so rotation is
+    /// ignored — this is the dead centre. Default `0.35`.
+    pub circular_min_radius: f64,
+}
+
+impl Default for ScrollConfig {
+    fn default() -> ScrollConfig {
+        ScrollConfig {
+            mode: ScrollMode::Circular,
+            sensitivity: 1.0,
+            natural: false,
+            horizontal: false,
+            circular_step_degrees: 15.0,
+            circular_min_radius: 0.35,
+        }
+    }
+}
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -269,6 +353,8 @@ pub struct Config {
     own_lizard: bool,
     /// Trackpad-cursor smoothing knobs (`[cursor]`/`[damping]` section).
     cursor: CursorConfig,
+    /// Left-trackpad scroll knobs (`[scroll]` section).
+    scroll: ScrollConfig,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -282,6 +368,16 @@ pub const DEFAULT_TOML: &str = r#"
 "guide+stick_left"  = "workspace -1" # right stick flicked left
 "guide+x" = "exec walker"            # launcher
 "guide+y" = "keyboard"               # toggle the on-screen keyboard (bottom deck; configurable)
+
+# Left trackpad scrolls the desktop (ambient) layer; the right pad keeps driving
+# the cursor. All knobs are tunable starting points.
+[scroll]
+mode = circular             # swipe | circular | off
+sensitivity = 1.0           # circular: scroll units per degree; swipe: per normalized unit
+natural = false             # invert scroll direction
+horizontal = false          # swipe only: also map left/right finger motion to horizontal scroll
+circular_step_degrees = 15  # circular only: rotation per emitted scroll tick
+circular_min_radius = 0.35  # circular only: ignore rotation nearer than this to the pad centre
 "#;
 
 impl Config {
@@ -290,6 +386,7 @@ impl Config {
         let mut bindings = HashMap::new();
         let mut own_lizard = false;
         let mut cursor = CursorConfig::default();
+        let mut scroll = ScrollConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -348,10 +445,46 @@ impl Config {
                         }
                     }
                 }
+                // Left-trackpad scroll knobs.
+                "scroll" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    match key.as_str() {
+                        "mode" => {
+                            scroll.mode = ScrollMode::parse(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "sensitivity" | "sens" => {
+                            scroll.sensitivity = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "natural" | "invert" => {
+                            scroll.natural = parse_bool(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "horizontal" | "swipe_horizontal" => {
+                            scroll.horizontal = parse_bool(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "circular_step_degrees" | "step_degrees" | "step" => {
+                            scroll.circular_step_degrees = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "circular_min_radius" | "min_radius" => {
+                            scroll.circular_min_radius = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [scroll] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, own_lizard, cursor })
+        Ok(Config { bindings, own_lizard, cursor, scroll })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -428,6 +561,12 @@ impl Config {
     /// section); defaults from [`CursorConfig::default`].
     pub fn cursor(&self) -> &CursorConfig {
         &self.cursor
+    }
+
+    /// The left-trackpad scroll knobs (`[scroll]` section); defaults from
+    /// [`ScrollConfig::default`].
+    pub fn scroll(&self) -> &ScrollConfig {
+        &self.scroll
     }
 }
 
@@ -854,6 +993,77 @@ deadzone = 0.001
         assert!(Config::from_toml_str("[cursor]\nwiggle = 1.0\n")
             .unwrap_err()
             .contains("unknown [cursor] setting"));
+    }
+
+    #[test]
+    fn scroll_defaults_and_parse() {
+        // The built-in default config reproduces ScrollConfig::default exactly
+        // (its `[scroll]` block is living documentation of the defaults).
+        let d = Config::load_default();
+        assert_eq!(d.scroll(), &ScrollConfig::default());
+        assert_eq!(d.scroll().mode, ScrollMode::Circular);
+        assert_eq!(d.scroll().sensitivity, 1.0);
+        assert!(!d.scroll().natural);
+        assert!(!d.scroll().horizontal);
+        assert_eq!(d.scroll().circular_step_degrees, 15.0);
+        assert_eq!(d.scroll().circular_min_radius, 0.35);
+
+        // A `[scroll]` section overrides individual knobs; bindings still parse.
+        let c = Config::from_toml_str(
+            r#"
+[scroll]
+mode = swipe
+sensitivity = 0.5
+natural = true
+horizontal = true
+circular_step_degrees = 20
+circular_min_radius = 0.25
+
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(c.scroll().mode, ScrollMode::Swipe);
+        assert_eq!(c.scroll().sensitivity, 0.5);
+        assert!(c.scroll().natural);
+        assert!(c.scroll().horizontal);
+        assert_eq!(c.scroll().circular_step_degrees, 20.0);
+        assert_eq!(c.scroll().circular_min_radius, 0.25);
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // Mode spellings and `off`; shorter key aliases; unspecified knobs keep
+        // their defaults.
+        assert_eq!(
+            Config::from_toml_str("[scroll]\nmode = off\n").unwrap().scroll().mode,
+            ScrollMode::Off
+        );
+        assert_eq!(
+            Config::from_toml_str("[scroll]\nmode = radial\n").unwrap().scroll().mode,
+            ScrollMode::Circular
+        );
+        let c = Config::from_toml_str("[scroll]\nsens = 2.0\nstep = 10\nmin_radius = 0.4\n").unwrap();
+        assert_eq!(c.scroll().sensitivity, 2.0);
+        assert_eq!(c.scroll().circular_step_degrees, 10.0);
+        assert_eq!(c.scroll().circular_min_radius, 0.4);
+        assert_eq!(c.scroll().mode, ScrollConfig::default().mode);
+
+        // Bad values and unknown keys/modes are reported, not silently ignored.
+        assert!(Config::from_toml_str("[scroll]\nmode = sideways\n")
+            .unwrap_err()
+            .contains("unknown scroll mode"));
+        assert!(Config::from_toml_str("[scroll]\nsensitivity = fast\n")
+            .unwrap_err()
+            .contains("expected a number"));
+        assert!(Config::from_toml_str("[scroll]\nnatural = maybe\n")
+            .unwrap_err()
+            .contains("boolean"));
+        assert!(Config::from_toml_str("[scroll]\nwiggle = 1.0\n")
+            .unwrap_err()
+            .contains("unknown [scroll] setting"));
     }
 
     #[test]
