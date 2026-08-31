@@ -18,6 +18,7 @@ use crate::{hidraw, report};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,11 @@ enum Input {
     /// Every puck reader thread has exited — the controller went away. The loop
     /// enters its reconnect wait instead of terminating.
     ReadersEnded,
+    /// SIGHUP (or `hyprpad reload`) asked us to re-read the config and apply it
+    /// live. Delivered by the SIGHUP self-pipe's waiter thread (see
+    /// [`install_reload_signal`]) so the async-signal-safe handler only ever
+    /// `write`s, and the actual reload runs in the loop's ordinary context.
+    Reload,
 }
 
 pub fn run() -> std::io::Result<()> {
@@ -43,7 +49,9 @@ pub fn run() -> std::io::Result<()> {
         eprintln!("no Steam Controller puck found (28de:1304)");
         std::process::exit(1);
     }
-    let config = match Config::load() {
+    // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
+    // live (see the `Input::Reload` arm and `apply_reload`).
+    let mut config = match Config::load() {
         Ok(c) => {
             match Config::config_path() {
                 Some(p) if p.exists() => eprintln!("hyprpad: config loaded from {}", p.display()),
@@ -63,7 +71,12 @@ pub fn run() -> std::io::Result<()> {
     // disables the puck's firmware keyboard/mouse emulation and re-sends
     // periodically to re-cover it across reconnects. It degrades gracefully:
     // failures log a warning and never take the daemon down.
-    let own_lizard = lizard_ownership_enabled(&config);
+    // Mutable so a live reload can react to `own_lizard` flipping in the config
+    // (see `apply_own_lizard_change`). The one-time startup wiring below —
+    // restore-on-exit and the periodic ownership loop — is keyed off the value
+    // as it stands *now*; reload only does a best-effort one-shot, and a full
+    // ownership change wants a restart.
+    let mut own_lizard = lizard_ownership_enabled(&config);
 
     // When we own lizard we must give it back on the way out, or the firmware
     // keyboard/mouse stays dead and the user has no pointer until a power-cycle.
@@ -77,6 +90,12 @@ pub fn run() -> std::io::Result<()> {
     } else {
         None
     };
+
+    // Advertise our PID so `hyprpad reload` can find us and send SIGHUP. The
+    // guard removes the pidfile on the clean-return and panic paths (a
+    // signal-driven exit via `std::process::exit` leaves it, but `hyprpad
+    // reload` treats a stale pidfile — a pid that is gone — as "not running").
+    let _pidfile = PidFile::create();
 
     let hypr = Hypr::connect()?;
     eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
@@ -92,6 +111,11 @@ pub fn run() -> std::io::Result<()> {
     // its reconnect wait instead of ending. `tx` is also how we re-arm a fresh
     // reader pipeline when the controller returns.
     let (tx, rx) = mpsc::channel::<Input>();
+
+    // SIGHUP -> live config reload, routed through its own self-pipe into the
+    // loop as `Input::Reload`. Installed regardless of lizard ownership so
+    // `hyprpad reload` works either way.
+    install_reload_signal(&tx);
 
     spawn_reader_pipeline(&nodes, &tx);
 
@@ -209,6 +233,16 @@ pub fn run() -> std::io::Result<()> {
                 );
                 waiting = true;
                 next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
+            }
+            Input::Reload => {
+                apply_reload(
+                    &mut config,
+                    &mut cursor,
+                    &mut scroll,
+                    &mut osk_route,
+                    pointer.as_mut(),
+                    &mut own_lizard,
+                );
             }
             Input::Compositor(ev) => {
                 if debug {
@@ -340,6 +374,16 @@ impl CursorState {
             left_down: false,
         }
     }
+
+    /// Apply new cursor tuning on a live reload: rebuild the damper from the new
+    /// knobs (a fresh [`PadDamper`] with cleared filter state, so a sens/smoothing
+    /// change can't jolt the cursor) and update the gain. The held-click flag is
+    /// deliberately left untouched — the reload path releases any held click
+    /// itself, so this never strands the button.
+    fn reconfigure(&mut self, cfg: &CursorConfig) {
+        self.damper = damper_from(cfg);
+        self.sens = cfg.sens;
+    }
 }
 
 /// Drive the pointer from the right trackpad for a single frame.
@@ -433,6 +477,13 @@ impl ScrollState {
         self.damper.reset();
         self.prev = None;
         self.angle.reset();
+    }
+
+    /// Apply new scroll (and shared cursor-smoothing) tuning on a live reload by
+    /// rebuilding from the new knobs. This resets all cross-frame state, so a
+    /// mode/sensitivity/step change can't jump the scroll on the next frame.
+    fn reconfigure(&mut self, cfg: &ScrollConfig, cursor: &CursorConfig) {
+        *self = ScrollState::new(cfg, cursor);
     }
 
     /// Difference the smoothed position `s` against the previous frame's, for the
@@ -621,6 +672,281 @@ fn lizard_ownership_enabled(config: &Config) -> bool {
         ),
         Err(_) => config.own_lizard(),
     }
+}
+
+/// Write end of the self-pipe the SIGHUP handler pokes to request a config
+/// reload. `-1` until [`install_reload_signal`] runs. Separate from the
+/// lizard restore-on-signal pipe in [`crate::lizard`]: that one drives an exit,
+/// this one drives a reload, and SIGHUP must never exit.
+static RELOAD_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// The SIGHUP handler. Async-signal-safe by construction: it does nothing but
+/// `write` a single byte to the self-pipe so the waiter thread can run the real
+/// reload in ordinary thread context. Mirrors [`crate::lizard`]'s
+/// `on_exit_signal`, but this pipe feeds a reload, not a process exit.
+extern "C" fn on_reload_signal(_sig: libc::c_int) {
+    let fd = RELOAD_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = 1u8;
+        // `write` is on POSIX's async-signal-safe list; best-effort, ignore the
+        // result — a full pipe just means a reload is already pending.
+        let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+}
+
+/// Install SIGHUP handling that asks the main loop to reload its config.
+///
+/// This reuses the same self-pipe pattern as the lizard restore-on-signal
+/// handler ([`crate::lizard::install_signal_restore`]) rather than adding a
+/// competing mechanism: the async-signal-safe handler only `write`s a byte to a
+/// pipe, and a dedicated waiter thread — blocked on the read end — turns each
+/// poke into an [`Input::Reload`] on the loop's channel, where the reload runs
+/// in ordinary context (loading the config, rebuilding dampers, logging). Because
+/// SIGHUP's default action is to *terminate*, installing this handler is what
+/// keeps a reload request from killing the daemon.
+///
+/// SIGINT/SIGTERM stay entirely with [`crate::lizard`] (whose waiter restores
+/// lizard mode and exits); SIGHUP is a distinct signal handled here, so the two
+/// never contend. `SA_RESTART` keeps a SIGHUP mid-read from erroring out the
+/// hidraw reader threads. Best-effort: if the pipe can't be created we log and
+/// leave SIGHUP at its default.
+fn install_reload_signal(tx: &mpsc::Sender<Input>) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid 2-element buffer for `pipe`.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        eprintln!(
+            "warning: config reload-on-SIGHUP not installed (pipe: {})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    RELOAD_WRITE_FD.store(write_fd, Ordering::Relaxed);
+
+    // SAFETY: `action` is fully zero-initialised, then `sa_sigaction`, `sa_mask`,
+    // and `sa_flags` are set to valid values before `sigaction` reads it; the
+    // null old-action pointer is allowed.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_reload_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
+
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        loop {
+            // SAFETY: `read_fd` is the live read end; `byte` is a valid 1-byte buffer.
+            let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+            if n < 0 {
+                // SA_RESTART covers most cases, but tolerate a stray EINTR.
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return; // unexpected read error: stop waiting.
+            }
+            if n == 0 {
+                return; // write end closed (only at shutdown).
+            }
+            // Ordinary thread context now: nudge the loop to reload. If the loop
+            // is gone the channel is closed and we stop.
+            if tx.send(Input::Reload).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Choose the config to run with after a reload attempt.
+///
+/// On a successful load the new config replaces the current one; on a parse
+/// error the current config is kept verbatim — the key safety property, so a
+/// typo in the file never crashes or blanks the running daemon. Returns the
+/// chosen config alongside the outcome the caller logs. Pure and side-effect
+/// free, so the keep-old-config-on-error policy is unit-tested without touching
+/// signals or the filesystem.
+fn resolve_reload(current: Config, loaded: Result<Config, String>) -> (Config, Result<(), String>) {
+    match loaded {
+        Ok(new) => (new, Ok(())),
+        Err(e) => (current, Err(e)),
+    }
+}
+
+/// Apply a SIGHUP / `hyprpad reload` request: re-read the config from disk and,
+/// on success, swap it in live and re-derive everything cached from it.
+///
+/// Bindings and the `[buttons]` map are read per-event straight off `config`
+/// (`config.resolve(..)`, `config.buttons()`), so swapping the `config` value is
+/// all those need. Only the pre-built pad dampers carry tuning that must be
+/// rebuilt: the cursor and scroll [`PadDamper`]s (from `[cursor]`/`[scroll]`) and
+/// the OSK router's dampers (from `[cursor]`). Rebuilding resets their filter
+/// state, so a tuning change can't jump the cursor/scroll.
+///
+/// On a parse error the current config is kept and the error logged (see
+/// [`resolve_reload`]).
+fn apply_reload(
+    config: &mut Config,
+    cursor: &mut CursorState,
+    scroll: &mut ScrollState,
+    osk_route: &mut OskRoute,
+    pointer: Option<&mut VirtualPointer>,
+    own_lizard: &mut bool,
+) {
+    // `mem::take` lets `resolve_reload` own the current config so it can hand it
+    // straight back on a parse error; on success it returns the freshly loaded
+    // one instead. Either way we reinstall a real config immediately.
+    let (new_config, outcome) = resolve_reload(std::mem::take(config), Config::load());
+    *config = new_config;
+
+    if let Err(e) = outcome {
+        eprintln!("warning: config reload failed: {e}; keeping current config");
+        return;
+    }
+
+    // Release any held synthetic left click before rebuilding the cursor damper,
+    // so a reload mid-drag never strands the button down (the rebuilt state
+    // starts with `left_down = false`).
+    if let Some(ptr) = pointer {
+        if cursor.left_down {
+            ptr.button(PointerButton::Left, false);
+            cursor.left_down = false;
+        }
+    }
+
+    cursor.reconfigure(config.cursor());
+    scroll.reconfigure(config.scroll(), config.cursor());
+    // The OSK router shares the `[cursor]` smoothing knobs; rebuild it too so a
+    // tuning change reaches the on-screen cursors. Reset (fresh dampers) is fine
+    // whether or not the keyboard is currently up.
+    *osk_route = OskRoute::new(config.cursor());
+
+    let new_own = lizard_ownership_enabled(config);
+    if new_own != *own_lizard {
+        apply_own_lizard_change(new_own);
+        *own_lizard = new_own;
+    }
+
+    eprintln!("hyprpad: config reloaded");
+}
+
+/// React to a live change of the effective `own_lizard` setting on reload.
+///
+/// Turning it **on** disables lizard mode once, now, so the change takes visible
+/// effect immediately. Turning it **off** leaves the device as-is (documented
+/// choice): the firmware keyboard/mouse comes back on the next power-cycle, or on
+/// exit if the restore guard is installed — we don't re-enable it here to avoid
+/// over-engineering. The periodic re-send loop, the restore-on-exit guard, and
+/// the SIGINT/SIGTERM restore are wired once at startup and are not reconfigured
+/// live, so a full ownership change wants a restart. (When `HYPRPAD_OWN_LIZARD`
+/// is set it pins the value, so this never fires from a config edit.)
+fn apply_own_lizard_change(now_on: bool) {
+    if now_on {
+        eprintln!(
+            "hyprpad: own_lizard enabled via reload; disabling lizard mode now \
+             (periodic re-send + restore-on-exit unchanged until restart)"
+        );
+        if let Err(e) = crate::lizard::disable_lizard_mode() {
+            eprintln!("warning: lizard disable on reload: {e}");
+        }
+    } else {
+        eprintln!(
+            "hyprpad: own_lizard disabled via reload; leaving current device state \
+             (firmware kbd/mouse restored on exit or next power-cycle)"
+        );
+    }
+}
+
+/// Path to the daemon's pidfile: `$XDG_RUNTIME_DIR/hyprpad.pid`. `hyprpad run`
+/// writes it on startup and removes it on clean exit; `hyprpad reload` reads it
+/// to find the daemon. Returns `None` when `XDG_RUNTIME_DIR` is unset/empty.
+pub fn pid_file_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(dir).join("hyprpad.pid"))
+}
+
+/// Owns the daemon pidfile for the life of [`run`]: writes `$XDG_RUNTIME_DIR/
+/// hyprpad.pid` on creation and removes it on drop (the clean-return and panic
+/// paths). A signal-driven exit (`std::process::exit` from the lizard waiter)
+/// skips the drop and leaves the file, but that is harmless — [`reload`] treats a
+/// pidfile whose pid is gone as "not running".
+struct PidFile {
+    path: PathBuf,
+}
+
+impl PidFile {
+    /// Write the pidfile with our PID. Best-effort: a failure (e.g. no
+    /// `XDG_RUNTIME_DIR`) just means `hyprpad reload` won't find us, and a manual
+    /// `kill -HUP <pid>` still works — so we log and carry on rather than fail.
+    fn create() -> Option<PidFile> {
+        let path = pid_file_path()?;
+        match std::fs::write(&path, format!("{}\n", std::process::id())) {
+            Ok(()) => {
+                eprintln!("hyprpad: pidfile {} (reload with `hyprpad reload`)", path.display());
+                Some(PidFile { path })
+            }
+            Err(e) => {
+                eprintln!("warning: could not write pidfile {}: {e}", path.display());
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The `hyprpad reload` subcommand: find the running daemon via its pidfile and
+/// send it SIGHUP, which triggers a live config reload (see
+/// [`install_reload_signal`]). Prints a clear message and returns `Err` when no
+/// live daemon can be found, so a stale or missing pidfile is not mistaken for
+/// success. (`kill -HUP <pid>` by hand does the same thing for power users.)
+pub fn reload() -> Result<(), String> {
+    let Some(path) = pid_file_path() else {
+        return Err("cannot locate pidfile (XDG_RUNTIME_DIR is unset)".to_string());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "no pidfile at {} — is the daemon running? start it with `hyprpad run`",
+                path.display()
+            ));
+        }
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let pid: i32 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("pidfile {} is corrupt (not a pid): {:?}", path.display(), text.trim()))?;
+
+    // Probe liveness with signal 0 (checks existence/permission, sends nothing)
+    // so a stale pidfile gives a clear message instead of a confusing failure.
+    // SAFETY: `kill` with a pid and signal is always safe to call.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Err(format!(
+                "daemon pid {pid} from {} is not running (stale pidfile); start it with `hyprpad run`",
+                path.display()
+            ));
+        }
+        return Err(format!("cannot signal daemon pid {pid}: {err}"));
+    }
+
+    // SAFETY: sending SIGHUP to the daemon pid.
+    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+        return Err(format!(
+            "sending SIGHUP to pid {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    eprintln!("hyprpad: sent SIGHUP to daemon (pid {pid}); it will re-read its config");
+    Ok(())
 }
 
 fn update_arbiter(arbiter: &mut Arbiter, ev: HyprEvent) {
@@ -980,5 +1306,62 @@ mod tests {
         ev.sort();
         assert_eq!(ev, vec![(103, true), (105, true)]);
         assert_eq!(st.held.len(), 2);
+    }
+
+    #[test]
+    fn reload_keeps_old_config_on_parse_error() {
+        // The safety property: a parse error keeps the current config verbatim,
+        // so a typo in the file never blanks the daemon.
+        let current = Config::load_default();
+        let current_len = current.len();
+        let (cfg, outcome) = resolve_reload(current, Err("line 3: unknown button".to_string()));
+        assert!(outcome.is_err());
+        assert_eq!(cfg.len(), current_len);
+        // The kept config still resolves its default binding.
+        assert_eq!(
+            cfg.resolve(&GestureEvent::GuideChord(report::Button::BumperR1)),
+            Action::Workspace(WorkspaceTarget::Relative(1))
+        );
+    }
+
+    #[test]
+    fn reload_swaps_in_new_config_on_success() {
+        // A successful load replaces the config wholesale: the new binding is in
+        // effect and the old default binding is gone.
+        let current = Config::load_default();
+        let new = Config::from_toml_str("[bindings]\n\"guide+a\" = \"fullscreen\"\n").unwrap();
+        let (cfg, outcome) = resolve_reload(current, Ok(new));
+        assert!(outcome.is_ok());
+        assert_eq!(
+            cfg.resolve(&GestureEvent::GuideChord(report::Button::A)),
+            Action::ToggleFullscreen
+        );
+        assert_eq!(
+            cfg.resolve(&GestureEvent::GuideChord(report::Button::BumperR1)),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn cursor_reconfigure_applies_sens_and_keeps_held_click() {
+        // A live reload rebuilds the damper (fresh filter state, no jump) and
+        // applies the new gain, but must not clear a held click — the reload path
+        // releases that itself before calling this.
+        let mut st = CursorState::new(&CursorConfig::default());
+        st.left_down = true;
+        let cfg = CursorConfig { sens: 0.2, ..CursorConfig::default() };
+        st.reconfigure(&cfg);
+        assert_eq!(st.sens, 0.2);
+        assert!(st.left_down, "reconfigure must not clear a held click");
+    }
+
+    #[test]
+    fn scroll_reconfigure_applies_new_mode() {
+        // Rebuilding from new knobs swaps the scroll mode live.
+        let mut st = ScrollState::new(&ScrollConfig::default(), &CursorConfig::default());
+        assert_eq!(st.cfg.mode, ScrollMode::Circular);
+        let cfg = ScrollConfig { mode: ScrollMode::Swipe, ..ScrollConfig::default() };
+        st.reconfigure(&cfg, &CursorConfig::default());
+        assert_eq!(st.cfg.mode, ScrollMode::Swipe);
     }
 }

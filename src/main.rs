@@ -7,6 +7,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("run") => run::run().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
+        // `reload`: nudge the running daemon (found via its pidfile) to re-read
+        // its config live, by sending it SIGHUP. `kill -HUP <pid>` also works.
+        Some("reload") => run::reload().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
         Some("monitor") => monitor(),
         Some("setup") => {
             // `setup [--revert]`: install (or uninstall) the masked-Steam hook.
@@ -22,9 +25,10 @@ fn main() {
             setup::run(revert).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
         }
         _ => {
-            eprintln!("usage: hyprpad <run|monitor|setup>");
+            eprintln!("usage: hyprpad <run|reload|monitor|setup>");
             eprintln!();
             eprintln!("  run              drive Hyprland from the controller (gestures -> dispatch)");
+            eprintln!("  reload           tell the running daemon to re-read its config (SIGHUP)");
             eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
             eprintln!("  setup [--revert] install (or remove) the masked-Steam launcher hook");
             std::process::exit(2);
