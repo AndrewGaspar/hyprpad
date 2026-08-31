@@ -62,9 +62,14 @@ Details and the rejected alternatives are in
 | [05 — Architectures](docs/05-architectures.md) | Six candidate designs, with honest trade-offs |
 | [06 — Recommendation](docs/06-recommendation.md) | The layered proposal, phased |
 | [07 — Open questions](docs/07-open-questions.md) | What is still unverified, and how to verify it |
+| [08 — The living-room vision](docs/08-living-room-vision.md) | The full target experience, and the input contract |
+| [09 — The programme](docs/09-programme.md) | **The costed attack on the vision** — work items, sizes, order, risks |
+| [research/](docs/research/) | Six consolidated deep-research reports the programme rests on |
 
 ## Status
 
-Research complete; no implementation started. Findings are dated 2026-08-30 and
-were taken against Hyprland 0.56.2, Linux 7.1.9, Steam client build 1785799196
-on Omarchy/Arch.
+Research complete through the full living-room programme
+([09](docs/09-programme.md)); no implementation started. Findings dated
+2026-08-30/31, taken against Hyprland 0.56.2 (HypXRland fork), Linux 7.1.9,
+Steam client build 1785799196 on Omarchy 4/Arch — on the Framework 16
+development machine; the living-room tower is not yet probed.
