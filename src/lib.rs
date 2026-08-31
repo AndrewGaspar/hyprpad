@@ -5,6 +5,7 @@
 //! higher-level [`gesture`] and [`config`] layers so that unit and integration
 //! tests — and any future front-end — can build against them.
 
+pub mod arbitrate;
 pub mod config;
 pub mod gesture;
 pub mod hidraw;
