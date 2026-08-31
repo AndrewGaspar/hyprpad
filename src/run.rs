@@ -7,10 +7,11 @@
 //! [`Arbiter`], and executes [`Action`]s via [`Hypr`].
 
 use crate::arbitrate::Arbiter;
-use crate::config::{Action, Config, WorkspaceTarget};
+use crate::config::{Action, Config, CursorConfig, WorkspaceTarget};
+use crate::filter::PadDamper;
 use crate::gesture::{GestureEngine, GestureEvent};
 use crate::hypr::{Hypr, HyprEvent};
-use crate::osk::{normalize_pad_axis, OskHandle, OskMode, OskPad};
+use crate::osk::{OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
 
@@ -100,7 +101,7 @@ pub fn run() -> std::io::Result<()> {
             None
         }
     };
-    let mut cursor = CursorState::default();
+    let mut cursor = CursorState::new(config.cursor());
 
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
@@ -110,7 +111,7 @@ pub fn run() -> std::io::Result<()> {
     // killed when this function returns (daemon exit). When it is showing, the
     // two pads drive the keyboard instead of the desktop cursor.
     let mut osk = OskHandle::new();
-    let mut osk_route = OskRoute::default();
+    let mut osk_route = OskRoute::new(config.cursor());
     // Previous frame, kept for edge detection in the OSK-active router (pad
     // click-down and the B/Menu dismiss).
     let mut prev_frame = report::Frame::default();
@@ -136,14 +137,14 @@ pub fn run() -> std::io::Result<()> {
                     // The keyboard owns both pads: route them to it, and keep the
                     // desktop cursor released (guide/suppressed = true forces the
                     // drop-and-forget branch of `drive_cursor`).
-                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route);
+                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route, now);
                     if let Some(ptr) = pointer.as_mut() {
-                        drive_cursor(ptr, &frame, &mut cursor, true, true);
+                        drive_cursor(ptr, &frame, &mut cursor, true, true, now);
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
                     // Ambient (non-guide) right-pad cursor. The guide layer and a
                     // focused game both take the pad away from cursor duty.
-                    drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed());
+                    drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), now);
                 }
                 prev_frame = frame;
             }
@@ -152,20 +153,40 @@ pub fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Right-trackpad cursor sensitivity: compositor pixels per pad count. The pad
-/// reports absolute i16 touch coordinates (roughly ±32767 across its surface),
-/// so at ~0.06 px/count a full-width swipe travels well over a screen width and
-/// the whole screen is reachable without re-clutching. Tune to taste.
-const PAD_CURSOR_SENS: f64 = 0.06;
+/// Build a [`PadDamper`] from the cursor/damping config knobs. Both pad
+/// consumers — the desktop cursor and each OSK pad — construct their damper this
+/// way, so the on-screen cursors are smoothed with *exactly* the same filter as
+/// the desktop cursor: one smoothed-position source, two consumers.
+fn damper_from(cfg: &CursorConfig) -> PadDamper {
+    PadDamper::new(
+        cfg.one_euro_min_cutoff,
+        cfg.one_euro_beta,
+        cfg.one_euro_d_cutoff,
+        cfg.hysteresis,
+        cfg.deadzone,
+    )
+}
 
 /// Cross-frame state for the trackpad cursor.
-#[derive(Default)]
 struct CursorState {
-    /// Last touched right-pad (x, y); `None` when not tracking, so a
-    /// lift-and-retouch never produces a jump.
-    prev: Option<(i16, i16)>,
+    /// Per-pad smoothing (One Euro + hysteresis + sub-pixel accumulation). Its
+    /// `reset()` on lift replaces the old raw `prev = None`, so a lift-and-
+    /// retouch never produces a jump.
+    damper: PadDamper,
+    /// Desktop-cursor gain (px per pad count), from `[cursor] sens`.
+    sens: f64,
     /// Whether the synthetic left mouse button is currently held.
     left_down: bool,
+}
+
+impl CursorState {
+    fn new(cfg: &CursorConfig) -> CursorState {
+        CursorState {
+            damper: damper_from(cfg),
+            sens: cfg.sens,
+            left_down: false,
+        }
+    }
 }
 
 /// Drive the pointer from the right trackpad for a single frame.
@@ -179,32 +200,33 @@ fn drive_cursor(
     st: &mut CursorState,
     guide_active: bool,
     suppressed: bool,
+    now: Instant,
 ) {
     if guide_active || suppressed {
         // Release the desktop's claim: drop any held click and forget the
-        // tracking origin so re-entry starts clean.
+        // tracking origin (all filter state) so re-entry starts clean.
         if st.left_down {
             ptr.button(PointerButton::Left, false);
             st.left_down = false;
         }
-        st.prev = None;
+        st.damper.reset();
         return;
     }
 
     if frame.pressed(report::Button::PadRightTouch) {
-        let cur = (frame.right_pad.x, frame.right_pad.y);
-        if let Some((px, py)) = st.prev {
-            // Widen to f64 before subtracting: an i16 delta can overflow.
-            let dx = (f64::from(cur.0) - f64::from(px)) * PAD_CURSOR_SENS;
-            // Pad +Y is up; screen +Y is down, so invert.
-            let dy = (f64::from(cur.1) - f64::from(py)) * -PAD_CURSOR_SENS;
-            if dx != 0.0 || dy != 0.0 {
-                ptr.move_relative(dx, dy);
-            }
+        // Smooth the absolute pad position first, then difference the *smoothed*
+        // position (pointer-damping doc §4): the One Euro Filter + hysteresis
+        // crush held-still jitter before the differencing high-pass can amplify
+        // it, and sub-pixel accumulation keeps slow, deliberate drags alive.
+        let s = st.damper.update(frame.right_pad.x, frame.right_pad.y, now);
+        // `relative` inverts y (pad +Y is up, screen +Y is down) and carries the
+        // sub-pixel remainder; the first touched frame clutches to (0, 0).
+        let (dx, dy) = st.damper.relative(s, st.sens, true);
+        if dx != 0 || dy != 0 {
+            ptr.move_relative(f64::from(dx), f64::from(dy));
         }
-        st.prev = Some(cur);
     } else {
-        st.prev = None;
+        st.damper.reset();
     }
 
     // A hard pad click (or a full right-trigger pull) is a left click.
@@ -290,32 +312,71 @@ fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode) {
     }
 }
 
-/// Cross-frame state for OSK-active pad routing: the last raw pad position sent
-/// for each pad, so identical positions aren't re-sent every 4 ms frame. `None`
-/// means that pad is not currently touched (so a re-touch always re-sends).
-#[derive(Default)]
+/// Cross-frame state for OSK-active pad routing: a smoothing damper plus the
+/// last sent (rounded) position for each pad, so identical positions aren't
+/// re-sent every 4 ms frame.
 struct OskRoute {
-    last_left: Option<(i16, i16)>,
-    last_right: Option<(i16, i16)>,
+    left: OskPadState,
+    right: OskPadState,
+}
+
+/// One OSK pad's routing state: its smoothing damper and the last position sent
+/// on the wire (rounded to the wire's precision so a settled finger stops
+/// re-sending). `None` means untouched, so a re-touch always re-sends.
+struct OskPadState {
+    damper: PadDamper,
+    last_sent: Option<(f32, f32)>,
+}
+
+impl OskRoute {
+    fn new(cfg: &CursorConfig) -> OskRoute {
+        OskRoute {
+            left: OskPadState::new(cfg),
+            right: OskPadState::new(cfg),
+        }
+    }
+
+    /// Forget both pads (on dismiss), resetting their filter state.
+    fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+    }
+}
+
+impl OskPadState {
+    fn new(cfg: &CursorConfig) -> OskPadState {
+        OskPadState { damper: damper_from(cfg), last_sent: None }
+    }
+
+    fn reset(&mut self) {
+        self.damper.reset();
+        self.last_sent = None;
+    }
 }
 
 /// Route one frame to the on-screen keyboard while it owns the pads:
 /// each pad's absolute position becomes a `cursor L|R`, a pad click (or a full
 /// trigger pull) commits the key under it, and `B`/`Menu` dismiss the keyboard.
-fn route_osk(osk: &mut OskHandle, frame: &report::Frame, prev: &report::Frame, st: &mut OskRoute) {
+fn route_osk(
+    osk: &mut OskHandle,
+    frame: &report::Frame,
+    prev: &report::Frame,
+    st: &mut OskRoute,
+    now: Instant,
+) {
     use report::Button::*;
 
     // Dismiss on B or Menu (edge-down): hide and leave OSK-active mode.
     if frame.edges_down(prev).any(|b| matches!(b, B | Menu)) {
         osk.hide();
-        *st = OskRoute::default();
+        st.reset();
         return;
     }
 
     // Move each pad's cursor first, so a click on the same frame commits the key
     // actually under the finger. Only while touched, and only on change.
-    route_pad(osk, OskPad::Left, frame.pressed(PadLeftTouch), frame.left_pad, &mut st.last_left);
-    route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.last_right);
+    route_pad(osk, OskPad::Left, frame.pressed(PadLeftTouch), frame.left_pad, &mut st.left, now);
+    route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.right, now);
 
     // Commit on click-down (the Deck commits on click, not release). A full
     // trigger pull on the same side is an alternate commit.
@@ -328,27 +389,40 @@ fn route_osk(osk: &mut OskHandle, frame: &report::Frame, prev: &report::Frame, s
     }
 }
 
-/// Forward one pad's position to the OSK, rate-limited to real movement. Clears
-/// `last` on lift so a lift-and-retouch at the same spot re-sends.
+/// Forward one pad's *smoothed* position to the OSK, rate-limited to real
+/// movement. The pad is smoothed by the same [`PadDamper`] as the desktop cursor
+/// (One Euro + hysteresis), so a held-still finger keeps the on-screen cursor
+/// steady too. Resets the damper on lift so a lift-and-retouch starts clean.
 fn route_pad(
     osk: &mut OskHandle,
     pad: OskPad,
     touched: bool,
     p: report::Pad,
-    last: &mut Option<(i16, i16)>,
+    st: &mut OskPadState,
+    now: Instant,
 ) {
     if !touched {
-        *last = None;
+        st.reset();
         return;
     }
-    let cur = (p.x, p.y);
-    if *last == Some(cur) {
+    // The smoothed position is already normalized to [-1, 1]. Pad +Y is up and
+    // the OSK's +ny is up too, so both axes pass straight through with no flip.
+    let (nx, ny) = st.damper.update(p.x, p.y, now);
+    // Dedup at the wire's precision (`cursor` serializes at %.4f), so a settled
+    // finger — whose smoothed position stops changing — stops re-sending.
+    let sent = (round_wire(nx), round_wire(ny));
+    if st.last_sent == Some(sent) {
         return;
     }
-    *last = Some(cur);
-    // Pad +Y is up and the OSK's +ny is up too, so both axes pass straight
-    // through after normalization.
-    osk.cursor(pad, normalize_pad_axis(cur.0), normalize_pad_axis(cur.1));
+    st.last_sent = Some(sent);
+    osk.cursor(pad, sent.0, sent.1);
+}
+
+/// Round a normalized axis to the OSK `cursor` command's wire precision (4
+/// decimals), as `f32`. Used both to dedup and as the value actually sent, so
+/// the dedup key and the wire value never disagree.
+fn round_wire(v: f64) -> f32 {
+    ((v * 10_000.0).round() / 10_000.0) as f32
 }
 
 /// Guide-scoped gestures carry the guide modifier and are always honored.
