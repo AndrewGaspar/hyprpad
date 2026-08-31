@@ -1,0 +1,12 @@
+[package]
+name = "hyprsc"
+version = "0.1.0"
+edition = "2021"
+description = "Drive Hyprland with a game controller — Steam Controller (2026) first"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AndrewGaspar/hyprsc"
+
+[dependencies]
+
+[profile.release]
+lto = true

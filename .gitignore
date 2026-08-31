@@ -2,3 +2,9 @@
 *.jsonl.snap
 __pycache__/
 target/
+
+
+# Added by cargo
+
+/target
+target/
