@@ -238,3 +238,17 @@ instability, not a hard failure. Notes:
   concluding anything about W5** — but W5's risk rating rises until it is.
 - `gamescope-type` backend validation therefore remains open; retry on the
   tower or after a gamescope update.
+
+## Q17 — `suppress_event = "activate"` does NOT stop Steam's guide focus-steal  **OPENED 2026-08-31**
+
+With `o.window("steam", { suppress_event = "activate" })` applied and
+validated, a bare guide tap still focused Steam. The rule was predicted to
+work on the theory that the steal rides `misc:focus_on_activate`; evidently
+Steam's XWayland window reaches focus through a different path (uninvestigated
+— possibly X11 raise/map handling rather than the activation event).
+
+**Deliberately not pursued.** Owner direction (2026-08-31): mitigations for
+Steam's guide handling are not worth debugging — **Tier 1 device ownership is
+the goal**, under which Steam never sees the guide button at all. This
+question stands only as a record that the one config-level mitigation tried
+did not work.

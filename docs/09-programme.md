@@ -216,7 +216,7 @@ standalone DRM program in the unl0kr mould, randomized layout now optional
 per the relaxed privacy bar) is separable and deferable — the everyday path
 after W9 is suspend/resume, making cold boot rare.
 
-### W12 — Tier 1: device ownership + focus routing (L, the structural finish)
+### W12 — Tier 1: device ownership + focus routing (L) — **prioritized: the point of the project**
 
 The [06 Tier 1](06-recommendation.md#tier-1--the-structural-answer) design:
 deny Steam the physical device (udev mechanism still to be verified — the
@@ -240,13 +240,17 @@ gamescope questions return on AMD where they're actually supported.
 ## Suggested order
 
 ```
-W0 ─ W1 ──► W2 ──► W3 ─► W4 ─► W5/W6/W7 ─► W8/W9 ─► W10 ─► W12 ─► W11 ─► W13
- experiments  daemon  glue   mode   living-room    lifecycle  OSK   ownership boot  deck
+W0 ─ W1 ──► W2 ──► W12 ──► W3 ─► W4 ─► W5/W6/W7 ─► W8/W9 ─► W10 ─► W11 ─► W13
+ experiments  daemon  OWNERSHIP glue  mode  living-room   lifecycle  OSK   boot  deck
 ```
 
-W10 can start any time after W2 (they share only the IPC contract) — it's
-sequenced by size, not dependency. W11 floats freely; do it whenever cold
-boots annoy enough.
+*Reordered 2026-08-31 at the owner's direction: Tier 1 ownership (W12) is the
+priority and moves directly after the daemon core.* Two things motivated it:
+the `suppress_event` mitigation for Steam's guide focus-steal failed in
+practice (Q17), and ownership obsoletes the entire mitigation category — the
+input contract holds by construction when Steam only ever sees the virtual
+controller. W10 can still start any time after W2 (they share only the IPC
+contract). W11 floats freely.
 
 ## Risk register (top five)
 
