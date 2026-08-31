@@ -1,5 +1,5 @@
 use hyprpad::report::Frame;
-use hyprpad::{hidraw, run};
+use hyprpad::{hidraw, run, setup};
 use std::io::Write;
 use std::time::Instant;
 
@@ -8,11 +8,25 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("run") => run::run().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
         Some("monitor") => monitor(),
+        Some("setup") => {
+            // `setup [--revert]`: install (or uninstall) the masked-Steam hook.
+            let revert = match args.get(2).map(String::as_str) {
+                None => false,
+                Some("--revert") => true,
+                Some(other) => {
+                    eprintln!("hyprpad setup: unknown argument {other:?}");
+                    eprintln!("usage: hyprpad setup [--revert]");
+                    std::process::exit(2);
+                }
+            };
+            setup::run(revert).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
+        }
         _ => {
-            eprintln!("usage: hyprpad <run|monitor>");
+            eprintln!("usage: hyprpad <run|monitor|setup>");
             eprintln!();
-            eprintln!("  run       drive Hyprland from the controller (gestures -> dispatch)");
-            eprintln!("  monitor   decode and print controller events (passive; Steam-safe)");
+            eprintln!("  run              drive Hyprland from the controller (gestures -> dispatch)");
+            eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
+            eprintln!("  setup [--revert] install (or remove) the masked-Steam launcher hook");
             std::process::exit(2);
         }
     }

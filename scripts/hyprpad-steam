@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# hyprpad-steam — the production masked Steam launcher.
+#
+# hyprpad-managed: installed by `hyprpad setup`, removed by `hyprpad setup
+# --revert`. This marker line is what the installer checks before deleting the
+# copy under ~/.local/bin, so it never removes a file it did not write.
+#
+# What it does: launches Steam with the Steam Controller puck's hidraw nodes
+# masked out of Steam's mount namespace, so hyprpad owns the real device and
+# Steam only ever sees the virtual controller hyprpad feeds it (W12 Candidate B,
+# proven in docs/experiments/w12-device-denial.md).
+#
+# Mechanism: bind /dev/null over each live puck hidraw node inside a bubblewrap
+# mount namespace. Opens inside the namespace still succeed but resolve to
+# /dev/null (major:minor 1:3), so Steam's HID probe reads nothing and treats the
+# controller as absent — while hyprpad, running OUTSIDE the namespace, keeps
+# reading the real node normally.
+#
+# FAIL-OPEN is the overriding rule. If anything about the mask is not exactly
+# right — bwrap missing, no puck node found, a discovery error — this wrapper
+# execs plain Steam UNMASKED. A broken or half-installed hyprpad must NEVER stop
+# the user from launching Steam.
+set -euo pipefail
+
+# --- Resolve the REAL Steam binary, robustly -------------------------------
+# Prefer the distro path (/usr/bin/steam). Fall back to the first `steam` on
+# PATH that is not this very wrapper — this guards against ~/.local/bin/hyprpad-
+# steam (or a future rename to `steam`) shadowing the real client and causing an
+# infinite exec loop.
+self="$(realpath -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+steam_bin=""
+if [ -x /usr/bin/steam ]; then
+    steam_bin=/usr/bin/steam
+else
+    # `type -aP` lists every `steam` on PATH, in order; pick the first that is
+    # not us. `|| true` keeps `set -e` from aborting when there is no match.
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        c="$(realpath -- "$cand" 2>/dev/null || echo "$cand")"
+        if [ "$c" != "$self" ]; then
+            steam_bin="$cand"
+            break
+        fi
+    done < <(type -aP steam 2>/dev/null || true)
+fi
+# Last resort: if we could not find Steam at all, still aim at the conventional
+# path so the user gets Steam's own "not found" error rather than ours.
+[ -n "$steam_bin" ] || steam_bin=/usr/bin/steam
+
+# --- Discover the puck's current hidraw nodes ------------------------------
+# The Steam Controller puck is USB VID 28DE, PID 1304. Each of its hidraw
+# interfaces exposes /sys/class/hidraw/hidrawN/device/uevent carrying an HID_ID
+# line with both ids. We build one `--dev-bind /dev/null /dev/hidrawN` mask per
+# node. Zero matches is fine (we fail open); a bad read is skipped, never fatal.
+masks=()
+for sysnode in /sys/class/hidraw/hidraw*; do
+    uevent="$sysnode/device/uevent"
+    [ -r "$uevent" ] || continue
+    # Both ids must appear in the same uevent file, matched case-insensitively.
+    if grep -qi 28DE "$uevent" && grep -qi 1304 "$uevent"; then
+        dev="/dev/$(basename "$sysnode")"
+        masks+=(--dev-bind /dev/null "$dev")
+    fi
+done
+
+# --- Decide: masked launch, or fail-open plain launch ----------------------
+if command -v bwrap >/dev/null 2>&1 && [ "${#masks[@]}" -gt 0 ]; then
+    # bwrap is present AND at least one puck node was found: launch masked.
+    #   --bind / /            keep the real root filesystem
+    #   --dev-bind /dev /dev  keep every real device node (GPU, uinput, input,
+    #                         other hidraw) …
+    #   "${masks[@]}"         … except each puck node, shadowed by /dev/null
+    #   --die-with-parent     bwrap (and thus Steam) exits if the launcher dies
+    # We do NOT try to stop an already-running Steam: Steam's single-instance
+    # handling forwards our args to the existing instance, which is fine.
+    echo "hyprpad-steam: masking $(( ${#masks[@]} / 3 )) puck node(s); launching Steam masked" >&2
+    exec bwrap \
+        --bind / / \
+        --dev-bind /dev /dev \
+        "${masks[@]}" \
+        --die-with-parent \
+        "$steam_bin" "$@"
+fi
+
+# Fail-open path: no bwrap, or no puck node found — launch Steam unmasked.
+echo "hyprpad-steam: no mask applied (bwrap or puck absent); launching Steam unmasked" >&2
+exec "$steam_bin" "$@"

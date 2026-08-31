@@ -14,3 +14,4 @@ pub mod hypr;
 pub mod output;
 pub mod report;
 pub mod run;
+pub mod setup;
