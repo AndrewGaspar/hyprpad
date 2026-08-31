@@ -205,6 +205,58 @@ fn parse_button(s: &str) -> Result<report::Button, String> {
     Ok(b)
 }
 
+/// Trackpad-cursor smoothing/damping knobs (the `[cursor]` — or its `[damping]`
+/// alias — config section).
+///
+/// These configure [`crate::filter::PadDamper`], the per-pad One Euro Filter +
+/// moving-center hysteresis + sub-pixel accumulation that keeps a held-still
+/// finger from making the cursor swim (see `docs/research/pointer-damping.md`).
+/// The same damper (and hence these same knobs) feeds *both* the desktop cursor
+/// and the OSK on-screen cursors.
+///
+/// Defaults are the research doc's starting points (§4.1) — deliberately
+/// *tunable*, not tuned: the pad's real noise floor should be measured
+/// on-device and the margins sized to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorConfig {
+    /// Desktop-cursor gain, in compositor pixels per pad count (the old
+    /// `PAD_CURSOR_SENS`). Orthogonal to smoothing: it scales the *filtered*
+    /// difference. Default `0.06`.
+    pub sens: f64,
+    /// One Euro `min_cutoff` (Hz): the cutoff floor at zero speed, i.e. how hard
+    /// a still finger is smoothed. Lower = steadier at rest (more lag). Paper
+    /// default `1.0`.
+    pub one_euro_min_cutoff: f64,
+    /// One Euro `beta`: how fast the cutoff opens up with speed, i.e. how little
+    /// a fast flick lags. Higher = snappier flicks. Applied on the normalized
+    /// `[-1, 1]` signal so the literature value transfers. Default `1.0`.
+    pub one_euro_beta: f64,
+    /// One Euro `d_cutoff` (Hz): fixed cutoff for the derivative low-pass. Paper
+    /// default `1.0`.
+    pub one_euro_d_cutoff: f64,
+    /// Moving-center hysteresis margin, in normalized (`[-1, 1]`) units. Guards a
+    /// *hard zero* for a truly motionless finger. `~2–4 × σ_noise` counts,
+    /// normalized: default `0.0002` (≈ 6.5 counts out of ±32767). `0.0` disables.
+    pub hysteresis: f64,
+    /// Extra dead-band applied only to the desktop cursor's relative-delta path,
+    /// on top of `hysteresis`, so fine desktop pointing can sit steadier than the
+    /// OSK cursor. Normalized units. Default `0.0` (off).
+    pub deadzone: f64,
+}
+
+impl Default for CursorConfig {
+    fn default() -> CursorConfig {
+        CursorConfig {
+            sens: 0.06,
+            one_euro_min_cutoff: 1.0,
+            one_euro_beta: 1.0,
+            one_euro_d_cutoff: 1.0,
+            hysteresis: 0.0002,
+            deadzone: 0.0,
+        }
+    }
+}
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -215,6 +267,8 @@ pub struct Config {
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
     own_lizard: bool,
+    /// Trackpad-cursor smoothing knobs (`[cursor]`/`[damping]` section).
+    cursor: CursorConfig,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -235,6 +289,7 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Result<Config, String> {
         let mut bindings = HashMap::new();
         let mut own_lizard = false;
+        let mut cursor = CursorConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -273,10 +328,30 @@ impl Config {
                         }
                     }
                 }
+                // Trackpad-cursor smoothing/damping knobs. `[damping]` is an
+                // alias for `[cursor]`.
+                "cursor" | "damping" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = parse_f64(&unquote(v))
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    match key.as_str() {
+                        "sens" | "sensitivity" => cursor.sens = val,
+                        "one_euro_min_cutoff" | "min_cutoff" => cursor.one_euro_min_cutoff = val,
+                        "one_euro_beta" | "beta" => cursor.one_euro_beta = val,
+                        "one_euro_d_cutoff" | "d_cutoff" => cursor.one_euro_d_cutoff = val,
+                        "hysteresis" | "hysteresis_margin" => cursor.hysteresis = val,
+                        "deadzone" | "dead_zone" => cursor.deadzone = val,
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [{section}] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, own_lizard })
+        Ok(Config { bindings, own_lizard, cursor })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -347,6 +422,23 @@ impl Config {
     /// section; default `false`.
     pub fn own_lizard(&self) -> bool {
         self.own_lizard
+    }
+
+    /// The trackpad-cursor smoothing/damping knobs (`[cursor]`/`[damping]`
+    /// section); defaults from [`CursorConfig::default`].
+    pub fn cursor(&self) -> &CursorConfig {
+        &self.cursor
+    }
+}
+
+/// Parse a floating-point config value, rejecting non-finite results so a
+/// bad knob is a reported error rather than a NaN/inf that silently breaks the
+/// filter.
+fn parse_f64(s: &str) -> Result<f64, String> {
+    let t = s.trim();
+    match t.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(format!("expected a number, got '{t}'")),
     }
 }
 
@@ -708,6 +800,60 @@ mod tests {
         assert!(Config::from_toml_str("[daemon]\nnope = true\n")
             .unwrap_err()
             .contains("unknown [daemon] setting"));
+    }
+
+    #[test]
+    fn cursor_damping_defaults_and_parse() {
+        // Defaults match the research doc's starting points.
+        let d = Config::load_default();
+        assert_eq!(d.cursor(), &CursorConfig::default());
+        assert_eq!(d.cursor().sens, 0.06);
+        assert_eq!(d.cursor().one_euro_min_cutoff, 1.0);
+        assert_eq!(d.cursor().one_euro_beta, 1.0);
+        assert_eq!(d.cursor().one_euro_d_cutoff, 1.0);
+        assert_eq!(d.cursor().deadzone, 0.0);
+
+        // A `[cursor]` section overrides individual knobs; bindings still parse.
+        let c = Config::from_toml_str(
+            r#"
+[cursor]
+sens = 0.09
+one_euro_min_cutoff = 0.5
+one_euro_beta = 2.0
+one_euro_d_cutoff = 1.5
+hysteresis = 0.0005
+deadzone = 0.001
+
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(c.cursor().sens, 0.09);
+        assert_eq!(c.cursor().one_euro_min_cutoff, 0.5);
+        assert_eq!(c.cursor().one_euro_beta, 2.0);
+        assert_eq!(c.cursor().one_euro_d_cutoff, 1.5);
+        assert_eq!(c.cursor().hysteresis, 0.0005);
+        assert_eq!(c.cursor().deadzone, 0.001);
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // `[damping]` is an accepted alias, with the shorter key spellings.
+        let c = Config::from_toml_str("[damping]\nbeta = 3.0\nmin_cutoff = 0.8\n").unwrap();
+        assert_eq!(c.cursor().one_euro_beta, 3.0);
+        assert_eq!(c.cursor().one_euro_min_cutoff, 0.8);
+        // Unspecified knobs keep their defaults.
+        assert_eq!(c.cursor().sens, CursorConfig::default().sens);
+
+        // A bad value and an unknown key are reported, not silently ignored.
+        assert!(Config::from_toml_str("[cursor]\nsens = fast\n")
+            .unwrap_err()
+            .contains("expected a number"));
+        assert!(Config::from_toml_str("[cursor]\nwiggle = 1.0\n")
+            .unwrap_err()
+            .contains("unknown [cursor] setting"));
     }
 
     #[test]

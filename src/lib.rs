@@ -8,6 +8,7 @@
 
 pub mod arbitrate;
 pub mod config;
+pub mod filter;
 pub mod gesture;
 pub mod hidraw;
 pub mod hypr;
