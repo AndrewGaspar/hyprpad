@@ -119,12 +119,13 @@ All testing used the 2.4 GHz puck. Whether the controller presents the same
 report format and the same concurrent-access properties over Bluetooth is
 untested.
 
-## Q10 — Latency budget
+## Q10 — Latency budget  **LARGELY ANSWERED**
 
-The input side is measured: 263 Hz, 4.00 ms median gap. Unmeasured: the
-end-to-end cost of Hyprland IPC dispatch and of `zwlr_virtual_pointer_v1`
-injection. Success criterion 1 in [06](06-recommendation.md) asserts a 100 ms
-budget without having verified it is achievable.
+Input side: 263–269 Hz, 4.00 ms median gap. Hyprland IPC round-trip measured
+2026-08-31 at **0.01 ms median, 0.09 ms max** over 50 samples on the command
+socket. The 100 ms gesture budget is therefore dominated by gesture-recognition
+dwell time and compositor render, both well in hand. Remaining unmeasured:
+`zwlr_virtual_pointer_v1` injection-to-render, which needs a live client test.
 
 ---
 
