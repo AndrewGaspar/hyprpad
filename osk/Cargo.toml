@@ -1,0 +1,48 @@
+# hyprpad-osk — the controller-driven on-screen keyboard for Hyprland.
+#
+# This crate is deliberately STANDALONE: the empty `[workspace]` table below
+# makes `osk/` its own workspace root so it can never be pulled in as a member
+# of the parent `hyprpad` crate. Nothing here touches the parent's `src/` or
+# `Cargo.toml`.
+[package]
+name = "hyprpad-osk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Controller-driven on-screen keyboard for Hyprland (kickoff skeleton)"
+repository = "https://github.com/AndrewGaspar/hyprpad"
+
+# Own workspace root — keeps this crate out of any ancestor workspace.
+[workspace]
+
+[[bin]]
+name = "hyprpad-osk"
+path = "src/main.rs"
+
+[dependencies]
+# Renderer + layer-shell boilerplate. smithay-client-toolkit wraps the
+# zwlr_layer_shell_v1 dance (create/configure/ack) and gives us an shm
+# `SlotPool` we draw the keyboard into. We disable default features to avoid
+# pulling `calloop` (we run our own poll loop, so the control-channel fd and the
+# Wayland fd share one thread) and `xkbcommon` (the OSK takes no keyboard focus —
+# keyboard_interactivity = None — so it needs no seat/keymap handling).
+smithay-client-toolkit = { version = "0.19", default-features = false }
+
+# Bound to the same version SCTK re-exports so the proxy types unify. `dlopen`
+# binds libwayland-client.so at runtime (the proven pattern from the parent
+# crate's src/output.rs), so no link-time dev package is required.
+wayland-client = { version = "0.31", features = ["dlopen"] }
+
+# Pure-Rust embedded 8x8 bitmap glyphs for legible keycap labels — no
+# cairo/pango/fontconfig C dependency, fully self-contained. Theming/real font
+# rendering is deferred (osk-technology.md §4.7).
+font8x8 = "0.3"
+
+# The uinput keyboard is hand-rolled `libc` ioctls, copied/adapted from the
+# parent crate's src/output.rs (VirtualKeyboard). uinput + real evdev keycodes
+# is the validated injection backend that types correctly everywhere including
+# XWayland (docs/07-open-questions.md Q14).
+libc = "0.2"
+
+[profile.release]
+lto = true
