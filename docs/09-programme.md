@@ -103,7 +103,11 @@ All shippable as an `omarchy`-style config layer or PR:
 - `suppressevent activatefocus` on Steam windows (Lua form), plus
   `float_switch_override_focus = 0`, `cursor:no_warps = true`.
 - The validated PiP rule block ([research §5](research/gamescope-hyprland-integration.md)).
-- `Relogin=true` in SDDM autologin.
+- ~~`Relogin=true` in SDDM autologin~~ — **declined by the owner (2026-08-31)**:
+  it forecloses deliberate logout and user switching, and is a workaround
+  rather than a step toward controller-driven login (Qt6 has no gamepad
+  support, so a controller-capable greeter is not on any roadmap). Accepted
+  cost: an accidental logout needs the keyboard once.
 - Tier 0 Steam neutering: empty the Desktop Layout and Guide Chord Layout
   (removes X→keyboard today; superseded by W12 later).
 - `omarchy-voxtype-install` + PTT bindings; install `playerctl`.
