@@ -25,8 +25,17 @@ against.
 
 1. **Cold boot.** Power button on the tower. Omarchy's disk-decrypt prompt
    appears. A controller-optimised security code is entered using buttons — or,
-   if none is configured, a full QWERTY keyboard that does not betray specific
-   inputs to a bystander in the room.
+   if none is configured, a full QWERTY on-screen keyboard.
+
+   *Privacy bar (clarified 2026-08-31):* entry must be **semi-private** — a
+   bystander should need to watch the controller inputs closely to steal the
+   code, the same standard as watching fingers on a physical keyboard. A
+   randomised layout is **not** required. Note the two modes differ here: a
+   button-sequence code meets the bar natively (the screen shows only bullets;
+   the signal is on the controller). A d-pad-driven OSK leaks through the
+   *screen* — the visible cursor broadcasts each selection — so it needs modest
+   countermeasures (subdued cursor, no key-commit animation, bullets only), but
+   nothing exotic.
 2. **Seamless handoff.** Autologin carries the LUKS passphrase through SDDM. No
    flashing, no intermediate UI. The first thing seen after the passcode is the
    Steam Big Picture splash.
