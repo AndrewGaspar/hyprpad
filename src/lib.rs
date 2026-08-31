@@ -1,4 +1,4 @@
-//! hyprsc library crate.
+//! hyprpad library crate.
 //!
 //! The binary (`main.rs`) declares its own `mod report; mod hidraw;` for the
 //! passive monitor. This library re-exports the same low-level modules plus the

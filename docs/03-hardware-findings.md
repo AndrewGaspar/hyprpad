@@ -181,7 +181,7 @@ Stick idle offsets are small but nonzero (±~400 counts) — apply a deadzone.
 contact and during pickup; individual assignment (left/right grip sense vs
 stick capacitive touch) is tentative — they were never isolated one at a time.
 Functionally they matter as a class ("hands on controller"), which is enough
-for hyprsc.
+for hyprpad.
 
 ### Lizard-mode output map (Steam closed) — the initramfs vocabulary
 
@@ -239,7 +239,7 @@ format, same rate as with Steam running.
 Lizard mode therefore governs only what the *evdev keyboard/mouse* interfaces
 emit; the vendor gamepad report is always on. Consequences:
 
-- hyprsc behaves identically pre-Steam, post-Steam, at a lock screen, in a
+- hyprpad behaves identically pre-Steam, post-Steam, at a lock screen, in a
   cold-boot userspace — no mode switching, no Steam dependency, no
   initialization handshake needed to read input.
 - The passive tap needs no awareness of Steam's lifecycle at all; Steam starting

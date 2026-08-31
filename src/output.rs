@@ -260,7 +260,7 @@ impl VirtualKeyboard {
                 product: 0x5678,
                 version: 1,
             };
-            let name = b"hyprsc virtual keyboard";
+            let name = b"hyprpad virtual keyboard";
             for (i, &b) in name.iter().enumerate() {
                 setup.name[i] = b as libc::c_char;
             }
@@ -331,7 +331,7 @@ impl VirtualKeyboard {
             )
         };
         if let Err(e) = self.file.write_all(bytes) {
-            eprintln!("hyprsc: uinput write failed: {e}");
+            eprintln!("hyprpad: uinput write failed: {e}");
         }
     }
 }

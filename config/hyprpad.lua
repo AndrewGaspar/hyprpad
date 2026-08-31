@@ -1,5 +1,5 @@
--- hyprsc living-room programme: compositor-side configuration (W1).
--- Research basis: hyprsc repo docs/research/gamescope-hyprland-integration.md
+-- hyprpad living-room programme: compositor-side configuration (W1).
+-- Research basis: hyprpad repo docs/research/gamescope-hyprland-integration.md
 -- (rule block validated `config ok` against this exact Hyprland build).
 
 hl.config({
@@ -15,7 +15,7 @@ hl.config({
     -- Don't let a cursor over a PiP/notification break fullscreen VRR.
     no_break_fs_vrr = 2,
 
-    -- Deferred until hyprsc does programmatic focus-restore (the focus
+    -- Deferred until hyprpad does programmatic focus-restore (the focus
     -- dispatcher warps the cursor into the target window; this suppresses
     -- it). Changes daily cursor behaviour, so left off until needed.
     -- no_warps = true,

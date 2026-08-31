@@ -194,7 +194,7 @@ targets on this stack, wholesale.** A kernel-level uinput keyboard with real
 evdev keycodes (`KEY_H`…) works perfectly into the same field
 (`/dev/uinput` is user-accessible via Steam's udev `uaccess` rule).
 
-**Design consequence (OSK/hyprsc injection layer):** per-target backends —
+**Design consequence (OSK/hyprpad injection layer):** per-target backends —
 native Wayland → virtual-keyboard-v1 with keymap swap (full Unicode);
 XWayland → uinput real keycodes (ASCII, layout-bound); nested gamescope →
 `gamescope_input_method` (full Unicode). Unicode-into-XWayland remains open:

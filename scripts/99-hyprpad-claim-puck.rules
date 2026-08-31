@@ -1,25 +1,25 @@
-# W12 reference rule — hand the 2026 Steam Controller puck to hyprsc, not the
+# W12 reference rule — hand the 2026 Steam Controller puck to hyprpad, not the
 # session user. Ordered 99- so it runs after Steam's 60-steam-input.rules (which
 # adds MODE=0660 + TAG+="uaccess") and after 70-uaccess.rules.
 #
 # Effect: strip the uaccess tag (so logind stops ACL-granting the node to the
 # active-session user — which is how BOTH Steam and a session-user process get
-# access today), and assign the node to a dedicated `hyprsc` group. Only a
-# process in that group (the privileged hyprsc daemon) can then open it; Steam,
+# access today), and assign the node to a dedicated `hyprpad` group. Only a
+# process in that group (the privileged hyprpad daemon) can then open it; Steam,
 # running as the ordinary session user, cannot — and instead sees the virtual
-# controller hyprsc emits.
+# controller hyprpad emits.
 #
-# Requires: a `hyprsc` group, and hyprsc running as a member of it (system
+# Requires: a `hyprpad` group, and hyprpad running as a member of it (system
 # daemon or setgid helper) — NOT as the plain session user, because the session
 # user is exactly who must be denied.
 #
-# INSTALL:  sudo groupadd -r hyprsc
-#           sudo cp 99-hyprsc-claim-puck.rules /etc/udev/rules.d/
+# INSTALL:  sudo groupadd -r hyprpad
+#           sudo cp 99-hyprpad-claim-puck.rules /etc/udev/rules.d/
 #           sudo udevadm control --reload
 #           sudo udevadm trigger --subsystem-match=hidraw   # or replug the puck
-# REVERT:   sudo rm /etc/udev/rules.d/99-hyprsc-claim-puck.rules && \
+# REVERT:   sudo rm /etc/udev/rules.d/99-hyprpad-claim-puck.rules && \
 #           sudo udevadm control --reload && (replug puck)
 #
 # Match both the hidraw nodes and the parent so all interface slots are covered.
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", \
-  TAG-="uaccess", GROUP="hyprsc", MODE="0660"
+  TAG-="uaccess", GROUP="hyprpad", MODE="0660"

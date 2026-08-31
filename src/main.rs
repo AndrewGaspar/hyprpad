@@ -1,15 +1,15 @@
-use hyprsc::report::Frame;
-use hyprsc::{hidraw, run};
+use hyprpad::report::Frame;
+use hyprpad::{hidraw, run};
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("run") => run::run().unwrap_or_else(|e| { eprintln!("hyprsc: {e}"); std::process::exit(1); }),
+        Some("run") => run::run().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
         Some("monitor") => monitor(),
         _ => {
-            eprintln!("usage: hyprsc <run|monitor>");
+            eprintln!("usage: hyprpad <run|monitor>");
             eprintln!();
             eprintln!("  run       drive Hyprland from the controller (gestures -> dispatch)");
             eprintln!("  monitor   decode and print controller events (passive; Steam-safe)");

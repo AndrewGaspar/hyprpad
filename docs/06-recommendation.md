@@ -53,18 +53,18 @@ while `controller_action` (the on-screen keyboard) and `xinput_button` (Steam's
 virtual pad) do land
 ([03](03-hardware-findings.md#not-all-of-these-reach-a-hyprland-desktop)). Tier 0
 is therefore cheaper *and* less complete than it looks — but the bindings it
-removes are precisely the ones that currently get through. hyprsc passive-taps and owns the desktop.
+removes are precisely the ones that currently get through. hyprpad passive-taps and owns the desktop.
 
 **Limits, stated plainly.** This is behavioural, not structural. Steam still owns
 the device, so a client update or a config resync can reintroduce behaviour
 without warning. Emptying the Desktop Layout also means the controller does
 nothing *in* the Steam client window when it is focused, which is a regression
-unless hyprsc covers that case. And it is not focus routing — it is
+unless hyprpad covers that case. And it is not focus routing — it is
 globally-nothing, which happens to look the same from the desktop.
 
 ## Tier 1 — the structural answer
 
-hyprsc owns the physical device; Steam receives a virtual controller that hyprsc
+hyprpad owns the physical device; Steam receives a virtual controller that hyprpad
 feeds **only when a Steam window or Steam game holds focus**.
 
 ```
@@ -72,7 +72,7 @@ feeds **only when a Steam window or Steam game holds focus**.
         │  exclusively owned — Steam cannot open it
         ▼
   ┌──────────────────────────────────────────────┐
-  │  hyprsc (privileged)                         │
+  │  hyprpad (privileged)                         │
   │    decode 0x42                               │
   │    ── desktop focused ─▶ Hyprland IPC        │
   │                          virtual pointer     │
@@ -94,8 +94,8 @@ Three candidate mechanisms, none yet verified on this machine:
   restricting the puck to root or a dedicated group. Note `uaccess` is applied by
   logind from the tag, and the udev man page documents `TAG` as a match key and
   `TAG+=` as an assignment — **it does not document `TAG-=`**, so clearing an
-  inherited tag needs testing rather than assuming. This implies hyprsc runs as a
-  system daemon, since any permission that lets a user-session hyprsc open the
+  inherited tag needs testing rather than assuming. This implies hyprpad runs as a
+  system daemon, since any permission that lets a user-session hyprpad open the
   node also lets user-session Steam open it.
 - **Mount namespace.** Launch Steam under `bwrap` with the puck's nodes masked.
   Avoids root, but `hidraw` numbering is dynamic and changes on replug, so the
@@ -125,7 +125,7 @@ A clone would have to survive a code path real hardware does not.
 
 ### The upside nobody should overlook
 
-Once hyprsc owns the trackpads, it drives `zwlr_virtual_pointer_v1` directly —
+Once hyprpad owns the trackpads, it drives `zwlr_virtual_pointer_v1` directly —
 which produces a **working desktop cursor**, something Steam cannot currently
 deliver on Hyprland at all because its `XTEST` output never escapes XWayland
 ([03](03-hardware-findings.md#portal-and-protocol-support)). Tier 1 does not just
@@ -134,7 +134,7 @@ satisfy the focus-routing requirement; it fixes the trackpad.
 ### Prefer InputPlumber if it can be made to fit
 
 InputPlumber already solves device ownership as a root daemon, ships a
-`deck-uhid` target, and has DBus intercept mode. hyprsc would shrink to a DBus
+`deck-uhid` target, and has DBus intercept mode. hyprpad would shrink to a DBus
 client plus a Hyprland IPC bridge.
 
 **Unverified and important:** whether InputPlumber can prevent Steam from opening

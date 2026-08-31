@@ -338,10 +338,10 @@ mod tests {
     #[test]
     fn parses_active_window() {
         assert_eq!(
-            parse_event("activewindow>>foot,ajg@framework:~/code/hyprsc"),
+            parse_event("activewindow>>foot,ajg@framework:~/code/hyprpad"),
             Some(HyprEvent::ActiveWindow {
                 class: "foot".into(),
-                title: "ajg@framework:~/code/hyprsc".into(),
+                title: "ajg@framework:~/code/hyprpad".into(),
             })
         );
     }
@@ -389,12 +389,12 @@ mod tests {
     #[test]
     fn parses_open_window() {
         assert_eq!(
-            parse_event("openwindow>>55d89d429360,7,foot,hyprsc-focus-probe"),
+            parse_event("openwindow>>55d89d429360,7,foot,hyprpad-focus-probe"),
             Some(HyprEvent::OpenWindow {
                 address: "0x55d89d429360".into(),
                 workspace: "7".into(),
                 class: "foot".into(),
-                title: "hyprsc-focus-probe".into(),
+                title: "hyprpad-focus-probe".into(),
             })
         );
     }

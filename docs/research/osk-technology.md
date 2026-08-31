@@ -175,7 +175,7 @@ hidden.
   `aboveLockscreen && ...aboveLock() != 2` → skip).
 
 `above_lock = 2` is exactly what a lock-screen OSK needs. **INFERRED:** since
-the OSK is driven entirely over IPC by the hyprsc daemon and needs no Wayland
+the OSK is driven entirely over IPC by the hyprpad daemon and needs no Wayland
 pointer input, `above_lock = 1` may suffice; `2` only if touch/pointer on the
 OSK is wanted.
 
@@ -883,7 +883,7 @@ keybinding docs included.
 
 **Answer: yes, push-to-talk dictation into the focused app is trivially
 triggerable programmatically** — `voxtype record start` / `record stop` from
-the hyprsc daemon; the state file drives a mic indicator on the OSK; and
+the hyprpad daemon; the state file drives a mic indicator on the OSK; and
 because its output path is the same virtual-keyboard protocol as the OSK's, it
 inherits the same XWayland and gamescope limitations (§3.1) — dictation into a
 gamescope-hosted game would need routing through the OSK's
@@ -983,7 +983,7 @@ special-case it.
    `keyboard_interactivity = NONE`, virtual-keyboard-primary with IM-v2
    strictly optional, static evdev-named base keymaps, exclusive-zone
    behaviour users already prefer on Hyprland. Its ~2 kLOC of legible C makes
-   replacing the input front-end wholesale — signals → hyprsc IPC;
+   replacing the input front-end wholesale — signals → hyprpad IPC;
    touch/pointer → dual absolute cursors + d-pad focus per §4.9 — a rewrite of
    the *input* layer against a *correct* output layer. Patch out its known
    defects while there: keycode-127 Unicode fallback (use gamescope's

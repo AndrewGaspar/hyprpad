@@ -34,8 +34,8 @@ pub fn run() -> std::io::Result<()> {
     let config = match Config::load() {
         Ok(c) => {
             match Config::config_path() {
-                Some(p) if p.exists() => eprintln!("hyprsc: config loaded from {}", p.display()),
-                _ => eprintln!("hyprsc: using built-in default config"),
+                Some(p) if p.exists() => eprintln!("hyprpad: config loaded from {}", p.display()),
+                _ => eprintln!("hyprpad: using built-in default config"),
             }
             c
         }
@@ -44,7 +44,7 @@ pub fn run() -> std::io::Result<()> {
             Config::load_default()
         }
     };
-    eprintln!("hyprsc: {} controller node(s), Hyprland IPC connected", nodes.len());
+    eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
 
     // Merge both event sources into one channel so the loop stays single-owner.
     let (tx, rx) = mpsc::channel::<Input>();
@@ -80,7 +80,7 @@ pub fn run() -> std::io::Result<()> {
     // switching still work.
     let mut pointer = match VirtualPointer::new() {
         Ok(p) => {
-            eprintln!("hyprsc: virtual pointer ready (right trackpad drives the cursor)");
+            eprintln!("hyprpad: virtual pointer ready (right trackpad drives the cursor)");
             Some(p)
         }
         Err(e) => {

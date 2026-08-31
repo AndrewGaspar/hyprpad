@@ -1,4 +1,4 @@
-//! Exercise `hyprsc::hypr` against the live compositor.
+//! Exercise `hyprpad::hypr` against the live compositor.
 //!
 //! Not part of `cargo test` (it needs a running Hyprland and it mutates global
 //! state — workspaces, fullscreen). Run it by hand:
@@ -11,7 +11,7 @@
 //! checking the state actually changed, and prints a few parsed events from
 //! the live stream.
 
-use hyprsc::hypr::{self, Hypr, HyprEvent};
+use hyprpad::hypr::{self, Hypr, HyprEvent};
 use std::time::Duration;
 
 /// Pull the `"id"` out of an `activeworkspace` JSON reply without a JSON crate.
@@ -108,7 +108,7 @@ fn main() {
     // Nudge the compositor so a spread of event kinds flow, then drain them:
     // a titled throwaway window (OpenWindow/CloseWindow), fullscreen toggles
     // (Fullscreen), and workspace hops (Workspace).
-    h.spawn("foot --title hyprsc-evt-probe sh -c 'sleep 1'");
+    h.spawn("foot --title hyprpad-evt-probe sh -c 'sleep 1'");
     h.toggle_fullscreen().unwrap();
     h.toggle_fullscreen().unwrap();
     h.workspace_relative(1).unwrap();

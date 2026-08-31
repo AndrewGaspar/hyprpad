@@ -3,7 +3,7 @@
 import time
 from evdev import UInput, ecodes as e
 KEYS = [e.KEY_H, e.KEY_E, e.KEY_L, e.KEY_L, e.KEY_O]
-ui = UInput({e.EV_KEY: KEYS}, name="hyprsc-test-kbd")
+ui = UInput({e.EV_KEY: KEYS}, name="hyprpad-test-kbd")
 time.sleep(1.0)   # let Hyprland/libinput pick the device up
 for k in KEYS:
     ui.write(e.EV_KEY, k, 1); ui.syn(); time.sleep(0.03)

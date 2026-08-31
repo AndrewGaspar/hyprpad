@@ -1,4 +1,4 @@
-//! Exercise `hyprsc::output::VirtualKeyboard` end-to-end against a live app.
+//! Exercise `hyprpad::output::VirtualKeyboard` end-to-end against a live app.
 //!
 //! Not part of `cargo test` (it needs a running Hyprland, `/dev/uinput`, and a
 //! terminal emulator). Run it by hand:
@@ -12,7 +12,7 @@
 //! and reports whether the text arrived — proving real evdev keycodes reach a
 //! focused, newly-created client.
 
-use hyprsc::output::VirtualKeyboard;
+use hyprpad::output::VirtualKeyboard;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread::sleep;
@@ -22,7 +22,7 @@ fn main() {
     let out: PathBuf = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("hyprsc-typed.txt"));
+        .unwrap_or_else(|| std::env::temp_dir().join("hyprpad-typed.txt"));
     let text = "hello world 123!\n";
     let _ = std::fs::remove_file(&out);
 

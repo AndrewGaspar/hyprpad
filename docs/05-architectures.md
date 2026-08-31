@@ -51,7 +51,7 @@ drives the desktop through Hyprland's own interfaces.
                         │                      │
                         ▼                      ▼
                  ┌────────────┐         ┌─────────────┐
-                 │  hyprsc    │         │    Steam    │  unaffected
+                 │  hyprpad    │         │    Steam    │  unaffected
                  └─────┬──────┘         └─────────────┘
                        │
         ┌──────────────┼───────────────────┐
@@ -120,7 +120,7 @@ The classic remapper shape: `EVIOCGRAB` the gamepad's evdev node, filter guide
 chords out, re-emit the remainder through `uinput`.
 
 ```
-/dev/input/eventN ──EVIOCGRAB──▶ hyprsc ──uinput──▶ virtual pad ──▶ Steam, games
+/dev/input/eventN ──EVIOCGRAB──▶ hyprpad ──uinput──▶ virtual pad ──▶ Steam, games
                                     │
                                     └──▶ Hyprland IPC
 ```
@@ -150,11 +150,11 @@ in B covers it better.
 Take the device away from Steam, and hand Steam a synthetic replacement.
 
 ```
-udev: strip uaccess from 28de:1304  ──▶  only hyprsc can open the real device
+udev: strip uaccess from 28de:1304  ──▶  only hyprpad can open the real device
                     │
                     ▼
      ┌────────────────────────────────┐
-     │  hyprsc                        │
+     │  hyprpad                        │
      │   decode 0x42                  │
      │   consume guide chords         │
      │   re-encode remainder ─────────┼──▶ uhid virtual Steam Controller
@@ -203,7 +203,7 @@ shared with B and should be proven there first. See
 
 Write a 2026 Steam Controller capability map for InputPlumber, let it own the
 device and emit a target, and use its DBus **intercept mode** to route guide
-chords to a small hyprsc client that talks to Hyprland.
+chords to a small hyprpad client that talks to Hyprland.
 
 **For.** Reuses a maintained, packaged daemon that is already part of SteamOS.
 Device compositing, target emulation and intercept are solved problems there.

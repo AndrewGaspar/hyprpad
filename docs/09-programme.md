@@ -16,7 +16,7 @@ Sizing legend — focused engineer-weeks at shippable quality:
 |---|---|---|---|---|
 | W0 | Validation experiment battery | S | experiments | all |
 | W1 | Config-land quick wins | S | config | 4, 7, 10, 12 |
-| W2 | hyprsc core: decoder, gesture engine, IPC | **L** | new daemon | 4, 8, 10, 11 |
+| W2 | hyprpad core: decoder, gesture engine, IPC | **L** | new daemon | 4, 8, 10, 11 |
 | W3 | Screenshot / voice / launcher chords | S | glue on W2 | 5, 6, 11 |
 | W4 | Living-room classifier + mode switch | M | small software | 3, 9 |
 | W5 | BPM workspace via nested gamescope | M | integration | 2, 3, 8 |
@@ -43,7 +43,7 @@ anywhere on Linux to borrow** ([osk-technology.md §5.1](research/osk-technology
    always on, Steam-independent, guide bit confirmed, concurrent hidraw reads
    proven harmless ([03](03-hardware-findings.md)).
 2. **This Hyprland build is Lua-only.** Classic `hyprctl dispatch`/`keyword`
-   are dead; hyprsc must speak `hl.dsp.*` dispatches. Every online recipe
+   are dead; hyprpad must speak `hl.dsp.*` dispatches. Every online recipe
    needs translation ([gamescope-hyprland-integration.md §0](research/gamescope-hyprland-integration.md)).
 3. **BPM belongs inside nested gamescope.** Bare-XWayland BPM inherits open
    bug #8640 (controller drives an invisible overlay) rooted in
@@ -114,7 +114,7 @@ All shippable as an `omarchy`-style config layer or PR:
 - Bind a key/chord to `omarchy-capture-screenshot fullscreen slurp`
   (already does disk+clipboard).
 
-### W2 — hyprsc core (L) — the daemon everything rides on
+### W2 — hyprpad core (L) — the daemon everything rides on
 
 Rust daemon, per [06](06-recommendation.md) phase 1–3, now with
 research-informed specifics:
@@ -180,7 +180,7 @@ minimize — **not** alpha-0 (scanout is already forfeit with a float; fine).
 
 Clone `omarchy.lock`, add `authenticate(password)` IPC calling
 `submitPassword()`; add `libpam_pwdfile` line (hashed second secret) to
-`omarchy-lock-password`; hyprsc lock-mode: read button code, map to the
+`omarchy-lock-password`; hyprpad lock-mode: read button code, map to the
 secret, call authenticate. Bonus channel: `locked = true` binds already work
 from a virtual keyboard for media/volume while locked. L=6 code ≈ 21.5 bits
 against `deny=10 unlock_time=120` — adequate for the house-guest threat
@@ -201,7 +201,7 @@ Per the [full spec](research/osk-technology.md): fork wvkbd (or build new if
 GPL-3.0/renderer chafes); OVERLAY layer surface destroyed on dismiss;
 `above_lock` for the lock screen; dual-backend injection
 (virtual-keyboard-v1 with the keymap-swap recipe + interpret-bearing
-modifier; `gamescope_input_method` for nested); driven by hyprsc over IPC
+modifier; `gamescope_input_method` for nested); driven by hyprpad over IPC
 (absolute dual-trackpad cursors per the extracted Deck spec — 55%/55%
 regions, click-down commit, per-key-crossing haptic tick, concurrent
 modality, the full button map); CSS-custom-property-style theming; voxtype
@@ -224,7 +224,7 @@ after W9 is suspend/resume, making cold boot rare.
 
 The [06 Tier 1](06-recommendation.md#tier-1--the-structural-answer) design:
 deny Steam the physical device (udev mechanism still to be verified — the
-`TAG-=`/uaccess question stands), hyprsc feeds a virtual controller only when
+`TAG-=`/uaccess question stands), hyprpad feeds a virtual controller only when
 Steam/game focused; bare-guide passthrough synthesized on release; Steam's
 chords rendered inert by construction. Target choice per the 06 table
 (uinput generic vs `deck-uhid`-class clone). This completes the input
@@ -238,9 +238,9 @@ clone imitates it.
 Constraints to carry now: **audit every always-on daemon for GPU/wakeup pins
 on battery hardware** — voxtype's Vulkan mode held a persistent NVIDIA
 context from the idle daemon, pinning the dGPU active (caught and reverted to
-CPU on the laptop, 2026-08-31); hyprsc itself must never hold a GPU or
+CPU on the laptop, 2026-08-31); hyprpad itself must never hold a GPU or
 busy-poll. no tower-specific assumptions in W4's classifier
-(internal-vs-external connector is the Deck signal); hyprsc's evdev path
+(internal-vs-external connector is the Deck signal); hyprpad's evdev path
 must handle the Deck's built-in controller (hid-steam, kernel ≥7.3); W11's
 posture decision diverges (portable device → keep strong secrets); embedded
 gamescope questions return on AMD where they're actually supported.
@@ -280,7 +280,7 @@ contract). W11 floats freely.
    invalidate Tier 0/W12 assumptions. Mitigation: passive-tap core is
    Steam-independent by design; revisit W12 at each client beta.
 5. **Fork drift.** HypXRland tracks Hyprland 0.56 with Lua config; upstream
-   is dropping hyprlang. hyprsc should target the Lua dispatch surface and
+   is dropping hyprlang. hyprpad should target the Lua dispatch surface and
    pin protocol usage to stable protocols only.
 
 ## Upstreaming targets (shippable-project dividends)

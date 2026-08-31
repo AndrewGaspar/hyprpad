@@ -201,7 +201,7 @@ pub struct Config {
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
 /// [`Config::load_default`]; also exercises the parser round-trip.
 pub const DEFAULT_TOML: &str = r#"
-# hyprsc default gesture bindings (docs/08-living-room-vision.md).
+# hyprpad default gesture bindings (docs/08-living-room-vision.md).
 [bindings]
 "guide+r1" = "workspace +1"          # workspace right
 "guide+l1" = "workspace -1"          # workspace left
@@ -246,15 +246,15 @@ impl Config {
     }
 
     /// The path the user config is read from:
-    /// `$XDG_CONFIG_HOME/hyprsc/config.toml`, or `~/.config/hyprsc/config.toml`
+    /// `$XDG_CONFIG_HOME/hyprpad/config.toml`, or `~/.config/hyprpad/config.toml`
     /// when `XDG_CONFIG_HOME` is unset. Returns `None` only if neither
     /// `XDG_CONFIG_HOME` nor `HOME` is set.
     pub fn config_path() -> Option<std::path::PathBuf> {
         if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Some(std::path::PathBuf::from(dir).join("hyprsc/config.toml"));
+            return Some(std::path::PathBuf::from(dir).join("hyprpad/config.toml"));
         }
         let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-        Some(std::path::PathBuf::from(home).join(".config/hyprsc/config.toml"))
+        Some(std::path::PathBuf::from(home).join(".config/hyprpad/config.toml"))
     }
 
     /// Load the user config from [`config_path`](Self::config_path), falling
@@ -583,8 +583,8 @@ mod tests {
         // file. No other test touches these vars, so the process-wide mutation
         // is safe here. Save/restore to leave the environment as we found it.
         let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let dir = std::env::temp_dir().join(format!("hyprsc-cfg-test-{}", std::process::id()));
-        let cfg_dir = dir.join("hyprsc");
+        let dir = std::env::temp_dir().join(format!("hyprpad-cfg-test-{}", std::process::id()));
+        let cfg_dir = dir.join("hyprpad");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 

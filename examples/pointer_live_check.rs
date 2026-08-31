@@ -1,4 +1,4 @@
-//! Exercise `hyprsc::output::VirtualPointer` against the live compositor.
+//! Exercise `hyprpad::output::VirtualPointer` against the live compositor.
 //!
 //! Not part of `cargo test` (it needs a running Hyprland and it moves the real
 //! cursor). Run it by hand:
@@ -11,7 +11,7 @@
 //! reports the observed change so a human (or the launcher) can confirm the
 //! cursor really moved.
 
-use hyprsc::output::{PointerButton, VirtualPointer};
+use hyprpad::output::{PointerButton, VirtualPointer};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;

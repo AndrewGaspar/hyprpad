@@ -1,4 +1,4 @@
-# hyprsc — driving Hyprland with a game controller
+# hyprpad — driving Hyprland with a game controller
 
 Research and architecture notes for controlling a [Hyprland](https://hypr.land)
 desktop from a game controller — primarily the 2026 Steam Controller, ideally any
@@ -41,7 +41,7 @@ IPC. Together these mean the passive design does not have to give anything up.
 
 ## Recommendation in one paragraph
 
-Build **hyprsc** as a passive-tap userspace daemon: read the controller
+Build **hyprpad** as a passive-tap userspace daemon: read the controller
 read-only (`hidraw` for the Steam Controller, `evdev` for everything else),
 run a small mode machine over guide-chords and gestures, and drive the desktop
 through Hyprland's IPC socket plus the `zwlr_virtual_pointer_v1` /

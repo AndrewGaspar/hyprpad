@@ -137,7 +137,7 @@ account    include                     system-local-login
    `{"locked":true,...,"sessionLocked":true,"secure":true,...}`.
 3. **`omarchy-hyprland-session-locked`** (exit code).
 
-**Critical for hyprsc: both `hyprctl` and the Quickshell IPC socket answer
+**Critical for hyprpad: both `hyprctl` and the Quickshell IPC socket answer
 normally while the session is locked** — verified live during the self-lock.
 The IPC socket is `/run/user/1000/quickshell/by-id/*/ipc.sock` (mode
 `srwxr-xr-x`, inside `0700` `/run/user/1000`).
@@ -170,7 +170,7 @@ evidence.
    `src/managers/input/InputManager.cpp:1642` `onKeyboardKey()` handles every
    keyboard. The only virtual-specific gate is `shouldIgnoreVirtualKeyboard()`
    (line 1763), which returns true **only** when the virtual keyboard's
-   `wl_client` is the active input-method grab client. An hyprsc keyboard is
+   `wl_client` is the active input-method grab client. An hyprpad keyboard is
    not the IME grab client, so events flow through
    `g_pKeybindManager->onKeyEvent(...)` then
    `g_pSeatManager->sendKeyboardKey(...)` — identical to physical. **There is
@@ -198,7 +198,7 @@ Every Wayland on-screen keyboard (wvkbd, sysboard, squeekboard) is a
 implementer states the mechanism in
 [PR #9793](https://github.com/hyprwm/Hyprland/pull/9793): the `abovelock`
 layer rule grants only *pointer* focus, "keyboard focus will stay on the
-lockscreen." **Corollary for hyprsc: a headless daemon needs no layer surface
+lockscreen." **Corollary for hyprpad: a headless daemon needs no layer surface
 and no rendering — `abovelock` exists only so a human can see/click an OSK.**
 The recurring "virtual keyboards don't work on lock screens" claim is always
 about *visibility*, never input routing. uinput injection (ydotool) is even
@@ -220,7 +220,7 @@ workaround.
 - **A virtual keyboard alone satisfies the seat's keyboard-capability
   requirement** (`anyHidHasCap(HID_INPUT_CAPABILITY_KEYBOARD)`), so a **tower
   with no physical keyboard** still gets working lock-surface focus once
-  hyprsc creates its virtual keyboard.
+  hyprpad creates its virtual keyboard.
 - **`input:virtualkeyboard` knobs that will bite a synthetic-input daemon:**
   `release_pressed_on_close` (default false — a daemon dying mid-keystroke
   leaves the key logically held), `share_states` (default 2 — merges modifier
@@ -246,7 +246,7 @@ killing/replacing it. Note `misc:allow_session_lock_restore` is **on** here
   definition — `hyprctl devices` lists
   `valve-software-steam-controller-puck-keyboard{,-1,-2,-3}`; but lizard mode
   is arrows/Enter/Esc, not alphanumeric). Works, but stores the login
-  password in hyprsc's memory.
+  password in hyprpad's memory.
 - **Path B — extend the lock plugin over IPC (RECOMMENDED).**
   `omarchy plugin clone omarchy.lock` copies the plugin to
   `~/.config/omarchy/plugins/<user>.lock/`, rewrites the id, sets
@@ -316,7 +316,7 @@ prior art exists for gamepad-driven PAM — this would be first.
 ## §4 — Suspend and wake-from-suspend (summary; full detail in [pam-auth-usb-wake.md](pam-auth-usb-wake.md))
 
 **Suspend is trivial and unprivileged:** `busctl ... CanSuspend` → `"yes"`;
-`systemctl suspend` from hyprsc just works (polkit grants suspend to an
+`systemctl suspend` from hyprpad just works (polkit grants suspend to an
 active local session).
 
 **Wake: the whole chain is armed here and the puck advertises the
@@ -375,7 +375,7 @@ Not a fragile `before_sleep_cmd` but a dedicated inhibitor-based service:
   the freshly-woken unlock screen (`lock/Service.qml:420` region).
 
 **So the session does come back locked, and the mechanism waits for `secure`
-rather than hoping.** hyprsc should `systemctl suspend` and let this run — do
+rather than hoping.** hyprpad should `systemctl suspend` and let this run — do
 not lock manually first.
 
 ## §6 — SDDM with a gamepad (verdict: "never log out, only lock")
@@ -518,7 +518,7 @@ live injection (deliberately not run against the live lock). **60-second
 confirmation test:** with the screen locked, `wtype -k Escape` and watch the
 backlight return (`LockView`'s `Keys.onPressed` → `wakeRequested()`); Escape
 clears the field, costs nothing, cannot trip faillock. Caveat: this path
-stores the login password in hyprsc's memory — prefer (b).
+stores the login password in hyprpad's memory — prefer (b).
 
 **(b) Custom / extended lock client — FEASIBLE, AND THE BEST OPTION.** Don't
 write an ext-session-lock client from scratch (waylock's `src/Lock.zig`,

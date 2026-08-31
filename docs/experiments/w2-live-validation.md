@@ -1,13 +1,13 @@
 # W2 — live end-to-end validation (2026-08-31)
 
-The full daemon (`hyprsc run`) driven by hand against the real controller, with
+The full daemon (`hyprpad run`) driven by hand against the real controller, with
 Steam running and holding the same hidraw nodes. All output paths confirmed.
 
 ## Trackpad cursor (`zwlr_virtual_pointer_v1`)
 Right-pad swipes moved the compositor cursor across the whole screen — 12
 distinct sampled positions spanning `396,1081` … `1343,1023` during a 28 s run.
 This is the affordance Steam cannot provide on Wayland (its XTEST cursor output
-never escapes XWayland); hyprsc delivers it from a passive tap. Right-pad click
+never escapes XWayland); hyprpad delivers it from a passive tap. Right-pad click
 and full-R2 map to left button.
 
 ## Guide handoff (pad ↔ gesture coexistence)
