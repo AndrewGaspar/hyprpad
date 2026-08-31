@@ -13,7 +13,7 @@
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 
-use crate::layout::{Key, PlacedKey};
+use crate::layout::{Key, KeyRole, PlacedKey, ShiftState};
 use crate::theme::{Color, Theme};
 
 /// Which input source a highlight comes from — mirrors osk-technology.md §4.5's
@@ -41,6 +41,25 @@ impl HighlightKind {
 pub struct Highlight {
     pub key: usize,
     pub kind: HighlightKind,
+}
+
+/// A trackpad cursor sprite to draw on top of the keys, at a panel-local pixel
+/// position. `kind` selects the per-pad body colour (osk-technology.md §4.1 —
+/// the Deck draws one ~30x30 pointer per active pad). Two can be live at once.
+#[derive(Clone, Copy, Debug)]
+pub struct Cursor {
+    pub x: f32,
+    pub y: f32,
+    pub kind: HighlightKind,
+}
+
+/// The live chrome state the draw path needs beyond the keys themselves: the
+/// shift/caps level (drives legends + the active indicator) and the current
+/// reflow policy (drives the `Push`/`Float` legend on the display-toggle key).
+#[derive(Clone, Copy, Debug)]
+pub struct Chrome {
+    pub shift: ShiftState,
+    pub reflow: bool,
 }
 
 /// A mutable view over an shm buffer as ARGB8888 pixels.
@@ -113,6 +132,34 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Fill a disc of radius `r` (px) centred at `(cx, cy)`.
+    fn fill_circle(&mut self, cx: i32, cy: i32, r: i32, c: Color) {
+        if r <= 0 {
+            return;
+        }
+        let r2 = r * r;
+        for yy in -r..=r {
+            for xx in -r..=r {
+                if xx * xx + yy * yy <= r2 {
+                    self.put(cx + xx, cy + yy, c);
+                }
+            }
+        }
+    }
+
+    /// Draw a per-pad trackpad **cursor sprite** centred at `(cx, cy)`: a
+    /// contrasting halo disc (`cursor_stroke`) with the pad's colour on top,
+    /// leaving a rim so it stays visible over a same-hued hover highlight
+    /// (osk-technology.md §4.1). Sized from `geom.cursor_size`; both colours come
+    /// from the [`Theme`], nothing hardcoded.
+    fn draw_cursor(&mut self, cx: i32, cy: i32, theme: &Theme, kind: HighlightKind) {
+        let r = ((theme.geom.cursor_size * 0.5) as i32).max(3);
+        let rim = (r / 3).max(2);
+        self.fill_circle(cx, cy, r, theme.colors.cursor_stroke); // contrast halo
+        self.fill_circle(cx, cy, r - rim, kind.color(theme)); // pad-coloured body
+        self.fill_circle(cx, cy, (rim / 2).max(1), theme.colors.cursor_stroke); // aim dot
+    }
+
     /// Draw one glyph at integer `scale`, top-left at `(x, y)`.
     fn glyph(&mut self, ch: char, x: i32, y: i32, scale: i32, c: Color) {
         let bitmap = match BASIC_FONTS.get(ch) {
@@ -152,12 +199,24 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Draw a whole panel: themed background, then every placed key, with any
-/// highlights. All colours and dimensions are read from `theme`.
-pub fn draw_panel(canvas: &mut Canvas, theme: &Theme, keys: &[Key], placed: &[PlacedKey], highlights: &[Highlight]) {
+/// Draw a whole panel: themed background, every placed key (legends reflecting
+/// the live shift state, Shift/Caps lit when engaged), then any per-pad
+/// highlights, then the trackpad cursor sprites on top. All colours and
+/// dimensions are read from `theme` — no hardcoded cursor / highlight / active
+/// colours in this path.
+pub fn draw_panel(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    keys: &[Key],
+    placed: &[PlacedKey],
+    highlights: &[Highlight],
+    cursors: &[Cursor],
+    chrome: Chrome,
+) {
     let col = &theme.colors;
     let corner = theme.geom.corner as i32;
     let border = theme.geom.border_width.max(1.0) as i32;
+    let shift_active = chrome.shift.is_active();
 
     canvas.fill_rect(0, 0, canvas.w, canvas.h, col.surface_bg);
 
@@ -165,21 +224,48 @@ pub fn draw_panel(canvas: &mut Canvas, theme: &Theme, keys: &[Key], placed: &[Pl
         let key = &keys[pk.key];
         let (x, y, w, h) = (pk.rect.x as i32, pk.rect.y as i32, pk.rect.w as i32, pk.rect.h as i32);
 
-        // Highlighted keys take their source colour; otherwise role tint.
+        // A Shift/Caps key whose state is engaged is "active" (lit); a hovered
+        // key is "highlighted". Highlight wins so the pad's focus stays visible.
         let hl = highlights.iter().find(|hh| hh.key == pk.key);
-        let fill = match hl {
-            Some(hh) => hh.kind.color(theme),
-            None => match key.role {
-                crate::layout::KeyRole::Char => col.key_fill,
+        let active = match key.role {
+            KeyRole::Shift => shift_active,
+            KeyRole::Caps => chrome.shift.caps_active(),
+            _ => false,
+        };
+        let fill = if let Some(hh) = hl {
+            hh.kind.color(theme)
+        } else if active {
+            col.shift_active
+        } else {
+            match key.role {
+                KeyRole::Char => col.key_fill,
                 _ => col.key_mod_fill,
-            },
+            }
+        };
+        // The display-toggle key's legend tracks what a press will DO next:
+        // "Push" while floating (press to displace), "Float" while displacing.
+        let label = match key.role {
+            KeyRole::DisplayToggle => {
+                if chrome.reflow {
+                    "Float"
+                } else {
+                    "Push"
+                }
+            }
+            _ => key.display_label(shift_active),
         };
         // Border via a rounded-rect underlay, then the fill inset by the border
         // width — a themeable stroke that respects the corner radius.
-        let bw = if hl.is_some() { border.max(2) } else { border };
+        let bw = if hl.is_some() || active { border.max(2) } else { border };
         canvas.fill_round_rect(x, y, w, h, corner, col.key_border);
         canvas.fill_round_rect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, (corner - bw).max(0), fill);
-        canvas.text_centered(key.label, (x, y, w, h), theme.font.scale_max, col.key_label);
+        canvas.text_centered(label, (x, y, w, h), theme.font.scale_max, col.key_label);
+    }
+
+    // Cursor sprites last, so each pad's pointer floats on top of the keys and
+    // its own highlight (osk-technology.md §4.1/§4.5 — up to two live at once).
+    for cur in cursors {
+        canvas.draw_cursor(cur.x as i32, cur.y as i32, theme, cur.kind);
     }
 }
 

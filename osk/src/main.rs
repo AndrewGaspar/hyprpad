@@ -101,10 +101,13 @@ fn print_help() {
            -h,--help       print this help\n\
          \n\
          CONTROL COMMANDS (one per line):\n\
-           show <bottom|split> [reflow|overlay]   create + render the surface(s)\n\
+           show <bottom|split> [reflow|overlay]   create + render (overlay is default)\n\
            hide                                    DESTROY the surface(s)\n\
            cursor <L|R> <nx> <ny>                  pad absolute pos, axes in [-1,1]\n\
            commit <L|R>                            commit key under that pad's cursor\n\
+           shift <off|oneshot|stuck|on>            set the shift/caps state\n\
+           layer <base|symbols|toggle>            switch QWERTY <-> numeric/symbols\n\
+           reflow <on|off>                         displace (on) vs overlay/float (off)\n\
            key <keycode>                           commit a raw evdev keycode\n\
            type <text>                             type an ASCII string\n\
            quit                                    exit\n"
