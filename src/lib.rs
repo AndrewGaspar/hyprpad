@@ -12,6 +12,7 @@ pub mod gesture;
 pub mod hidraw;
 pub mod hypr;
 pub mod lizard;
+pub mod osk;
 pub mod output;
 pub mod report;
 pub mod run;

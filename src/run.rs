@@ -10,6 +10,7 @@ use crate::arbitrate::Arbiter;
 use crate::config::{Action, Config, WorkspaceTarget};
 use crate::gesture::{GestureEngine, GestureEvent};
 use crate::hypr::{Hypr, HyprEvent};
+use crate::osk::{normalize_pad_axis, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
 
@@ -105,6 +106,15 @@ pub fn run() -> std::io::Result<()> {
     let mut engine = GestureEngine::new();
     let mut arbiter = Arbiter::new();
 
+    // The on-screen keyboard bridge. Spawns lazily on the first toggle and is
+    // killed when this function returns (daemon exit). When it is showing, the
+    // two pads drive the keyboard instead of the desktop cursor.
+    let mut osk = OskHandle::new();
+    let mut osk_route = OskRoute::default();
+    // Previous frame, kept for edge detection in the OSK-active router (pad
+    // click-down and the B/Menu dismiss).
+    let mut prev_frame = report::Frame::default();
+
     for input in rx {
         match input {
             Input::Compositor(ev) => {
@@ -120,13 +130,22 @@ pub fn run() -> std::io::Result<()> {
                     if debug {
                         eprintln!("[gesture] {ge:?} -> {:?}", config.resolve(&ge));
                     }
-                    handle_gesture(&hypr, &config, &arbiter, ge);
+                    handle_gesture(&hypr, &config, &arbiter, &mut osk, ge);
                 }
-                // Ambient (non-guide) right-pad cursor. The guide layer and a
-                // focused game both take the pad away from cursor duty.
-                if let Some(ptr) = pointer.as_mut() {
+                if osk.is_active() {
+                    // The keyboard owns both pads: route them to it, and keep the
+                    // desktop cursor released (guide/suppressed = true forces the
+                    // drop-and-forget branch of `drive_cursor`).
+                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route);
+                    if let Some(ptr) = pointer.as_mut() {
+                        drive_cursor(ptr, &frame, &mut cursor, true, true);
+                    }
+                } else if let Some(ptr) = pointer.as_mut() {
+                    // Ambient (non-guide) right-pad cursor. The guide layer and a
+                    // focused game both take the pad away from cursor duty.
                     drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed());
                 }
+                prev_frame = frame;
             }
         }
     }
@@ -220,7 +239,13 @@ fn update_arbiter(arbiter: &mut Arbiter, ev: HyprEvent) {
     }
 }
 
-fn handle_gesture(hypr: &Hypr, config: &Config, arbiter: &Arbiter, ge: GestureEvent) {
+fn handle_gesture(
+    hypr: &Hypr,
+    config: &Config,
+    arbiter: &Arbiter,
+    osk: &mut OskHandle,
+    ge: GestureEvent,
+) {
     // A bare guide tap belongs to Steam: do nothing so the client sees its own
     // button (it acts on release). Chords and flicks are ours.
     if let GestureEvent::GuideLeave { was_chorded: false } = ge {
@@ -235,13 +260,95 @@ fn handle_gesture(hypr: &Hypr, config: &Config, arbiter: &Arbiter, ge: GestureEv
     if matches!(action, Action::None) {
         return;
     }
+    // While the keyboard is up it owns the pads: suppress every desktop gesture
+    // except the keyboard toggle itself, so the toggle chord can still dismiss.
+    if osk.is_active() && !matches!(action, Action::ToggleKeyboard { .. }) {
+        return;
+    }
     if arbiter.suppressed() && !is_guide_scoped(&ge) {
+        return;
+    }
+
+    // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
+    if let Action::ToggleKeyboard { mode } = action {
+        toggle_keyboard(osk, mode);
         return;
     }
 
     if let Err(e) = execute(hypr, &action) {
         eprintln!("dispatch failed: {e}");
     }
+}
+
+/// Flip the on-screen keyboard: show it (in `mode`, reflowing workspace content)
+/// when hidden, hide it when shown.
+fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode) {
+    if osk.is_active() {
+        osk.hide();
+    } else {
+        osk.show(mode, true);
+    }
+}
+
+/// Cross-frame state for OSK-active pad routing: the last raw pad position sent
+/// for each pad, so identical positions aren't re-sent every 4 ms frame. `None`
+/// means that pad is not currently touched (so a re-touch always re-sends).
+#[derive(Default)]
+struct OskRoute {
+    last_left: Option<(i16, i16)>,
+    last_right: Option<(i16, i16)>,
+}
+
+/// Route one frame to the on-screen keyboard while it owns the pads:
+/// each pad's absolute position becomes a `cursor L|R`, a pad click (or a full
+/// trigger pull) commits the key under it, and `B`/`Menu` dismiss the keyboard.
+fn route_osk(osk: &mut OskHandle, frame: &report::Frame, prev: &report::Frame, st: &mut OskRoute) {
+    use report::Button::*;
+
+    // Dismiss on B or Menu (edge-down): hide and leave OSK-active mode.
+    if frame.edges_down(prev).any(|b| matches!(b, B | Menu)) {
+        osk.hide();
+        *st = OskRoute::default();
+        return;
+    }
+
+    // Move each pad's cursor first, so a click on the same frame commits the key
+    // actually under the finger. Only while touched, and only on change.
+    route_pad(osk, OskPad::Left, frame.pressed(PadLeftTouch), frame.left_pad, &mut st.last_left);
+    route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.last_right);
+
+    // Commit on click-down (the Deck commits on click, not release). A full
+    // trigger pull on the same side is an alternate commit.
+    for b in frame.edges_down(prev) {
+        match b {
+            PadLeftClick | TriggerL2Full => osk.commit(OskPad::Left),
+            PadRightClick | TriggerR2Full => osk.commit(OskPad::Right),
+            _ => {}
+        }
+    }
+}
+
+/// Forward one pad's position to the OSK, rate-limited to real movement. Clears
+/// `last` on lift so a lift-and-retouch at the same spot re-sends.
+fn route_pad(
+    osk: &mut OskHandle,
+    pad: OskPad,
+    touched: bool,
+    p: report::Pad,
+    last: &mut Option<(i16, i16)>,
+) {
+    if !touched {
+        *last = None;
+        return;
+    }
+    let cur = (p.x, p.y);
+    if *last == Some(cur) {
+        return;
+    }
+    *last = Some(cur);
+    // Pad +Y is up and the OSK's +ny is up too, so both axes pass straight
+    // through after normalization.
+    osk.cursor(pad, normalize_pad_axis(cur.0), normalize_pad_axis(cur.1));
 }
 
 /// Guide-scoped gestures carry the guide modifier and are always honored.
@@ -278,6 +385,8 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
             Ok(())
         }
         Action::Dispatch(payload) => hypr.dispatch_raw(payload).map(|_| ()),
+        // Handled in `handle_gesture` against the OSK handle, never reaches here.
+        Action::ToggleKeyboard { .. } => Ok(()),
         Action::None => Ok(()),
     }
 }

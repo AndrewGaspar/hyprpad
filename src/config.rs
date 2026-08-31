@@ -69,6 +69,9 @@ pub enum Action {
     Exec(String),
     /// A raw Hyprland dispatch payload; the integration layer decides delivery.
     Dispatch(String),
+    /// Toggle the on-screen keyboard: show it (in `mode`) if hidden, hide it if
+    /// shown. Driven by [`crate::osk::OskHandle`], not a Hyprland dispatch.
+    ToggleKeyboard { mode: crate::osk::OskMode },
     /// No action.
     None,
 }
@@ -104,6 +107,16 @@ impl Action {
                 } else {
                     Ok(Action::Dispatch(rest.to_string()))
                 }
+            }
+            "keyboard" | "osk" => {
+                let mode = match rest.to_ascii_lowercase().as_str() {
+                    "" | "bottom" | "deck" => crate::osk::OskMode::Bottom,
+                    "split" | "side" => crate::osk::OskMode::Split,
+                    other => {
+                        return Err(format!("unknown keyboard mode '{other}' (want bottom|split)"))
+                    }
+                };
+                Ok(Action::ToggleKeyboard { mode })
             }
             other => Err(format!("unknown action '{other}'")),
         }
@@ -214,6 +227,7 @@ pub const DEFAULT_TOML: &str = r#"
 "guide+stick_right" = "workspace +1" # right stick flicked right
 "guide+stick_left"  = "workspace -1" # right stick flicked left
 "guide+x" = "exec walker"            # launcher
+"guide+y" = "keyboard"               # toggle the on-screen keyboard (bottom deck; configurable)
 "#;
 
 impl Config {
@@ -417,10 +431,54 @@ mod tests {
     }
 
     #[test]
+    fn default_binds_keyboard_toggle() {
+        use crate::osk::OskMode;
+        let c = Config::load_default();
+        // The default keyboard chord is guide+y -> toggle the bottom deck.
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::Y)),
+            Action::ToggleKeyboard { mode: OskMode::Bottom }
+        );
+    }
+
+    #[test]
+    fn parses_keyboard_action_modes() {
+        use crate::osk::OskMode;
+        let toml = r#"
+[bindings]
+"guide+y" = "keyboard"
+"guide+a" = "keyboard bottom"
+"guide+b" = "keyboard split"
+"guide+x" = "osk split"
+"#;
+        let c = Config::from_toml_str(toml).expect("parse");
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::Y)),
+            Action::ToggleKeyboard { mode: OskMode::Bottom }
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleKeyboard { mode: OskMode::Bottom }
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::B)),
+            Action::ToggleKeyboard { mode: OskMode::Split }
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::X)),
+            Action::ToggleKeyboard { mode: OskMode::Split }
+        );
+        // An unknown mode is a reported error, not a silent default.
+        assert!(Config::from_toml_str("[bindings]\n\"guide+y\" = \"keyboard sideways\"\n")
+            .unwrap_err()
+            .contains("unknown keyboard mode"));
+    }
+
+    #[test]
     fn unbound_events_resolve_to_none() {
         let c = Config::load_default();
-        // Unbound chord.
-        assert_eq!(c.resolve(&GestureEvent::GuideChord(Button::Y)), Action::None);
+        // Unbound chord (A carries no default binding).
+        assert_eq!(c.resolve(&GestureEvent::GuideChord(Button::A)), Action::None);
         // Left stick is unbound in defaults.
         assert_eq!(
             c.resolve(&GestureEvent::GuideStickFlick {
