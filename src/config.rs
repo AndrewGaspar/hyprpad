@@ -72,6 +72,11 @@ pub enum Action {
     /// Toggle the on-screen keyboard: show it (in `mode`) if hidden, hide it if
     /// shown. Driven by [`crate::osk::OskHandle`], not a Hyprland dispatch.
     ToggleKeyboard { mode: crate::osk::OskMode },
+    /// Emit a raw evdev keycode (`KEY_*`). Bound to a *bare* controller button
+    /// in the `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
+    /// button is held and released when it lifts, so the kernel auto-repeats.
+    /// Driven by [`crate::keyboard::VirtualKeyboard`], not a Hyprland dispatch.
+    Key(u16),
     /// No action.
     None,
 }
@@ -117,6 +122,13 @@ impl Action {
                     }
                 };
                 Ok(Action::ToggleKeyboard { mode })
+            }
+            "key" => {
+                if rest.is_empty() {
+                    Err("key needs a name".to_string())
+                } else {
+                    Ok(Action::Key(key_code(rest)?))
+                }
             }
             other => Err(format!("unknown action '{other}'")),
         }
@@ -203,6 +215,33 @@ fn parse_button(s: &str) -> Result<report::Button, String> {
         other => return Err(format!("unknown button '{other}'")),
     };
     Ok(b)
+}
+
+/// Map a key name (as used in a `[buttons]` binding's `key <name>` value) to
+/// its raw evdev keycode (`input-event-codes.h`, the `KEY_*` constants).
+///
+/// Covers the arrow keys (the D-pad-to-arrows default) plus the common editing
+/// and navigation keys, so bare buttons can be bound to more than the arrows
+/// without extending this table. An unknown name is a reported error, never a
+/// silent no-op. Names are matched case-insensitively by the caller.
+fn key_code(name: &str) -> Result<u16, String> {
+    let code = match name.trim().to_ascii_lowercase().as_str() {
+        "up" => 103,        // KEY_UP
+        "down" => 108,      // KEY_DOWN
+        "left" => 105,      // KEY_LEFT
+        "right" => 106,     // KEY_RIGHT
+        "enter" | "return" => 28, // KEY_ENTER
+        "backspace" => 14,  // KEY_BACKSPACE
+        "space" => 57,      // KEY_SPACE
+        "tab" => 15,        // KEY_TAB
+        "escape" | "esc" => 1, // KEY_ESC
+        "home" => 102,      // KEY_HOME
+        "end" => 107,       // KEY_END
+        "pageup" | "pgup" => 104, // KEY_PAGEUP
+        "pagedown" | "pgdn" => 109, // KEY_PAGEDOWN
+        other => return Err(format!("unknown key '{other}'")),
+    };
+    Ok(code)
 }
 
 /// Trackpad-cursor smoothing/damping knobs (the `[cursor]` — or its `[damping]`
@@ -345,6 +384,11 @@ impl Default for ScrollConfig {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     bindings: HashMap<GestureKey, Action>,
+    /// Bare-button bindings (the `[buttons]` section): a controller button
+    /// pressed *without* the guide modifier emits a raw evdev keycode. Distinct
+    /// from `bindings`, which are guide chords. Maps the button to its `KEY_*`
+    /// code; the default maps the D-pad to the arrow keys.
+    buttons: HashMap<report::Button, u16>,
     /// Whether hyprpad should take ownership of the puck's lizard mode and keep
     /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
     /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
@@ -369,6 +413,16 @@ pub const DEFAULT_TOML: &str = r#"
 "guide+x" = "exec walker"            # launcher
 "guide+y" = "keyboard"               # toggle the on-screen keyboard (bottom deck; configurable)
 
+# Bare buttons: pressed WITHOUT the guide modifier, they emit a raw key. The
+# D-pad acts as the arrow keys on the desktop (holding repeats, like a real
+# keyboard). These are suppressed while the guide layer or on-screen keyboard is
+# up, and in a focused game — there the D-pad reaches the game as a controller.
+[buttons]
+dpad_up = "key up"
+dpad_down = "key down"
+dpad_left = "key left"
+dpad_right = "key right"
+
 # Left trackpad scrolls the desktop (ambient) layer; the right pad keeps driving
 # the cursor. All knobs are tunable starting points.
 [scroll]
@@ -384,6 +438,7 @@ impl Config {
     /// Parse a config from the TOML dialect described in the module docs.
     pub fn from_toml_str(s: &str) -> Result<Config, String> {
         let mut bindings = HashMap::new();
+        let mut buttons = HashMap::new();
         let mut own_lizard = false;
         let mut cursor = CursorConfig::default();
         let mut scroll = ScrollConfig::default();
@@ -409,6 +464,26 @@ impl Config {
                     let action = Action::parse(&unquote(v))
                         .map_err(|e| format!("line {lineno}: {e}"))?;
                     bindings.insert(key, action);
+                }
+                // Bare-button bindings: a button pressed WITHOUT the guide
+                // modifier emits a raw key. The key uses the same button-name
+                // aliases as the guide chords (`dpad_up`, `a`, `r1`, ...); the
+                // value must be a `key <name>` action.
+                "buttons" => {
+                    let button = parse_button(&unquote(k).trim().to_ascii_lowercase())
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    let action = Action::parse(&unquote(v))
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    match action {
+                        Action::Key(code) => {
+                            buttons.insert(button, code);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "line {lineno}: [buttons] values must be a 'key <name>' action"
+                            ));
+                        }
+                    }
                 }
                 // Daemon-wide settings (not gesture bindings).
                 "daemon" => {
@@ -484,7 +559,7 @@ impl Config {
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, own_lizard, cursor, scroll })
+        Ok(Config { bindings, buttons, own_lizard, cursor, scroll })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -548,6 +623,13 @@ impl Config {
     /// Whether there are no bindings.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
+    }
+
+    /// The bare-button bindings (`[buttons]` section): each controller button
+    /// pressed *without* the guide modifier maps to a raw evdev keycode. The
+    /// default maps the D-pad to the arrow keys.
+    pub fn buttons(&self) -> &HashMap<report::Button, u16> {
+        &self.buttons
     }
 
     /// Whether hyprpad should take ownership of the puck's lizard mode
@@ -906,6 +988,82 @@ mod tests {
     #[test]
     fn default_config_is_nonempty() {
         assert!(!Config::load_default().is_empty());
+    }
+
+    #[test]
+    fn key_name_table_maps_arrows_and_extras() {
+        // The arrows, which the default D-pad binding uses.
+        assert_eq!(key_code("up"), Ok(103));
+        assert_eq!(key_code("down"), Ok(108));
+        assert_eq!(key_code("left"), Ok(105));
+        assert_eq!(key_code("right"), Ok(106));
+        // A few of the editing/nav extras and their aliases; case-insensitive.
+        assert_eq!(key_code("enter"), Ok(28));
+        assert_eq!(key_code("return"), Ok(28));
+        assert_eq!(key_code("Backspace"), Ok(14));
+        assert_eq!(key_code("space"), Ok(57));
+        assert_eq!(key_code("tab"), Ok(15));
+        assert_eq!(key_code("esc"), Ok(1));
+        assert_eq!(key_code("escape"), Ok(1));
+        assert_eq!(key_code("pageup"), Ok(104));
+        assert_eq!(key_code("pgdn"), Ok(109));
+        // Every arrow/nav code stays inside the range keyboard.rs registers.
+        for name in ["up", "down", "left", "right", "home", "end", "pageup", "pagedown"] {
+            assert!(key_code(name).unwrap() <= 127);
+        }
+        // An unknown name is a reported error, not a silent default.
+        assert!(key_code("f13").unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
+    fn key_action_parses_and_reports_unknown() {
+        assert_eq!(Action::parse("key up").unwrap(), Action::Key(103));
+        assert_eq!(Action::parse("key ESC").unwrap(), Action::Key(1));
+        assert!(Action::parse("key").unwrap_err().contains("key needs a name"));
+        assert!(Action::parse("key nope").unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
+    fn default_buttons_map_dpad_to_arrows() {
+        let c = Config::load_default();
+        let b = c.buttons();
+        assert_eq!(b.get(&Button::DpadUp), Some(&103));
+        assert_eq!(b.get(&Button::DpadDown), Some(&108));
+        assert_eq!(b.get(&Button::DpadLeft), Some(&105));
+        assert_eq!(b.get(&Button::DpadRight), Some(&106));
+        // Only the four D-pad buttons are bound by default.
+        assert_eq!(b.len(), 4);
+    }
+
+    #[test]
+    fn buttons_section_parses_aliases_and_reports_errors() {
+        // Uses the same button-name aliases as the guide chords, plus a
+        // non-D-pad button, and the value must be a `key <name>` action.
+        let toml = r#"
+[buttons]
+dpad_up = "key up"
+a = "key enter"
+r1 = "key pageup"
+"#;
+        let c = Config::from_toml_str(toml).expect("parse");
+        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&103));
+        assert_eq!(c.buttons().get(&Button::A), Some(&28));
+        assert_eq!(c.buttons().get(&Button::BumperR1), Some(&104));
+        // Bindings and buttons are independent sections.
+        assert!(c.is_empty());
+
+        // An unknown button name is reported.
+        assert!(Config::from_toml_str("[buttons]\nnope = \"key up\"\n")
+            .unwrap_err()
+            .contains("unknown button"));
+        // An unknown key name is reported.
+        assert!(Config::from_toml_str("[buttons]\ndpad_up = \"key sideways\"\n")
+            .unwrap_err()
+            .contains("unknown key"));
+        // A non-key action in [buttons] is rejected.
+        assert!(Config::from_toml_str("[buttons]\ndpad_up = \"fullscreen\"\n")
+            .unwrap_err()
+            .contains("must be a 'key <name>' action"));
     }
 
     #[test]

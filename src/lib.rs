@@ -12,6 +12,7 @@ pub mod filter;
 pub mod gesture;
 pub mod hidraw;
 pub mod hypr;
+pub mod keyboard;
 pub mod lizard;
 pub mod osk;
 pub mod output;
