@@ -61,6 +61,12 @@ const REPORT_ID_FEATURES_CONTROLLER: u8 = 0x01;
 
 /// `ID_CLEAR_DIGITAL_MAPPINGS` — clear the firmware button→key/mouse mappings.
 const ID_CLEAR_DIGITAL_MAPPINGS: u8 = 0x81;
+/// `ID_SET_DEFAULT_DIGITAL_MAPPINGS` — restore the firmware's default
+/// button→key/mouse mappings (the mirror of `ID_CLEAR_DIGITAL_MAPPINGS`). This
+/// is exactly what the kernel `hid-steam` driver sends from
+/// `steam_set_lizard_mode(enable = true)` to bring the lizard keyboard/mouse
+/// back (`STEAM_CMD_DEFAULT_MAPPINGS`).
+const ID_SET_DEFAULT_DIGITAL_MAPPINGS: u8 = 0x85;
 /// `ID_SET_SETTINGS_VALUES` — write `(setting, u16 value)` pairs.
 const ID_SET_SETTINGS_VALUES: u8 = 0x87;
 
@@ -128,6 +134,46 @@ fn disable_lizard_settings_report() -> [u8; WIRE_LEN] {
 /// mappings, then write the disabling settings.
 fn disable_sequence() -> [[u8; WIRE_LEN]; 2] {
     [clear_digital_mappings_report(), disable_lizard_settings_report()]
+}
+
+/// Build the `ID_SET_DEFAULT_DIGITAL_MAPPINGS` feature frame — restore the
+/// default button→key/mouse mappings that [`clear_digital_mappings_report`]
+/// wiped, so the firmware keyboard/mouse fires again.
+fn set_default_digital_mappings_report() -> [u8; WIRE_LEN] {
+    let mut buf = [0u8; WIRE_LEN];
+    buf[0] = REPORT_ID_FEATURES_CONTROLLER;
+    buf[1] = ID_SET_DEFAULT_DIGITAL_MAPPINGS;
+    buf
+}
+
+/// Build the `ID_SET_SETTINGS_VALUES` feature frame that turns lizard mode and
+/// the revert-watchdog back **on** — the exact inverse of
+/// [`disable_lizard_settings_report`] (values 1 instead of 0). Re-enabling
+/// `SETTING_STEAM_WATCHDOG_ENABLE` matters: disable turned it off, and it is the
+/// switch that lets the firmware fall back to lizard mode on its own when no
+/// host heartbeat is seen.
+fn enable_lizard_settings_report() -> [u8; WIRE_LEN] {
+    let mut buf = [0u8; WIRE_LEN];
+    buf[0] = REPORT_ID_FEATURES_CONTROLLER;
+    buf[1] = ID_SET_SETTINGS_VALUES;
+    buf[2] = 6; // payload length = 3 bytes * 2 settings
+    // SETTING_LIZARD_MODE = 1 (u16 little-endian)
+    buf[3] = SETTING_LIZARD_MODE;
+    buf[4] = 0x01;
+    buf[5] = 0x00;
+    // SETTING_STEAM_WATCHDOG_ENABLE = 1 (u16 little-endian)
+    buf[6] = SETTING_STEAM_WATCHDOG_ENABLE;
+    buf[7] = 0x01;
+    buf[8] = 0x00;
+    buf
+}
+
+/// The full enable-lizard feature sequence, in send order: restore the default
+/// digital mappings, then write the enabling settings. Undoes exactly what
+/// [`disable_sequence`] did, so the firmware keyboard/mouse comes back when
+/// hyprpad exits.
+fn enable_sequence() -> [[u8; WIRE_LEN]; 2] {
+    [set_default_digital_mappings_report(), enable_lizard_settings_report()]
 }
 
 // `HIDIOCSFEATURE(len)` from <linux/hidraw.h> is `_IOC(_IOC_WRITE|_IOC_READ,
@@ -203,31 +249,31 @@ fn send_sequence(node: &Path, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr>
     Ok(())
 }
 
-/// Disable lizard mode on the attached puck.
+/// Send one feature sequence to every puck node, succeeding if *any* node
+/// accepts the full sequence.
 ///
-/// Finds the puck's hidraw nodes and sends the disable sequence to each that
-/// accepts it. hidraw is not exclusive, so this succeeds while Steam also holds
-/// the nodes. The puck exposes one interface per pairing slot plus a
-/// dongle-control interface; only the slot with the connected controller (and
-/// the controller feature report) will accept the reports, and the active slot
-/// can change on replug — so we try every node and treat the call as successful
-/// if *any* node accepted the full sequence.
+/// Finds the puck's hidraw nodes and sends `reports` to each. hidraw is not
+/// exclusive, so this succeeds while Steam also holds the nodes. The puck
+/// exposes one interface per pairing slot plus a dongle-control interface; only
+/// the slot with the connected controller (and the controller feature report)
+/// will accept the reports, and the active slot can change on replug — so we try
+/// every node and treat the call as successful if *any* node accepted the full
+/// sequence.
 ///
 /// Returns `Err` only if no node could be found or none accepted the reports;
 /// per-node failures (e.g. the dongle-control interface, which has no controller
 /// feature report) are expected and folded into the error only when they are
 /// total.
-pub fn disable_lizard_mode() -> Result<(), String> {
+fn apply_to_puck(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
     let nodes = crate::hidraw::puck_nodes().map_err(|e| format!("enumerating puck nodes: {e}"))?;
     if nodes.is_empty() {
         return Err("no Steam Controller puck found (28de:1304)".to_string());
     }
-    let reports = disable_sequence();
     let mut accepted = 0usize;
     let mut stalls = 0usize;
     let mut hard_errors = Vec::new();
     for node in &nodes {
-        match send_sequence(node, &reports) {
+        match send_sequence(node, reports) {
             Ok(()) => accepted += 1,
             Err(SendErr::Stall) => stalls += 1,
             Err(SendErr::Other(e)) => hard_errors.push(format!("{}: {e}", node.display())),
@@ -245,6 +291,35 @@ pub fn disable_lizard_mode() -> Result<(), String> {
         ))
     } else {
         Err(hard_errors.join("; "))
+    }
+}
+
+/// Disable lizard mode on the attached puck (clear the digital mappings, then
+/// turn `SETTING_LIZARD_MODE` and the revert-watchdog off).
+pub fn disable_lizard_mode() -> Result<(), String> {
+    apply_to_puck(&disable_sequence())
+}
+
+/// Re-enable lizard mode on the attached puck — the inverse of
+/// [`disable_lizard_mode`]: restore the default digital mappings, then turn
+/// `SETTING_LIZARD_MODE` and `SETTING_STEAM_WATCHDOG_ENABLE` back on. Called on
+/// exit so the firmware keyboard/mouse comes back and the user is not left
+/// without a pointer.
+///
+/// Like disable, this is best-effort against a possibly-absent controller: if
+/// the puck is asleep/unpaired every node STALLs and this returns `Err`. That is
+/// fine on exit — the firmware powers up in lizard mode by default, so the next
+/// wake restores it anyway.
+pub fn enable_lizard_mode() -> Result<(), String> {
+    apply_to_puck(&enable_sequence())
+}
+
+/// Best-effort lizard restore for the exit paths: re-enable lizard mode and log
+/// the outcome (never propagate the error — the process is on its way out).
+pub fn restore_lizard_on_exit() {
+    match enable_lizard_mode() {
+        Ok(()) => eprintln!("hyprpad: lizard mode re-enabled on exit (firmware kbd/mouse restored)"),
+        Err(e) => eprintln!("hyprpad: best-effort lizard restore on exit skipped: {e}"),
     }
 }
 
@@ -279,6 +354,88 @@ pub fn own_lizard_loop() {
         }
         std::thread::sleep(RESEND_INTERVAL);
     }
+}
+
+/// RAII guard that restores lizard mode when it drops. Owning one for the life
+/// of [`crate::run::run`] covers the *normal* exit paths: a clean return and a
+/// panic unwinding out of the daemon both run this destructor. Signal-driven
+/// exit (Ctrl-C / SIGTERM) does **not** unwind, so it is handled separately by
+/// [`install_signal_restore`], whose waiter calls `std::process::exit` before
+/// this guard could run — the two paths never both fire.
+pub struct LizardRestoreGuard;
+
+impl Drop for LizardRestoreGuard {
+    fn drop(&mut self) {
+        restore_lizard_on_exit();
+    }
+}
+
+/// Write end of the self-pipe the signal handler nudges. `-1` until installed.
+static SIGNAL_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The SIGINT/SIGTERM handler. Async-signal-safe: it does nothing but poke the
+/// self-pipe with the signal number so the waiter thread can do the real work.
+extern "C" fn on_exit_signal(sig: libc::c_int) {
+    let fd = SIGNAL_WRITE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = sig as u8;
+        // `write` is on POSIX's async-signal-safe list; best-effort, ignore the
+        // result — a full/closed pipe just means the waiter already fired.
+        let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+}
+
+/// Install SIGINT/SIGTERM handling that restores lizard mode before the process
+/// dies.
+///
+/// A `Drop` guard cannot cover a signal, because a signal terminates the process
+/// without unwinding — and the real restore (`open`/`ioctl`/allocation/logging)
+/// is not async-signal-safe, so it must not run inside the handler. We use the
+/// self-pipe trick: the handler only `write`s the signal number to a pipe, and a
+/// dedicated waiter thread — blocked on the read end — performs the restore in
+/// ordinary thread context, then exits `128 + signum`.
+///
+/// We deliberately install a plain handler and do **not** block the signals:
+/// blocking would set a process-wide mask that child processes (the OSK) inherit,
+/// which would stop Ctrl-C from ever reaching them. `SA_RESTART` keeps worker
+/// threads' blocking reads from erroring out on the delivery.
+pub fn install_signal_restore() {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid 2-element buffer for `pipe`.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        eprintln!(
+            "warning: lizard restore-on-signal not installed (pipe: {})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    SIGNAL_WRITE_FD.store(write_fd, std::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: `action` is fully zero-initialised, then `sa_sigaction`,
+    // `sa_mask`, and `sa_flags` are set to valid values before `sigaction` reads
+    // it; the null old-action pointer is allowed.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_exit_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+
+    std::thread::spawn(move || {
+        // Park until the handler pokes the pipe, then restore and exit.
+        let mut byte = [0u8; 1];
+        // SAFETY: `read_fd` is the live read end; `byte` is a valid 1-byte buffer.
+        let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+        let sig = if n == 1 { libc::c_int::from(byte[0]) } else { 0 };
+        if sig != 0 {
+            eprintln!("hyprpad: caught signal {sig}, restoring lizard mode before exit");
+        }
+        restore_lizard_on_exit();
+        std::process::exit(128 + sig);
+    });
 }
 
 #[cfg(test)]
@@ -318,6 +475,48 @@ mod tests {
         assert_eq!(seq.len(), 2);
         assert_eq!(seq[0][1], 0x81); // clear digital mappings first
         assert_eq!(seq[1][1], 0x87); // then set settings values
+    }
+
+    #[test]
+    fn set_default_mappings_report_bytes() {
+        let r = set_default_digital_mappings_report();
+        assert_eq!(r.len(), 64);
+        assert_eq!(r[0], 0x01); // REPORT_ID_FEATURES_CONTROLLER
+        assert_eq!(r[1], 0x85); // ID_SET_DEFAULT_DIGITAL_MAPPINGS
+        assert!(r[2..].iter().all(|&b| b == 0), "rest must be zero-padded");
+    }
+
+    #[test]
+    fn enable_settings_report_bytes() {
+        let r = enable_lizard_settings_report();
+        assert_eq!(r.len(), 64);
+        // 0x87 SET_SETTINGS_VALUES, len 6, (9,1,0) lizard on, (71,1,0) watchdog on.
+        assert_eq!(
+            &r[..9],
+            &[0x01, 0x87, 0x06, 0x09, 0x01, 0x00, 0x47, 0x01, 0x00]
+        );
+        assert!(r[9..].iter().all(|&b| b == 0), "rest must be zero-padded");
+    }
+
+    #[test]
+    fn enable_sequence_is_default_mappings_then_settings() {
+        let seq = enable_sequence();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0][1], 0x85); // restore default digital mappings first
+        assert_eq!(seq[1][1], 0x87); // then set settings values
+    }
+
+    #[test]
+    fn enable_exactly_inverts_disable_settings() {
+        // Same command, same settings, same order — only the values flip 0 <-> 1.
+        let dis = disable_lizard_settings_report();
+        let en = enable_lizard_settings_report();
+        assert_eq!(dis[1], en[1]); // ID_SET_SETTINGS_VALUES
+        assert_eq!(dis[2], en[2]); // payload length
+        assert_eq!(dis[3], en[3]); // SETTING_LIZARD_MODE id
+        assert_eq!(dis[6], en[6]); // SETTING_STEAM_WATCHDOG_ENABLE id
+        assert_eq!((dis[4], en[4]), (0x00, 0x01)); // lizard value 0 -> 1
+        assert_eq!((dis[7], en[7]), (0x00, 0x01)); // watchdog value 0 -> 1
     }
 
     #[test]

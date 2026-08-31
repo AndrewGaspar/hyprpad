@@ -15,15 +15,24 @@ use crate::osk::{OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
 
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// One unit of work for the main loop: either a controller report or a
-/// compositor event. The two source threads funnel into this so the loop can
-/// own all mutable state without locks.
+/// How often the reconnect wait re-scans for the controller's return. Bounded so
+/// we never busy-spin (the scan sleeps between attempts) yet re-arm within a
+/// couple of seconds of the puck reappearing.
+const RECONNECT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// One unit of work for the main loop: a controller report, a compositor event,
+/// or the signal that the controller's readers have all ended. The source
+/// threads funnel into this so the loop can own all mutable state without locks.
 enum Input {
     Report(Vec<u8>),
     Compositor(HyprEvent),
+    /// Every puck reader thread has exited — the controller went away. The loop
+    /// enters its reconnect wait instead of terminating.
+    ReadersEnded,
 }
 
 pub fn run() -> std::io::Result<()> {
@@ -32,7 +41,6 @@ pub fn run() -> std::io::Result<()> {
         eprintln!("no Steam Controller puck found (28de:1304)");
         std::process::exit(1);
     }
-    let hypr = Hypr::connect()?;
     let config = match Config::load() {
         Ok(c) => {
             match Config::config_path() {
@@ -46,7 +54,6 @@ pub fn run() -> std::io::Result<()> {
             Config::load_default()
         }
     };
-    eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
 
     // Lizard-mode ownership (opt-in). Off by default so we never fight an
     // unmasked Steam that is managing lizard mode itself
@@ -54,23 +61,37 @@ pub fn run() -> std::io::Result<()> {
     // disables the puck's firmware keyboard/mouse emulation and re-sends
     // periodically to re-cover it across reconnects. It degrades gracefully:
     // failures log a warning and never take the daemon down.
-    if lizard_ownership_enabled(&config) {
+    let own_lizard = lizard_ownership_enabled(&config);
+
+    // When we own lizard we must give it back on the way out, or the firmware
+    // keyboard/mouse stays dead and the user has no pointer until a power-cycle.
+    // Install the signal-driven restore early, so an immediate Ctrl-C is already
+    // covered, and pair it with a `_restore` guard that handles the normal-return
+    // and panic paths. The two never both fire: the signal path exits the process
+    // (skipping unwinding), the guard fires only when the function actually returns.
+    let _restore = if own_lizard {
+        crate::lizard::install_signal_restore();
+        Some(crate::lizard::LizardRestoreGuard)
+    } else {
+        None
+    };
+
+    let hypr = Hypr::connect()?;
+    eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
+
+    if own_lizard {
         eprintln!("hyprpad: lizard-mode ownership on; taking over the puck's firmware kbd/mouse");
         std::thread::spawn(crate::lizard::own_lizard_loop);
     }
 
     // Merge both event sources into one channel so the loop stays single-owner.
+    // We keep `tx` alive for the whole run (never `drop` it) so `rx` never
+    // disconnects while the controller is briefly gone: the loop then blocks in
+    // its reconnect wait instead of ending. `tx` is also how we re-arm a fresh
+    // reader pipeline when the controller returns.
     let (tx, rx) = mpsc::channel::<Input>();
 
-    let reports = hidraw::read_all(&nodes);
-    let tx_r = tx.clone();
-    std::thread::spawn(move || {
-        for r in reports {
-            if tx_r.send(Input::Report(r.data)).is_err() {
-                return;
-            }
-        }
-    });
+    spawn_reader_pipeline(&nodes, &tx);
 
     match crate::hypr::subscribe() {
         Ok(events) => {
@@ -87,7 +108,6 @@ pub fn run() -> std::io::Result<()> {
         // daemon is still useful, just not game-aware.
         Err(e) => eprintln!("warning: no compositor event feed ({e}); arbitration disabled"),
     }
-    drop(tx);
 
     // The cursor path degrades gracefully: without it, gestures and workspace
     // switching still work.
@@ -118,8 +138,61 @@ pub fn run() -> std::io::Result<()> {
     // click-down and the B/Menu dismiss).
     let mut prev_frame = report::Frame::default();
 
-    for input in rx {
+    // Supervisor loop. Two states: *connected*, where it blocks on `rx`; and
+    // *waiting*, entered when the readers all end (controller gone), where it
+    // re-scans for the puck on a timer while still draining compositor events —
+    // and, crucially, never returns. Hyprland IPC and the virtual pointer stay
+    // alive across the gap; only the hidraw reader pipeline is torn down and
+    // re-armed. `recv_timeout` with a shrinking deadline guarantees the scan
+    // still fires even if compositor events keep arriving.
+    let mut waiting = false;
+    let mut next_scan = Instant::now();
+    loop {
+        let input = if waiting {
+            match rx.recv_timeout(next_scan.saturating_duration_since(Instant::now())) {
+                Ok(input) => input,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(nodes) = hidraw::puck_readable() {
+                        eprintln!("hyprpad: controller reconnected ({} node(s))", nodes.len());
+                        if own_lizard {
+                            // Re-cover the fresh device now rather than waiting for
+                            // the ownership loop's periodic re-send.
+                            if let Err(e) = crate::lizard::disable_lizard_mode() {
+                                eprintln!("warning: lizard re-disable on reconnect: {e}");
+                            }
+                        }
+                        spawn_reader_pipeline(&nodes, &tx);
+                        waiting = false;
+                    }
+                    next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            }
+        };
+
         match input {
+            Input::ReadersEnded => {
+                eprintln!("hyprpad: controller disconnected, waiting for it to return…");
+                // Release everything held for the vanished controller — a
+                // synthetic click and all smoothing/gesture state — so nothing is
+                // stuck down and a stale `prev` cannot jump the cursor on return.
+                reset_frame_state(
+                    &mut engine,
+                    &mut cursor,
+                    &mut scroll,
+                    &mut osk_route,
+                    &mut prev_frame,
+                    pointer.as_mut(),
+                );
+                waiting = true;
+                next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
+            }
             Input::Compositor(ev) => {
                 if debug {
                     eprintln!("[event] {ev:?}");
@@ -157,6 +230,56 @@ pub fn run() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Arm the hidraw reader pipeline for `nodes`: spawn `read_all`'s per-node
+/// reader threads and a forwarder that funnels their reports into the main
+/// loop's channel. Used for both the initial connect and every reconnect, so
+/// the two paths are identical.
+fn spawn_reader_pipeline(nodes: &[PathBuf], tx: &mpsc::Sender<Input>) {
+    let reports = hidraw::read_all(nodes);
+    let tx = tx.clone();
+    std::thread::spawn(move || forward_reports(reports, tx));
+}
+
+/// Forward every report from one reader generation into the loop's input
+/// channel, then — once they have all ended (the controller went away) — send a
+/// single [`Input::ReadersEnded`] so the loop enters its reconnect wait instead
+/// of going silently idle. Split out from [`spawn_reader_pipeline`] so the
+/// sentinel behaviour is unit-testable without hardware.
+fn forward_reports(reports: mpsc::Receiver<hidraw::Report>, tx: mpsc::Sender<Input>) {
+    for r in reports {
+        if tx.send(Input::Report(r.data)).is_err() {
+            return; // main loop gone; nothing to announce to.
+        }
+    }
+    let _ = tx.send(Input::ReadersEnded);
+}
+
+/// Forget all per-frame state on disconnect (equivalently, before a reconnect —
+/// no reports flow in between): drop any held synthetic click, then reset the
+/// gesture engine, the cursor/scroll dampers, and the OSK router, and clear the
+/// previous frame. Without this a stale `prev` (position or timestamp) would
+/// jump the cursor or misfire a gesture on the first frame after the gap.
+fn reset_frame_state(
+    engine: &mut GestureEngine,
+    cursor: &mut CursorState,
+    scroll: &mut ScrollState,
+    osk_route: &mut OskRoute,
+    prev_frame: &mut report::Frame,
+    pointer: Option<&mut VirtualPointer>,
+) {
+    if let Some(ptr) = pointer {
+        if cursor.left_down {
+            ptr.button(PointerButton::Left, false);
+            cursor.left_down = false;
+        }
+    }
+    *engine = GestureEngine::new();
+    cursor.damper.reset();
+    scroll.reset();
+    osk_route.reset();
+    *prev_frame = report::Frame::default();
 }
 
 /// Build a [`PadDamper`] from the cursor/damping config knobs. Both pad
@@ -681,5 +804,41 @@ mod tests {
         assert!((dy3 - 45.0).abs() < 1e-9);
         let (_, dy_sens) = circular_scroll(-1, 2.0, 15.0, false);
         assert!((dy_sens - 30.0).abs() < 1e-9);
+    }
+
+    fn report(data: Vec<u8>) -> hidraw::Report {
+        hidraw::Report { node: PathBuf::from("/dev/hidraw0"), data }
+    }
+
+    #[test]
+    fn forward_reports_emits_readers_ended_when_source_closes() {
+        let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        rtx.send(report(vec![1, 2, 3])).unwrap();
+        rtx.send(report(vec![4])).unwrap();
+        drop(rtx); // every reader gone -> the source channel closes
+
+        // Runs to completion: the source is already closed, so it drains the two
+        // buffered reports and then announces the readers ended.
+        forward_reports(rrx, itx);
+
+        assert!(matches!(irx.recv(), Ok(Input::Report(d)) if d == [1, 2, 3]));
+        assert!(matches!(irx.recv(), Ok(Input::Report(d)) if d == [4]));
+        assert!(matches!(irx.recv(), Ok(Input::ReadersEnded)));
+        // The forwarder dropped its sender, so the loop's channel is now closed.
+        assert!(irx.recv().is_err());
+    }
+
+    #[test]
+    fn forward_reports_stops_without_sentinel_when_loop_gone() {
+        let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        rtx.send(report(vec![9])).unwrap();
+        drop(irx); // main loop is gone: sends fail
+
+        // Returns on the failed send; must not panic and must not try to send a
+        // sentinel into the dead channel.
+        forward_reports(rrx, itx);
+        drop(rtx);
     }
 }
