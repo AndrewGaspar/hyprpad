@@ -23,7 +23,7 @@
 //! local h = hyprpad
 //!
 //! -- Settings: one call per section, taking the same keys the TOML has.
-//! h.daemon  { own_lizard = true }
+//! h.daemon  { own_lizard = true, rescan_on_title_change = true, process_rescan_ms = 500 }
 //! h.cursor  { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
 //! h.haptics { cursor_spacing_px = 96 }
@@ -135,6 +135,11 @@ pub struct LuaRuntime {
     /// Focused-window `/proc` walk cache, so `process_tree_has` costs one walk
     /// per focused pid however many predicates ask.
     procs: Rc<RefCell<ProcCache>>,
+    /// Whether the loaded file mentions `process_tree_has` at all. Decided once,
+    /// at load, by scanning the source: a config that never walks the process
+    /// tree must never be polled for changes in it
+    /// ([`crate::mode::ModeEngine::process_rescan_useful`]).
+    walks_process_tree: bool,
     /// Predicate ids that have already logged a failure, so a permanently
     /// broken predicate complains once instead of on every focus change.
     complained: RefCell<Vec<usize>>,
@@ -152,6 +157,23 @@ impl LuaRuntime {
     /// How many predicates the config registered.
     pub fn predicate_count(&self) -> usize {
         self.predicates.len()
+    }
+
+    /// Whether any predicate in this config walks the focused window's process
+    /// tree. Decided at load from the source text, which is conservative in the
+    /// safe direction: a file that mentions `process_tree_has` may still never
+    /// call it (one wasted `/proc` walk per rescan interval), but a file that
+    /// does not mention it cannot possibly call it, and is never polled.
+    pub fn walks_process_tree(&self) -> bool {
+        self.walks_process_tree
+    }
+
+    /// Drop the focused window's cached `/proc` walk so the next predicate that
+    /// asks re-walks it. The rescan paths' one lever: everything else about
+    /// re-resolving is unchanged, which is what keeps a rescan-driven mode
+    /// transition identical to a focus-driven one.
+    pub fn forget_process_tree(&self) {
+        self.procs.borrow_mut().forget();
     }
 
     /// Evaluate predicate `id` against the current focus context.
@@ -262,11 +284,13 @@ fn truthy(v: &Value) -> bool {
 /// One focused pid's `/proc` descendants, flattened to lowercase
 /// `"<comm> <cmdline>"` strings and cached.
 ///
-/// The walk happens on a **focus change**, at most once per focused pid however
-/// many predicates ask — docs/13's "cheap, not per-frame" requirement. It is
-/// deliberately not re-walked on a timer: starting `claude` inside an
-/// already-focused terminal needs a refocus to be noticed, which the owner
-/// signed off on as "finnicky by design".
+/// The walk happens at most once per focused pid however many predicates ask —
+/// docs/13's "cheap, not per-frame" requirement — and is re-walked only when
+/// something says the tree may have moved under a *still-focused* window:
+/// Hyprland renaming it (`rescan_on_title_change`, the event-driven path, since
+/// starting `claude` renames the terminal) or the periodic
+/// `process_rescan_ms` sweep for the programs that rename nothing. Both spell
+/// that as [`LuaRuntime::forget_process_tree`]; neither changes what a walk is.
 #[derive(Debug, Default)]
 struct ProcCache {
     pid: Option<i32>,
@@ -281,6 +305,12 @@ impl ProcCache {
         }
         let needle = needle.to_ascii_lowercase();
         self.entries.iter().any(|e| e.contains(&needle))
+    }
+
+    /// Forget the cached walk, so the next `tree_has` re-reads `/proc`.
+    fn forget(&mut self) {
+        self.pid = None;
+        self.entries.clear();
     }
 }
 
@@ -391,7 +421,12 @@ pub fn load_str(src: &str, name: &str) -> Result<Config, String> {
     // a handle to, which both hands us the data and breaks the only reference
     // cycle that could keep the interpreter alive after the Config is dropped.
     let b = std::mem::take(&mut *build.borrow_mut());
-    finish(b, lua, deadline).map_err(|e| format!("{name}: {e}"))
+    // Whether any predicate can walk the process tree is a property of the
+    // *source*, not of anything the file did while it ran: a rule that only ever
+    // calls `process_tree_has` on a class it has not seen yet would otherwise
+    // look unused at load time and never be polled.
+    finish(b, lua, deadline, src.contains("process_tree_has"))
+        .map_err(|e| format!("{name}: {e}"))
 }
 
 /// Install the instruction-count watchdog hook.
@@ -418,6 +453,7 @@ fn finish(
     mut b: Build,
     lua: Lua,
     deadline: Rc<Cell<Option<Instant>>>,
+    walks_process_tree: bool,
 ) -> Result<Config, String> {
     // A `default_mode` nobody declared is a convenience, not a typo: declare it
     // implicitly (with no rule) so `h.default_mode "desktop"` alone works.
@@ -445,6 +481,7 @@ fn finish(
         predicates: std::mem::take(&mut b.predicates),
         deadline,
         procs: Rc::new(RefCell::new(ProcCache::default())),
+        walks_process_tree,
         complained: RefCell::new(Vec::new()),
     };
 
@@ -453,6 +490,8 @@ fn finish(
         buttons: b.buttons,
         osk_buttons: b.osk_buttons,
         own_lizard: b.own_lizard,
+        rescan_on_title_change: b.rescan_on_title_change,
+        process_rescan_ms: b.process_rescan_ms,
         cursor: b.cursor,
         scroll: b.scroll,
         haptics: b.haptics,
@@ -516,6 +555,8 @@ struct Build {
     osk_buttons: HashMap<crate::report::Button, u16>,
     osk_button_guards: HashMap<crate::report::Button, Guard>,
     own_lizard: bool,
+    rescan_on_title_change: Option<bool>,
+    process_rescan_ms: Option<u64>,
     cursor: CursorConfig,
     cursor_guard: Guard,
     scroll: ScrollConfig,
@@ -949,7 +990,8 @@ fn default_mode_fn(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
 
 // --- settings sections -----------------------------------------------------
 
-/// `h.daemon { own_lizard = true }`.
+/// `h.daemon { own_lizard = true, rescan_on_title_change = true,
+/// process_rescan_ms = 500 }`.
 fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
     lua.create_function(move |_, t: Table| {
@@ -958,7 +1000,17 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
             let (k, v) = pair?;
             match k.as_str() {
                 "own_lizard" => b.own_lizard = as_bool(&v, &k)?,
-                other => return Err(unknown_key("h.daemon", other, &["own_lizard"])),
+                "rescan_on_title_change" => {
+                    b.rescan_on_title_change = Some(as_bool(&v, &k)?)
+                }
+                "process_rescan_ms" => b.process_rescan_ms = Some(as_millis(&v, &k)?),
+                other => {
+                    return Err(unknown_key(
+                        "h.daemon",
+                        other,
+                        &["own_lizard", "rescan_on_title_change", "process_rescan_ms"],
+                    ))
+                }
             }
         }
         Ok(())
@@ -1342,6 +1394,19 @@ fn as_bool(v: &Value, key: &str) -> mlua::Result<bool> {
     }
 }
 
+/// A whole number of milliseconds (`0` = off). Built on [`as_f64`] so it accepts
+/// the same spellings every other numeric knob does, and rejects the ones a
+/// timer cannot mean.
+fn as_millis(v: &Value, key: &str) -> mlua::Result<u64> {
+    let n = as_f64(v, key)?;
+    if n < 0.0 || n.fract() != 0.0 {
+        return Err(err(format!(
+            "'{key}' must be a whole number of milliseconds (0 = off), got {n}"
+        )));
+    }
+    Ok(n as u64)
+}
+
 fn as_string(v: &Value, key: &str) -> mlua::Result<String> {
     match v {
         Value::String(s) => Ok(s.to_str()?.to_string()),
@@ -1491,6 +1556,99 @@ mod tests {
 
         let e = load_str(r#"hyprpad.bind("guide+nope", hyprpad.exec "x")"#, "t.lua").unwrap_err();
         assert!(e.contains("unknown button 'nope'"), "{e}");
+    }
+
+    #[test]
+    fn the_rescan_knobs_parse_and_keep_their_defaults() {
+        // Untouched by the file: the title path on, the sweep at half a second.
+        let d = load(r#"hyprpad.daemon { own_lizard = true }"#);
+        assert!(d.rescan_on_title_change());
+        assert_eq!(d.process_rescan_ms(), 500);
+
+        let c = load(
+            r#"hyprpad.daemon {
+                 rescan_on_title_change = false,
+                 process_rescan_ms = 250,
+               }"#,
+        );
+        assert!(!c.rescan_on_title_change());
+        assert_eq!(c.process_rescan_ms(), 250);
+        assert_eq!(load("hyprpad.daemon { process_rescan_ms = 0 }").process_rescan_ms(), 0);
+
+        // Values a timer cannot mean, and a typo, are load errors.
+        for bad in ["-1", "0.5"] {
+            let e = load_str(&format!("hyprpad.daemon {{ process_rescan_ms = {bad} }}"), "t.lua")
+                .unwrap_err();
+            assert!(e.contains("whole number of milliseconds"), "{bad}: {e}");
+        }
+        let e = load_str("hyprpad.daemon { rescan_on_title = true }", "t.lua").unwrap_err();
+        assert!(e.contains("rescan_on_title_change"), "the typo should list the real key: {e}");
+    }
+
+    /// The load-time gate on the periodic rescan: a config that never mentions
+    /// `process_tree_has` must never be polled for changes in it.
+    #[test]
+    fn walks_process_tree_is_decided_from_the_source() {
+        let walker = load(
+            r#"
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus:process_tree_has("claude")
+            end)
+            "#,
+        );
+        assert!(walker.lua().unwrap().walks_process_tree());
+
+        let title_only = load(
+            r#"
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus.title:match("claude") ~= nil
+            end)
+            "#,
+        );
+        assert!(!title_only.lua().unwrap().walks_process_tree());
+    }
+
+    #[test]
+    fn forgetting_the_process_tree_makes_the_next_predicate_re_walk() {
+        // The cache is what makes a walk once-per-focus; `forget` is the single
+        // lever both rescan paths pull, and this is the proof it re-reads.
+        let c = load(
+            r#"
+            hyprpad.mode("has").when(function(ctx)
+              return ctx.focus:process_tree_has("hyprpad-forget-probe")
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let rt = c.lua().unwrap();
+        let rule = c.modes()[0].rule.unwrap();
+        let focus = Focus { pid: Some(std::process::id() as i32), ..Focus::default() };
+        assert!(!rt.eval_predicate(rule, &focus), "nothing by that name yet");
+
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg0("hyprpad-forget-probe")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+
+        // Without forgetting, the cached walk still answers "no"...
+        assert!(!rt.eval_predicate(rule, &focus), "the cache must not re-walk on its own");
+        // ...and with it, the child is found (retried: `spawn` returns before
+        // the child has exec'd).
+        let mut found = false;
+        for _ in 0..50 {
+            rt.forget_process_tree();
+            found = rt.eval_predicate(rule, &focus);
+            if found {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(found);
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

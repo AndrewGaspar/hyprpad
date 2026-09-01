@@ -282,33 +282,73 @@ pub fn run() -> std::io::Result<()> {
     // still fires even if compositor events keep arriving.
     let mut waiting = false;
     let mut next_scan = Instant::now();
+    // What the loop knows about the focused window: which address it is (so a
+    // `windowtitle` event can be attributed), which title form this compositor
+    // speaks, and when its process tree may next be re-walked.
+    let mut watch = FocusWatch::new();
     loop {
-        let input = if waiting {
-            match rx.recv_timeout(next_scan.saturating_duration_since(Instant::now())) {
+        // The periodic process-tree rescan (`process_rescan_ms`), the title-less
+        // half of noticing a program that starts under the focused window.
+        // Checked *before* the receive, so a busy report stream (a hand resting
+        // on a pad) can never starve it, and used as the receive deadline below,
+        // so an idle loop still wakes for it. `arm_rescan` is what rate-limits
+        // it: one walk per interval however many events arrive in between.
+        let rescan_at = process_rescan_due(&config, &modes, &watch);
+        if rescan_at.is_some_and(|at| at <= Instant::now()) {
+            watch.arm_rescan(&config);
+            if modes.rescan_processes(&config) {
+                eprintln!("hyprpad: mode -> {} (process rescan)", modes.active());
+                mode_handoff(
+                    &mut engine,
+                    &mut cursor,
+                    &mut scroll,
+                    &mut osk_route,
+                    &mut prev_frame,
+                    pointer.as_mut(),
+                    &mut button_keys,
+                    &mut keyboard,
+                    &mut gamepad,
+                    &mut haptics,
+                );
+            }
+            continue;
+        }
+
+        // The earliest deadline this iteration must wake for: the reconnect
+        // re-scan while the controller is away, and the process rescan whenever
+        // it is armed. With neither, this is the plain blocking receive it has
+        // always been.
+        let wake = match (waiting.then_some(next_scan), rescan_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let input = match wake {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(input) => input,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(nodes) = hidraw::puck_readable() {
-                        eprintln!("hyprpad: controller reconnected ({} node(s))", nodes.len());
-                        if own_lizard {
-                            // Re-cover the fresh device now rather than waiting for
-                            // the ownership loop's periodic re-send.
-                            if let Err(e) = crate::lizard::disable_lizard_mode() {
-                                eprintln!("warning: lizard re-disable on reconnect: {e}");
+                    if waiting && Instant::now() >= next_scan {
+                        if let Some(nodes) = hidraw::puck_readable() {
+                            eprintln!("hyprpad: controller reconnected ({} node(s))", nodes.len());
+                            if own_lizard {
+                                // Re-cover the fresh device now rather than waiting for
+                                // the ownership loop's periodic re-send.
+                                if let Err(e) = crate::lizard::disable_lizard_mode() {
+                                    eprintln!("warning: lizard re-disable on reconnect: {e}");
+                                }
                             }
+                            spawn_reader_pipeline(&nodes, &tx);
+                            waiting = false;
                         }
-                        spawn_reader_pipeline(&nodes, &tx);
-                        waiting = false;
+                        next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
                     }
-                    next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
+            },
+            None => match rx.recv() {
                 Ok(input) => input,
                 Err(_) => break,
-            }
+            },
         };
 
         match input {
@@ -347,22 +387,24 @@ pub fn run() -> std::io::Result<()> {
                 if debug {
                     eprintln!("[event] {ev:?}");
                 }
-                if update_modes(&mut modes, &config, &hypr, ev) {
-                    eprintln!("hyprpad: mode -> {}", modes.active());
-                    // A mode transition is a handoff: whatever the outgoing mode
-                    // was holding — a synthetic click, a held key, the virtual
-                    // pad's last stick values, a mid-flight gesture — must be
-                    // let go before the incoming mode's gates apply.
-                    reset_frame_state(
+                let titled = matches!(ev, HyprEvent::WindowTitle { .. });
+                if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
+                    // Name the cause: a transition with no focus change behind
+                    // it is otherwise a mystery in the log.
+                    let why = if titled { " (title change)" } else { "" };
+                    eprintln!("hyprpad: mode -> {}{why}", modes.active());
+                    mode_handoff(
                         &mut engine,
                         &mut cursor,
                         &mut scroll,
                         &mut osk_route,
                         &mut prev_frame,
                         pointer.as_mut(),
+                        &mut button_keys,
+                        &mut keyboard,
+                        &mut gamepad,
+                        &mut haptics,
                     );
-                    button_keys.release_all(&mut keyboard);
-                    gamepad.release(&mut haptics);
                 }
             }
             Input::Osk(OskEvent::Crossed(pad)) => {
@@ -391,16 +433,18 @@ pub fn run() -> std::io::Result<()> {
                     // A binding forced a mode (`h.set_mode` / `h.clear_mode`).
                     // Same handoff as a context-driven transition.
                     eprintln!("hyprpad: mode -> {} (manual)", modes.active());
-                    reset_frame_state(
+                    mode_handoff(
                         &mut engine,
                         &mut cursor,
                         &mut scroll,
                         &mut osk_route,
                         &mut prev_frame,
                         pointer.as_mut(),
+                        &mut button_keys,
+                        &mut keyboard,
+                        &mut gamepad,
+                        hx.dev,
                     );
-                    button_keys.release_all(&mut keyboard);
-                    gamepad.release(hx.dev);
                 }
                 if osk.is_active() {
                     // The keyboard owns both pads: route them to it, and keep the
@@ -635,6 +679,32 @@ fn reset_frame_state(
     scroll.reset();
     osk_route.reset();
     *prev_frame = report::Frame::default();
+}
+
+/// The clean handoff a mode transition runs, wherever the transition came from
+/// — a focus change, a rename of the focused window, the periodic process
+/// rescan, a manual override from a binding, or a reload.
+///
+/// Whatever the outgoing mode was holding — a synthetic click, a held key, the
+/// virtual pad's last stick values, a mid-flight gesture — is let go before the
+/// incoming mode's gates apply. One function, so a new way of *noticing* a
+/// transition can never come with a subtly different way of *making* one.
+#[allow(clippy::too_many_arguments)]
+fn mode_handoff(
+    engine: &mut GestureEngine,
+    cursor: &mut CursorState,
+    scroll: &mut ScrollState,
+    osk_route: &mut OskRoute,
+    prev_frame: &mut report::Frame,
+    pointer: Option<&mut VirtualPointer>,
+    button_keys: &mut ButtonKeys,
+    keyboard: &mut Option<VirtualKeyboard>,
+    gamepad: &mut GamepadState,
+    haptics: &mut Haptics,
+) {
+    reset_frame_state(engine, cursor, scroll, osk_route, prev_frame, pointer);
+    button_keys.release_all(keyboard);
+    gamepad.release(haptics);
 }
 
 /// Build a [`PadDamper`] from the cursor/damping config knobs. Both pad
@@ -1595,6 +1665,84 @@ pub fn reload() -> Result<(), String> {
     Ok(())
 }
 
+/// What the loop remembers about the focused window between compositor events,
+/// so a `windowtitle` line can be answered without asking the compositor
+/// anything, and so the process rescan has a clock.
+struct FocusWatch {
+    /// The focused window's address, from `activewindowv2`. A `windowtitle`
+    /// event for any other address is some background window renaming itself
+    /// (a browser tab, a spinner in another terminal) and is not our business.
+    /// Empty until the first focus change of the session.
+    address: String,
+    /// Whether this compositor emits the `windowtitlev2` form, which carries
+    /// the new title on the wire. The target fork emits **both** forms for
+    /// every rename, so once one v2 line has been seen the bare `windowtitle`
+    /// line is redundant — and answering it anyway would cost a
+    /// `j/activewindow` round trip per rename, on a stream that runs at
+    /// spinner speed.
+    titles_v2: bool,
+    /// Earliest instant the focused window's process tree may be re-walked.
+    /// Pushed out by every walk, whatever caused it, so the interval measures
+    /// time since the last walk rather than time since the last timeout.
+    next_rescan: Instant,
+}
+
+impl FocusWatch {
+    fn new() -> FocusWatch {
+        FocusWatch { address: String::new(), titles_v2: false, next_rescan: Instant::now() }
+    }
+
+    /// Push the process rescan a full interval out. Called whenever the tree
+    /// has just been (or is about to be) re-walked.
+    fn arm_rescan(&mut self, config: &Config) {
+        self.next_rescan = Instant::now() + Duration::from_millis(config.process_rescan_ms());
+    }
+
+    /// Decide what a `windowtitle` event asks of the loop.
+    ///
+    /// Pure, so the focused-window test is unit-testable without a compositor:
+    /// everything it needs is the event's address and title, this struct, and
+    /// the live knob.
+    fn title_update(
+        &mut self,
+        config: &Config,
+        address: &str,
+        title: Option<String>,
+    ) -> TitleUpdate {
+        if title.is_some() {
+            self.titles_v2 = true;
+        }
+        // A config that declares no modes (every `config.toml`) resolves on
+        // window class alone, so no rename can change its answer — the same
+        // "never pay for what you did not ask for" rule as `needs_focus_pid`.
+        if config.modes().is_empty()
+            || !config.rescan_on_title_change()
+            || address.is_empty()
+            || address != self.address
+        {
+            return TitleUpdate::Ignore;
+        }
+        match title {
+            Some(t) => TitleUpdate::Title(t),
+            None if self.titles_v2 => TitleUpdate::Ignore,
+            None => TitleUpdate::Query,
+        }
+    }
+}
+
+/// What a `windowtitle` event asks the loop to do.
+#[derive(Debug, PartialEq, Eq)]
+enum TitleUpdate {
+    /// Another window renamed itself, or the title path is switched off:
+    /// nothing to do, and nothing to ask the compositor.
+    Ignore,
+    /// The focused window's new title, straight off the wire (`windowtitlev2`).
+    Title(String),
+    /// The focused window renamed itself, but this line did not say to what
+    /// (the bare `windowtitle` form): ask `j/activewindow`.
+    Query,
+}
+
 /// Feed a compositor event into the mode engine; returns whether the active
 /// mode changed (so the caller can run the clean handoff).
 ///
@@ -1603,7 +1751,20 @@ pub fn reload() -> Result<(), String> {
 /// are fetched with one `j/activewindow` query — on the focus change, never per
 /// frame — because `ctx.focus:process_tree_has(..)` needs a pid to walk from. A
 /// config with no modes (every `config.toml`) never pays for the round trip.
-fn update_modes(modes: &mut ModeEngine, config: &Config, hypr: &Hypr, ev: HyprEvent) -> bool {
+///
+/// `windowtitle` is the second context source, and the one that fixes starting a
+/// program inside an already-focused terminal: the terminal renames itself, so
+/// the rules get to run again the moment `claude` starts rather than on the next
+/// refocus. Only the focused window's rename counts — [`FocusWatch`] tracks
+/// which address that is, from `activewindowv2`, so a background window's
+/// spinner costs one string compare.
+fn update_modes(
+    modes: &mut ModeEngine,
+    config: &Config,
+    hypr: &Hypr,
+    watch: &mut FocusWatch,
+    ev: HyprEvent,
+) -> bool {
     match ev {
         HyprEvent::ActiveWindow { class, title, pid } => {
             let mut focus = crate::mode::Focus { class, title, pid, fullscreen: false };
@@ -1616,12 +1777,50 @@ fn update_modes(modes: &mut ModeEngine, config: &Config, hypr: &Hypr, ev: HyprEv
                     Err(e) => eprintln!("warning: could not read the focused window's pid: {e}"),
                 }
             }
+            // A fresh window means a fresh tree; the resolve below walks it, so
+            // the sweep starts its interval from here.
+            watch.arm_rescan(config);
             // One complete context, one re-resolve — never a half-updated one.
             modes.context_changed(config, focus)
+        }
+        HyprEvent::ActiveWindowV2 { address } => {
+            watch.address = address;
+            false
+        }
+        HyprEvent::WindowTitle { address, title } => {
+            let title = match watch.title_update(config, &address, title) {
+                TitleUpdate::Ignore => return false,
+                TitleUpdate::Title(t) => t,
+                TitleUpdate::Query => match hypr.active_window() {
+                    Ok(info) => info.title,
+                    Err(e) => {
+                        eprintln!("warning: could not read the focused window's title: {e}");
+                        return false;
+                    }
+                },
+            };
+            // Only a *real* rename re-walks the tree, so only a real rename
+            // resets the sweep's clock — a compositor that re-announced the
+            // title it already sent must not be able to starve it.
+            if modes.focus_title() != title {
+                watch.arm_rescan(config);
+            }
+            modes.title_changed(config, &title)
         }
         HyprEvent::Fullscreen(on) => modes.set_fullscreen(config, on),
         _ => false,
     }
+}
+
+/// The instant the focused window's process tree is next due to be re-walked,
+/// or `None` when the periodic sweep is off for this config and context.
+///
+/// Off is the common case and every test of it is free: `process_rescan_ms = 0`,
+/// a config no predicate of which mentions `process_tree_has`, or no focused pid
+/// to walk from.
+fn process_rescan_due(config: &Config, modes: &ModeEngine, watch: &FocusWatch) -> Option<Instant> {
+    (config.process_rescan_ms() > 0 && modes.process_rescan_useful(config))
+        .then_some(watch.next_rescan)
 }
 
 /// Handle one recognized gesture. Returns whether it moved the active mode
@@ -1880,6 +2079,125 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `config.lua` whose rule walks the process tree, so the periodic
+    /// rescan has something to be armed for.
+    fn walking_config(daemon: &str) -> Config {
+        crate::lua_config::load_str(
+            &format!(
+                r#"
+                hyprpad.daemon {{ {daemon} }}
+                hyprpad.mode("claude").when(function(ctx)
+                  return ctx.focus:process_tree_has("nothing-by-that-name")
+                end)
+                hyprpad.mode("desktop")
+                "#
+            ),
+            "test.lua",
+        )
+        .expect("config should load")
+    }
+
+    /// The focused-window check: which `windowtitle` line is ours, and which of
+    /// the compositor's two lines per rename to answer.
+    #[test]
+    fn a_title_event_is_answered_only_for_the_focused_window() {
+        let c = walking_config("");
+        let mut w = FocusWatch::new();
+        w.address = "0xfocused".to_string();
+
+        // The v2 form for the focused window carries the new title.
+        assert_eq!(
+            w.title_update(&c, "0xfocused", Some("claude — foot".into())),
+            TitleUpdate::Title("claude — foot".into())
+        );
+        // Another window's spinner is not our business, in either form.
+        assert_eq!(w.title_update(&c, "0xother", Some("⠙ build".into())), TitleUpdate::Ignore);
+        assert_eq!(w.title_update(&c, "0xother", None), TitleUpdate::Ignore);
+        // Nor is the bare line for the focused window, now that a v2 has proved
+        // this compositor sends both per rename.
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Ignore);
+
+        // Before the session's first focus change we do not know which window
+        // holds focus, so no rename is attributable.
+        let mut fresh = FocusWatch::new();
+        assert_eq!(fresh.title_update(&c, "0xfocused", Some("x".into())), TitleUpdate::Ignore);
+    }
+
+    #[test]
+    fn the_bare_title_form_is_queried_until_a_v2_form_proves_it_redundant() {
+        let c = walking_config("");
+        let mut w = FocusWatch::new();
+        w.address = "0xfocused".to_string();
+        // A compositor that has only ever sent the title-less form: ask it.
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Query);
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Query);
+        // One v2 line settles it for the rest of the session.
+        w.title_update(&c, "0xfocused", Some("t".into()));
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Ignore);
+    }
+
+    #[test]
+    fn rescan_on_title_change_false_suppresses_the_title_path() {
+        let c = walking_config("rescan_on_title_change = false");
+        let mut w = FocusWatch::new();
+        w.address = "0xfocused".to_string();
+        assert_eq!(w.title_update(&c, "0xfocused", Some("claude".into())), TitleUpdate::Ignore);
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Ignore);
+    }
+
+    #[test]
+    fn a_config_with_no_modes_never_takes_the_title_path() {
+        // Every `config.toml`: the built-in path selects on class alone, so a
+        // rename cannot change its answer and must not cost a query.
+        let c = Config::load_default();
+        let mut w = FocusWatch::new();
+        w.address = "0xfocused".to_string();
+        assert_eq!(w.title_update(&c, "0xfocused", Some("claude".into())), TitleUpdate::Ignore);
+        assert_eq!(w.title_update(&c, "0xfocused", None), TitleUpdate::Ignore);
+    }
+
+    #[test]
+    fn the_process_rescan_timer_is_armed_only_when_a_walk_could_matter() {
+        let c = walking_config("");
+        let mut modes = ModeEngine::new(&c);
+        let mut w = FocusWatch::new();
+        assert!(process_rescan_due(&c, &modes, &w).is_none(), "no focused pid yet");
+
+        modes.focus_changed(&c, "foot", "shell", Some(std::process::id() as i32));
+        assert!(process_rescan_due(&c, &modes, &w).is_some());
+
+        // Arming pushes the deadline a full interval out — the rate limit, and
+        // the only thing that moves it, so an event burst cannot bring it
+        // forward.
+        w.arm_rescan(&c);
+        let due = process_rescan_due(&c, &modes, &w).expect("armed");
+        assert!(due > Instant::now());
+        assert!(due <= Instant::now() + Duration::from_millis(c.process_rescan_ms()));
+
+        // `process_rescan_ms = 0` switches the sweep off outright...
+        let off = walking_config("process_rescan_ms = 0");
+        let mut modes = ModeEngine::new(&off);
+        modes.focus_changed(&off, "foot", "shell", Some(std::process::id() as i32));
+        assert!(process_rescan_due(&off, &modes, &w).is_none());
+
+        // ...and so does a config no rule of which walks the tree, however
+        // eagerly it is configured.
+        let title_only = crate::lua_config::load_str(
+            r#"
+            hyprpad.daemon { process_rescan_ms = 50 }
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus.title:match("claude") ~= nil
+            end)
+            hyprpad.mode("desktop")
+            "#,
+            "test.lua",
+        )
+        .unwrap();
+        let mut modes = ModeEngine::new(&title_only);
+        modes.focus_changed(&title_only, "foot", "shell", Some(std::process::id() as i32));
+        assert!(process_rescan_due(&title_only, &modes, &w).is_none());
+    }
 
     #[test]
     fn swipe_maps_vertical_delta_to_scroll() {
