@@ -53,16 +53,16 @@ Details and the rejected alternatives are in
 
 ## Configuring the daemon
 
-hyprpad reads **one** of two config files from `~/.config/hyprpad/`, and
-`config.lua` wins when both exist:
+hyprpad reads **one** config file, checked in this order (first that exists wins):
 
-| file | front-end | when to use it |
+| path | front-end | when to use it |
 |---|---|---|
-| `config.lua` | embedded Lua 5.4 (`mlua`, vendored) | you want **modes** — context-selected controller behaviour |
-| `config.toml` | the built-in flat TOML dialect | everything else; nothing about it changed |
+| `~/.config/hypr/hyprpad.lua` | embedded Lua 5.4 (`mlua`, vendored) | the convention — alongside `hypridle.conf`/`hyprlock.conf`; you want **modes** |
+| `~/.config/hyprpad/config.lua` | same Lua front-end | the pre-convention location, still honoured |
+| `~/.config/hyprpad/config.toml` | the built-in flat TOML dialect | everything else; nothing about it changed |
 
 Both produce the same internal config, so nothing downstream knows which ran.
-`config/config.lua` in this repo is a ready-to-copy sample. See
+`config/hyprpad.lua` in this repo is a ready-to-copy sample (and `config/hyprpad-rules.lua` is the *compositor-side* rules file Hyprland `require`s — a different consumer, hence the distinct name). See
 [docs/research/lua-config.md](docs/research/lua-config.md) for why the second
 front-end exists (short version: **mode selection is logic, not data**) and
 [docs/13-modality-design.md](docs/13-modality-design.md) for the model.

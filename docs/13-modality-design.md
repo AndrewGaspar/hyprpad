@@ -200,10 +200,10 @@ so the schema above is superseded by the Lua one. What shipped:
   It *embeds* an `Arbiter` for the built-in path, so a config that declares no
   modes (every `config.toml`) keeps today's behaviour exactly rather than a
   re-implementation of it.
-- `src/lua_config.rs` — the `config.lua` front-end and the `hyprpad` API.
+- `src/lua_config.rs` — the `hyprpad.lua` (Lua) front-end and the `hyprpad` API.
 - `src/config.rs` — `ModeDef`, `Guard`, `ModeState`, `Action::SetMode` /
   `Action::ClearMode`, and the dual-front-end `Config::load`.
-- `config/config.lua` — the owner's live `config.toml` translated 1:1, plus the
+- `config/hyprpad.lua` — the owner's live `config.toml` translated 1:1, plus the
   game mode, the guards, and a commented Claude-Code mode.
 
 Schema, in the shape the owner's decisions asked for:
