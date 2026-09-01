@@ -85,8 +85,11 @@ pub enum Action {
     /// A raw Hyprland dispatch payload; the integration layer decides delivery.
     Dispatch(String),
     /// Toggle the on-screen keyboard: show it (in `mode`) if hidden, hide it if
-    /// shown. Driven by [`crate::osk::OskHandle`], not a Hyprland dispatch.
-    ToggleKeyboard { mode: crate::osk::OskMode },
+    /// shown. `reflow` picks the presentation: `false` (the default) floats the
+    /// keyboard over the desktop; `true` claims an exclusive zone so workspace
+    /// content is displaced around it. Driven by [`crate::osk::OskHandle`], not
+    /// a Hyprland dispatch.
+    ToggleKeyboard { mode: crate::osk::OskMode, reflow: bool },
     /// Emit a raw evdev keycode (`KEY_*`). Bound to a *bare* controller button
     /// in the `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
     /// button is held and released when it lifts, so the kernel auto-repeats.
@@ -129,14 +132,25 @@ impl Action {
                 }
             }
             "keyboard" | "osk" => {
-                let mode = match rest.to_ascii_lowercase().as_str() {
-                    "" | "bottom" | "deck" => crate::osk::OskMode::Bottom,
-                    "split" | "side" => crate::osk::OskMode::Split,
-                    other => {
-                        return Err(format!("unknown keyboard mode '{other}' (want bottom|split)"))
+                // Grammar: `keyboard [bottom|split] [overlay|reflow]`. Both
+                // words optional; overlay (float over the desktop) is the
+                // default presentation, matching the OSK's own default.
+                let mut mode = crate::osk::OskMode::Bottom;
+                let mut reflow = false;
+                for word in rest.to_ascii_lowercase().split_whitespace() {
+                    match word {
+                        "bottom" | "deck" => mode = crate::osk::OskMode::Bottom,
+                        "split" | "side" => mode = crate::osk::OskMode::Split,
+                        "overlay" | "float" => reflow = false,
+                        "reflow" | "displace" | "push" => reflow = true,
+                        other => {
+                            return Err(format!(
+                                "unknown keyboard option '{other}' (want bottom|split, overlay|reflow)"
+                            ))
+                        }
                     }
-                };
-                Ok(Action::ToggleKeyboard { mode })
+                }
+                Ok(Action::ToggleKeyboard { mode, reflow })
             }
             "key" => {
                 if rest.is_empty() {
@@ -920,10 +934,11 @@ mod tests {
     fn default_binds_keyboard_toggle() {
         use crate::osk::OskMode;
         let c = Config::load_default();
-        // The default keyboard chord is guide+y -> toggle the bottom deck.
+        // The default keyboard chord is guide+y -> toggle the bottom deck,
+        // floating over the desktop (overlay).
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
         );
     }
 
@@ -935,29 +950,30 @@ mod tests {
 "guide+y" = "keyboard"
 "guide+a" = "keyboard bottom"
 "guide+b" = "keyboard split"
-"guide+x" = "osk split"
+"guide+x" = "osk split reflow"
 "#;
         let c = Config::from_toml_str(toml).expect("parse");
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::A)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
         );
+        // Presentation defaults to overlay (float); `reflow` opts in.
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::B)),
-            Action::ToggleKeyboard { mode: OskMode::Split }
+            Action::ToggleKeyboard { mode: OskMode::Split, reflow: false }
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::X)),
-            Action::ToggleKeyboard { mode: OskMode::Split }
+            Action::ToggleKeyboard { mode: OskMode::Split, reflow: true }
         );
-        // An unknown mode is a reported error, not a silent default.
+        // An unknown option is a reported error, not a silent default.
         assert!(Config::from_toml_str("[bindings]\n\"guide+y\" = \"keyboard sideways\"\n")
             .unwrap_err()
-            .contains("unknown keyboard mode"));
+            .contains("unknown keyboard option"));
     }
 
     #[test]

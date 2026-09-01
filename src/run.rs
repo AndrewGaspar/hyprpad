@@ -1187,8 +1187,8 @@ fn handle_gesture(
     hx.fire(Haptic::Gesture, HapticPad::Both);
 
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
-    if let Action::ToggleKeyboard { mode } = action {
-        toggle_keyboard(osk, mode);
+    if let Action::ToggleKeyboard { mode, reflow } = action {
+        toggle_keyboard(osk, mode, reflow);
         return;
     }
 
@@ -1197,13 +1197,14 @@ fn handle_gesture(
     }
 }
 
-/// Flip the on-screen keyboard: show it (in `mode`, reflowing workspace content)
+/// Flip the on-screen keyboard: show it (in `mode`, with the binding's chosen
+/// presentation — overlay floats over the desktop, reflow displaces content)
 /// when hidden, hide it when shown.
-fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode) {
+fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode, reflow: bool) {
     if osk.is_active() {
         osk.hide();
     } else {
-        osk.show(mode, true);
+        osk.show(mode, reflow);
     }
 }
 
