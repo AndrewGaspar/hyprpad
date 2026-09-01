@@ -534,3 +534,28 @@ What to verify on first run (the genuine unknowns):
 
 Start with a one-shot manual test (a single `haptic_tick(Pad::Right)` behind a
 debug key) before wiring it into the OSK loop.
+
+---
+
+## 14. Verified on-device — 2026-08-31 (implementation of `src/haptics.rs`)
+
+One-shot pulses were sent to the live puck (controller awake, a `hyprpad run`
+daemon owning it, `hid-generic` bound) by opening each node `O_RDWR` and
+`write()`ing the 8 bytes. Five reports: tick right `81 00 90 01 00 00 01 00`,
+tick left `81 01 90 01 …`, click left/right `81 0x 58 02 2c 01 02 00`, buzz both
+`81 02 f4 01 f4 01 0a 00`.
+
+1. **The `0x81` output report fires** (§13 item 1): every write returned 8 bytes
+   written on **every** one of the five puck nodes, in ~1–3 ms (one 19–31 ms
+   outlier on the first touch of `/dev/hidraw11`). No `EPIPE`, no STALL, no
+   `SETTING_HAPTICS_ENABLED` preflight needed (§6 was not exercised).
+2. **Which node** (§13 item 3): *the write-success signal cannot tell you.* An
+   output report is fire-and-forget, so all five nodes accept it — unlike the
+   *feature* reports in `lizard.rs`, where the inactive slots STALL and the
+   "try every node, keep what works" strategy converges. Input identifies the
+   live slot instead: a 1 s read poll saw **268 reports/s (ids `0x42`, `0x7B`) on
+   `/dev/hidraw7` and 0 on the other four**. `src/haptics.rs` therefore opens
+   every node read-write, `poll`s briefly for readability, and pulses only the
+   node(s) that streamed — falling back to the shotgun if nothing is streaming.
+3. **Physical side** (§13 item 2) and **feel/tuning** (item 4) still need a human
+   in the loop: the agent that sent these pulses could not feel them.

@@ -7,15 +7,35 @@
 //! `cursor <L|R> <nx> <ny>`, `commit <L|R>`, `quit` — so the daemon forwards
 //! each pad's absolute cursor and its click independently.
 //!
+//! ## The back-channel (child stdout -> daemon)
+//!
+//! Responsibility for the OSK's haptic tick is split: the **child** knows when a
+//! pad's cursor crosses onto a new key (it owns the layout and the hit-test),
+//! but the **daemon** owns the puck's writable hidraw node ([`crate::haptics`]).
+//! So the child announces the crossing and the daemon fires the pulse. The child
+//! prints one machine-readable line per event on its **stdout**:
+//!
+//! ```text
+//! event crossed <L|R>
+//! ```
+//!
+//! and keeps its human-oriented logs on **stderr** (which stays inherited, so
+//! the `hyprpad-osk:` lines still land in the daemon's log). We pipe stdout, read
+//! it on a thread, and forward each parsed [`OskEvent`] to the daemon over an
+//! [`mpsc`] channel. The parser is deliberately **version-tolerant**: any line
+//! that is not a recognized `event …` is ignored, so a newer OSK can add events
+//! (or print anything else) without breaking an older daemon.
+//!
 //! The handle is deliberately forgiving: the OSK binary may not be installed,
 //! and the daemon must keep running without it. Spawn is **lazy** (on the first
 //! [`show`](OskHandle::show)) and every failure degrades to a logged warning
 //! plus a no-op — never a panic and never a daemon exit. The child is killed on
 //! [`Drop`], i.e. when the daemon exits.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 
 /// Which OSK layout to show. Mirrors the `show <bottom|split>` grammar; the
 /// two-region dual-trackpad model is the same in both modes.
@@ -51,6 +71,41 @@ impl OskPad {
             OskPad::Left => "L",
             OskPad::Right => "R",
         }
+    }
+
+    /// Parse a wire pad token (`L`/`R`, either case) from a back-channel event.
+    fn parse_wire(tok: &str) -> Option<OskPad> {
+        match tok {
+            "L" | "l" => Some(OskPad::Left),
+            "R" | "r" => Some(OskPad::Right),
+            _ => None,
+        }
+    }
+}
+
+/// An event read back from the OSK child over its stdout back-channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OskEvent {
+    /// That pad's cursor moved onto a **new** key (`event crossed <L|R>`). The
+    /// child emits this only on an actual change of focused key, and never for a
+    /// crossing onto a gap — so the daemon can fire a haptic tick per line with
+    /// no further filtering.
+    Crossed(OskPad),
+}
+
+/// Parse one line of the OSK's stdout back-channel into an [`OskEvent`].
+///
+/// The grammar is `event <name> [args…]`. Anything else — a log line, a blank
+/// line, an event name or argument this daemon does not know — yields `None` and
+/// is ignored, so the two binaries can be upgraded independently.
+fn parse_event(line: &str) -> Option<OskEvent> {
+    let mut it = line.split_whitespace();
+    if it.next()? != "event" {
+        return None;
+    }
+    match it.next()? {
+        "crossed" => Some(OskEvent::Crossed(OskPad::parse_wire(it.next()?)?)),
+        _ => None,
     }
 }
 
@@ -107,12 +162,30 @@ pub struct OskHandle {
     /// Set once spawning has failed, so we neither retry every frame nor
     /// re-log the warning.
     spawn_failed: bool,
+    /// Where parsed back-channel events go. `None` means the caller does not
+    /// want them, and the child's stdout is simply inherited as before. Cloned
+    /// (not taken) on spawn, so a respawn after a broken pipe keeps reporting.
+    events: Option<mpsc::Sender<OskEvent>>,
 }
 
 impl OskHandle {
-    /// A handle that has not spawned anything yet.
+    /// A handle that has not spawned anything yet, and does not read the child's
+    /// back-channel.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A handle that forwards every [`OskEvent`] it reads from the child's
+    /// stdout to `events`. The daemon uses this to turn a key crossing into a
+    /// haptic tick on the device it (not the child) owns.
+    pub fn with_events(events: mpsc::Sender<OskEvent>) -> Self {
+        OskHandle {
+            child: None,
+            stdin: None,
+            active: false,
+            spawn_failed: false,
+            events: Some(events),
+        }
     }
 
     /// Whether the OSK surface is currently shown.
@@ -180,9 +253,15 @@ impl OskHandle {
             return false;
         }
         let bin = resolve_osk_bin();
-        match spawn_osk(&bin) {
-            Ok((child, stdin)) => {
+        // Only pipe the child's stdout when someone is listening; otherwise
+        // inherit it, so a stdout-piped-but-never-read child could never block
+        // on a full pipe.
+        match spawn_osk(&bin, self.events.is_some()) {
+            Ok((child, stdin, stdout)) => {
                 eprintln!("hyprpad: on-screen keyboard ready ({})", bin.display());
+                if let (Some(stdout), Some(events)) = (stdout, self.events.clone()) {
+                    spawn_event_reader(stdout, events);
+                }
                 self.child = Some(child);
                 self.stdin = Some(stdin);
                 true
@@ -237,18 +316,50 @@ impl Drop for OskHandle {
     }
 }
 
-/// Spawn `hyprpad-osk --stdin` with a piped stdin, inheriting stdout/stderr so
-/// its logs surface alongside the daemon's.
-fn spawn_osk(bin: &Path) -> std::io::Result<(Child, ChildStdin)> {
-    let mut child = Command::new(bin)
-        .arg("--stdin")
-        .stdin(Stdio::piped())
-        .spawn()?;
+/// Spawn `hyprpad-osk --stdin` with a piped stdin (the control channel) and,
+/// when `pipe_stdout` is set, a piped stdout (the event back-channel). **stderr
+/// stays inherited** either way, so the child's human-oriented `hyprpad-osk:`
+/// logs keep surfacing alongside the daemon's.
+fn spawn_osk(bin: &Path, pipe_stdout: bool) -> std::io::Result<(Child, ChildStdin, Option<ChildStdout>)> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--stdin").stdin(Stdio::piped());
+    if pipe_stdout {
+        cmd.stdout(Stdio::piped());
+    }
+    let mut child = cmd.spawn()?;
     let stdin = child
         .stdin
         .take()
         .expect("child spawned with Stdio::piped() has a stdin");
-    Ok((child, stdin))
+    let stdout = child.stdout.take();
+    Ok((child, stdin, stdout))
+}
+
+/// Read the child's stdout back-channel on its own thread, forwarding every
+/// recognized [`OskEvent`] to `events`.
+///
+/// Ends silently when the pipe closes — the child exited or was killed. This is
+/// a best-effort feedback path, so an unreadable line or a broken pipe must
+/// never be louder than a no-op.
+///
+/// When the *receiver* goes away (the daemon is shutting down) the thread keeps
+/// **draining** the pipe instead of returning: a piped stdout nobody reads fills
+/// up, and the child's next event line would then block on the write. Draining
+/// costs nothing and guarantees the keyboard can never wedge on our account; the
+/// thread still ends promptly, because a shutting-down daemon kills the child.
+fn spawn_event_reader(stdout: ChildStdout, events: mpsc::Sender<OskEvent>) {
+    std::thread::spawn(move || {
+        let mut listening = true;
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if !listening {
+                continue;
+            }
+            if let Some(ev) = parse_event(&line) {
+                listening = events.send(ev).is_ok();
+            }
+        }
+    });
 }
 
 /// Resolve the OSK binary to run, in priority order:
@@ -358,6 +469,79 @@ mod tests {
         assert!(!osk.is_active());
         assert!(osk.child.is_none());
         assert!(osk.stdin.is_none());
+        assert!(osk.events.is_none(), "plain handle wants no back-channel");
+    }
+
+    #[test]
+    fn with_events_handle_arms_the_back_channel_without_spawning() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let osk = OskHandle::with_events(tx);
+        assert!(osk.events.is_some());
+        assert!(osk.child.is_none());
+        assert!(!osk.is_active());
+    }
+
+    #[test]
+    fn parses_crossing_events_from_the_back_channel() {
+        assert_eq!(parse_event("event crossed L"), Some(OskEvent::Crossed(OskPad::Left)));
+        assert_eq!(parse_event("event crossed R"), Some(OskEvent::Crossed(OskPad::Right)));
+        // Tolerant of surrounding whitespace, as a line read off a pipe may be.
+        assert_eq!(
+            parse_event("  event   crossed   R  "),
+            Some(OskEvent::Crossed(OskPad::Right))
+        );
+    }
+
+    #[test]
+    fn back_channel_ignores_everything_it_does_not_know() {
+        // Version tolerance: an unknown event, an unknown pad, a truncated line,
+        // a plain log line, and noise all parse to None rather than erroring —
+        // a newer OSK can add events without breaking an older daemon.
+        assert_eq!(parse_event("event pressed L"), None);
+        assert_eq!(parse_event("event crossed X"), None);
+        assert_eq!(parse_event("event crossed"), None);
+        assert_eq!(parse_event("event"), None);
+        assert_eq!(parse_event("hyprpad-osk: show mode=BottomDeck"), None);
+        assert_eq!(parse_event(""), None);
+        // Extra trailing arguments are tolerated (a future event may add them).
+        assert_eq!(
+            parse_event("event crossed L 42"),
+            Some(OskEvent::Crossed(OskPad::Left))
+        );
+    }
+
+    #[test]
+    fn event_reader_forwards_recognized_lines_off_a_real_pipe() {
+        // End-to-end for the reader half: a child writing the back-channel to a
+        // piped stdout, read on the thread, parsed, delivered in order. The log
+        // line and the unknown event are dropped without desyncing the stream.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf 'hyprpad-osk: show mode=BottomDeck\\nevent crossed L\\nevent frobnicate\\nevent crossed R\\n'")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_event_reader(stdout, tx);
+
+        assert_eq!(rx.recv().unwrap(), OskEvent::Crossed(OskPad::Left));
+        assert_eq!(rx.recv().unwrap(), OskEvent::Crossed(OskPad::Right));
+        // EOF ends the reader thread, which drops the sender.
+        assert!(rx.recv().is_err());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn back_channel_pad_tokens_match_the_command_wire_tokens() {
+        // The event grammar reuses the `cursor`/`commit` L|R tokens, so the two
+        // directions can never drift apart.
+        for pad in [OskPad::Left, OskPad::Right] {
+            assert_eq!(
+                parse_event(&format!("event crossed {}", pad.wire())),
+                Some(OskEvent::Crossed(pad))
+            );
+        }
     }
 
     #[test]

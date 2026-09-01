@@ -1,9 +1,24 @@
 //! Declarative gesture -> action bindings.
 //!
 //! A [`Config`] maps recognized [`gesture::GestureEvent`]s to [`Action`]s. It
-//! is loaded from a small, flat TOML dialect: a single `[bindings]` table whose
-//! keys name a gesture (`"guide+r1"`, `"guide+stick_right"`) and whose values
-//! are action strings (`"workspace +1"`, `"exec walker"`, `"fullscreen"`).
+//! is loaded from a small, flat TOML dialect whose headline table is
+//! `[bindings]`: keys name a gesture (`"guide+r1"`, `"guide+stick_right"`) and
+//! values are action strings (`"workspace +1"`, `"exec walker"`, `"fullscreen"`).
+//!
+//! The other sections are flat `key = value` tables of the same shape:
+//!
+//! | Section | What it configures |
+//! |---|---|
+//! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
+//! | `[buttons]` | bare buttons -> raw keys (D-pad = arrows by default) |
+//! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
+//! | `[daemon]` | daemon-wide switches (`own_lizard`) |
+//! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
+//! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
+//! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
+//!
+//! [`DEFAULT_TOML`] carries the built-in defaults and doubles as living
+//! documentation of every knob.
 //!
 //! **Why a hand-written parser instead of the `toml` crate.** The rest of the
 //! crate is dependency-free (see Cargo.toml), and this schema is a flat table of
@@ -380,6 +395,59 @@ impl Default for ScrollConfig {
     }
 }
 
+/// Haptic-feedback knobs (the `[haptics]` config section).
+///
+/// The puck has an actuator behind each trackpad ([`crate::haptics`]); firing a
+/// short pulse on the pad a thumb is resting on is what makes the on-screen
+/// keyboard feel physical. Each trigger point has its own toggle so the feel can
+/// be dialled in one piece at a time, and `intensity` scales every pulse's width
+/// (the only strength knob this device exposes).
+///
+/// All of these are read *per event* by the daemon, so `hyprpad reload` takes
+/// effect on the next tick without a restart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HapticsConfig {
+    /// Master switch. Default `true` — feedback is the point of the section, and
+    /// a puck that can't be written to degrades to a silent no-op anyway.
+    pub enabled: bool,
+    /// Tick the pad whose OSK cursor crosses onto a **new** key (the Deck's
+    /// signature keyboard feel). Reported by the OSK child over its stdout
+    /// back-channel; suppressed when the cursor crosses onto a gap. Default
+    /// `true`.
+    pub crossing: bool,
+    /// Click the pad that committed an OSK key (pad click, full trigger pull, or
+    /// an `[osk_buttons]` helper). Default `true`.
+    pub commit: bool,
+    /// Buzz when a guide chord or stick flick resolves to an action. Fires on
+    /// both actuators. Default `true`.
+    pub gesture: bool,
+    /// Tick the left pad on each emitted circular-scroll detent, so the radial
+    /// scroll feels like a physical wheel. Default `true`.
+    pub scroll: bool,
+    /// Tick on a bare-button (`[buttons]`) key press — the press edge only,
+    /// never the kernel's auto-repeat. Default **`false`**: the D-pad is held
+    /// down for navigation and a buzz per arrow gets old fast.
+    pub buttons: bool,
+    /// Pulse-width scale, `1.0` = the kernel's calibrated widths. Clamped to a
+    /// sane range by [`crate::haptics`]; `0` or below fires nothing (use
+    /// `enabled = false` to switch off properly). Default `1.0`.
+    pub intensity: f64,
+}
+
+impl Default for HapticsConfig {
+    fn default() -> HapticsConfig {
+        HapticsConfig {
+            enabled: true,
+            crossing: true,
+            commit: true,
+            gesture: true,
+            scroll: true,
+            buttons: false,
+            intensity: 1.0,
+        }
+    }
+}
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -404,6 +472,8 @@ pub struct Config {
     cursor: CursorConfig,
     /// Left-trackpad scroll knobs (`[scroll]` section).
     scroll: ScrollConfig,
+    /// Haptic-feedback knobs (`[haptics]` section).
+    haptics: HapticsConfig,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -444,6 +514,19 @@ natural = false             # invert scroll direction
 horizontal = false          # swipe only: also map left/right finger motion to horizontal scroll
 circular_step_degrees = 15  # circular only: rotation per emitted scroll tick
 circular_min_radius = 0.35  # circular only: ignore rotation nearer than this to the pad centre
+
+# Haptic feedback from the actuator behind each trackpad: a tick as an on-screen
+# keyboard cursor crosses onto a new key, a click on commit, a buzz on a
+# recognized gesture, a detent per circular-scroll tick. Every knob is read per
+# event, so `hyprpad reload` retunes the feel live.
+[haptics]
+enabled = true              # master switch
+crossing = true             # tick that pad when its OSK cursor crosses onto a new key
+commit = true               # click that pad when it commits an OSK key
+gesture = true              # buzz both pads when a guide chord/flick resolves
+scroll = true               # tick the left pad on each circular-scroll detent
+buttons = false             # tick on a bare-button ([buttons]) press edge
+intensity = 1.0             # pulse-width scale; 1.0 = the kernel's calibrated widths
 "#;
 
 impl Config {
@@ -455,6 +538,7 @@ impl Config {
         let mut own_lizard = false;
         let mut cursor = CursorConfig::default();
         let mut scroll = ScrollConfig::default();
+        let mut haptics = HapticsConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -588,10 +672,37 @@ impl Config {
                         }
                     }
                 }
+                // Haptic-feedback knobs: a master switch, one toggle per trigger
+                // point, and the pulse-width scale.
+                "haptics" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    let flag = |slot: &mut bool| -> Result<(), String> {
+                        *slot = parse_bool(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        Ok(())
+                    };
+                    match key.as_str() {
+                        "enabled" | "enable" | "on" => flag(&mut haptics.enabled)?,
+                        "crossing" | "key_crossing" | "crossings" => flag(&mut haptics.crossing)?,
+                        "commit" | "commits" => flag(&mut haptics.commit)?,
+                        "gesture" | "gestures" => flag(&mut haptics.gesture)?,
+                        "scroll" | "scroll_ticks" => flag(&mut haptics.scroll)?,
+                        "buttons" | "bare_buttons" => flag(&mut haptics.buttons)?,
+                        "intensity" | "strength" | "gain" => {
+                            haptics.intensity = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [haptics] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, buttons, osk_buttons, own_lizard, cursor, scroll })
+        Ok(Config { bindings, buttons, osk_buttons, own_lizard, cursor, scroll, haptics })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -688,6 +799,13 @@ impl Config {
     /// [`ScrollConfig::default`].
     pub fn scroll(&self) -> &ScrollConfig {
         &self.scroll
+    }
+
+    /// The haptic-feedback knobs (`[haptics]` section); defaults from
+    /// [`HapticsConfig::default`]. Read per event by the daemon so a reload
+    /// retunes the feel live.
+    pub fn haptics(&self) -> &HapticsConfig {
+        &self.haptics
     }
 }
 
@@ -1261,6 +1379,71 @@ circular_min_radius = 0.25
         assert!(Config::from_toml_str("[scroll]\nwiggle = 1.0\n")
             .unwrap_err()
             .contains("unknown [scroll] setting"));
+    }
+
+    #[test]
+    fn haptics_defaults_and_parse() {
+        // The built-in default config reproduces HapticsConfig::default exactly
+        // (its `[haptics]` block is living documentation of the defaults).
+        let d = Config::load_default();
+        assert_eq!(d.haptics(), &HapticsConfig::default());
+        // Feedback is on by default — it is the point of the section — except
+        // the bare-button tick, which would buzz on every held arrow.
+        assert!(d.haptics().enabled);
+        assert!(d.haptics().crossing);
+        assert!(d.haptics().commit);
+        assert!(d.haptics().gesture);
+        assert!(d.haptics().scroll);
+        assert!(!d.haptics().buttons);
+        assert_eq!(d.haptics().intensity, 1.0);
+
+        // A `[haptics]` section overrides individual knobs; bindings still parse.
+        let c = Config::from_toml_str(
+            r#"
+[haptics]
+enabled = true
+crossing = false
+commit = false
+gesture = false
+scroll = false
+buttons = true
+intensity = 0.5
+
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert!(c.haptics().enabled);
+        assert!(!c.haptics().crossing);
+        assert!(!c.haptics().commit);
+        assert!(!c.haptics().gesture);
+        assert!(!c.haptics().scroll);
+        assert!(c.haptics().buttons);
+        assert_eq!(c.haptics().intensity, 0.5);
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // The master switch and the key aliases; unspecified knobs keep their
+        // defaults.
+        assert!(!Config::from_toml_str("[haptics]\nenabled = off\n").unwrap().haptics().enabled);
+        let c = Config::from_toml_str("[haptics]\nstrength = 2.0\nbare_buttons = yes\n").unwrap();
+        assert_eq!(c.haptics().intensity, 2.0);
+        assert!(c.haptics().buttons);
+        assert!(c.haptics().crossing); // untouched knobs keep the default
+
+        // Bad values and unknown keys are reported, not silently ignored.
+        assert!(Config::from_toml_str("[haptics]\nenabled = maybe\n")
+            .unwrap_err()
+            .contains("boolean"));
+        assert!(Config::from_toml_str("[haptics]\nintensity = strong\n")
+            .unwrap_err()
+            .contains("expected a number"));
+        assert!(Config::from_toml_str("[haptics]\nwiggle = true\n")
+            .unwrap_err()
+            .contains("unknown [haptics] setting"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod arbitrate;
 pub mod config;
 pub mod filter;
 pub mod gesture;
+pub mod haptics;
 pub mod hidraw;
 pub mod hypr;
 pub mod keyboard;

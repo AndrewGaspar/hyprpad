@@ -16,6 +16,10 @@
 //! # or, with the socket running:
 //! printf 'show split\n' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hyprpad-osk.sock
 //! ```
+//!
+//! Commands come in; machine-readable **events go out on stdout** (`event
+//! crossed <L|R>` when a pad's cursor moves onto a new key — the daemon's cue to
+//! fire that pad's haptic tick). Logs stay on stderr.
 
 use hyprpad_osk::app::Osk;
 use hyprpad_osk::control::Channel;
@@ -110,6 +114,9 @@ fn print_help() {
            reflow <on|off>                         displace (on) vs overlay/float (off)\n\
            key <keycode>                           commit a raw evdev keycode\n\
            type <text>                             type an ASCII string\n\
-           quit                                    exit\n"
+           quit                                    exit\n\
+         \n\
+         EVENTS (one per line, on STDOUT; logs stay on stderr):\n\
+           event crossed <L|R>                     that pad's cursor moved onto a NEW key\n"
     );
 }

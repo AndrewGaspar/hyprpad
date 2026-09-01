@@ -7,12 +7,17 @@
 //! [`Arbiter`], and executes [`Action`]s via [`Hypr`].
 
 use crate::arbitrate::Arbiter;
-use crate::config::{Action, Config, CursorConfig, ScrollConfig, ScrollMode, WorkspaceTarget};
+use crate::config::{
+    Action, Config, CursorConfig, HapticsConfig, ScrollConfig, ScrollMode, WorkspaceTarget,
+};
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gesture::{GestureEngine, GestureEvent};
+// `Pad` is renamed: this module already talks about `report::Pad` (a pad
+// *position*), while the haptics one names an *actuator*.
+use crate::haptics::{Feel, Haptics, Pad as HapticPad};
 use crate::hypr::{Hypr, HyprEvent};
 use crate::keyboard::VirtualKeyboard;
-use crate::osk::{OskHandle, OskMode, OskPad};
+use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
 
@@ -33,6 +38,10 @@ const RECONNECT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 enum Input {
     Report(Vec<u8>),
     Compositor(HyprEvent),
+    /// An event the on-screen keyboard child reported back over its stdout
+    /// channel (see [`crate::osk`]) — currently a key crossing, which the daemon
+    /// answers with a haptic tick because it, not the child, owns the device.
+    Osk(OskEvent),
     /// Every puck reader thread has exited — the controller went away. The loop
     /// enters its reconnect wait instead of terminating.
     ReadersEnded,
@@ -166,6 +175,13 @@ pub fn run() -> std::io::Result<()> {
     };
     let mut button_keys = ButtonKeys::new();
 
+    // Haptic feedback from the actuator behind each trackpad. Built
+    // unconditionally: it opens nothing until the first pulse, so a
+    // `[haptics] enabled = false` config never touches the device, and a live
+    // reload that switches it on works with no restart. Failures are
+    // logged-once no-ops inside the module, never fatal here.
+    let mut haptics = Haptics::new();
+
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
     let mut arbiter = Arbiter::new();
@@ -173,7 +189,18 @@ pub fn run() -> std::io::Result<()> {
     // The on-screen keyboard bridge. Spawns lazily on the first toggle and is
     // killed when this function returns (daemon exit). When it is showing, the
     // two pads drive the keyboard instead of the desktop cursor.
-    let mut osk = OskHandle::new();
+    //
+    // Its stdout back-channel (`event crossed <L|R>`) arrives on its own
+    // channel; a forwarder thread funnels it into this loop's single input
+    // stream as `Input::Osk`, where a crossing becomes a haptic tick under that
+    // thumb. Split this way because the child owns the hit-test and the daemon
+    // owns the writable puck node.
+    let (osk_tx, osk_rx) = mpsc::channel::<OskEvent>();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || forward_osk_events(osk_rx, tx));
+    }
+    let mut osk = OskHandle::with_events(osk_tx);
     let mut osk_route = OskRoute::new(config.cursor());
     // Previous frame, kept for edge detection in the OSK-active router (pad
     // click-down and the B/Menu dismiss).
@@ -250,31 +277,58 @@ pub fn run() -> std::io::Result<()> {
                 }
                 update_arbiter(&mut arbiter, ev);
             }
+            Input::Osk(OskEvent::Crossed(pad)) => {
+                // The child hit-tested a crossing onto a NEW key; we hold the
+                // writable puck node, so the tick is fired here. Gating and
+                // intensity come off the live config, so a reload retunes it.
+                let mut hx = HapticCtx { dev: &mut haptics, cfg: config.haptics() };
+                hx.fire(Haptic::Crossing, haptic_pad(pad));
+            }
             Input::Report(data) => {
                 let Some(frame) = report::Frame::decode(&data) else { continue };
                 let now = Instant::now();
+                // The live haptics context for this frame: the device handle plus
+                // the current `[haptics]` knobs, read fresh so `hyprpad reload`
+                // takes effect on the very next pulse.
+                let mut hx = HapticCtx { dev: &mut haptics, cfg: config.haptics() };
                 for ge in engine.update(&frame, now) {
                     if debug {
                         eprintln!("[gesture] {ge:?} -> {:?}", config.resolve(&ge));
                     }
-                    handle_gesture(&hypr, &config, &arbiter, &mut osk, ge);
+                    handle_gesture(&hypr, &config, &arbiter, &mut osk, &mut hx, ge);
                 }
                 if osk.is_active() {
                     // The keyboard owns both pads: route them to it, and keep the
                     // desktop cursor and scroll released (guide/suppressed = true
                     // forces the drop-and-forget branch of `drive_cursor` /
-                    // `drive_scroll`).
-                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route, config.osk_buttons(), now);
+                    // `drive_scroll`, which also means no scroll detent ticks).
+                    route_osk(
+                        &mut osk,
+                        &frame,
+                        &prev_frame,
+                        &mut osk_route,
+                        config.osk_buttons(),
+                        &mut hx,
+                        now,
+                    );
                     if let Some(ptr) = pointer.as_mut() {
                         drive_cursor(ptr, &frame, &mut cursor, true, true, now);
-                        drive_scroll(ptr, &frame, &mut scroll, true, true, now);
+                        drive_scroll(ptr, &frame, &mut scroll, true, true, &mut hx, now);
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
                     // Ambient (non-guide) layer: the RIGHT pad drives the cursor
                     // and the LEFT pad drives scroll. The guide layer and a
                     // focused game both take the pads away. Same gate for both.
                     drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), now);
-                    drive_scroll(ptr, &frame, &mut scroll, engine.guide_active(), arbiter.suppressed(), now);
+                    drive_scroll(
+                        ptr,
+                        &frame,
+                        &mut scroll,
+                        engine.guide_active(),
+                        arbiter.suppressed(),
+                        &mut hx,
+                        now,
+                    );
                 }
                 // Bare-button bindings (D-pad -> arrows by default). Gated OFF on
                 // the guide layer (so guide+dpad stays a chord), while the OSK
@@ -282,7 +336,14 @@ pub fn run() -> std::io::Result<()> {
                 // the game via the virtual controller) — mirroring `drive_cursor`.
                 let buttons_active =
                     !engine.guide_active() && !osk.is_active() && !arbiter.suppressed();
-                drive_buttons(&mut keyboard, &frame, config.buttons(), &mut button_keys, buttons_active);
+                drive_buttons(
+                    &mut keyboard,
+                    &frame,
+                    config.buttons(),
+                    &mut button_keys,
+                    buttons_active,
+                    &mut hx,
+                );
                 prev_frame = frame;
             }
         }
@@ -312,6 +373,98 @@ fn forward_reports(reports: mpsc::Receiver<hidraw::Report>, tx: mpsc::Sender<Inp
         }
     }
     let _ = tx.send(Input::ReadersEnded);
+}
+
+/// Forward every event the OSK child reported on its stdout back-channel into
+/// the loop's single input stream. Ends when the OSK handle (and hence its
+/// reader thread) is gone, or the loop is. Split out from [`run`] so the
+/// forwarding is unit-testable without spawning a child, exactly like
+/// [`forward_reports`].
+fn forward_osk_events(events: mpsc::Receiver<OskEvent>, tx: mpsc::Sender<Input>) {
+    for ev in events {
+        if tx.send(Input::Osk(ev)).is_err() {
+            return; // main loop gone
+        }
+    }
+}
+
+/// One haptic trigger point in the daemon, each gated by its own `[haptics]`
+/// toggle. Naming the *occasion* rather than the pulse keeps the "which feel?"
+/// decision in one place ([`haptic_feel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Haptic {
+    /// An OSK cursor crossed onto a new key (reported by the child).
+    Crossing,
+    /// An OSK key was committed (pad click, trigger, or an `[osk_buttons]`
+    /// helper).
+    Commit,
+    /// A guide chord or stick flick resolved to an action.
+    Gesture,
+    /// One circular-scroll detent was emitted.
+    Scroll,
+    /// A bare-button (`[buttons]`) key went down.
+    Button,
+}
+
+/// The pulse a trigger fires under `cfg`, or `None` when `[haptics]` has it
+/// switched off — globally (`enabled = false`) or per trigger. Pure, so the
+/// whole gating policy is unit-testable without a device.
+fn haptic_feel(cfg: &HapticsConfig, what: Haptic) -> Option<Feel> {
+    if !cfg.enabled {
+        return None;
+    }
+    let (on, feel) = match what {
+        Haptic::Crossing => (cfg.crossing, Feel::Tick),
+        Haptic::Commit => (cfg.commit, Feel::Click),
+        Haptic::Gesture => (cfg.gesture, Feel::Buzz),
+        Haptic::Scroll => (cfg.scroll, Feel::Tick),
+        Haptic::Button => (cfg.buttons, Feel::Tick),
+    };
+    on.then_some(feel)
+}
+
+/// The haptic side of one frame: the device handle plus the live `[haptics]`
+/// knobs. Bundled into one value so the per-frame routers take a single extra
+/// argument, and so every call site reads the *current* config — a `hyprpad
+/// reload` retunes the feel on the next pulse with nothing to rebuild.
+struct HapticCtx<'a> {
+    dev: &'a mut Haptics,
+    cfg: &'a HapticsConfig,
+}
+
+impl HapticCtx<'_> {
+    /// Fire `what` on `pad`, if the config enables it. Non-blocking: the pulse is
+    /// queued for the haptics writer thread and dropped if that queue is full.
+    fn fire(&mut self, what: Haptic, pad: HapticPad) {
+        if let Some(feel) = haptic_feel(self.cfg, what) {
+            self.dev.play(feel, pad, self.cfg.intensity);
+        }
+    }
+}
+
+/// Which actuator sits under an OSK pad: each thumb feels its own cursor.
+fn haptic_pad(pad: OskPad) -> HapticPad {
+    match pad {
+        OskPad::Left => HapticPad::Left,
+        OskPad::Right => HapticPad::Right,
+    }
+}
+
+/// Which actuator sits under a controller button — the side its feedback should
+/// fire on. The face cluster, R bumper/trigger/grips, R3, Menu and the right pad
+/// are under the right thumb; the D-pad, L bumper/trigger/grips, L3, View and the
+/// left pad under the left. The guide button and the capacitive flags belong to
+/// neither hand, so they buzz both. Exhaustive on purpose: a new button has to
+/// pick a side.
+fn button_pad(b: report::Button) -> HapticPad {
+    use report::Button::*;
+    match b {
+        A | B | X | Y | QuickAccess | R3 | Menu | GripR4 | GripR5 | BumperR1 | PadRightTouch
+        | PadRightClick | TriggerR2Full => HapticPad::Right,
+        DpadUp | DpadDown | DpadLeft | DpadRight | View | L3 | GripL4 | GripL5 | BumperL1
+        | PadLeftTouch | PadLeftClick | TriggerL2Full => HapticPad::Left,
+        Steam | Cap0 | Cap1 | Cap2 | Cap3 => HapticPad::Both,
+    }
 }
 
 /// Forget all per-frame state on disconnect (equivalently, before a reconnect —
@@ -512,6 +665,7 @@ fn drive_scroll(
     st: &mut ScrollState,
     guide_active: bool,
     suppressed: bool,
+    hx: &mut HapticCtx,
     now: Instant,
 ) {
     // Disabled, or the desktop's claim is released (guide layer / focused game /
@@ -543,6 +697,12 @@ fn drive_scroll(
             if ticks == 0 {
                 (0.0, 0.0)
             } else {
+                // A detent under the rotating thumb — this is what makes the
+                // radial scroll feel like a physical wheel. One pulse per frame
+                // that emitted at least one detent: several detents inside a
+                // single 4 ms frame (a very fast spin) would blur into one buzz
+                // anyway, and firing them back-to-back would only smear it.
+                hx.fire(Haptic::Scroll, HapticPad::Left);
                 circular_scroll(ticks, st.cfg.sensitivity, st.cfg.circular_step_degrees, st.cfg.natural)
             }
         }
@@ -606,8 +766,10 @@ impl ButtonKeys {
     }
 
     /// Reconcile the desired key state against what is held, returning the
-    /// `(code, pressed)` events to emit and updating the held set. Pure (no
-    /// I/O), so the gating and release-on-state-change logic is unit-testable.
+    /// `(button, code, pressed)` events to emit and updating the held set. Pure
+    /// (no I/O), so the gating and release-on-state-change logic is
+    /// unit-testable. The originating button rides along so the caller can fire
+    /// feedback on the side of the controller it sits on.
     ///
     /// When `active` is false (guide/OSK/suppressed), every held key is
     /// released. Otherwise each bound button that is physically down but not yet
@@ -618,14 +780,14 @@ impl ButtonKeys {
         bindings: &HashMap<report::Button, u16>,
         pressed: F,
         active: bool,
-    ) -> Vec<(u16, bool)> {
+    ) -> Vec<(report::Button, u16, bool)> {
         let mut events = Vec::new();
         // Release anything that should no longer be held: the gate closed or the
         // button lifted.
         self.held.retain(|&btn, &mut code| {
             let keep = active && pressed(btn);
             if !keep {
-                events.push((code, false));
+                events.push((btn, code, false));
             }
             keep
         });
@@ -633,7 +795,7 @@ impl ButtonKeys {
         if active {
             for (&btn, &code) in bindings {
                 if pressed(btn) && !self.held.contains_key(&btn) {
-                    events.push((code, true));
+                    events.push((btn, code, true));
                     self.held.insert(btn, code);
                 }
             }
@@ -646,16 +808,24 @@ impl ButtonKeys {
 /// key on its down edge and release it on its up edge, subject to `active` (the
 /// guide/OSK/suppressed gate, mirroring [`drive_cursor`]). A missing keyboard
 /// (uinput unavailable) makes this a no-op.
+///
+/// Feedback fires on the **press edge only** ([`Haptic::Button`], off by
+/// default): a held D-pad auto-repeats in the kernel — which produces no further
+/// events here, so a repeat never buzzes — and a release is not a keystroke.
 fn drive_buttons(
     kbd: &mut Option<VirtualKeyboard>,
     frame: &report::Frame,
     bindings: &HashMap<report::Button, u16>,
     st: &mut ButtonKeys,
     active: bool,
+    hx: &mut HapticCtx,
 ) {
     let Some(kbd) = kbd.as_mut() else { return };
-    for (code, pressed) in st.reconcile(bindings, |b| frame.pressed(b), active) {
+    for (btn, code, pressed) in st.reconcile(bindings, |b| frame.pressed(b), active) {
         kbd.key(code, pressed);
+        if pressed {
+            hx.fire(Haptic::Button, button_pad(btn));
+        }
     }
 }
 
@@ -777,12 +947,13 @@ fn resolve_reload(current: Config, loaded: Result<Config, String>) -> (Config, R
 /// Apply a SIGHUP / `hyprpad reload` request: re-read the config from disk and,
 /// on success, swap it in live and re-derive everything cached from it.
 ///
-/// Bindings and the `[buttons]` map are read per-event straight off `config`
-/// (`config.resolve(..)`, `config.buttons()`), so swapping the `config` value is
-/// all those need. Only the pre-built pad dampers carry tuning that must be
-/// rebuilt: the cursor and scroll [`PadDamper`]s (from `[cursor]`/`[scroll]`) and
-/// the OSK router's dampers (from `[cursor]`). Rebuilding resets their filter
-/// state, so a tuning change can't jump the cursor/scroll.
+/// Bindings, the `[buttons]` map, and the `[haptics]` knobs are read per-event
+/// straight off `config` (`config.resolve(..)`, `config.buttons()`,
+/// `config.haptics()`), so swapping the `config` value is all those need. Only
+/// the pre-built pad dampers carry tuning that must be rebuilt: the cursor and
+/// scroll [`PadDamper`]s (from `[cursor]`/`[scroll]`) and the OSK router's
+/// dampers (from `[cursor]`). Rebuilding resets their filter state, so a tuning
+/// change can't jump the cursor/scroll.
 ///
 /// On a parse error the current config is kept and the error logged (see
 /// [`resolve_reload`]).
@@ -962,6 +1133,7 @@ fn handle_gesture(
     config: &Config,
     arbiter: &Arbiter,
     osk: &mut OskHandle,
+    hx: &mut HapticCtx,
     ge: GestureEvent,
 ) {
     // A bare guide tap belongs to Steam: do nothing so the client sees its own
@@ -986,6 +1158,12 @@ fn handle_gesture(
     if arbiter.suppressed() && !is_guide_scoped(&ge) {
         return;
     }
+
+    // Past every gate: the gesture *landed*. Buzz both actuators before acting,
+    // so the confirmation is felt at the moment of recognition rather than after
+    // the compositor has answered. This is the only feedback the guide layer
+    // gives — nothing else about a chord is visible or audible.
+    hx.fire(Haptic::Gesture, HapticPad::Both);
 
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
     if let Action::ToggleKeyboard { mode } = action {
@@ -1053,12 +1231,18 @@ impl OskPadState {
 /// Route one frame to the on-screen keyboard while it owns the pads:
 /// each pad's absolute position becomes a `cursor L|R`, a pad click (or a full
 /// trigger pull) commits the key under it, and `B`/`Menu` dismiss the keyboard.
+///
+/// Every commit gets a haptic click on the committing side ([`Haptic::Commit`]).
+/// The lighter per-key-crossing tick is *not* fired here: only the OSK child
+/// knows where the key boundaries are, so it reports crossings back and the loop
+/// answers them (`Input::Osk`).
 fn route_osk(
     osk: &mut OskHandle,
     frame: &report::Frame,
     prev: &report::Frame,
     st: &mut OskRoute,
     osk_buttons: &HashMap<report::Button, u16>,
+    hx: &mut HapticCtx,
     now: Instant,
 ) {
     use report::Button::*;
@@ -1082,11 +1266,20 @@ fn route_osk(
     // commit buttons take precedence over a helper binding.
     for b in frame.edges_down(prev) {
         match b {
-            PadLeftClick | TriggerL2Full => osk.commit(OskPad::Left),
-            PadRightClick | TriggerR2Full => osk.commit(OskPad::Right),
+            PadLeftClick | TriggerL2Full => {
+                osk.commit(OskPad::Left);
+                hx.fire(Haptic::Commit, HapticPad::Left);
+            }
+            PadRightClick | TriggerR2Full => {
+                osk.commit(OskPad::Right);
+                hx.fire(Haptic::Commit, HapticPad::Right);
+            }
             _ => {
                 if let Some(&code) = osk_buttons.get(&b) {
                     osk.key(code);
+                    // A helper (Y = Space, X = Backspace) is a commit too — click
+                    // under the hand whose button it is.
+                    hx.fire(Haptic::Commit, button_pad(b));
                 }
             }
         }
@@ -1276,12 +1469,19 @@ mod tests {
         let bindings = HashMap::from([(DpadUp, 103u16), (DpadDown, 108u16)]);
         let mut st = ButtonKeys::new();
         // DpadUp goes down while active: press KEY_UP, nothing for the unpressed
-        // DpadDown.
-        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
-        // Held and still down next frame: no repeated event (the kernel repeats).
+        // DpadDown. The originating button rides along for the haptic side.
+        assert_eq!(
+            st.reconcile(&bindings, |b| b == DpadUp, true),
+            vec![(DpadUp, 103, true)]
+        );
+        // Held and still down next frame: no repeated event (the kernel repeats)
+        // — which is also why a held arrow cannot buzz per repeat.
         assert!(st.reconcile(&bindings, |b| b == DpadUp, true).is_empty());
         // Lifts: release KEY_UP, held set empties.
-        assert_eq!(st.reconcile(&bindings, |_| false, true), vec![(103, false)]);
+        assert_eq!(
+            st.reconcile(&bindings, |_| false, true),
+            vec![(DpadUp, 103, false)]
+        );
         assert!(st.held.is_empty());
     }
 
@@ -1291,15 +1491,24 @@ mod tests {
         let bindings = HashMap::from([(DpadUp, 103u16)]);
         let mut st = ButtonKeys::new();
         // Press while active.
-        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
+        assert_eq!(
+            st.reconcile(&bindings, |b| b == DpadUp, true),
+            vec![(DpadUp, 103, true)]
+        );
         // The gate closes (guide/OSK/game) while the D-pad is still held: the key
         // is released cleanly rather than left stuck down.
-        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, false), vec![(103, false)]);
+        assert_eq!(
+            st.reconcile(&bindings, |b| b == DpadUp, false),
+            vec![(DpadUp, 103, false)]
+        );
         assert!(st.held.is_empty());
         // Still held but gated off: no new press (the chord/game gets it instead).
         assert!(st.reconcile(&bindings, |b| b == DpadUp, false).is_empty());
         // Gate reopens while still held: re-press so the arrow resumes.
-        assert_eq!(st.reconcile(&bindings, |b| b == DpadUp, true), vec![(103, true)]);
+        assert_eq!(
+            st.reconcile(&bindings, |b| b == DpadUp, true),
+            vec![(DpadUp, 103, true)]
+        );
     }
 
     #[test]
@@ -1311,9 +1520,82 @@ mod tests {
         assert!(st.reconcile(&bindings, |b| b == A, true).is_empty());
         // Two bound buttons down at once: both press (HashMap order is arbitrary).
         let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, true);
-        ev.sort();
-        assert_eq!(ev, vec![(103, true), (105, true)]);
+        ev.sort_by_key(|&(_, code, _)| code);
+        assert_eq!(ev, vec![(DpadUp, 103, true), (DpadLeft, 105, true)]);
         assert_eq!(st.held.len(), 2);
+    }
+
+    #[test]
+    fn haptic_feel_maps_each_trigger_to_its_pulse() {
+        // The defaults: everything on except the bare-button tick.
+        let cfg = HapticsConfig::default();
+        assert_eq!(haptic_feel(&cfg, Haptic::Crossing), Some(Feel::Tick));
+        assert_eq!(haptic_feel(&cfg, Haptic::Commit), Some(Feel::Click));
+        assert_eq!(haptic_feel(&cfg, Haptic::Gesture), Some(Feel::Buzz));
+        assert_eq!(haptic_feel(&cfg, Haptic::Scroll), Some(Feel::Tick));
+        assert_eq!(haptic_feel(&cfg, Haptic::Button), None);
+    }
+
+    #[test]
+    fn haptic_master_switch_and_per_trigger_toggles_gate() {
+        // `enabled = false` silences every trigger, whatever the per-trigger
+        // toggles say.
+        let off = HapticsConfig { enabled: false, buttons: true, ..HapticsConfig::default() };
+        for what in [
+            Haptic::Crossing,
+            Haptic::Commit,
+            Haptic::Gesture,
+            Haptic::Scroll,
+            Haptic::Button,
+        ] {
+            assert_eq!(haptic_feel(&off, what), None, "{what:?} must be silent");
+        }
+        // A per-trigger toggle silences only its own trigger.
+        let no_scroll = HapticsConfig { scroll: false, ..HapticsConfig::default() };
+        assert_eq!(haptic_feel(&no_scroll, Haptic::Scroll), None);
+        assert_eq!(haptic_feel(&no_scroll, Haptic::Crossing), Some(Feel::Tick));
+        // And the opt-in bare-button tick can be switched on.
+        let buttons = HapticsConfig { buttons: true, ..HapticsConfig::default() };
+        assert_eq!(haptic_feel(&buttons, Haptic::Button), Some(Feel::Tick));
+    }
+
+    #[test]
+    fn haptic_pads_follow_the_hand() {
+        use report::Button::*;
+        // Each OSK cursor ticks under its own thumb.
+        assert_eq!(haptic_pad(OskPad::Left), HapticPad::Left);
+        assert_eq!(haptic_pad(OskPad::Right), HapticPad::Right);
+        // Buttons fire on the side they sit on; the guide belongs to neither.
+        assert_eq!(button_pad(Y), HapticPad::Right);
+        assert_eq!(button_pad(BumperR1), HapticPad::Right);
+        assert_eq!(button_pad(PadRightClick), HapticPad::Right);
+        assert_eq!(button_pad(DpadUp), HapticPad::Left);
+        assert_eq!(button_pad(TriggerL2Full), HapticPad::Left);
+        assert_eq!(button_pad(PadLeftClick), HapticPad::Left);
+        assert_eq!(button_pad(Steam), HapticPad::Both);
+    }
+
+    #[test]
+    fn forward_osk_events_feeds_the_loop_and_stops_with_it() {
+        let (etx, erx) = mpsc::channel::<OskEvent>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        etx.send(OskEvent::Crossed(OskPad::Left)).unwrap();
+        etx.send(OskEvent::Crossed(OskPad::Right)).unwrap();
+        drop(etx); // the OSK reader thread ended (child gone)
+
+        forward_osk_events(erx, itx);
+
+        assert!(matches!(irx.recv(), Ok(Input::Osk(OskEvent::Crossed(OskPad::Left)))));
+        assert!(matches!(irx.recv(), Ok(Input::Osk(OskEvent::Crossed(OskPad::Right)))));
+        assert!(irx.recv().is_err(), "forwarder dropped its sender on exit");
+
+        // With the loop gone the forwarder returns instead of panicking.
+        let (etx, erx) = mpsc::channel::<OskEvent>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        etx.send(OskEvent::Crossed(OskPad::Left)).unwrap();
+        drop(irx);
+        forward_osk_events(erx, itx);
+        drop(etx);
     }
 
     #[test]

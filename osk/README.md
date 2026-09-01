@@ -178,6 +178,32 @@ Bursts of lines written together (e.g. two `cursor` lines in one write) are all
 processed on the same wakeup on **both** transports — stdin is set non-blocking
 and drained in full — so the two pad cursors never lag a step behind.
 
+### Events back to the daemon (stdout)
+
+Commands come **in**; a small stream of machine-readable events goes **out on
+stdout**, one per line:
+
+```
+event crossed <L|R>      # that pad's cursor moved onto a NEW key
+```
+
+Human-oriented logs stay on **stderr** (every `hyprpad-osk:` line), so a parent
+that pipes stdout gets a clean event stream and still sees the logs.
+
+`crossed` exists because responsibility for the Deck's key-crossing **haptic
+tick** (§4.3) is split: the OSK owns the layout and the hit-test, so only it
+knows when the cursor changes key — but the daemon owns the controller's
+writable `hidraw` node, so only it can pulse the actuator. The line is emitted
+**only on an actual change of focused key**, and never for a crossing onto a gap
+(the Deck's "double-thunk" fix), so the daemon can tick once per line with no
+filtering of its own. A layer switch or a resize re-derives focus without moving
+the finger and deliberately emits nothing.
+
+The daemon (`src/osk.rs`) pipes stdout, reads it on a thread, and turns each line
+into a `tick` on that pad — gated by the `[haptics] crossing` config knob. Its
+parser ignores any line it does not recognize, so this crate can add events (or
+print anything else) without breaking an older daemon.
+
 ## Done / Stubbed / Deferred — mapped to `osk-technology.md`
 
 ### Done (implemented + live-verified on Hyprland 0.56.2)
@@ -243,10 +269,15 @@ and drained in full — so the two pad cursors never lag a step behind.
 - **Emoji / close meta keys** — present in the model with `keycode 0`; commit is
   a no-op (§4.6 "Layers"). Layer/reflow/arrow meta keys DO act (see Done).
 
+- **Per-key-crossing haptic tick** (§4.3), as far as this crate can take it: the
+  crossing is detected here and reported as `event crossed <L|R>` on stdout, with
+  the tick suppressed on key→gap; the daemon owns the actuator and fires the
+  pulse. See "Events back to the daemon" above.
+
 ### Deferred (clear TODOs → research section)
 
-- **Per-key-crossing haptic tick**, cached-rect re-hit-test, tick suppressed on
-  key→gap (§4.3 / §4.9 item 3).
+- **Cached-rect re-hit-test** (§4.9 item 3) — the hit-test still scans the placed
+  keys per move rather than short-circuiting on the last key's rect.
 - **Commit-on-click-down nuances**: extended-character popups commit on up / open
   at 450 ms; backspace auto-repeat 450→200 ms; rollover (§4.2/§4.6).
 - **Long-press extended-character popups** (§4.6 — keys carry `extended_keys`, a

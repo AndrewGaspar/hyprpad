@@ -353,8 +353,13 @@ impl Osk {
 
     /// Move a pad's absolute cursor: record its position, hit-test the key under
     /// it, refresh the highlight + the visible cursor sprite, and mark the
-    /// affected panel dirty (osk-technology.md §4.1). The haptic tick on
-    /// key-crossing (§4.3) is DEFERRED.
+    /// affected panel dirty (osk-technology.md §4.1).
+    ///
+    /// A **key crossing** — the hit-test landing on a different key than last
+    /// move — is announced on stdout as `event crossed <L|R>` (§4.3): the daemon
+    /// owns the controller's haptic actuators, so it turns that line into a tick
+    /// under this pad's thumb. Emitted only on an actual change, and never for a
+    /// crossing onto a gap (the Deck's "double-thunk" fix, §4.3).
     ///
     /// A no-op move — same focused key AND the cursor sprite lands on the same
     /// integer pixel — is skipped entirely: the daemon already dedupes at
@@ -373,7 +378,12 @@ impl Osk {
         let old_focus = self.pad_focus(pad);
         let old_px = self.pad_px(pad);
         self.recompute_pad(pad);
-        if self.pad_focus(pad) == old_focus && same_pixel(old_px, self.pad_px(pad)) {
+        let new_focus = self.pad_focus(pad);
+        // Crossing onto a *key* (not off one, and not key→gap) is the tick.
+        if new_focus != old_focus && new_focus.is_some() {
+            emit_event(&format!("crossed {}", pad_wire(pad)));
+        }
+        if new_focus == old_focus && same_pixel(old_px, self.pad_px(pad)) {
             return;
         }
         self.rebuild_highlights();
@@ -800,6 +810,32 @@ fn draw_panel(
     let _ = render::buffer_len; // keep the helper referenced; used by tests/tools
 }
 
+/// The `L`/`R` token a pad uses on the wire — the same one the control channel
+/// parses in `cursor`/`commit`, reused for the outbound event lines so the two
+/// directions of the protocol can never drift apart.
+fn pad_wire(pad: Pad) -> &'static str {
+    match pad {
+        Pad::Left => "L",
+        Pad::Right => "R",
+    }
+}
+
+/// Emit one machine-readable event line on **stdout**: the back-channel the
+/// hyprpad daemon reads (`event <name> [args…]`).
+///
+/// Human-oriented logs stay on **stderr** (every `hyprpad-osk:` line above), so
+/// a daemon that pipes stdout gets a clean, parseable stream and still sees the
+/// logs inherited on its own stderr. Best-effort: a closed or full pipe is
+/// ignored rather than killing the keyboard — feedback is never worth a crash.
+/// Rust's stdout is line-buffered, and the explicit flush keeps the tick timely
+/// even if that ever changes.
+fn emit_event(args: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "event {args}");
+    let _ = out.flush();
+}
+
 /// Whether two optional cursor points land on the same integer pixel — the
 /// renderer draws the cursor sprite at `x as i32 / y as i32`, so a sub-pixel
 /// move that rounds to the same pixel produces an identical frame and is
@@ -899,3 +935,20 @@ delegate_output!(Osk);
 delegate_shm!(Osk);
 delegate_layer!(Osk);
 delegate_registry!(Osk);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_pad_tokens_match_the_control_grammar() {
+        // The outbound `event crossed <L|R>` reuses the inbound `cursor <L|R>`
+        // tokens; the daemon parses both with the same table.
+        assert_eq!(pad_wire(Pad::Left), "L");
+        assert_eq!(pad_wire(Pad::Right), "R");
+        assert_eq!(
+            crate::control::parse(&format!("cursor {} 0 0", pad_wire(Pad::Left))),
+            Ok(crate::control::Command::Cursor { pad: Pad::Left, nx: 0.0, ny: 0.0 })
+        );
+    }
+}
