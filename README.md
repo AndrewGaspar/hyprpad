@@ -190,10 +190,16 @@ a description — gets a label *derived* from its action (`workspace +1` reads a
 marked in the JSON and shown dimmed on the card, so it is obvious which
 bindings still want a description.
 
-The widget itself is a Quickshell plugin for Omarchy's shell: it draws every
-guide chord onto a diagram of the pad, with tables for the bare buttons, the
-OSK helpers and the modes. `guide+view` toggles it. Install and design notes
-are in [shell/README.md](shell/README.md); artwork provenance and licensing in
+The widget itself is a Quickshell plugin for Omarchy's shell. It draws a
+diagram of the pad with one callout per *physical control*, and every binding
+that lands on that control stacked inside it — a Steam glyph in front of a row
+means "hold Steam, then press", a keyboard glyph means "while the on-screen
+keyboard is up", and nothing in front means the control does that on its own.
+So the X button's callout reads "Omarchy launcher" under the Steam glyph and
+"Backspace" under the keyboard glyph, instead of the reader having to join a
+table at the bottom of the card back to a button in the picture. The declared
+modes and a legend sit underneath. `guide+view` toggles it. Install and design
+notes are in [shell/README.md](shell/README.md); artwork provenance and licensing in
 [shell/hyprpad.cheatsheet/art/LICENSES.md](shell/hyprpad.cheatsheet/art/LICENSES.md).
 
 ```

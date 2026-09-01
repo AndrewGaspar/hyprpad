@@ -1,12 +1,43 @@
 # The cheat-sheet widget
 
-An on-screen card showing what the controller currently does: every guide chord
-drawn onto a diagram of the pad, plus compact tables for the bare buttons, the
-OSK helpers and the declared modes.
+An on-screen card showing what the controller currently does: a diagram of the
+pad with one callout per physical control, every binding that lands on that
+control stacked inside it, and the declared modes underneath.
 
     scripts/hyprpad-cheatsheet install     # copy it into Omarchy
     omarchy plugin enable hyprpad.cheatsheet
     hyprpad-cheatsheet toggle              # what the guide chord runs
+
+## What a callout says
+
+A callout is a **control**, not a binding family. Every row inside it is one
+binding, and the glyph in front of the row says what you have to be holding for
+it to do that:
+
+| row | means |
+| --- | --- |
+| `Enter` | press it on its own |
+| Steam glyph + `Dictation toggle` | hold Steam, then press |
+| keyboard glyph + `Backspace` | while the on-screen keyboard is up |
+| `· only in desktop` | a mode guard, dimmed |
+| *italic* | the label was derived from the action, not written in the config |
+
+So the A button reads `Enter` / `ⓢ Dictation toggle`, and X reads
+`ⓢ Omarchy launcher` / `⌨ Backspace`. The first version put the bare buttons
+and the OSK helpers in tables under the drawing, which meant the reader had to
+join the string `x` in a table back to the X button in the picture themselves —
+the one thing the drawing was supposed to do for them.
+
+Rows stack bare-first, then the guide layer, then the keyboard helpers, so the
+top of every callout is what the control does if you just press it.
+
+A **group** in the layout descriptor lets several of hyprpad's control ids be
+one thing you point at: the four d-pad directions get one anchor and one
+leader. If all four are bound to nothing but their own arrow key, that collapses
+further to a single `→ arrow keys` row; bind one of them to something
+interesting and the four rows come back, each with its direction arrow. The
+engine checks that for itself — the layout only supplies the members and what
+the collapsed row should say.
 
 The chord is `guide+view` — View is the "show me the map" button — bound in
 `config/hyprpad.lua`:
@@ -56,7 +87,7 @@ the card if it finds none. `hyprpad-cheatsheet status` reports the same.
 | `manifest.json` | the Omarchy plugin manifest (schemaVersion 1, kind `panel`) |
 | `Panel.qml` | layer-shell surface, summon/dismiss, runs `hyprpad bindings --json` |
 | `Sheet.qml` | the card itself — pure QtQuick, no Quickshell, no `qs.Commons` |
-| `Callouts.js` | grouping, placement and the SVG recolour; the arithmetic |
+| `Callouts.js` | grouping, collapsing, lane splitting, placement, leader routing and the SVG recolour; the arithmetic |
 | `layouts/*.json` | one file per controller: drawing + control anchors + glyphs |
 | `art/` | the drawings and glyphs, and `LICENSES.md` for their provenance |
 
@@ -71,18 +102,31 @@ A **layout** is the whole of what the widget knows about a pad:
 
 ```jsonc
 {
-  "viewBox": { "width": 456, "height": 320 },
-  "art":      [ /* ordered; first drawing that exists wins */ ],
-  "controls": { "r1": { "x": 362.5, "y": 16.8, "side": "right" }, ... },
-  "glyphs":   { "r1": { "image": "art/kenney/steam_rb.svg", "text": "R1" }, ... }
+  "viewBox":   { "width": 456, "height": 320 },
+  "art":       [ /* ordered; first drawing that exists wins */ ],
+  "controls":  { "r1": { "x": 362.5, "y": 16.8, "side": "right" }, ... },
+  "glyphs":    { "r1": { "image": "art/kenney/steam_rb.svg", "text": "R1" }, ... },
+
+  // optional: several control ids that are one thing you can point at
+  "groups":    { "dpad": { "label": "D-pad",
+                           "members":  { "dpad_up": "up", ... },
+                           "collapse": { "direction": "→", "label": "arrow keys" } } },
+
+  // optional: what a row's leading glyph means, and how the legend spells it
+  "modifiers": { "guide": { "image": "art/kenney/controller_icon.svg",
+                            "text": "S", "legend": "hold Steam, then press" },
+                 "osk":   { "image": "art/kenney/keyboard.svg",
+                            "text": "K", "legend": "while the on-screen keyboard is up" } }
 }
 ```
 
 The keys are hyprpad's own control ids — the `control` field of every
 `hyprpad bindings --json` entry — so adding Xbox, PlayStation, Switch Pro or
-the Steam Deck is a new file in `layouts/`, not a code change. `Panel.qml`
-names no controller anywhere; the layout is chosen by `layoutId`, overridable
-per summon:
+the Steam Deck is a new file in `layouts/`, not a code change. A Nintendo
+layout swaps A and B by pointing the glyph map elsewhere; a pad with a hat
+switch groups it the same way the puck groups its d-pad. `Panel.qml` names no
+controller anywhere; the layout is chosen by `layoutId`, overridable per
+summon:
 
     omarchy-shell shell toggle hyprpad.cheatsheet '{"layout":"steam-deck"}'
 
@@ -90,6 +134,41 @@ Glyphs come from Kenney's CC0 "Input Prompts", which covers every mainstream
 pad with one naming convention. The *diagram* is the part that varies: see
 `art/LICENSES.md` for why Kenney's own `controller_*.svg` files cannot serve as
 one, and how the 2026 puck's diagram is sourced.
+
+## Laying out multi-row callouts
+
+A callout is now a box as tall as its rows and as wide as its widest line
+(measured with `TextMetrics`, so nothing is ever clipped and a lane of terse
+labels reserves no room it will not use). That makes the columns much taller
+than they were, and the puck is lopsided: the face cluster, Menu, the right
+stick, the right pad and the grips all want the right-hand side.
+
+So a side is not a column, it is **one or two lanes**, decided from the data:
+
+1. **How many.** Enough that no lane is taller than the drawing it annotates,
+   capped at two — `ceil(extent / diagramHeight)`, and never more lanes than
+   half the boxes, so two lanes of one box each cannot happen.
+2. **Which box in which lane.** Sort innermost-first (nearest the middle of
+   the drawing), then split at the point that makes the taller lane shortest.
+   Keeping the split on the *x* order means the lanes read outward in the same
+   order as the hardware, and no leader doubles back past a control that sits
+   closer in than the one it serves.
+3. **Down the lane.** Each box wants its *header* — the line the leader lands
+   on, and the line that names the control — level with its own anchor. A
+   forward sweep pushes boxes down to clear their predecessors; a backward
+   sweep packs the run against the floor if it overflowed. Deterministic, so
+   the sheet does not jitter between summons.
+4. **Leaders.** Every leader on a side bends at the same x, just clear of the
+   drawing, so the lead-ins read as one comb. A lane-0 leader then runs
+   straight into its box. A lane-1 leader has to get *past* lane 0, and this is
+   the part worth knowing about: it crosses in a **gap** between two lane-0
+   boxes and then turns down the channel between the lanes. Letting it run at
+   its own height instead would put it behind a near box and out the far side,
+   which reads as though the two boxes were joined. Gaps are handed out in y
+   order and never reused, so the crossings cannot cross each other either.
+
+Boxes paint the card's own background, so the few leaders that still have to
+pass behind one do so cleanly rather than through the text.
 
 ## Theme
 

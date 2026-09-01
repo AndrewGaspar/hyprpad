@@ -67,8 +67,55 @@
     "r4":          { "x": 394,   "y": 235,   "side": "right", "hidden": true },
     "r5":          { "x": 350,   "y": 268,   "side": "right", "hidden": true },
 
+    "dpad":        { "x": 91.5,  "y": 75.5,  "side": "left" },
+
     "quickaccess": { "x": 227.6, "y": 194.7, "side": "right" },
     "steam":       { "x": 227.5, "y": 76,    "side": "right" }
+  },
+
+  "_groups_comment": [
+    "Several of hyprpad's control ids can be one thing you point at. The four",
+    "d-pad directions are a d-pad: one anchor, one leader, one stack of rows.",
+    "`members` maps each member id to the direction arrow its rows draw, and",
+    "`collapse` is what the widget says when EVERY member is bound to nothing",
+    "but its own direction key — 'arrow keys' beats four lines reading Up,",
+    "Down, Left, Right. The engine checks that for itself and never names a",
+    "control: delete this block and the four directions get four callouts",
+    "again, from the `controls` entries below them, with no code change.",
+    "",
+    "The group's own id needs its own `controls` anchor and `glyphs` chip."
+  ],
+  "groups": {
+    "dpad": {
+      "label": "D-pad",
+      "members": {
+        "dpad_up": "up",
+        "dpad_down": "down",
+        "dpad_left": "left",
+        "dpad_right": "right"
+      },
+      "collapse": { "direction": "→", "label": "arrow keys" }
+    }
+  },
+
+  "_modifiers_comment": [
+    "What a row's leading glyph means. The widget maps a binding's family to",
+    "one of these keys — the guide layer to `guide`, the on-screen keyboard's",
+    "helpers to `osk`, everything else to no glyph at all — and the legend",
+    "under the drawing is built from whichever ones the live config uses.",
+    "`legend` is the phrase that legend spells out."
+  ],
+  "modifiers": {
+    "guide": {
+      "image": "art/kenney/controller_icon.svg",
+      "text": "S",
+      "legend": "hold Steam, then press"
+    },
+    "osk": {
+      "image": "art/kenney/keyboard.svg",
+      "text": "K",
+      "legend": "while the on-screen keyboard is up"
+    }
   },
 
   "_glyphs_comment": [
@@ -87,6 +134,7 @@
     "b":           { "image": "art/kenney/steam_button_b.svg",                "text": "B" },
     "x":           { "image": "art/kenney/steam_button_x.svg",                "text": "X" },
     "y":           { "image": "art/kenney/steam_button_y.svg",                "text": "Y" },
+    "dpad":        { "image": "art/kenney/steam_dpad.svg",                    "text": "Dpad" },
     "dpad_up":     { "image": "art/kenney/steam_dpad_up.svg",                 "text": "Up" },
     "dpad_down":   { "image": "art/kenney/steam_dpad_down.svg",               "text": "Dn" },
     "dpad_left":   { "image": "art/kenney/steam_dpad_left.svg",               "text": "Lt" },

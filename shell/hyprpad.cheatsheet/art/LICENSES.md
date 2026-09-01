@@ -17,13 +17,27 @@ verbatim to `kenney/LICENSE.txt`; the operative wording is:
 Attribution is explicitly optional, so bundling is unencumbered — we credit
 anyway, here and in `shell/README.md`.
 
-Only the 26 SVGs the Steam Controller layout actually references are vendored
-(~108 KB), not the whole 4.8 MB pack. They are byte-for-byte upstream. Kenney
+Only the 28 SVGs the Steam Controller layout actually references are vendored
+(~113 KB), not the whole 4.8 MB pack. They are byte-for-byte upstream. Kenney
 is the intended base for the *multi-controller* collection: it covers Xbox,
 PlayStation 1–5, Switch/Switch 2 + Joy-Con + Pro, Steam Deck, Steam Frame,
 Valve Index, Meta Quest, keyboard and mouse with the same systematic
 `<platform>_<control>.svg` naming, so another controller's glyph map is a list
 of filenames rather than new art.
+
+Two of the 28 are not button glyphs and are worth naming, because they carry
+meaning rather than identifying a control:
+
+* `keyboard.svg`, from the pack's **Keyboard & Mouse** set, is the modifier
+  glyph for the on-screen keyboard's helper bindings — the "while the keyboard
+  is up" mark in front of a callout row. It is the only glyph the widget takes
+  from outside the Steam Controller set, and it is deliberately a *device*
+  pictogram rather than a key cap: the row means "whenever the OSK is on
+  screen", not "press this key".
+* `steam_dpad.svg` is the whole d-pad rather than one of its directions, for
+  the grouped d-pad callout. The four `steam_dpad_<dir>.svg` files are still
+  vendored, because a layout that does not group its d-pad draws four
+  callouts and wants them.
 
 ### What Kenney is NOT used for
 
@@ -72,5 +86,9 @@ Drop a `layouts/<id>.json` in beside the existing one:
 * `controls` — hyprpad's control ids mapped to `{x, y, side}` in that space.
 * `glyphs` — the same ids mapped to `art/kenney/<platform>_<control>.svg`,
   with a `text` fallback.
+* `groups` / `modifiers` — optional; see `shell/README.md`. The modifier
+  glyphs are Kenney too (`controller_icon.svg` for the Steam button,
+  `keyboard.svg` for the on-screen keyboard), so a new controller inherits
+  them by naming the same files.
 
 No QML changes. `Panel.qml` names no controller anywhere.

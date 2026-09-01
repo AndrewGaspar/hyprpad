@@ -1,5 +1,6 @@
-// The cheat sheet itself: a controller diagram with a callout per guide chord,
-// plus compact tables for the bare buttons, the OSK helpers and the modes.
+// The cheat sheet itself: a controller diagram with one callout per physical
+// control, each stacking every binding that lands on that control, plus the
+// declared modes and a legend underneath.
 //
 // Deliberately PURE QtQuick — no Quickshell, no `qs.Commons`. Everything it
 // needs comes in through properties:
@@ -13,6 +14,15 @@
 // which is what would let it be dropped into a plain `quickshell -p` config,
 // or rendered by a test harness, without dragging Omarchy in behind it.
 // `Panel.qml` is the only file here that knows Omarchy exists.
+//
+// # The callout model
+//
+// A callout is a control, not a binding family. A row inside it is one
+// binding: a modifier glyph saying what you hold (the Steam button, the
+// on-screen keyboard, or nothing at all), the label, and a dim tag for a
+// binding that only lives in some modes. That is the whole of it — there is no
+// table underneath the drawing that the reader has to join back to a button by
+// eye, which is what the first version got wrong.
 
 import QtQuick
 import QtQuick.Layouts
@@ -44,92 +54,208 @@ Item {
   property int fontHeading: 16
 
   // --- geometry -----------------------------------------------------------
+  readonly property int pad: 28
   readonly property int diagramWidth: 520
   readonly property int diagramHeight: layout && layout.viewBox
     ? Math.round(diagramWidth * layout.viewBox.height / layout.viewBox.width)
     : 365
-  readonly property int columnWidth: 330
-  readonly property int columnGap: 26
-  readonly property int calloutGap: 8
+  readonly property int columnGap: 26     // drawing to nearest lane
+  readonly property int laneGap: 14       // lane to lane
+  readonly property int calloutGap: 12    // box to box down a lane, and the width of a leader channel
+  readonly property int maxLanes: 2       // a third lane is a spreadsheet
+
+  // Inside a box.
+  readonly property int glyphSize: 18     // the control's chip, in the header
+  readonly property int modSize: 14       // the modifier glyph, on a row
+  readonly property int arrowW: 13        // the direction column
+  readonly property int cellGap: 6
+  readonly property int boxPadH: 8
+  readonly property int boxPadTop: 5
+  readonly property int boxPadBottom: 7
+  readonly property int headerH: fontSmall + 9
+  readonly property int rowH: fontBody + 7
 
   implicitWidth: content.implicitWidth + 2 * pad
   implicitHeight: content.implicitHeight + 2 * pad
-  readonly property int pad: 28
 
   // --- placement ----------------------------------------------------------
   //
-  // Which sheet sections get a callout on the drawing. The guide layer is what
-  // the sheet is FOR, and the trackpads are the two biggest controls on the
-  // puck — leaving them unlabelled would be a lie. Bare buttons and OSK
-  // helpers go in the tables instead: they would double the leader count for
-  // controls the diagram already names.
-  readonly property var diagramSections: ["guide_chords", "ambient"]
+  // Everything below is computed once, in `relayout()`, and parked in these
+  // properties: the delegates read them and never compute, so no binding can
+  // loop back into the arithmetic.
 
-  property var leftPlaced: []
-  property var rightPlaced: []
-  property var overflow: []
+  property var placed: []             // every callout, with box geometry
+  property var overflow: []           // bindings this layout cannot anchor
+  property var modifierKeys: []       // which modifiers the legend explains
+  property int leftWidth: 0
+  property int rightWidth: 0
+  property int rowHeight: 0
+  property int diagramX: 0
+  property int diagramTop: 0
 
-  function calloutHeight(item) {
-    // Deterministic, so placement can run before the delegates exist and no
-    // binding loop is possible: a title row plus one row per binding.
-    return 20 + item.lines.length * 19 + 10
+  function measure(tm, s) {
+    tm.text = String(s === undefined || s === null ? "" : s)
+    return tm.advanceWidth
+  }
+
+  // A box is exactly as wide as its widest line, so nothing is ever clipped
+  // and a lane of terse labels does not reserve room it will not use.
+  function boxWidth(c) {
+    var w = glyphSize + cellGap + measure(mHeader, c.controlLabel)
+    for (var i = 0; i < c.rows.length; i++) {
+      var r = c.rows[i]
+      var rw = 0
+      // The direction and modifier columns are reserved for the whole box, not
+      // per row, so the labels in one callout line up under each other.
+      if (c.hasDirection) rw += arrowW + cellGap
+      if (c.hasModifier) rw += modSize + cellGap
+      rw += measure(r.described ? mRow : mRowItalic, r.label)
+      if (r.guarded) rw += cellGap + measure(mTag, "· " + r.guard)
+      if (rw > w) w = rw
+    }
+    return Math.ceil(w) + 2 * boxPadH
   }
 
   function relayout() {
-    if (!sheet || !layout) {
-      leftPlaced = []; rightPlaced = []; overflow = []
+    if (!sheet || !layout || !mHeader) {
+      placed = []; overflow = []; modifierKeys = []
+      leftWidth = 0; rightWidth = 0; rowHeight = 0
       return
     }
-    var groups = Callouts.group(sheet, layout, diagramSections)
-    overflow = Callouts.unplaced(sheet, layout, diagramSections)
 
-    var vb = layout.viewBox
-    var scale = diagramWidth / vb.width
-    var top = diagramTop()
+    var list = Callouts.callouts(sheet, layout)
+    overflow = Callouts.unplaced(sheet, layout)
+    modifierKeys = Callouts.usedModifiers(list)
 
     var left = [], right = []
-    for (var i = 0; i < groups.length; i++) {
-      var g = groups[i]
-      // Anchor in diagram-row pixel space.
-      g.px = diagramX() + g.ax * scale
-      g.py = top + g.ay * scale
-      g.h = calloutHeight(g)
-      ;(g.side === "left" ? left : right).push(g)
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i]
+      c.h = boxPadTop + headerH + c.rows.length * rowH + boxPadBottom
+      // Where the leader lands: on the header, which is the line that names
+      // the control. Pointing at the middle of a five-row box points at a
+      // binding rather than at the thing bound.
+      c.link = boxPadTop + headerH / 2
+      c.w = boxWidth(c)
+      ;(c.side === "left" ? left : right).push(c)
     }
-    left.sort(Callouts.byAnchor)
-    right.sort(Callouts.byAnchor)
 
-    var rowH = diagramRowHeight()
-    leftPlaced = Callouts.place(left, left.map(function (g) { return g.h }),
-                                0, rowH, calloutGap)
-    rightPlaced = Callouts.place(right, right.map(function (g) { return g.h }),
-                                 0, rowH, calloutGap)
-  }
+    var lanesLeft = laneSplit(left, "left")
+    var lanesRight = laneSplit(right, "right")
 
-  // The diagram row is as tall as the taller of (the drawing, either column),
-  // so a right-heavy config — which the puck's face cluster makes the norm —
-  // simply grows the card rather than cramming its callouts.
-  function columnExtent(side) {
-    if (!sheet || !layout) return 0
-    var groups = Callouts.group(sheet, layout, diagramSections)
-    var n = 0, h = 0
-    for (var i = 0; i < groups.length; i++) {
-      var anchor = layout.controls[groups[i].control]
-      if ((anchor.side === "left" ? "left" : "right") !== side) continue
-      h += calloutHeight(groups[i]); n++
+    leftWidth = sideWidth(lanesLeft)
+    rightWidth = sideWidth(lanesRight)
+    diagramX = leftWidth + columnGap
+
+    // The drawing's height is the target; a lane that still will not fit sets
+    // the row height itself rather than being crammed.
+    var need = diagramHeight
+    var all = lanesLeft.concat(lanesRight)
+    for (var l = 0; l < all.length; l++)
+      need = Math.max(need, Callouts.extent(all[l], calloutGap))
+    rowHeight = need
+    diagramTop = Math.round((rowHeight - diagramHeight) / 2)
+
+    var scale = diagramWidth / layout.viewBox.width
+    for (var k = 0; k < list.length; k++) {
+      list[k].px = diagramX + list[k].ax * scale
+      list[k].py = diagramTop + list[k].ay * scale
     }
-    return n > 0 ? h + (n - 1) * calloutGap : 0
+
+    layLane(lanesLeft, "left")
+    layLane(lanesRight, "right")
+
+    placed = left.concat(right)
   }
 
-  function diagramRowHeight() {
-    return Math.max(diagramHeight, columnExtent("left"), columnExtent("right"))
+  function laneSplit(items, side) {
+    items.sort(Callouts.byInner(side))
+    var n = Callouts.laneCount(items, diagramHeight, calloutGap, maxLanes)
+    var lanes = Callouts.splitLanes(items, n, calloutGap)
+    for (var i = 0; i < lanes.length; i++) lanes[i].sort(Callouts.byAnchor)
+    return lanes
   }
 
-  function diagramTop() { return (diagramRowHeight() - diagramHeight) / 2 }
-  function diagramX() { return columnWidth + columnGap }
+  function sideWidth(lanes) {
+    var w = 0
+    for (var i = 0; i < lanes.length; i++) {
+      if (lanes[i].length === 0) continue
+      if (w > 0) w += laneGap
+      w += Callouts.laneWidth(lanes[i])
+    }
+    return w
+  }
+
+  // Give every box in every lane of one side its x, its y, and the four points
+  // its leader is drawn through. Lane 0 is the one nearest the drawing.
+  //
+  // A lane-0 leader is the simple thing: out of the anchor, bend, into the box.
+  // A lane-1 leader threads a gap in lane 0 and then runs down the channel
+  // between the lanes to its own box — see `Callouts.threadGaps`. Both are the
+  // same four-point path; for lane 0 the middle two points collapse onto the
+  // bend, so one delegate draws either.
+  function layLane(lanes, side) {
+    var isLeft = side === "left"
+    // Every leader on a side bends at the same x, just clear of the drawing,
+    // so the lead-ins read as one comb rather than a scribble.
+    var bend = isLeft ? leftWidth + columnGap - 4
+                      : diagramX + diagramWidth + 4
+    var cursor = isLeft ? leftWidth : diagramX + diagramWidth + columnGap
+
+    for (var j = 0; j < lanes.length; j++) {
+      var lane = lanes[j]
+      if (lane.length === 0) continue
+      var lw = Callouts.laneWidth(lane)
+      Callouts.place(lane, 0, rowHeight, calloutGap)
+      for (var i = 0; i < lane.length; i++) {
+        var c = lane[i]
+        c.lane = j
+        c.bx = isLeft ? cursor - c.w : cursor
+        c.by = c.top
+        c.linkY = c.top + c.link
+        // The leader meets the box on the edge that faces the drawing, which
+        // is the lane edge either way: a left-hand box is right-aligned in its
+        // lane, a right-hand one left-aligned.
+        c.endX = cursor
+        c.bendX = bend
+        c.channelX = bend
+        c.crossY = c.linkY
+      }
+      cursor += isLeft ? -(lw + laneGap) : (lw + laneGap)
+    }
+
+    if (lanes.length < 2 || lanes[0].length === 0 || lanes[1].length === 0) return
+
+    var inner = Callouts.laneWidth(lanes[0])
+    var channel = isLeft
+      ? leftWidth - inner - laneGap / 2
+      : diagramX + diagramWidth + columnGap + inner + laneGap / 2
+    var outer = lanes[1].slice()
+    outer.sort(function (a, b) { return a.linkY - b.linkY })
+    Callouts.threadGaps(outer, lanes[0], 0, rowHeight, 3)
+    for (var q = 0; q < outer.length; q++) outer[q].channelX = channel
+  }
 
   onSheetChanged: relayout()
   onLayoutChanged: relayout()
+
+  // Text measurement for `boxWidth`. Hidden, and only ever poked at from
+  // `relayout()` — the fonts here must match the delegates below exactly.
+  TextMetrics {
+    id: mHeader
+    font.family: root.fontFamily; font.pixelSize: root.fontSmall; font.bold: true
+  }
+  TextMetrics {
+    id: mRow
+    font.family: root.fontFamily; font.pixelSize: root.fontBody
+  }
+  TextMetrics {
+    id: mRowItalic
+    font.family: root.fontFamily; font.pixelSize: root.fontBody; font.italic: true
+  }
+  TextMetrics {
+    id: mTag
+    font.family: root.fontFamily; font.pixelSize: root.fontCaption
+  }
 
   // --- chrome -------------------------------------------------------------
 
@@ -208,15 +334,16 @@ Item {
     Item {
       id: diagramRow
       Layout.alignment: Qt.AlignHCenter
-      implicitWidth: 2 * root.columnWidth + 2 * root.columnGap + root.diagramWidth
-      implicitHeight: root.diagramRowHeight()
+      implicitWidth: root.leftWidth + root.rightWidth + 2 * root.columnGap
+        + root.diagramWidth
+      implicitHeight: root.rowHeight
 
       // The drawing. `artSvg` arrives already recoloured, as a data: URL —
       // Qt renders SVG from one happily, and it keeps the themed copy out of
       // the filesystem.
       Image {
-        x: root.diagramX()
-        y: root.diagramTop()
+        x: root.diagramX
+        y: root.diagramTop
         width: root.diagramWidth
         height: root.diagramHeight
         fillMode: Image.PreserveAspectFit
@@ -229,30 +356,17 @@ Item {
           : ""
       }
 
-      // Leader lines, under the callout chips.
+      // Leader lines, UNDER the callout boxes. A box paints the card's own
+      // background, so where a second-lane leader has to reach past the first
+      // lane it disappears behind it instead of scribbling through the text.
       Repeater {
-        model: root.leftPlaced.concat(root.rightPlaced)
+        model: root.placed
         delegate: Shape {
           id: leader
           required property var modelData
           anchors.fill: parent
           preferredRendererType: Shape.CurveRenderer
           z: 0
-
-          readonly property bool isLeft: modelData.side === "left"
-          // Where the leader meets the callout: its inner edge, at its centre.
-          readonly property real endX: isLeft
-            ? root.columnWidth
-            : root.columnWidth + root.columnGap + root.diagramWidth + root.columnGap
-          readonly property real endY: modelData.cy
-          // A short horizontal run into the label. The column is always taller
-          // than the span of the anchors it serves — ten callouts do not fit in
-          // the height of one face-button cluster — so the leaders necessarily
-          // fan out; the lead-in is what makes it obvious, at a glance, which
-          // line belongs to which label.
-          // The anchor is always on the diagram, i.e. INSIDE `endX`: to the
-          // right of a left-hand label, to the left of a right-hand one.
-          readonly property real leadX: isLeft ? endX + 22 : endX - 22
 
           ShapePath {
             strokeColor: root.palAccent
@@ -265,15 +379,17 @@ Item {
             dashPattern: [3, 3]
             startX: leader.modelData.px
             startY: leader.modelData.py
-            PathLine { x: leader.leadX; y: leader.endY }
-            PathLine { x: leader.endX; y: leader.endY }
+            PathLine { x: leader.modelData.bendX; y: leader.modelData.crossY }
+            PathLine { x: leader.modelData.channelX; y: leader.modelData.crossY }
+            PathLine { x: leader.modelData.channelX; y: leader.modelData.linkY }
+            PathLine { x: leader.modelData.endX; y: leader.modelData.linkY }
           }
         }
       }
 
       // Anchor dots, on top of the drawing.
       Repeater {
-        model: root.leftPlaced.concat(root.rightPlaced)
+        model: root.placed
         delegate: Rectangle {
           required property var modelData
           z: 1
@@ -286,11 +402,7 @@ Item {
 
       // The callouts themselves.
       Repeater {
-        model: root.leftPlaced
-        delegate: calloutComponent
-      }
-      Repeater {
-        model: root.rightPlaced
+        model: root.placed
         delegate: calloutComponent
       }
     }
@@ -302,23 +414,11 @@ Item {
       opacity: 0.35
     }
 
-    // ------------------------------------------------------------- tables
+    // -------------------------------------------------------- legend + modes
     RowLayout {
       Layout.fillWidth: true
-      spacing: 24
+      spacing: 28
 
-      TableBlock {
-        title: "Bare buttons"
-        subtitle: "no modifier"
-        rows: root.sheet ? root.sheet.buttons.concat(root.overflow) : []
-        Layout.alignment: Qt.AlignTop
-      }
-      TableBlock {
-        title: "OSK helpers"
-        subtitle: "while the keyboard is up"
-        rows: root.sheet ? root.sheet.osk_buttons : []
-        Layout.alignment: Qt.AlignTop
-      }
       ModesBlock {
         modes: root.sheet ? root.sheet.modes : []
         total: root.sheet
@@ -326,7 +426,116 @@ Item {
             + root.sheet.osk_buttons.length + root.sheet.ambient.length
           : 0
         Layout.alignment: Qt.AlignTop
-        Layout.fillWidth: true
+      }
+
+      Item { Layout.fillWidth: true }
+
+      // Anything the layout could not anchor. Empty for a drawing that covers
+      // the pad, which is the point — but a binding must never vanish just
+      // because the diagram has no dot for it.
+      ColumnLayout {
+        visible: root.overflow.length > 0
+        Layout.alignment: Qt.AlignTop
+        spacing: 4
+        Text {
+          text: "Not on this diagram"
+          color: root.palAccent
+          font.family: root.fontFamily
+          font.pixelSize: root.fontSmall
+          font.bold: true
+        }
+        Repeater {
+          model: root.overflow
+          delegate: RowLayout {
+            required property var modelData
+            spacing: 8
+            Text {
+              text: modelData.chord
+              color: root.palText
+              font.family: root.monoFamily
+              font.pixelSize: root.fontCaption
+              Layout.minimumWidth: 74
+            }
+            Text {
+              text: modelData.label
+              color: root.palText
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+              opacity: modelData.described ? 1.0 : 0.8
+            }
+          }
+        }
+      }
+    }
+
+    // ------------------------------------------------------------- legend
+    Flow {
+      Layout.fillWidth: true
+      spacing: 18
+
+      Repeater {
+        model: root.modifierKeys
+        delegate: Row {
+          id: legendItem
+          required property var modelData
+          spacing: 6
+          readonly property var spec: (root.layout && root.layout.modifiers)
+            ? root.layout.modifiers[modelData] : null
+
+          Item {
+            width: root.modSize; height: root.modSize
+            anchors.verticalCenter: parent.verticalCenter
+            Image {
+              id: legendGlyph
+              anchors.fill: parent
+              fillMode: Image.PreserveAspectFit
+              smooth: true
+              sourceSize.width: root.modSize * 3
+              sourceSize.height: root.modSize * 3
+              source: (legendItem.spec && legendItem.spec.image && root.pluginDir)
+                ? "file://" + root.pluginDir + "/" + legendItem.spec.image : ""
+              visible: status === Image.Ready
+            }
+            Text {
+              anchors.centerIn: parent
+              visible: !legendGlyph.visible
+              text: (legendItem.spec && legendItem.spec.text)
+                ? legendItem.spec.text : ""
+              color: root.palAccent
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+              font.bold: true
+            }
+          }
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "= " + ((legendItem.spec && legendItem.spec.legend)
+                          ? legendItem.spec.legend : legendItem.modelData)
+            color: root.palMuted
+            font.family: root.fontFamily
+            font.pixelSize: root.fontCaption
+          }
+        }
+      }
+
+      Text {
+        text: "no glyph = press it on its own"
+        color: root.palMuted
+        font.family: root.fontFamily
+        font.pixelSize: root.fontCaption
+      }
+      Text {
+        text: "· dim tag = only in that mode"
+        color: root.palMuted
+        font.family: root.fontFamily
+        font.pixelSize: root.fontCaption
+      }
+      Text {
+        text: "italic = label derived from the action, not described in the config"
+        color: root.palMuted
+        font.family: root.fontFamily
+        font.pixelSize: root.fontCaption
+        font.italic: true
       }
     }
 
@@ -335,7 +544,7 @@ Item {
       Layout.fillWidth: true
       textFormat: Text.PlainText
       text: {
-        var bits = ["Hold Steam, then press."]
+        var bits = []
         if (root.toggleChord !== "") bits.push(root.toggleChord + " or Esc closes this sheet.")
         else bits.push("Esc closes this sheet.")
         bits.push("Re-read on every summon — edit the config and summon again.")
@@ -352,168 +561,175 @@ Item {
     id: calloutComponent
 
     Item {
+      id: callout
       required property var modelData
       z: 2
-      readonly property bool isLeft: modelData.side === "left"
-      width: root.columnWidth
+      x: modelData.bx
+      y: modelData.by
+      width: modelData.w
       height: modelData.h
-      x: isLeft ? 0 : root.columnWidth + 2 * root.columnGap + root.diagramWidth
-      y: modelData.cy - modelData.h / 2
+
+      // Opaque, so a leader running past to the outer lane goes behind the
+      // text rather than through it; the hairline border is what turns a
+      // stack of rows into one thing you can read as a unit.
+      Rectangle {
+        anchors.fill: parent
+        radius: 6
+        color: root.palBackground
+        border.width: 1
+        border.color: Qt.rgba(root.palMuted.r, root.palMuted.g, root.palMuted.b, 0.30)
+      }
 
       Column {
-        anchors.fill: parent
-        anchors.leftMargin: 6
-        anchors.rightMargin: 6
-        spacing: 2
+        x: root.boxPadH
+        y: root.boxPadTop
+        width: parent.width - 2 * root.boxPadH
+        spacing: 0
 
-        // Title row: the glyph chip and the control's name.
-        Row {
-          spacing: 6
-          layoutDirection: isLeft ? Qt.RightToLeft : Qt.LeftToRight
-          anchors.right: isLeft ? parent.right : undefined
+        // Header: the control's chip and its name. This is the line the
+        // leader lands on.
+        Item {
+          width: parent.width
+          height: root.headerH
 
-          Item {
-            width: 18; height: 18
-            Image {
-              id: glyphImage
-              anchors.fill: parent
-              fillMode: Image.PreserveAspectFit
-              smooth: true
-              sourceSize.width: 36
-              sourceSize.height: 36
-              source: {
-                var g = root.layout && root.layout.glyphs
-                  ? root.layout.glyphs[modelData.control] : null
-                return (g && g.image && root.pluginDir)
-                  ? "file://" + root.pluginDir + "/" + g.image : ""
+          Row {
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: root.cellGap
+
+            Item {
+              width: root.glyphSize; height: root.glyphSize
+              Image {
+                id: glyphImage
+                anchors.fill: parent
+                fillMode: Image.PreserveAspectFit
+                smooth: true
+                sourceSize.width: root.glyphSize * 3
+                sourceSize.height: root.glyphSize * 3
+                source: {
+                  var g = root.layout && root.layout.glyphs
+                    ? root.layout.glyphs[callout.modelData.control] : null
+                  return (g && g.image && root.pluginDir)
+                    ? "file://" + root.pluginDir + "/" + g.image : ""
+                }
+                visible: status === Image.Ready
               }
-              visible: status === Image.Ready
+              // The layout's `text` fallback, for a glyph file that is missing
+              // — which is the normal case for a layout that ships no art.
+              Text {
+                anchors.centerIn: parent
+                visible: !glyphImage.visible
+                text: {
+                  var g = root.layout && root.layout.glyphs
+                    ? root.layout.glyphs[callout.modelData.control] : null
+                  return g && g.text ? g.text : callout.modelData.control
+                }
+                color: root.palAccent
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+                font.bold: true
+              }
             }
-            // The layout's `text` fallback, for a glyph file that is missing —
-            // which is the normal case for a layout that ships no art.
+
             Text {
-              anchors.centerIn: parent
-              visible: !glyphImage.visible
-              text: {
-                var g = root.layout && root.layout.glyphs
-                  ? root.layout.glyphs[modelData.control] : null
-                return g && g.text ? g.text : modelData.control
-              }
+              anchors.verticalCenter: parent.verticalCenter
+              text: callout.modelData.controlLabel
               color: root.palAccent
               font.family: root.fontFamily
-              font.pixelSize: root.fontCaption
+              font.pixelSize: root.fontSmall
               font.bold: true
             }
-          }
-
-          Text {
-            text: modelData.controlLabel
-            color: root.palAccent
-            font.family: root.fontFamily
-            font.pixelSize: root.fontSmall
-            font.bold: true
           }
         }
 
         // One row per binding on this control.
         Repeater {
-          model: modelData.lines
-          delegate: Row {
+          model: modelData.rows
+          delegate: Item {
+            id: row
             required property var modelData
-            spacing: 6
-            anchors.right: isLeft ? parent.right : undefined
-            layoutDirection: isLeft ? Qt.RightToLeft : Qt.LeftToRight
+            width: parent.width
+            height: root.rowH
 
-            Text {
-              text: modelData.direction !== ""
-                ? ({ up: "↑", down: "↓", left: "←", right: "→" }[modelData.direction] || "")
-                : ""
-              visible: text !== ""
-              color: root.palText
-              font.family: root.fontFamily
-              font.pixelSize: root.fontBody
-            }
-            Text {
-              text: modelData.label
-              color: root.palText
-              font.family: root.fontFamily
-              font.pixelSize: root.fontBody
-              // A label the config actually wrote reads as authored; a derived
-              // one is dimmed, so the owner can see at a glance which bindings
-              // still want a description.
-              opacity: modelData.described ? 1.0 : 0.75
-              font.italic: !modelData.described
-            }
-            Text {
-              text: modelData.guarded ? "· " + modelData.guard : ""
-              visible: text !== ""
-              color: root.palMuted
-              font.family: root.fontFamily
-              font.pixelSize: root.fontCaption
+            Row {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: root.cellGap
+
+              // Reserved for the whole box, so labels line up whether or not a
+              // given row has an arrow or a modifier.
+              Item {
+                width: root.arrowW; height: root.rowH
+                visible: callout.modelData.hasDirection
+                Text {
+                  anchors.centerIn: parent
+                  text: Callouts.arrow(row.modelData.direction)
+                    || row.modelData.direction
+                  color: root.palText
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fontBody
+                }
+              }
+
+              Item {
+                width: root.modSize; height: root.rowH
+                visible: callout.modelData.hasModifier
+                Image {
+                  id: modImage
+                  anchors.centerIn: parent
+                  width: root.modSize; height: root.modSize
+                  fillMode: Image.PreserveAspectFit
+                  smooth: true
+                  sourceSize.width: root.modSize * 3
+                  sourceSize.height: root.modSize * 3
+                  source: {
+                    var m = row.modelData.modifier
+                    if (!m || !root.layout || !root.layout.modifiers) return ""
+                    var spec = root.layout.modifiers[m]
+                    return (spec && spec.image && root.pluginDir)
+                      ? "file://" + root.pluginDir + "/" + spec.image : ""
+                  }
+                  visible: status === Image.Ready
+                }
+                Text {
+                  anchors.centerIn: parent
+                  visible: !modImage.visible && row.modelData.modifier !== ""
+                  text: {
+                    var m = row.modelData.modifier
+                    var spec = (root.layout && root.layout.modifiers)
+                      ? root.layout.modifiers[m] : null
+                    return spec && spec.text ? spec.text : m
+                  }
+                  color: root.palAccent
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fontCaption
+                  font.bold: true
+                }
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: row.modelData.label
+                color: root.palText
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBody
+                // A label the config actually wrote reads as authored; a
+                // derived one is dimmed and italic, so the owner can see at a
+                // glance which bindings still want a description.
+                opacity: row.modelData.described ? 1.0 : 0.75
+                font.italic: !row.modelData.described
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: row.modelData.guarded ? "· " + row.modelData.guard : ""
+                visible: text !== ""
+                color: root.palMuted
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+              }
             }
           }
         }
       }
-    }
-  }
-
-  // --- a small two-column table -------------------------------------------
-  component TableBlock: ColumnLayout {
-    id: block
-    property string title: ""
-    property string subtitle: ""
-    property var rows: []
-    spacing: 4
-
-    Text {
-      text: block.title
-      color: root.palAccent
-      font.family: root.fontFamily
-      font.pixelSize: root.fontSmall
-      font.bold: true
-    }
-    Text {
-      text: block.subtitle
-      visible: text !== ""
-      color: root.palMuted
-      font.family: root.fontFamily
-      font.pixelSize: root.fontCaption
-    }
-    Repeater {
-      model: block.rows
-      delegate: RowLayout {
-        required property var modelData
-        spacing: 8
-        Text {
-          text: modelData.chord
-          color: root.palText
-          font.family: root.monoFamily
-          font.pixelSize: root.fontCaption
-          Layout.minimumWidth: 74
-        }
-        Text {
-          text: modelData.label
-          color: root.palText
-          font.family: root.fontFamily
-          font.pixelSize: root.fontCaption
-          opacity: modelData.described ? 1.0 : 0.8
-        }
-        Text {
-          text: (modelData.guard && modelData.guard.kind !== "always")
-            ? "· " + modelData.guard_label : ""
-          visible: text !== ""
-          color: root.palMuted
-          font.family: root.fontFamily
-          font.pixelSize: root.fontCaption
-        }
-      }
-    }
-    Text {
-      visible: block.rows.length === 0
-      text: "(none)"
-      color: root.palMuted
-      font.family: root.fontFamily
-      font.pixelSize: root.fontCaption
     }
   }
 
