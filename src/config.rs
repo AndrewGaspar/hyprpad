@@ -617,6 +617,35 @@ pub struct ModeDef {
     pub forward: bool,
 }
 
+/// A **second** bare-button binding for a button that already carries one, with
+/// its own guard — how a button means different things in different modes.
+///
+/// `buttons` holds one binding per button: all a `config.toml` can say, and all
+/// the no-modes path can use. Once modes exist a button can be bound more than
+/// once, each binding guarded into a different mode:
+///
+/// ```lua
+/// h.button("b", h.key "backspace"):only_in("desktop")
+/// h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
+/// ```
+///
+/// Modes are exclusive, so at most one of a button's bindings is ever live;
+/// [`Config::buttons_in`] takes the first whose guard passes, the base map's
+/// binding first, so the file reads top-down. Two bindings that *are* live at
+/// once (both unguarded — a config bug) resolve to the first declared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ButtonAlt {
+    /// The button being bound again.
+    pub button: report::Button,
+    /// The `KEY_*` code it emits where this binding is live.
+    pub code: u16,
+    /// Where it is live. Practically always a mode guard: an unguarded
+    /// re-binding of an already-bound button can never win.
+    pub guard: Guard,
+    /// The optional human description, for `hyprpad bindings`.
+    pub desc: Option<String>,
+}
+
 /// When a binding — or an ambient handler such as the cursor — is live.
 ///
 /// Every `h.bind` / `h.button` / `h.osk_button`, and the `h.cursor` /
@@ -759,6 +788,11 @@ pub struct Config {
     pub(crate) binding_guards: HashMap<GestureKey, Guard>,
     /// Per-binding guards for the bare-button (`[buttons]`) map.
     pub(crate) button_guards: HashMap<report::Button, Guard>,
+    /// Further bare-button bindings for buttons `buttons` already binds, in
+    /// declaration order — the same button meaning different things in
+    /// different modes ([`ButtonAlt`]). Empty for a TOML config, which has one
+    /// binding per button and no modes to tell them apart.
+    pub(crate) button_alts: Vec<ButtonAlt>,
     /// Per-binding guards for the OSK-helper (`[osk_buttons]`) map.
     pub(crate) osk_button_guards: HashMap<report::Button, Guard>,
 
@@ -1306,8 +1340,20 @@ impl Config {
     /// The bare-button map filtered to the bindings live in `st`. Built on a
     /// **mode transition**, never per frame, and handed to
     /// `crate::run::drive_buttons` in place of [`buttons`](Self::buttons).
+    ///
+    /// A button bound once per mode ([`ButtonAlt`]) resolves here: the base
+    /// binding first, then the alternates in declaration order, first guard
+    /// that passes wins. Since modes are exclusive there is normally no
+    /// competition — `b` is backspace on the desktop and escape under the cheat
+    /// sheet, and never both.
     pub fn buttons_in(&self, st: &ModeState) -> HashMap<report::Button, u16> {
-        filter_buttons(&self.buttons, &self.button_guards, st)
+        let mut live = filter_buttons(&self.buttons, &self.button_guards, st);
+        for alt in &self.button_alts {
+            if alt.guard.allows(st) {
+                live.entry(alt.button).or_insert(alt.code);
+            }
+        }
+        live
     }
 
     /// The OSK-helper map filtered to the bindings live in `st`.
@@ -1334,6 +1380,7 @@ impl Config {
             .values()
             .chain(self.button_guards.values())
             .chain(self.osk_button_guards.values())
+            .chain(self.button_alts.iter().map(|a| &a.guard))
             .chain([&self.cursor_guard, &self.scroll_guard]);
         let from_guards = guards.filter_map(|g| match g {
             Guard::When(i) => Some(*i + 1),

@@ -102,7 +102,8 @@ the TOML file uses.
 
 A **mode** is a named context chosen by a predicate. Rules run in definition
 order, first match wins, and **only on a context change** — a focus change, a
-fullscreen change, a manual override, a reload. Never per input frame.
+fullscreen change, an overlay opening or closing, a manual override, a reload.
+Never per input frame.
 
 ```lua
 h.mode("game", { forward = true }).when(function(ctx)
@@ -111,12 +112,28 @@ end)
 h.mode("claude").when(function(ctx)          -- Claude Code in a terminal:
   return ctx.focus:process_tree_has("claude") -- same class as any terminal, so
 end)                                          -- look inside the window
+h.mode("cheatsheet").when(function(ctx)      -- an overlay is a context too:
+  return ctx.layers:has("hyprpad-cheatsheet") -- the sheet has the keyboard, and
+end)                                          -- no window event fires for it
 h.mode("desktop")
 h.default_mode "desktop"
 ```
 
 `ctx.focus` carries `class`, `title`, `pid`, `fullscreen`, and the
-`process_tree_has` method (a cached `/proc` descendant walk).
+`process_tree_has` method (a cached `/proc` descendant walk). `ctx.layers` is
+the layer-shell overlays on screen — hyprpad's own (`hyprpad-cheatsheet`,
+`hyprpad-osk`) and everyone else's — as an array of namespaces with `:has(name)`
+and `:list()` on it. It is seeded from the compositor at startup, so a daemon
+restarted under the cheat sheet knows it is there.
+
+A button can be bound once per mode, which is how one control means two things:
+
+```lua
+h.button("b", h.key "backspace"):only_in("desktop")
+h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
+```
+
+Modes are exclusive, so at most one of them is ever live.
 
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:

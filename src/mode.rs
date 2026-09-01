@@ -23,10 +23,10 @@
 //!
 //! Rules and `:when` guards are Lua predicates, and they run **on a context
 //! change only** — a focus change, a rename of the focused window, a fullscreen
-//! change, a manual override, a config reload, or the periodic process-tree
-//! rescan. Never per input frame: the resolved mode, the guard results,
-//! and the filtered button maps are all cached in this struct, and the
-//! per-frame handlers only read them.
+//! change, an overlay opening or closing, a manual override, a config reload,
+//! or the periodic process-tree rescan. Never per input frame: the resolved
+//! mode, the guard results, and the filtered button maps are all cached in this
+//! struct, and the per-frame handlers only read them.
 //!
 //! ## The built-in behaviour
 //!
@@ -41,7 +41,7 @@ use crate::arbitrate::Arbiter;
 use crate::config::{Config, ModeState};
 use crate::gesture::GestureEvent;
 use crate::report;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// The name the built-in (no modes declared) behaviour uses for "a game window
 /// holds focus", and the name a `config.lua` conventionally gives the same
@@ -52,7 +52,32 @@ pub const BUILTIN_GAME: &str = "game";
 /// default `default_mode`.
 pub const BUILTIN_DESKTOP: &str = "desktop";
 
-/// The observable world a mode rule selects on: the focused window.
+/// The observable world a mode rule selects on, whole.
+///
+/// Two sources, both from the compositor and both cheap: the focused *window*
+/// ([`Focus`]) and the *overlays* on screen. The second exists because an
+/// overlay is a context a focus-only engine cannot see — a layer-shell surface
+/// takes the keyboard without any `activewindow` event behind it, so nothing
+/// but `openlayer`/`closelayer` says hyprpad's own cheat sheet is up and modal.
+///
+/// Reaches Lua as `ctx`, one table per re-resolve.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Context {
+    /// The focused window. `ctx.focus`.
+    pub focus: Focus,
+    /// The namespaces of the layer-shell surfaces currently on screen —
+    /// hyprpad's own overlays (`hyprpad-cheatsheet`, `hyprpad-osk`) and
+    /// everyone else's (`omarchy-bar`, `omarchy-background`). `ctx.layers`.
+    ///
+    /// A namespace is all the wire gives us: `openlayer>>hyprpad-cheatsheet`
+    /// carries no address and nothing else, so this is a set of names and not a
+    /// map of surfaces. Ordered (a `BTreeSet`) so `ipairs(ctx.layers)` and
+    /// `ctx.layers:list()` read the same way twice running — a rule that
+    /// renders the set must not watch it reshuffle.
+    pub layers: BTreeSet<String>,
+}
+
+/// The focused window a mode rule selects on.
 ///
 /// Fed by `activewindow` from the compositor's event socket (class, title) plus
 /// a one-shot `j/activewindow` query for the fields the event stream does not
@@ -78,7 +103,9 @@ pub struct Focus {
 /// per-frame handlers need to know about it.
 #[derive(Debug)]
 pub struct ModeEngine {
-    focus: Focus,
+    /// Everything the rules select on — the focused window and the open
+    /// overlays — kept whole so a predicate never sees half of a change.
+    ctx: Context,
     /// The manual override, top of the precedence. `Some` until a
     /// [`crate::config::Action::ClearMode`].
     manual: Option<String>,
@@ -101,7 +128,7 @@ impl ModeEngine {
     /// focused yet, so the default mode unless a rule matches an empty focus).
     pub fn new(config: &Config) -> ModeEngine {
         let mut me = ModeEngine {
-            focus: Focus::default(),
+            ctx: Context::default(),
             manual: None,
             arbiter: Arbiter::new(),
             state: ModeState::default(),
@@ -136,7 +163,7 @@ impl ModeEngine {
                 class: class.to_string(),
                 title: title.to_string(),
                 pid,
-                fullscreen: self.focus.fullscreen,
+                fullscreen: self.ctx.focus.fullscreen,
             },
         )
     }
@@ -150,7 +177,7 @@ impl ModeEngine {
     pub fn context_changed(&mut self, config: &Config, focus: Focus) -> bool {
         self.arbiter.focus_changed(&focus.class);
         self.arbiter.set_fullscreen(focus.fullscreen);
-        self.focus = focus;
+        self.ctx.focus = focus;
         self.refresh(config)
     }
 
@@ -168,10 +195,10 @@ impl ModeEngine {
     /// re-resolves nothing, which is what makes the compositor's two events per
     /// rename (`windowtitle` then `windowtitlev2`) cost one re-resolve.
     pub fn title_changed(&mut self, config: &Config, title: &str) -> bool {
-        if self.focus.title == title {
+        if self.ctx.focus.title == title {
             return false;
         }
-        self.focus.title = title.to_string();
+        self.ctx.focus.title = title.to_string();
         self.forget_process_tree(config);
         self.refresh(config)
     }
@@ -201,7 +228,7 @@ impl ModeEngine {
     /// from. The owner's rule is that a config which never asks about processes
     /// never polls for them.
     pub fn process_rescan_useful(&self, config: &Config) -> bool {
-        self.focus.pid.is_some()
+        self.ctx.focus.pid.is_some()
             && !config.modes().is_empty()
             && config.lua().is_some_and(|rt| rt.walks_process_tree())
     }
@@ -217,7 +244,55 @@ impl ModeEngine {
     /// The focused window's fullscreen state changed.
     pub fn set_fullscreen(&mut self, config: &Config, on: bool) -> bool {
         self.arbiter.set_fullscreen(on);
-        self.focus.fullscreen = on;
+        self.ctx.focus.fullscreen = on;
+        self.refresh(config)
+    }
+
+    /// A layer-shell overlay appeared or disappeared (Hyprland's `openlayer` /
+    /// `closelayer`, [`crate::hypr::HyprEvent::Layer`]).
+    ///
+    /// The context source a focus-only engine is blind to. The cheat sheet
+    /// takes the keyboard the moment it is drawn and no `activewindow` event
+    /// fires for it, so without this the daemon has no way of knowing that its
+    /// own modal overlay is up — which is what makes "B closes the sheet"
+    /// expressible as an ordinary guarded binding instead of a special case
+    /// wired into the input path.
+    ///
+    /// An event that does not move the set — a repeat `openlayer` for a
+    /// namespace already open, a `closelayer` for one we never saw — is not a
+    /// context change and re-resolves nothing, exactly as a rename to the title
+    /// we already hold does not.
+    ///
+    /// A config that declares no modes — the TOML front-end, which is the only
+    /// one that can have none — never tracks layers at all. It resolves on
+    /// window class alone, so no overlay can change its answer, and the set
+    /// stays empty however many come and go: the same "never pay for what you
+    /// did not ask for" rule as the focused-pid query.
+    pub fn layer_changed(&mut self, config: &Config, namespace: &str, open: bool) -> bool {
+        if config.modes().is_empty() {
+            return false;
+        }
+        let moved = if open {
+            self.ctx.layers.insert(namespace.to_string())
+        } else {
+            self.ctx.layers.remove(namespace)
+        };
+        moved && self.refresh(config)
+    }
+
+    /// Adopt the overlays already on screen (the daemon's startup seed from
+    /// `j/layers`, [`crate::hypr::Hypr::open_layers`]).
+    ///
+    /// The event socket announces only changes, so a daemon started — or
+    /// restarted, mid-session — while the cheat sheet is up would otherwise
+    /// believe nothing is showing until the sheet was closed and reopened.
+    /// Same gating as [`layer_changed`](Self::layer_changed), and the same
+    /// "seeding is one complete context change" contract as the focus seed.
+    pub fn seed_layers(&mut self, config: &Config, layers: BTreeSet<String>) -> bool {
+        if config.modes().is_empty() || self.ctx.layers == layers {
+            return false;
+        }
+        self.ctx.layers = layers;
         self.refresh(config)
     }
 
@@ -276,7 +351,13 @@ impl ModeEngine {
     /// against it to tell a real rename from a repeat of the one it already
     /// holds.
     pub fn focus_title(&self) -> &str {
-        &self.focus.title
+        &self.ctx.focus.title
+    }
+
+    /// The layer-shell namespaces the rules currently see. Always empty for a
+    /// config that declares no modes, which never tracks them.
+    pub fn layers(&self) -> &BTreeSet<String> {
+        &self.ctx.layers
     }
 
     /// Whether the active mode hands raw input to the game
@@ -388,7 +469,7 @@ impl ModeEngine {
         let mut results = vec![false; slots];
         if let Some(rt) = config.lua() {
             for (i, slot) in results.iter_mut().enumerate() {
-                *slot = rt.eval_predicate(i, &self.focus);
+                *slot = rt.eval_predicate(i, &self.ctx);
             }
         }
 
@@ -426,6 +507,17 @@ mod tests {
 
     fn lua(src: &str) -> Config {
         load_str(src, "test.lua").expect("config should load")
+    }
+
+    /// The file the owner will actually drop in, loaded from the repo. Several
+    /// tests run end to end against it, so it is worth exactly one reader.
+    fn sample_config() -> Config {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/hyprpad.lua"
+        ))
+        .expect("config/hyprpad.lua");
+        load_str(&src, "config/hyprpad.lua").expect("sample config should load")
     }
 
     /// The shape the shipped sample uses: a game mode selected by class, with
@@ -641,6 +733,38 @@ mod tests {
         assert_eq!(m.active(), "desktop");
     }
 
+    /// A reload must not lose sight of an overlay that is still on screen: the
+    /// sheet does not close because the config was re-read, so the new rules
+    /// have to be resolved against the same overlays the old ones saw.
+    #[test]
+    fn a_reload_keeps_the_overlays_that_are_still_up() {
+        let old = lua(
+            r#"
+            hyprpad.mode("cheatsheet").when(function(ctx)
+              return ctx.layers:has("hyprpad-cheatsheet")
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&old);
+        m.layer_changed(&old, "hyprpad-cheatsheet", true);
+        assert_eq!(m.active(), "cheatsheet");
+
+        // The same rule under a new name: the sheet is still up, so we land in
+        // it again without waiting for the overlay to be closed and reopened.
+        let new = lua(
+            r#"
+            hyprpad.mode("sheet").when(function(ctx)
+              return ctx.layers:has("hyprpad-cheatsheet")
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        assert!(m.reconfigure(&new));
+        assert_eq!(m.active(), "sheet");
+        assert!(m.layers().contains("hyprpad-cheatsheet"));
+    }
+
     #[test]
     fn fullscreen_is_available_to_a_rule_but_triggers_nothing_by_itself() {
         let c = lua(GAME_CONFIG);
@@ -667,12 +791,7 @@ mod tests {
         // End to end on the file the owner will actually drop in: the game
         // classes select `game`, everything ambient goes quiet, the guide
         // chords survive, and the pad is handed to the game.
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/config/hyprpad.lua"
-        ))
-        .expect("config/hyprpad.lua");
-        let c = load_str(&src, "config/hyprpad.lua").expect("sample config should load");
+        let c = sample_config();
         let mut m = ModeEngine::new(&c);
 
         m.focus_changed(&c, "foot", "ajg@framework", None);
@@ -709,6 +828,139 @@ mod tests {
         m.set_fullscreen(&c, true);
         assert_eq!(m.active(), "desktop");
         assert!(m.cursor_enabled() && !m.forwards());
+    }
+
+    /// The overlay path end to end, on the file the owner will actually drop
+    /// in: raising the cheat sheet is a context change all by itself, it wins
+    /// over every other rule, and it re-points one button without disturbing
+    /// anything else.
+    #[test]
+    fn the_cheat_sheet_is_a_mode_and_b_closes_it() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "ajg@framework", None);
+        assert_eq!(m.active(), "desktop");
+        assert_eq!(m.buttons().get(&Button::B), Some(&14), "B is Backspace here");
+
+        // The sheet comes up. No focus event fires for a layer surface, so this
+        // is the only thing that says so — and it is one transition.
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
+        assert_eq!(m.active(), "cheatsheet");
+        assert_eq!(m.buttons().get(&Button::B), Some(&1), "B is Escape under the sheet");
+        assert_eq!(m.buttons().len(), 1, "nothing else is guarded into cheatsheet");
+
+        // A repeat `openlayer` is not a context change: no re-resolve, and the
+        // caller runs no second handoff.
+        assert!(!m.layer_changed(&c, "hyprpad-cheatsheet", true));
+        // Nor is somebody else's overlay coming and going.
+        assert!(!m.layer_changed(&c, "omarchy-bar", true));
+        assert_eq!(m.active(), "cheatsheet");
+        assert!(!m.layer_changed(&c, "omarchy-bar", false));
+        assert_eq!(m.active(), "cheatsheet");
+
+        // Escape lands, the sheet closes, and the desktop takes B back.
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", false));
+        assert_eq!(m.active(), "desktop");
+        assert_eq!(m.buttons().get(&Button::B), Some(&14));
+        // Closing what is not open re-resolves nothing.
+        assert!(!m.layer_changed(&c, "hyprpad-cheatsheet", false));
+    }
+
+    /// The sheet is *modal*: it is drawn over whatever is focused, so it has to
+    /// beat the game rule — the sheet has the keyboard, the game does not.
+    #[test]
+    fn the_cheat_sheet_wins_over_a_game() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam_app_413080", "Portal 2", None);
+        assert_eq!(m.active(), "game");
+        assert!(m.forwards() && m.buttons().is_empty());
+
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
+        assert_eq!(m.active(), "cheatsheet");
+        assert!(!m.forwards(), "the sheet has the keyboard, not the game");
+        assert_eq!(m.buttons().get(&Button::B), Some(&1));
+
+        // ...and the game gets everything back when the sheet goes away. The
+        // focused window never moved.
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", false));
+        assert_eq!(m.active(), "game");
+        assert!(m.forwards() && m.desktop_yielded());
+    }
+
+    #[test]
+    fn ctx_layers_answers_has_for_what_is_open_and_only_that() {
+        let c = lua(
+            r#"
+            hyprpad.mode("sheet").when(function(ctx)
+              return ctx.layers:has("hyprpad-cheatsheet")
+            end)
+            hyprpad.mode("osk").when(function(ctx)
+              return ctx.layers:has("hyprpad-osk")
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.active(), "desktop", "nothing is showing yet");
+
+        m.layer_changed(&c, "hyprpad-osk", true);
+        assert_eq!(m.active(), "osk", "`has` is true for the one that is open");
+        // A near-miss is a miss: no prefix or substring matching.
+        m.layer_changed(&c, "hyprpad-cheatsheet-preview", true);
+        assert_eq!(m.active(), "osk");
+
+        // Both open: definition order decides, as for every other rule.
+        m.layer_changed(&c, "hyprpad-cheatsheet", true);
+        assert_eq!(m.active(), "sheet");
+        m.layer_changed(&c, "hyprpad-cheatsheet", false);
+        assert_eq!(m.active(), "osk");
+        m.layer_changed(&c, "hyprpad-osk", false);
+        assert_eq!(m.active(), "desktop");
+    }
+
+    /// The startup seed, driven off the real `j/layers` reply captured from
+    /// this machine with the sheet up: a daemon restarted under the sheet knows
+    /// it is there.
+    #[test]
+    fn a_daemon_started_under_the_sheet_seeds_the_mode_from_the_layers_reply() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "ajg@framework", None);
+        assert_eq!(m.active(), "desktop");
+
+        let open = crate::hypr::parse_layer_namespaces(crate::hypr::CAPTURED_LAYERS_JSON);
+        assert!(m.seed_layers(&c, open.clone()));
+        assert_eq!(m.active(), "cheatsheet");
+        assert_eq!(m.buttons().get(&Button::B), Some(&1));
+        // Everyone else's overlays came along and changed nothing.
+        assert!(m.layers().contains("omarchy-bar"));
+        // Seeding the same set again is not a context change.
+        assert!(!m.seed_layers(&c, open));
+
+        // And the ordinary close event still gets us out of it, so the seed
+        // leaves the engine in the same state the events would have.
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", false));
+        assert_eq!(m.active(), "desktop");
+    }
+
+    #[test]
+    fn a_config_with_no_modes_never_tracks_layers() {
+        // Nothing a layer could change, so nothing is remembered — the same
+        // "never pay for what you did not ask for" rule as the pid query.
+        let toml = Config::load_default();
+        let mut m = ModeEngine::new(&toml);
+        assert!(!m.layer_changed(&toml, "hyprpad-cheatsheet", true));
+        assert!(m.layers().is_empty(), "the set must stay empty");
+        assert_eq!(m.active(), BUILTIN_DESKTOP);
+
+        let open = crate::hypr::parse_layer_namespaces(crate::hypr::CAPTURED_LAYERS_JSON);
+        assert!(!m.seed_layers(&toml, open));
+        assert!(m.layers().is_empty(), "not even the startup seed lands");
+        // Which is the whole point: the built-in path resolves on window class,
+        // so an overlay cannot change its answer and the daemon never asks.
+        assert!(!m.layer_changed(&toml, "hyprpad-cheatsheet", false));
+        assert_eq!(m.active(), BUILTIN_DESKTOP);
     }
 
     /// The gap this whole path exists to close: `claude` starts in the terminal

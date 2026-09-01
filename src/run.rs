@@ -330,6 +330,28 @@ pub fn run() -> std::io::Result<()> {
             Err(e) => eprintln!("warning: could not seed focus from activewindow ({e})"),
         }
     }
+
+    // Seed the overlays already on screen, for the same reason and with the
+    // same gating: `openlayer`/`closelayer` announce only *changes*, so a
+    // daemon restarted while the cheat sheet is up would think nothing is
+    // showing and leave B on its desktop meaning until the sheet was closed and
+    // reopened. Nothing is held yet at this point, so — as with the focus seed
+    // — there is no handoff to run, only a line saying where we landed.
+    if !config.modes().is_empty() {
+        match hypr.open_layers() {
+            Ok(open) => {
+                let showing = open.iter().map(String::as_str).collect::<Vec<_>>().join(", ");
+                if modes.seed_layers(&config, open) {
+                    eprintln!(
+                        "hyprpad: overlays seeded ({showing}), mode '{}'",
+                        modes.active()
+                    );
+                }
+            }
+            Err(e) => eprintln!("warning: could not seed open overlays from j/layers ({e})"),
+        }
+    }
+
     loop {
         // The periodic process-tree rescan (`process_rescan_ms`), the title-less
         // half of noticing a program that starts under the focused window.
@@ -431,11 +453,14 @@ pub fn run() -> std::io::Result<()> {
                 if debug {
                     eprintln!("[event] {ev:?}");
                 }
-                let titled = matches!(ev, HyprEvent::WindowTitle { .. });
+                // Name the cause: a transition with no focus change behind it
+                // is otherwise a mystery in the log.
+                let why = match &ev {
+                    HyprEvent::WindowTitle { .. } => " (title change)",
+                    HyprEvent::Layer { .. } => " (overlay)",
+                    _ => "",
+                };
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
-                    // Name the cause: a transition with no focus change behind
-                    // it is otherwise a mystery in the log.
-                    let why = if titled { " (title change)" } else { "" };
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());
                     mode_handoff(
                         &mut engine,
@@ -1852,6 +1877,9 @@ fn update_modes(
             modes.title_changed(config, &title)
         }
         HyprEvent::Fullscreen(on) => modes.set_fullscreen(config, on),
+        // An overlay came up or went away. No compositor round trip: the
+        // namespace is the whole event, and the engine keeps the set.
+        HyprEvent::Layer { namespace, open } => modes.layer_changed(config, &namespace, open),
         _ => false,
     }
 }
