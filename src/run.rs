@@ -95,11 +95,23 @@ enum Input {
 }
 
 pub fn run() -> std::io::Result<()> {
-    let nodes = hidraw::puck_nodes()?;
-    if nodes.is_empty() {
-        eprintln!("no Steam Controller puck found (28de:1304)");
-        std::process::exit(1);
-    }
+    // Wait for the controller rather than exiting when it isn't there yet. The
+    // loop below already survives the puck *leaving*; this makes startup
+    // symmetric, so a daemon launched at login (or restarted while the puck is
+    // unplugged / asleep on a dead dongle) simply sits until it appears —
+    // "leave it running" has to include "start it before the controller".
+    let nodes = {
+        let mut nodes = hidraw::puck_nodes()?;
+        if nodes.is_empty() {
+            eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
+            while nodes.is_empty() {
+                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
+                nodes = hidraw::puck_nodes()?;
+            }
+            eprintln!("hyprpad: controller found ({} node(s))", nodes.len());
+        }
+        nodes
+    };
     // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
     // live (see the `Input::Reload` arm and `apply_reload`).
     let mut config = match Config::load() {
