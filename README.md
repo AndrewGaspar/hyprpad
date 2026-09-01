@@ -53,16 +53,18 @@ Details and the rejected alternatives are in
 
 ## Configuring the daemon
 
-hyprpad reads **one** of two config files from `~/.config/hyprpad/`, and
-`config.lua` wins when both exist:
+hyprpad reads **one** config file, the first of these that exists:
 
 | file | front-end | when to use it |
 |---|---|---|
-| `config.lua` | embedded Lua 5.4 (`mlua`, vendored) | you want **modes** — context-selected controller behaviour |
-| `config.toml` | the built-in flat TOML dialect | everything else; nothing about it changed |
+| `~/.config/hypr/hyprpad.lua` | embedded Lua 5.4 (`mlua`, vendored) | the daemon's home, beside the Hyprland config it accompanies |
+| `~/.config/hyprpad/config.lua` | the same Lua front-end | the older location; still read |
+| `~/.config/hyprpad/config.toml` | the built-in flat TOML dialect | everything else; nothing about it changed |
 
-Both produce the same internal config, so nothing downstream knows which ran.
-`config/config.lua` in this repo is a ready-to-copy sample. See
+Lua always wins over TOML, so migrating is "write the Lua file" and rolling
+back is "rename it". Both front-ends produce the same internal config, so
+nothing downstream knows which ran. `config/hyprpad.lua` in this repo is a
+ready-to-copy sample. See
 [docs/research/lua-config.md](docs/research/lua-config.md) for why the second
 front-end exists (short version: **mode selection is logic, not data**) and
 [docs/13-modality-design.md](docs/13-modality-design.md) for the model.
@@ -149,6 +151,37 @@ design the owner already proved in HypXRland's `src/config/lua/ConfigManager.cpp
 * **Last-good retention.** Any failure — syntax, runtime, a guard naming a mode
   nobody declared — leaves the running config untouched and logs the reason.
   `hyprpad reload` can never leave the daemon input dead.
+
+## The cheat sheet
+
+`hyprpad bindings` prints what the controller currently does, as a terminal
+table; `hyprpad bindings --json` prints the same data for the on-screen widget.
+Both load the config through the daemon's own `Config::load()`, so the sheet
+cannot drift from the daemon — and neither touches the device, so it is safe to
+run while `hyprpad run` owns the controller.
+
+A binding's Lua description is what the sheet shows:
+
+```lua
+h.bind("guide+r1", "Workspace right", h.workspace "+1")
+```
+
+A binding without one — and every TOML binding, since that dialect cannot spell
+a description — gets a label *derived* from its action (`workspace +1` reads as
+"Workspace next", `exec omarchy-menu` as "Omarchy menu"). Derived labels are
+marked in the JSON and shown dimmed on the card, so it is obvious which
+bindings still want a description.
+
+The widget itself is a Quickshell plugin for Omarchy's shell: it draws every
+guide chord onto a diagram of the pad, with tables for the bare buttons, the
+OSK helpers and the modes. `guide+view` toggles it. Install and design notes
+are in [shell/README.md](shell/README.md); artwork provenance and licensing in
+[shell/hyprpad.cheatsheet/art/LICENSES.md](shell/hyprpad.cheatsheet/art/LICENSES.md).
+
+```
+scripts/hyprpad-cheatsheet install
+omarchy plugin enable hyprpad.cheatsheet
+```
 
 ## Documents
 

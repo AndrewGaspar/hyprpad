@@ -462,6 +462,9 @@ fn finish(
         binding_guards: b.binding_guards,
         button_guards: b.button_guards,
         osk_button_guards: b.osk_button_guards,
+        binding_descs: b.binding_descs,
+        button_descs: b.button_descs,
+        osk_button_descs: b.osk_button_descs,
         cursor_guard: b.cursor_guard,
         scroll_guard: b.scroll_guard,
         lua: Some(Rc::new(runtime)),
@@ -515,6 +518,12 @@ struct Build {
     button_guards: HashMap<crate::report::Button, Guard>,
     osk_buttons: HashMap<crate::report::Button, u16>,
     osk_button_guards: HashMap<crate::report::Button, Guard>,
+    /// The optional description each binding was declared with, keyed exactly
+    /// like the maps above. Documentation only — read by `hyprpad bindings`,
+    /// never by the input path.
+    binding_descs: HashMap<GestureKey, String>,
+    button_descs: HashMap<crate::report::Button, String>,
+    osk_button_descs: HashMap<crate::report::Button, String>,
     own_lizard: bool,
     cursor: CursorConfig,
     cursor_guard: Guard,
@@ -857,12 +866,15 @@ fn bind_fn(
         let mut it = args.into_iter();
         let key = string_arg(it.next(), "the binding key")?;
         // `h.bind(key, desc, action)` mirrors the owner's `o.bind(keys, desc,
-        // action)`. The description is accepted so a config reads like the
-        // Hyprland one, and is not stored — nothing in hyprpad displays it yet.
+        // action)`. Arity decides which is which: with a third argument the
+        // middle one is the description, otherwise the middle one IS the action
+        // (an action can be a plain string too, so there is nothing else to go
+        // on). The description is stored for `hyprpad bindings` — the cheat
+        // sheet — and is never consulted by the input path.
         let second = it.next();
-        let value = match it.next() {
-            Some(third) => third,
-            None => second.ok_or_else(|| err("h.bind needs an action"))?,
+        let (desc, value) = match it.next() {
+            Some(third) => (Some(string_arg(second, "the description")?), third),
+            None => (None, second.ok_or_else(|| err("h.bind needs an action"))?),
         };
         let action = value_to_action(&value)?;
 
@@ -871,6 +883,9 @@ fn bind_fn(
             BindKind::Gesture => {
                 let k = GestureKey::parse(&key).map_err(err)?;
                 b.bindings.insert(k, action);
+                if let Some(d) = desc {
+                    b.binding_descs.insert(k, d);
+                }
                 b.slot(Slot::Binding(k, key))
             }
             BindKind::Button | BindKind::OskButton => {
@@ -884,10 +899,16 @@ fn bind_fn(
                 match kind {
                     BindKind::Button => {
                         b.buttons.insert(btn, code);
+                        if let Some(d) = desc {
+                            b.button_descs.insert(btn, d);
+                        }
                         b.slot(Slot::Button(btn, key))
                     }
                     _ => {
                         b.osk_buttons.insert(btn, code);
+                        if let Some(d) = desc {
+                            b.osk_button_descs.insert(btn, d);
+                        }
                         b.slot(Slot::OskButton(btn, key))
                     }
                 }
@@ -1790,14 +1811,14 @@ mod tests {
 
     #[test]
     fn the_ported_sample_config_matches_the_toml_it_replaces() {
-        // `config/config.lua` is the shipped translation of the owner's live
+        // `config/hyprpad.lua` is the shipped translation of the owner's live
         // `config.toml`; the two must agree binding for binding.
         let lua_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/config/config.lua"
+            "/config/hyprpad.lua"
         ))
-        .expect("config/config.lua");
-        let lua = load_str(&lua_src, "config/config.lua").expect("sample config should load");
+        .expect("config/hyprpad.lua");
+        let lua = load_str(&lua_src, "config/hyprpad.lua").expect("sample config should load");
         let toml = Config::from_toml_str(SAMPLE_TOML).expect("sample toml");
 
         assert_eq!(lua.own_lizard(), toml.own_lizard());
@@ -1838,8 +1859,10 @@ mod tests {
         out
     }
 
-    /// The owner's live `~/.config/hyprpad/config.toml`, verbatim, as the
-    /// reference the shipped `config/config.lua` is checked against.
+    /// The owner's live `config.toml`, plus the cheat-sheet chord, as the
+    /// reference the shipped `config/hyprpad.lua` is checked against. Keeping
+    /// the two in step is the point: a binding that only one front-end can
+    /// spell is a binding a TOML user silently loses.
     const SAMPLE_TOML: &str = r#"
 [daemon]
 own_lizard = true
@@ -1884,5 +1907,6 @@ x = "key backspace"
 "guide+l2" = "dispatch hl.dsp.group.prev()"
 "guide+r2" = "dispatch hl.dsp.group.next()"
 "guide+y" = "keyboard split"
+"guide+view" = "exec hyprpad-cheatsheet toggle"
 "#;
 }

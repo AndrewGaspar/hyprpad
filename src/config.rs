@@ -743,6 +743,18 @@ pub struct Config {
     pub(crate) button_guards: HashMap<report::Button, Guard>,
     /// Per-binding guards for the OSK-helper (`[osk_buttons]`) map.
     pub(crate) osk_button_guards: HashMap<report::Button, Guard>,
+
+    // --- Descriptions (Lua front-end only; empty from TOML) ----------------
+    /// The optional human description a `config.lua` gave a binding —
+    /// `h.bind("guide+r1", "Workspace right", …)`. Keyed exactly like
+    /// `bindings`; a missing entry means the cheat sheet derives a label from
+    /// the action instead ([`crate::bindings_sheet`]). Never consulted by the
+    /// input path: this is documentation, not behaviour.
+    pub(crate) binding_descs: HashMap<GestureKey, String>,
+    /// Descriptions for the bare-button (`[buttons]`) map.
+    pub(crate) button_descs: HashMap<report::Button, String>,
+    /// Descriptions for the OSK-helper (`[osk_buttons]`) map.
+    pub(crate) osk_button_descs: HashMap<report::Button, String>,
     /// The guard on the cursor "virtual binding" (`h.cursor { only_in = … }`).
     pub(crate) cursor_guard: Guard,
     /// The guard on the scroll "virtual binding" (`h.scroll { only_in = … }`).
@@ -1051,15 +1063,28 @@ impl Config {
         Config::from_toml_str(DEFAULT_TOML).expect("built-in default config is valid")
     }
 
+    /// The config *home*: `$XDG_CONFIG_HOME`, or `~/.config` when it is unset.
+    /// `None` only if neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    pub fn config_home() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(std::path::PathBuf::from(dir));
+        }
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        Some(std::path::PathBuf::from(home).join(".config"))
+    }
+
     /// The config directory: `$XDG_CONFIG_HOME/hyprpad`, or
     /// `~/.config/hyprpad` when `XDG_CONFIG_HOME` is unset. `None` only if
     /// neither `XDG_CONFIG_HOME` nor `HOME` is set.
     pub fn config_dir() -> Option<std::path::PathBuf> {
-        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Some(std::path::PathBuf::from(dir).join("hyprpad"));
-        }
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-        Some(std::path::PathBuf::from(home).join(".config/hyprpad"))
+        Some(Config::config_home()?.join("hyprpad"))
+    }
+
+    /// The preferred home for the Lua config: `<config>/hypr/hyprpad.lua`,
+    /// beside the Hyprland config it accompanies. Checked before
+    /// [`lua_config_path`](Self::lua_config_path).
+    pub fn hypr_config_path() -> Option<std::path::PathBuf> {
+        Some(Config::config_home()?.join("hypr/hyprpad.lua"))
     }
 
     /// The path the TOML user config is read from:
@@ -1081,7 +1106,7 @@ impl Config {
     /// front-end it would use — for the daemon's startup banner and for
     /// diagnostics. `None` when neither file exists (built-in defaults).
     pub fn active_config_path() -> Option<(std::path::PathBuf, ConfigFormat)> {
-        pick_front_end(&Config::config_dir()?)
+        pick_front_end(&Config::config_home()?)
     }
 
     /// Load the user config, preferring `config.lua` (the Lua front-end) over
@@ -1282,13 +1307,26 @@ impl std::fmt::Display for ConfigFormat {
     }
 }
 
-/// Which config file in `dir` wins, and which front-end reads it.
+/// Which config file wins, and which front-end reads it.
 ///
-/// `config.lua` beats `config.toml` when both exist, so migrating is "write the
-/// Lua file", and rolling back is "rename it". Split out from
-/// [`Config::active_config_path`] so the precedence is testable against a
-/// scratch directory rather than the process environment.
-fn pick_front_end(dir: &std::path::Path) -> Option<(std::path::PathBuf, ConfigFormat)> {
+/// Search order, first hit wins:
+///
+///   1. `<config>/hypr/hyprpad.lua` — the home the daemon's config has moved
+///      to, next to the Hyprland config it is the companion of, and named the
+///      way hypridle/hyprlock name theirs.
+///   2. `<config>/hyprpad/config.lua`
+///   3. `<config>/hyprpad/config.toml`
+///
+/// Lua always beats TOML, so migrating is "write the Lua file" and rolling back
+/// is "rename it". Split out from [`Config::active_config_path`] so the
+/// precedence is testable against a scratch directory rather than the process
+/// environment.
+fn pick_front_end(config_home: &std::path::Path) -> Option<(std::path::PathBuf, ConfigFormat)> {
+    let hypr_lua = config_home.join("hypr/hyprpad.lua");
+    if hypr_lua.exists() {
+        return Some((hypr_lua, ConfigFormat::Lua));
+    }
+    let dir = config_home.join("hyprpad");
     let lua = dir.join("config.lua");
     if lua.exists() {
         return Some((lua, ConfigFormat::Lua));
@@ -2055,20 +2093,22 @@ rumble_intensity = 0.25
 
     #[test]
     fn config_lua_wins_over_config_toml_when_both_exist() {
-        let dir = std::env::temp_dir().join(format!(
+        let home = std::env::temp_dir().join(format!(
             "hyprpad-front-end-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
+        let dir = home.join("hyprpad");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(home.join("hypr")).unwrap();
 
-        // Neither file: built-in defaults.
-        assert_eq!(pick_front_end(&dir), None);
+        // Nothing at all: built-in defaults.
+        assert_eq!(pick_front_end(&home), None);
 
         // TOML only.
         std::fs::write(dir.join("config.toml"), "").unwrap();
         assert_eq!(
-            pick_front_end(&dir),
+            pick_front_end(&home),
             Some((dir.join("config.toml"), ConfigFormat::Toml))
         );
 
@@ -2076,11 +2116,17 @@ rumble_intensity = 0.25
         // rolling back is "rename it".
         std::fs::write(dir.join("config.lua"), "").unwrap();
         assert_eq!(
-            pick_front_end(&dir),
+            pick_front_end(&home),
             Some((dir.join("config.lua"), ConfigFormat::Lua))
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // And `hypr/hyprpad.lua` — the config's new home, beside the Hyprland
+        // config — beats both, so moving the file is the whole migration.
+        let hypr = home.join("hypr/hyprpad.lua");
+        std::fs::write(&hypr, "").unwrap();
+        assert_eq!(pick_front_end(&home), Some((hypr, ConfigFormat::Lua)));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

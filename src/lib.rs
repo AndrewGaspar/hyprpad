@@ -9,6 +9,7 @@
 //! build against them.
 
 pub mod arbitrate;
+pub mod bindings_sheet;
 pub mod config;
 pub mod filter;
 pub mod gamepad;
