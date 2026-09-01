@@ -428,6 +428,13 @@ pub struct HapticsConfig {
     /// never the kernel's auto-repeat. Default **`false`**: the D-pad is held
     /// down for navigation and a buzz per arrow gets old fast.
     pub buttons: bool,
+    /// Texture-tick the right pad as it drives the desktop cursor — one faint
+    /// pulse per [`cursor_spacing_px`](Self::cursor_spacing_px) pixels of cursor
+    /// travel, Steam Input's trackpad-friction feel. Default `true`.
+    pub cursor: bool,
+    /// Pixels of desktop-cursor travel per texture tick. Smaller = finer,
+    /// busier texture. Default `64.0`.
+    pub cursor_spacing_px: f64,
     /// Pulse-width scale, `1.0` = the kernel's calibrated widths. Clamped to a
     /// sane range by [`crate::haptics`]; `0` or below fires nothing (use
     /// `enabled = false` to switch off properly). Default `1.0`.
@@ -443,6 +450,8 @@ impl Default for HapticsConfig {
             gesture: true,
             scroll: true,
             buttons: false,
+            cursor: true,
+            cursor_spacing_px: 64.0,
             intensity: 1.0,
         }
     }
@@ -526,6 +535,8 @@ commit = true               # click that pad when it commits an OSK key
 gesture = true              # buzz both pads when a guide chord/flick resolves
 scroll = true               # tick the left pad on each circular-scroll detent
 buttons = false             # tick on a bare-button ([buttons]) press edge
+cursor = true               # texture-tick the right pad as it drives the desktop cursor
+cursor_spacing_px = 64      # pixels of cursor travel per texture tick (smaller = finer)
 intensity = 1.0             # pulse-width scale; 1.0 = the kernel's calibrated widths
 "#;
 
@@ -688,6 +699,11 @@ impl Config {
                         "gesture" | "gestures" => flag(&mut haptics.gesture)?,
                         "scroll" | "scroll_ticks" => flag(&mut haptics.scroll)?,
                         "buttons" | "bare_buttons" => flag(&mut haptics.buttons)?,
+                        "cursor" | "cursor_texture" => flag(&mut haptics.cursor)?,
+                        "cursor_spacing_px" | "cursor_spacing" => {
+                            haptics.cursor_spacing_px = parse_f64(&unquote(v))
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
                         "intensity" | "strength" | "gain" => {
                             haptics.intensity = parse_f64(&val)
                                 .map_err(|e| format!("line {lineno}: {e}"))?;

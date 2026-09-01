@@ -130,6 +130,10 @@ pub enum Feel {
     Click,
     /// A ~10 ms train — "the gesture landed".
     Buzz,
+    /// The faintest pulse — half a [`Tick`](Feel::Tick). Fired repeatedly as the
+    /// right pad drives the desktop cursor (one per spacing of travel), so the
+    /// pad feels textured, like Steam Input's trackpad-friction haptics.
+    Texture,
 }
 
 impl Feel {
@@ -143,6 +147,7 @@ impl Feel {
             Feel::Tick => (0x0190, 0x0000, 0x0001),
             Feel::Click => (0x0258, 0x012C, 0x0002),
             Feel::Buzz => (0x01F4, 0x01F4, 0x000A),
+            Feel::Texture => (0x00C8, 0x0000, 0x0001),
         }
     }
 }

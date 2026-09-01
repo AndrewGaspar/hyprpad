@@ -312,14 +312,14 @@ pub fn run() -> std::io::Result<()> {
                         now,
                     );
                     if let Some(ptr) = pointer.as_mut() {
-                        drive_cursor(ptr, &frame, &mut cursor, true, true, now);
+                        drive_cursor(ptr, &frame, &mut cursor, true, true, &mut hx, now);
                         drive_scroll(ptr, &frame, &mut scroll, true, true, &mut hx, now);
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
                     // Ambient (non-guide) layer: the RIGHT pad drives the cursor
                     // and the LEFT pad drives scroll. The guide layer and a
                     // focused game both take the pads away. Same gate for both.
-                    drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), now);
+                    drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), &mut hx, now);
                     drive_scroll(
                         ptr,
                         &frame,
@@ -404,6 +404,8 @@ enum Haptic {
     Scroll,
     /// A bare-button (`[buttons]`) key went down.
     Button,
+    /// The desktop cursor travelled one texture-spacing of pixels (right pad).
+    CursorMove,
 }
 
 /// The pulse a trigger fires under `cfg`, or `None` when `[haptics]` has it
@@ -419,6 +421,7 @@ fn haptic_feel(cfg: &HapticsConfig, what: Haptic) -> Option<Feel> {
         Haptic::Gesture => (cfg.gesture, Feel::Buzz),
         Haptic::Scroll => (cfg.scroll, Feel::Tick),
         Haptic::Button => (cfg.buttons, Feel::Tick),
+        Haptic::CursorMove => (cfg.cursor, Feel::Texture),
     };
     on.then_some(feel)
 }
@@ -517,6 +520,10 @@ struct CursorState {
     sens: f64,
     /// Whether the synthetic left mouse button is currently held.
     left_down: bool,
+    /// Pixels of cursor travel accumulated toward the next haptic texture tick
+    /// (`[haptics] cursor` / `cursor_spacing_px`). Reset on lift so a re-touch
+    /// starts a fresh spacing.
+    travel_px: f64,
 }
 
 impl CursorState {
@@ -525,6 +532,7 @@ impl CursorState {
             damper: damper_from(cfg),
             sens: cfg.sens,
             left_down: false,
+            travel_px: 0.0,
         }
     }
 
@@ -550,6 +558,7 @@ fn drive_cursor(
     st: &mut CursorState,
     guide_active: bool,
     suppressed: bool,
+    hx: &mut HapticCtx,
     now: Instant,
 ) {
     if guide_active || suppressed {
@@ -560,6 +569,7 @@ fn drive_cursor(
             st.left_down = false;
         }
         st.damper.reset();
+        st.travel_px = 0.0;
         return;
     }
 
@@ -574,9 +584,20 @@ fn drive_cursor(
         let (dx, dy) = st.damper.relative(s, st.sens, true);
         if dx != 0 || dy != 0 {
             ptr.move_relative(f64::from(dx), f64::from(dy));
+            // Trackpad texture: one faint pulse per spacing of cursor travel
+            // (Steam Input's friction feel), on the pad doing the driving. At
+            // most one per frame — the remainder carries, so fast flicks don't
+            // burst-fire and slow drags still tick.
+            let spacing = hx.cfg.cursor_spacing_px.max(1.0);
+            st.travel_px += f64::from(dx).hypot(f64::from(dy));
+            if st.travel_px >= spacing {
+                st.travel_px %= spacing;
+                hx.fire(Haptic::CursorMove, HapticPad::Right);
+            }
         }
     } else {
         st.damper.reset();
+        st.travel_px = 0.0;
     }
 
     // A hard pad click (or a full right-trigger pull) is a left click.
