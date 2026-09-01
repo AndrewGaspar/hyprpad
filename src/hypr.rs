@@ -159,6 +159,25 @@ impl Hypr {
         self.request(&format!("j/{command}"))
     }
 
+    /// The focused window's `pid` and fullscreen state, from
+    /// `j/activewindow`.
+    ///
+    /// The `activewindow` **event** carries only class and title, so this fills
+    /// the gap for the modality layer: `pid` is what a mode rule's
+    /// `ctx.focus:process_tree_has(..)` walks, and `fullscreen` is what an
+    /// opt-in rule reads. Verified against the live compositor: the reply has
+    /// `"pid": <n>` and `"fullscreen": <n>` (0 = not fullscreen).
+    ///
+    /// Called on a focus change only — never per frame — and only when a config
+    /// actually declares modes ([`crate::config::Config::needs_focus_pid`]).
+    pub fn active_window(&self) -> io::Result<ActiveWindowInfo> {
+        let json = self.query("activewindow")?;
+        Ok(ActiveWindowInfo {
+            pid: json_number(&json, "pid").map(|n| n as i32),
+            fullscreen: json_number(&json, "fullscreen").is_some_and(|n| n != 0),
+        })
+    }
+
     /// Fire-and-forget exec of a shell command, detached from our stdio. A
     /// short-lived reaper thread waits on the child so it never lingers as a
     /// zombie; if the daemon exits first the child is simply reparented and
@@ -199,6 +218,35 @@ impl Hypr {
     }
 }
 
+/// The fields of `j/activewindow` the modality layer needs, and which the
+/// `activewindow` event does not carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveWindowInfo {
+    /// The focused window's process id.
+    pub pid: Option<i32>,
+    /// Whether it is fullscreen (any non-zero Hyprland fullscreen state).
+    pub fullscreen: bool,
+}
+
+/// Pull a top-level numeric field out of a Hyprland JSON reply.
+///
+/// A four-line scanner rather than a JSON crate, matching this crate's
+/// hand-rolled ethos (see `config.rs`'s note on the TOML parser): the replies
+/// are machine-generated, flat where we read them, and we want exactly two
+/// integers out of one of them. It looks for `"<field>":` at the top level —
+/// nesting is irrelevant here because `pid` and `fullscreen` appear once each
+/// in an `activewindow` reply.
+fn json_number(json: &str, field: &str) -> Option<i64> {
+    let needle = format!("\"{field}\":");
+    let rest = &json[json.find(&needle)? + needle.len()..];
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
 /// A parsed line from the `.socket2.sock` event stream.
 ///
 /// Addresses are normalized to the `0x…` form used by the JSON queries and by
@@ -209,7 +257,13 @@ impl Hypr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HyprEvent {
     /// Keyboard focus moved to a window. `activewindow>>class,title`.
-    ActiveWindow { class: String, title: String },
+    ///
+    /// `pid` is **not** on the wire — the event stream carries class and title
+    /// only. It is `None` from [`subscribe`] and filled in by the daemon from
+    /// [`Hypr::active_window`] when a config actually needs it (a `config.lua`
+    /// mode rule calling `ctx.focus:process_tree_has(..)`), so the extra socket
+    /// round trip is paid only by configs that use it.
+    ActiveWindow { class: String, title: String, pid: Option<i32> },
     /// Keyboard focus moved, address form. `activewindowv2>>address`.
     ActiveWindowV2 { address: String },
     /// The active window's fullscreen state changed. `fullscreen>>0|1`
@@ -265,6 +319,7 @@ fn parse_event(line: &str) -> Option<HyprEvent> {
             HyprEvent::ActiveWindow {
                 class: class.to_string(),
                 title: title.to_string(),
+                pid: None,
             }
         }
         "activewindowv2" => HyprEvent::ActiveWindowV2 {
@@ -335,6 +390,37 @@ fn lua_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A real `j/activewindow` reply from the live compositor (Hyprland 0.56.2,
+    /// HypXRland fork), trimmed to the fields this module reads plus enough
+    /// neighbours to keep the scanner honest.
+    const ACTIVE_WINDOW_JSON: &str = r#"{
+    "address": "0x55d89bdb6a70",
+    "at": [0, 54],
+    "size": [2048, 1226],
+    "class": "foot",
+    "title": "◑ hyprpad",
+    "pid": 3996259,
+    "xwayland": false,
+    "pinned": false,
+    "pinFullscreened": false,
+    "fullscreen": 0,
+    "fullscreenClient": 0,
+    "depth": 0.600
+}"#;
+
+    #[test]
+    fn reads_pid_and_fullscreen_out_of_an_active_window_reply() {
+        assert_eq!(json_number(ACTIVE_WINDOW_JSON, "pid"), Some(3996259));
+        assert_eq!(json_number(ACTIVE_WINDOW_JSON, "fullscreen"), Some(0));
+        // A field that isn't there, and one whose value isn't a number, are
+        // `None` rather than a wrong answer.
+        assert_eq!(json_number(ACTIVE_WINDOW_JSON, "nosuchfield"), None);
+        assert_eq!(json_number(ACTIVE_WINDOW_JSON, "class"), None);
+        // A fullscreened window: any non-zero state counts.
+        let fs = ACTIVE_WINDOW_JSON.replace("\"fullscreen\": 0", "\"fullscreen\": 2");
+        assert_eq!(json_number(&fs, "fullscreen"), Some(2));
+    }
+
     #[test]
     fn parses_active_window() {
         assert_eq!(
@@ -342,6 +428,7 @@ mod tests {
             Some(HyprEvent::ActiveWindow {
                 class: "foot".into(),
                 title: "ajg@framework:~/code/hyprpad".into(),
+                pid: None,
             })
         );
     }
@@ -353,6 +440,7 @@ mod tests {
             Some(HyprEvent::ActiveWindow {
                 class: "google-chrome".into(),
                 title: "Doc, v2, final — Chrome".into(),
+                pid: None,
             })
         );
     }
@@ -364,6 +452,7 @@ mod tests {
             Some(HyprEvent::ActiveWindow {
                 class: "foot".into(),
                 title: String::new(),
+                pid: None,
             })
         );
     }

@@ -10,6 +10,17 @@
 //! This module is deliberately decoupled from the Hyprland event types: the
 //! main loop translates compositor events into `focus_changed` / `fullscreen`
 //! calls, and asks `suppressed()` before executing a desktop action.
+//!
+//! ## Its place after modality (docs/13)
+//!
+//! [`crate::mode::ModeEngine`] subsumes this as the daemon's gate: the loop
+//! consults *it*, not an `Arbiter`, and a `config.lua` that declares modes
+//! never reaches this code. What remains is the **built-in path** — the
+//! behaviour a config with no declared modes (every `config.toml`) gets — and
+//! `ModeEngine` implements that by *embedding an `Arbiter`* rather than
+//! restating its rules. So "no modes declared" is not a re-implementation of
+//! the old behaviour; it is literally the old behaviour, still covered by the
+//! tests below.
 
 /// Window classes that indicate a game/Steam surface currently has focus.
 /// Steam launches native and Proton titles as `steam_app_<id>`; Proton-direct

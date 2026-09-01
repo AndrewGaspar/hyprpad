@@ -18,5 +18,14 @@ wayland-client = { version = "0.31", features = ["dlopen"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 libc = "0.2"
 
+# Config front-end: the embedded Lua interpreter behind `config.lua`. `vendored`
+# builds PUC Lua 5.4 from source through `cc`, so no system Lua (and no `-dev`
+# package) is needed and the daemon stays a single self-contained binary.
+# See docs/research/lua-config.md for why this one dependency earns its weight:
+# mode selection is logic, not data, and a predicate language beats a bespoke
+# mini-DSL. The TOML front-end stays, so nothing here is load-bearing for a user
+# who never writes a `config.lua`.
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
 [profile.release]
 lto = true

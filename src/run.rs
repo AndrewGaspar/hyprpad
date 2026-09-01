@@ -1,11 +1,11 @@
 //! The daemon pipeline: passive controller tap -> gesture recognition ->
-//! config lookup -> game-focus gate -> Hyprland dispatch, or forwarding to the
+//! config lookup -> mode gate -> Hyprland dispatch, or forwarding to the
 //! virtual gamepad a focused game sees.
 //!
 //! Two threads feed one loop. `hidraw::read_all` streams raw reports (merged
 //! across the puck's pairing slots); `hypr::subscribe` streams compositor
 //! events. The main loop owns the [`GestureEngine`], [`Config`], and
-//! [`Arbiter`], and executes [`Action`]s via [`Hypr`].
+//! [`ModeEngine`], and executes [`Action`]s via [`Hypr`].
 //!
 //! ## Who owns the controller on any given frame
 //!
@@ -16,17 +16,36 @@
 //! 1. **Guide** — `guide_active()`. Every per-frame handler drops out while the
 //!    guide button is held, in a game as much as on the desktop.
 //! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
-//! 3. **Game forwarding** — [`drive_gamepad`], when a game holds focus and
-//!    neither layer above is claiming.
+//! 3. **Game forwarding** — [`drive_gamepad`], when the active mode forwards
+//!    and neither layer above is claiming.
 //! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`drive_buttons`],
-//!    already self-suppressing via `arbiter.suppressed()`.
+//!    each gated by its own guard in the active mode.
 //!
-//! Ranks 3 and 4 are mutually exclusive by construction: `suppressed()` is true
-//! exactly when `game_focused()` is. On every transition *out* of rank 3 the
-//! virtual pad is sent one `neutral()` report and the rumble is stopped, so a
-//! game is never left holding input hyprpad has stopped feeding it.
+//! Ranks 3 and 4 are mutually exclusive by construction: forwarding needs
+//! `ModeEngine::desktop_yielded()`, which is true exactly when neither the
+//! cursor nor scroll is live. On every transition *out* of rank 3 the virtual
+//! pad is sent one `neutral()` report and the rumble is stopped, so a game is
+//! never left holding input hyprpad has stopped feeding it.
+//!
+//! ## Where modality is consulted
+//!
+//! [`ModeEngine`] re-resolves only on a **context change** — a compositor
+//! event ([`update_modes`]), a manual override from a binding
+//! ([`handle_gesture`]), or a reload ([`apply_reload`]). Every per-frame read
+//! is a cached lookup:
+//!
+//! | handler | consults |
+//! |---|---|
+//! | [`handle_gesture`] | `modes.allows_gesture(..)` + `config.resolve_in(.., modes.state())` |
+//! | [`drive_cursor`] | `modes.cursor_enabled()` |
+//! | [`drive_scroll`] | `modes.scroll_enabled()` |
+//! | [`drive_buttons`] | `modes.buttons()` (already filtered by each binding's guard) |
+//! | [`drive_gamepad`] | `gamepad_forwarding(.., modes.forwards(), modes.desktop_yielded(), ..)` |
+//!
+//! A mode transition runs the same clean handoff a controller disconnect does
+//! ([`reset_frame_state`] + `GamepadState::release`), so no key, click, or
+//! stick value is ever stranded across a switch.
 
-use crate::arbitrate::Arbiter;
 use crate::config::{
     Action, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode, ScrollConfig,
     ScrollMode, WorkspaceTarget,
@@ -39,6 +58,7 @@ use crate::gesture::{GestureEngine, GestureEvent};
 use crate::haptics::{Feel, Haptics, Pad as HapticPad};
 use crate::hypr::{Hypr, HyprEvent};
 use crate::keyboard::VirtualKeyboard;
+use crate::mode::ModeEngine;
 use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::{hidraw, report};
@@ -84,9 +104,11 @@ pub fn run() -> std::io::Result<()> {
     // live (see the `Input::Reload` arm and `apply_reload`).
     let mut config = match Config::load() {
         Ok(c) => {
-            match Config::config_path() {
-                Some(p) if p.exists() => eprintln!("hyprpad: config loaded from {}", p.display()),
-                _ => eprintln!("hyprpad: using built-in default config"),
+            match Config::active_config_path() {
+                Some((p, fmt)) => {
+                    eprintln!("hyprpad: config loaded from {} ({fmt} front-end)", p.display())
+                }
+                None => eprintln!("hyprpad: using built-in default config"),
             }
             c
         }
@@ -218,7 +240,18 @@ pub fn run() -> std::io::Result<()> {
 
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
-    let mut arbiter = Arbiter::new();
+    // Modality (docs/13). With no modes declared this is exactly the old
+    // `Arbiter` game gate; a `config.lua` that declares modes drives it with
+    // Lua predicates instead. Either way it is re-resolved only on a context
+    // change and read as cached state per frame.
+    let mut modes = ModeEngine::new(&config);
+    if !config.modes().is_empty() {
+        eprintln!(
+            "hyprpad: {} mode(s) declared, starting in '{}'",
+            config.modes().len(),
+            modes.active()
+        );
+    }
 
     // The on-screen keyboard bridge. Spawns lazily on the first toggle and is
     // killed when this function returns (daemon exit). When it is showing, the
@@ -307,13 +340,30 @@ pub fn run() -> std::io::Result<()> {
                     &mut osk_route,
                     pointer.as_mut(),
                     &mut own_lizard,
+                    &mut modes,
                 );
             }
             Input::Compositor(ev) => {
                 if debug {
                     eprintln!("[event] {ev:?}");
                 }
-                update_arbiter(&mut arbiter, ev);
+                if update_modes(&mut modes, &config, &hypr, ev) {
+                    eprintln!("hyprpad: mode -> {}", modes.active());
+                    // A mode transition is a handoff: whatever the outgoing mode
+                    // was holding — a synthetic click, a held key, the virtual
+                    // pad's last stick values, a mid-flight gesture — must be
+                    // let go before the incoming mode's gates apply.
+                    reset_frame_state(
+                        &mut engine,
+                        &mut cursor,
+                        &mut scroll,
+                        &mut osk_route,
+                        &mut prev_frame,
+                        pointer.as_mut(),
+                    );
+                    button_keys.release_all(&mut keyboard);
+                    gamepad.release(&mut haptics);
+                }
             }
             Input::Osk(OskEvent::Crossed(pad)) => {
                 // The child hit-tested a crossing onto a NEW key; we hold the
@@ -329,11 +379,28 @@ pub fn run() -> std::io::Result<()> {
                 // the current `[haptics]` knobs, read fresh so `hyprpad reload`
                 // takes effect on the very next pulse.
                 let mut hx = HapticCtx { dev: &mut haptics, cfg: config.haptics() };
+                let mut mode_changed = false;
                 for ge in engine.update(&frame, now) {
                     if debug {
-                        eprintln!("[gesture] {ge:?} -> {:?}", config.resolve(&ge));
+                        eprintln!("[gesture] {ge:?} -> {:?}", config.resolve_in(&ge, modes.state()));
                     }
-                    handle_gesture(&hypr, &config, &arbiter, &mut osk, &mut hx, ge);
+                    mode_changed |=
+                        handle_gesture(&hypr, &config, &mut modes, &mut osk, &mut hx, ge);
+                }
+                if mode_changed {
+                    // A binding forced a mode (`h.set_mode` / `h.clear_mode`).
+                    // Same handoff as a context-driven transition.
+                    eprintln!("hyprpad: mode -> {} (manual)", modes.active());
+                    reset_frame_state(
+                        &mut engine,
+                        &mut cursor,
+                        &mut scroll,
+                        &mut osk_route,
+                        &mut prev_frame,
+                        pointer.as_mut(),
+                    );
+                    button_keys.release_all(&mut keyboard);
+                    gamepad.release(hx.dev);
                 }
                 if osk.is_active() {
                     // The keyboard owns both pads: route them to it, and keep the
@@ -345,7 +412,7 @@ pub fn run() -> std::io::Result<()> {
                         &frame,
                         &prev_frame,
                         &mut osk_route,
-                        config.osk_buttons(),
+                        modes.osk_buttons(),
                         &mut hx,
                         now,
                     );
@@ -355,29 +422,39 @@ pub fn run() -> std::io::Result<()> {
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
                     // Ambient (non-guide) layer: the RIGHT pad drives the cursor
-                    // and the LEFT pad drives scroll. The guide layer and a
-                    // focused game both take the pads away. Same gate for both.
-                    drive_cursor(ptr, &frame, &mut cursor, engine.guide_active(), arbiter.suppressed(), &mut hx, now);
+                    // and the LEFT pad drives scroll. The guide layer takes both
+                    // pads away; the active mode decides each independently, via
+                    // that handler's own guard (`h.cursor { only_in = … }`).
+                    drive_cursor(
+                        ptr,
+                        &frame,
+                        &mut cursor,
+                        engine.guide_active(),
+                        !modes.cursor_enabled(),
+                        &mut hx,
+                        now,
+                    );
                     drive_scroll(
                         ptr,
                         &frame,
                         &mut scroll,
                         engine.guide_active(),
-                        arbiter.suppressed(),
+                        !modes.scroll_enabled(),
                         &mut hx,
                         now,
                     );
                 }
                 // Bare-button bindings (D-pad -> arrows by default). Gated OFF on
-                // the guide layer (so guide+dpad stays a chord), while the OSK
-                // owns the pads, and in a focused game (there the D-pad reaches
-                // the game via the virtual controller) — mirroring `drive_cursor`.
-                let buttons_active =
-                    !engine.guide_active() && !osk.is_active() && !arbiter.suppressed();
+                // the guide layer (so guide+dpad stays a chord) and while the OSK
+                // owns the pads. The per-mode gate is in the *map*: `modes
+                // .buttons()` already carries only the bindings whose guard
+                // passes, so a game mode that guards them out yields an empty
+                // map and `reconcile` releases anything held.
+                let buttons_active = !engine.guide_active() && !osk.is_active();
                 drive_buttons(
                     &mut keyboard,
                     &frame,
-                    config.buttons(),
+                    modes.buttons(),
                     &mut button_keys,
                     buttons_active,
                     &mut hx,
@@ -388,8 +465,8 @@ pub fn run() -> std::io::Result<()> {
                 // game never sees a stuck stick.
                 let forwarding = gamepad_forwarding(
                     config.gamepad().enabled,
-                    arbiter.game_focused(),
-                    arbiter.suppressed(),
+                    modes.forwards(),
+                    modes.desktop_yielded(),
                     engine.guide_active(),
                     osk.is_active(),
                 );
@@ -871,10 +948,11 @@ impl ButtonKeys {
     /// unit-testable. The originating button rides along so the caller can fire
     /// feedback on the side of the controller it sits on.
     ///
-    /// When `active` is false (guide/OSK/suppressed), every held key is
-    /// released. Otherwise each bound button that is physically down but not yet
-    /// held presses its key, and each held key whose button lifted releases.
-    /// Releases are emitted before presses.
+    /// When `active` is false (guide/OSK), every held key is released.
+    /// Otherwise each bound button that is physically down but not yet held
+    /// presses its key, and each held key whose button lifted — **or whose
+    /// binding has gone away**, which is what a mode transition or a reload
+    /// looks like from here — releases. Releases are emitted before presses.
     fn reconcile<F: Fn(report::Button) -> bool>(
         &mut self,
         bindings: &HashMap<report::Button, u16>,
@@ -882,10 +960,10 @@ impl ButtonKeys {
         active: bool,
     ) -> Vec<(report::Button, u16, bool)> {
         let mut events = Vec::new();
-        // Release anything that should no longer be held: the gate closed or the
-        // button lifted.
+        // Release anything that should no longer be held: the gate closed, the
+        // button lifted, or the binding is no longer live in this mode.
         self.held.retain(|&btn, &mut code| {
-            let keep = active && pressed(btn);
+            let keep = active && pressed(btn) && bindings.get(&btn) == Some(&code);
             if !keep {
                 events.push((btn, code, false));
             }
@@ -901,6 +979,19 @@ impl ButtonKeys {
             }
         }
         events
+    }
+
+    /// Release every held key immediately, outside the per-frame reconcile.
+    ///
+    /// Used by the mode-transition handoff: `reconcile` would get there on the
+    /// next report anyway, but "no key is stranded across a mode switch" should
+    /// not depend on another report arriving.
+    fn release_all(&mut self, kbd: &mut Option<VirtualKeyboard>) {
+        for (_, code) in self.held.drain() {
+            if let Some(kbd) = kbd.as_mut() {
+                kbd.key(code, false);
+            }
+        }
     }
 }
 
@@ -961,11 +1052,15 @@ const PULSE_ON_MAX: u16 = 600;
 /// * `osk_active` — the on-screen keyboard owns both pads. `Guide+Y` is meant to
 ///   raise it over a game, and while it is up the game gets a neutral pad rather
 ///   than the thumb movements aimed at the keyboard.
-/// * `desktop_suppressed` — `Arbiter::suppressed()`, which is `game_focused()`
-///   unless the reserved manual desktop override is on. Consulting it as well as
-///   `game_focused` is what keeps ranks 3 and 4 mutually exclusive: if the
-///   override ever forces the desktop layer live over a game, forwarding yields
-///   rather than both driving at once.
+/// * `game_focused` — the active mode declares `forward = true`
+///   ([`ModeEngine::forwards`]); on the built-in path that is exactly "a
+///   game-classed window holds focus".
+/// * `desktop_suppressed` — the ambient desktop layer has actually let go of
+///   the pads ([`ModeEngine::desktop_yielded`]). Consulting it as well as
+///   `game_focused` is what keeps ranks 3 and 4 mutually exclusive: a manual
+///   override that forces the desktop live over a game, or a mode that
+///   forwards while leaving the cursor guarded in, yields rather than having
+///   both layers drive at once.
 ///
 /// Pure, so the whole gate is unit-testable without a device or a compositor.
 fn gamepad_forwarding(
@@ -1303,6 +1398,12 @@ fn install_reload_signal(tx: &mpsc::Sender<Input>) {
 /// chosen config alongside the outcome the caller logs. Pure and side-effect
 /// free, so the keep-old-config-on-error policy is unit-tested without touching
 /// signals or the filesystem.
+///
+/// This is the **last-good retention** half of the Lua guardrails, and it needs
+/// nothing new to cover a `config.lua`: [`crate::lua_config::load_str`] builds
+/// a fresh interpreter and a fresh `Config` and only returns `Ok` when the file
+/// compiled *and* ran *and* validated, so a broken `config.lua` reaches here as
+/// an `Err` with nothing swapped — exactly like a broken `config.toml`.
 fn resolve_reload(current: Config, loaded: Result<Config, String>) -> (Config, Result<(), String>) {
     match loaded {
         Ok(new) => (new, Ok(())),
@@ -1330,6 +1431,7 @@ fn apply_reload(
     osk_route: &mut OskRoute,
     pointer: Option<&mut VirtualPointer>,
     own_lizard: &mut bool,
+    modes: &mut ModeEngine,
 ) {
     // `mem::take` lets `resolve_reload` own the current config so it can hand it
     // straight back on a parse error; on success it returns the freshly loaded
@@ -1363,6 +1465,13 @@ fn apply_reload(
     if new_own != *own_lizard {
         apply_own_lizard_change(new_own);
         *own_lizard = new_own;
+    }
+
+    // Modes and guards came from the new file: re-resolve immediately against
+    // the *unchanged* context, so the reload takes effect without waiting for
+    // the next focus change. A held click/key was already released above.
+    if modes.reconfigure(config) {
+        eprintln!("hyprpad: mode -> {} (reload)", modes.active());
     }
 
     eprintln!("hyprpad: config reloaded");
@@ -1486,43 +1595,67 @@ pub fn reload() -> Result<(), String> {
     Ok(())
 }
 
-fn update_arbiter(arbiter: &mut Arbiter, ev: HyprEvent) {
+/// Feed a compositor event into the mode engine; returns whether the active
+/// mode changed (so the caller can run the clean handoff).
+///
+/// The `activewindow` event carries class and title only. When a config
+/// actually declares modes, the focused window's **pid** and fullscreen state
+/// are fetched with one `j/activewindow` query — on the focus change, never per
+/// frame — because `ctx.focus:process_tree_has(..)` needs a pid to walk from. A
+/// config with no modes (every `config.toml`) never pays for the round trip.
+fn update_modes(modes: &mut ModeEngine, config: &Config, hypr: &Hypr, ev: HyprEvent) -> bool {
     match ev {
-        HyprEvent::ActiveWindow { class, .. } => arbiter.focus_changed(&class),
-        HyprEvent::Fullscreen(on) => arbiter.set_fullscreen(on),
-        _ => {}
+        HyprEvent::ActiveWindow { class, title, pid } => {
+            let mut focus = crate::mode::Focus { class, title, pid, fullscreen: false };
+            if config.needs_focus_pid() {
+                match hypr.active_window() {
+                    Ok(info) => {
+                        focus.pid = focus.pid.or(info.pid);
+                        focus.fullscreen = info.fullscreen;
+                    }
+                    Err(e) => eprintln!("warning: could not read the focused window's pid: {e}"),
+                }
+            }
+            // One complete context, one re-resolve — never a half-updated one.
+            modes.context_changed(config, focus)
+        }
+        HyprEvent::Fullscreen(on) => modes.set_fullscreen(config, on),
+        _ => false,
     }
 }
 
+/// Handle one recognized gesture. Returns whether it moved the active mode
+/// (via [`Action::SetMode`] / [`Action::ClearMode`]).
 fn handle_gesture(
     hypr: &Hypr,
     config: &Config,
-    arbiter: &Arbiter,
+    modes: &mut ModeEngine,
     osk: &mut OskHandle,
     hx: &mut HapticCtx,
     ge: GestureEvent,
-) {
+) -> bool {
     // A bare guide tap belongs to Steam: do nothing so the client sees its own
     // button (it acts on release). Chords and flicks are ours.
     if let GestureEvent::GuideLeave { was_chorded: false } = ge {
-        return;
+        return false;
     }
 
-    // Guide-held gestures drive the desktop even over a game — that is the whole
-    // point of a global modifier. Only ambient (non-guide) actions would be
-    // gated by the arbiter; the current binding set is entirely guide-scoped, so
-    // we consult `suppressed()` defensively for any future ambient action.
-    let action = config.resolve(&ge);
+    // The modality gate. On the built-in path this is the old rule verbatim —
+    // guide-held gestures drive the desktop even over a game, because that is
+    // the whole point of a global modifier. With declared modes it is *this
+    // binding's* guard, so a config can retire individual chords in a mode
+    // while the rest survive.
+    if !modes.allows_gesture(config, &ge, is_guide_scoped(&ge)) {
+        return false;
+    }
+    let action = config.resolve_in(&ge, modes.state());
     if matches!(action, Action::None) {
-        return;
+        return false;
     }
     // While the keyboard is up it owns the pads: suppress every desktop gesture
     // except the keyboard toggle itself, so the toggle chord can still dismiss.
     if osk.is_active() && !matches!(action, Action::ToggleKeyboard { .. }) {
-        return;
-    }
-    if arbiter.suppressed() && !is_guide_scoped(&ge) {
-        return;
+        return false;
     }
 
     // Past every gate: the gesture *landed*. Buzz both actuators before acting,
@@ -1534,12 +1667,22 @@ fn handle_gesture(
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
     if let Action::ToggleKeyboard { mode, reflow } = action {
         toggle_keyboard(osk, mode, reflow);
-        return;
+        return false;
+    }
+
+    // The manual override drives the mode engine, not Hyprland. Top of the
+    // resolution precedence (docs/13 decision #4), so this wins over whatever
+    // the focus rules say until it is cleared.
+    match &action {
+        Action::SetMode(name) => return modes.set_mode(config, name),
+        Action::ClearMode => return modes.clear_mode(config),
+        _ => {}
     }
 
     if let Err(e) = execute(hypr, &action) {
         eprintln!("dispatch failed: {e}");
     }
+    false
 }
 
 /// Flip the on-screen keyboard: show it (in `mode`, with the binding's chosen
@@ -1728,6 +1871,8 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
         // Bare-button keys are emitted by `drive_buttons` against the virtual
         // keyboard, not dispatched here; a `key` bound to a guide chord no-ops.
         Action::Key(_) => Ok(()),
+        // Handled in `handle_gesture` against the mode engine, never here.
+        Action::SetMode(_) | Action::ClearMode => Ok(()),
         Action::None => Ok(()),
     }
 }
@@ -1982,6 +2127,40 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_config_lua_leaves_the_last_good_config_intact() {
+        // The Lua front-end's half of the reload guardrail: a `config.lua` that
+        // no longer compiles arrives here as an `Err`, and `resolve_reload`
+        // keeps the running config byte for byte — the daemon never goes input
+        // dead over a typo. (HypXRland's "a broken syntax doesn't nuke the
+        // config and leave the user with no binds", one layer up.)
+        let good = crate::lua_config::load_str(
+            r#"
+            hyprpad.mode("desktop")
+            hyprpad.bind("guide+r1", hyprpad.exec "good")
+            "#,
+            "good.lua",
+        )
+        .expect("the good config loads");
+
+        for broken in [
+            "hyprpad.bind(",                       // syntax error
+            r#"hyprpad.cursor { sesn = 1 }"#,      // unknown key
+            r#"hyprpad.button("a", hyprpad.key "up"):only_in("nope")"#, // undeclared mode
+        ] {
+            let loaded = crate::lua_config::load_str(broken, "broken.lua");
+            assert!(loaded.is_err(), "{broken:?} should not load");
+            let (kept, outcome) = resolve_reload(good.clone(), loaded);
+            assert!(outcome.is_err());
+            assert_eq!(
+                kept.resolve(&GestureEvent::GuideChord(report::Button::BumperR1)),
+                Action::Exec("good".into()),
+                "the last-good binding must survive {broken:?}"
+            );
+            assert_eq!(kept.modes().len(), 1, "and so must its modes");
+        }
+    }
+
+    #[test]
     fn reload_swaps_in_new_config_on_success() {
         // A successful load replaces the config wholesale: the new binding is in
         // effect and the old default binding is gone.
@@ -2033,16 +2212,55 @@ mod tests {
 
     #[test]
     fn gamepad_gate_yields_to_a_forced_desktop_layer() {
-        // `Arbiter::set_force_desktop` keeps `game_focused()` true while turning
-        // `suppressed()` off — the reserved manual override. Ranks 3 and 4 must
-        // stay mutually exclusive: if the desktop is forced live over a game,
-        // forwarding yields rather than both driving the controller at once.
-        let mut a = Arbiter::new();
-        a.focus_changed("steam_app_413080");
-        assert!(gamepad_forwarding(true, a.game_focused(), a.suppressed(), false, false));
-        a.set_force_desktop(true);
-        assert!(a.game_focused() && !a.suppressed());
-        assert!(!gamepad_forwarding(true, a.game_focused(), a.suppressed(), false, false));
+        // The manual mode override (`Action::SetMode "desktop"`, docs/13
+        // decision #4) is the successor to `Arbiter::set_force_desktop`. Ranks 3
+        // and 4 must stay mutually exclusive: if the desktop is forced live over
+        // a game, forwarding yields rather than both driving the pad at once.
+        let cfg = Config::load_default();
+        let mut m = ModeEngine::new(&cfg);
+        m.focus_changed(&cfg, "steam_app_413080", "", None);
+        assert!(gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), false, false));
+
+        m.set_mode(&cfg, crate::mode::BUILTIN_DESKTOP);
+        assert!(m.cursor_enabled() && !m.desktop_yielded());
+        assert!(!gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), false, false));
+
+        // Clearing the override hands the pad straight back to the game.
+        m.clear_mode(&cfg);
+        assert!(gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), false, false));
+    }
+
+    #[test]
+    fn a_mode_change_releases_a_held_bare_button_key() {
+        // The mode-transition handoff must not strand a key: `reconcile` drops
+        // anything whose binding is no longer live, and `release_all` does it
+        // without waiting for another report to arrive.
+        let cfg = Config::load_default();
+        let mut m = ModeEngine::new(&cfg);
+        let mut keys = ButtonKeys::new();
+
+        // Desktop: D-pad up is bound, press it.
+        let down = keys.reconcile(m.buttons(), |b| b == report::Button::DpadUp, true);
+        assert_eq!(down, vec![(report::Button::DpadUp, 103, true)]);
+
+        // A game takes focus. The map goes empty, so the held key releases even
+        // though the button is still physically down.
+        m.focus_changed(&cfg, "steam_app_413080", "", None);
+        let up = keys.reconcile(m.buttons(), |b| b == report::Button::DpadUp, true);
+        assert_eq!(up, vec![(report::Button::DpadUp, 103, false)]);
+        assert!(keys.held.is_empty());
+    }
+
+    #[test]
+    fn release_all_drops_every_held_key_with_no_keyboard() {
+        // `release_all` runs on the transition path, where the uinput keyboard
+        // may legitimately be absent; it must still clear the held set.
+        let mut keys = ButtonKeys::new();
+        let map = HashMap::from([(report::Button::DpadUp, 103u16), (report::Button::A, 28)]);
+        keys.reconcile(&map, |_| true, true);
+        assert_eq!(keys.held.len(), 2);
+        keys.release_all(&mut None);
+        assert!(keys.held.is_empty());
     }
 
     /// Drive `st` through one frame at the given gate, with no real device

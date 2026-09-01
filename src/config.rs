@@ -5,6 +5,23 @@
 //! `[bindings]`: keys name a gesture (`"guide+r1"`, `"guide+stick_right"`) and
 //! values are action strings (`"workspace +1"`, `"exec walker"`, `"fullscreen"`).
 //!
+//! ## Two front-ends, one `Config`
+//!
+//! [`Config::load`] reads whichever of the two config files exists:
+//!
+//! | file | front-end |
+//! |---|---|
+//! | `~/.config/hyprpad/config.lua` | the Lua front-end ([`crate::lua_config`]) — preferred when present |
+//! | `~/.config/hyprpad/config.toml` | the flat TOML dialect described below |
+//!
+//! Both produce *this* `Config`, so the rest of the daemon never learns which
+//! one was used. The Lua front-end additionally populates the modality fields —
+//! [`ModeDef`]s and per-binding [`Guard`]s — which the TOML front-end leaves
+//! empty; an empty mode list puts [`crate::mode::ModeEngine`] into its
+//! built-in game/desktop behaviour, which is exactly what the TOML config has
+//! always had. See `docs/research/lua-config.md` for why the second front-end
+//! exists at all.
+//!
 //! The other sections are flat `key = value` tables of the same shape:
 //!
 //! | Section | What it configures |
@@ -30,6 +47,7 @@
 use crate::gesture::{self, Stick, StickDir};
 use crate::report;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Where a workspace action points.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +114,12 @@ pub enum Action {
     /// button is held and released when it lifts, so the kernel auto-repeats.
     /// Driven by [`crate::keyboard::VirtualKeyboard`], not a Hyprland dispatch.
     Key(u16),
+    /// Force the named mode, overriding whatever the context rules resolve to
+    /// ([`crate::mode::ModeEngine`]'s manual override — the top of the
+    /// precedence, docs/13). Applied by the daemon loop, not dispatched.
+    SetMode(String),
+    /// Drop a manual override so the context rules decide again.
+    ClearMode,
     /// No action.
     None,
 }
@@ -160,14 +184,29 @@ impl Action {
                     Ok(Action::Key(key_code(rest)?))
                 }
             }
+            // The manual mode override (docs/13 "Owner decisions" #4). Spelled
+            // in TOML too, so a `config.toml` user can bind a chord to force a
+            // mode even though only the Lua front-end can *declare* modes.
+            "set_mode" | "mode" => {
+                if rest.is_empty() {
+                    Err("set_mode needs a mode name".to_string())
+                } else {
+                    Ok(Action::SetMode(rest.to_string()))
+                }
+            }
+            "clear_mode" | "unset_mode" => Ok(Action::ClearMode),
             other => Err(format!("unknown action '{other}'")),
         }
     }
 }
 
 /// The normalized binding key a gesture event resolves against.
+///
+/// `pub(crate)` so the Lua front-end ([`crate::lua_config`]) can build the same
+/// binding table this module's TOML parser does; it is not part of the public
+/// API and callers outside the crate go through [`Config::resolve`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum GestureKey {
+pub(crate) enum GestureKey {
     Chord(report::Button),
     Flick(Stick, StickDir),
     /// A bare guide tap (`GuideLeave { was_chorded: false }`).
@@ -177,9 +216,23 @@ enum GestureKey {
 }
 
 impl GestureKey {
+    /// The binding key a gesture event resolves against, or `None` for the
+    /// lifecycle events that carry no binding — `GuideEnter` and a *chorded*
+    /// `GuideLeave`.
+    pub(crate) fn of(ev: &gesture::GestureEvent) -> Option<GestureKey> {
+        use gesture::GestureEvent as E;
+        match ev {
+            E::GuideChord(b) => Some(GestureKey::Chord(*b)),
+            E::GuideStickFlick { stick, dir } => Some(GestureKey::Flick(*stick, *dir)),
+            E::GuideLeave { was_chorded: false } => Some(GestureKey::Tap),
+            E::GuideHold => Some(GestureKey::Hold),
+            E::GuideEnter | E::GuideLeave { was_chorded: true } => None,
+        }
+    }
+
     /// Parse a binding key such as `"guide+r1"`, `"guide+stick_right"`,
     /// `"guide+lstick_up"`, `"guide_tap"`, or `"guide_hold"`.
-    fn parse(raw: &str) -> Result<GestureKey, String> {
+    pub(crate) fn parse(raw: &str) -> Result<GestureKey, String> {
         let k = raw.trim().to_ascii_lowercase();
         match k.as_str() {
             "guide" | "guide_tap" | "guide+tap" => return Ok(GestureKey::Tap),
@@ -216,7 +269,7 @@ fn parse_dir(s: &str) -> Result<StickDir, String> {
     }
 }
 
-fn parse_button(s: &str) -> Result<report::Button, String> {
+pub(crate) fn parse_button(s: &str) -> Result<report::Button, String> {
     use report::Button::*;
     let b = match s {
         "a" => A,
@@ -254,7 +307,7 @@ fn parse_button(s: &str) -> Result<report::Button, String> {
 /// and navigation keys, so bare buttons can be bound to more than the arrows
 /// without extending this table. An unknown name is a reported error, never a
 /// silent no-op. Names are matched case-insensitively by the caller.
-fn key_code(name: &str) -> Result<u16, String> {
+pub(crate) fn key_code(name: &str) -> Result<u16, String> {
     let code = match name.trim().to_ascii_lowercase().as_str() {
         "up" => 103,        // KEY_UP
         "down" => 108,      // KEY_DOWN
@@ -490,7 +543,7 @@ pub enum RumbleMode {
 }
 
 impl RumbleMode {
-    fn parse(s: &str) -> Result<RumbleMode, String> {
+    pub(crate) fn parse(s: &str) -> Result<RumbleMode, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "native" | "rumble" | "ff" => Ok(RumbleMode::Native),
             "pulse" | "pulses" | "approx" => Ok(RumbleMode::Pulse),
@@ -540,34 +593,165 @@ impl Default for GamepadConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Modality: modes as named contexts, and per-binding guards (docs/13).
+// ---------------------------------------------------------------------------
+
+/// A declared **mode**: a named context the daemon can be in.
+///
+/// Per the owner's decision (docs/13 "Owner decisions" #1) a mode is *only* a
+/// name plus the rule that selects it — it does not carry category switches.
+/// What is live in a mode is decided per binding, by that binding's [`Guard`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModeDef {
+    /// The mode's name, as written in `h.mode("game")` and in every guard that
+    /// refers to it.
+    pub name: String,
+    /// Index of this mode's selection predicate in the Lua predicate table, or
+    /// `None` for a mode with no rule — reachable only as `default_mode` or via
+    /// a manual override ([`Action::SetMode`]).
+    pub rule: Option<usize>,
+    /// Whether raw controller input is handed to the virtual gamepad while this
+    /// mode is active (`h.mode("game", { forward = true })`). This is the mode
+    /// model's replacement for "a game window is focused".
+    pub forward: bool,
+}
+
+/// When a binding — or an ambient handler such as the cursor — is live.
+///
+/// Every `h.bind` / `h.button` / `h.osk_button`, and the `h.cursor` /
+/// `h.scroll` "virtual bindings", carries one of these. [`Guard::Always`] (the
+/// default, and everything the TOML front-end produces) means *live in every
+/// mode*, which is why an unguarded config behaves exactly as it always has.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Guard {
+    /// Live in every mode. The default for an unguarded binding.
+    #[default]
+    Always,
+    /// Live only while one of these modes is active (`:only_in("desktop")`).
+    OnlyIn(Vec<String>),
+    /// Live except while one of these modes is active (`:not_in("game")`).
+    NotIn(Vec<String>),
+    /// Live when this Lua predicate returns truthy (`:when(function(ctx) …
+    /// end)`). The index is into the config's predicate table; the *result* is
+    /// cached in [`ModeState`], recomputed only on a context change — never per
+    /// input frame.
+    When(usize),
+}
+
+/// The `Guard::Always` singleton, so [`Config::gesture_guard`] can hand back a
+/// reference for an unguarded binding without allocating.
+static ALWAYS: Guard = Guard::Always;
+
+impl Guard {
+    /// Whether this guard passes in the given resolved modality snapshot.
+    ///
+    /// A [`When`](Guard::When) guard whose predicate is missing from the
+    /// snapshot (it errored or timed out) reads as **false** — the same
+    /// "a broken predicate is not a match" rule the mode rules use, so a bad
+    /// guard silences one binding rather than taking the daemon with it.
+    pub fn allows(&self, st: &ModeState) -> bool {
+        match self {
+            Guard::Always => true,
+            Guard::OnlyIn(modes) => modes.iter().any(|m| m == st.active()),
+            Guard::NotIn(modes) => !modes.iter().any(|m| m == st.active()),
+            Guard::When(i) => st.predicate(*i),
+        }
+    }
+
+    /// Every mode name this guard mentions, for load-time validation (a typo in
+    /// `:only_in("desktopp")` would otherwise silently disable a binding).
+    pub fn mode_names(&self) -> &[String] {
+        match self {
+            Guard::OnlyIn(m) | Guard::NotIn(m) => m,
+            Guard::Always | Guard::When(_) => &[],
+        }
+    }
+}
+
+/// The resolved modality snapshot every [`Guard`] is evaluated against: which
+/// mode is active, and the cached truth of every `:when` predicate.
+///
+/// Built by [`crate::mode::ModeEngine`] on a **context change** (focus,
+/// fullscreen, manual override, reload) and then read — never recomputed — by
+/// the per-frame handlers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModeState {
+    active: String,
+    predicates: Vec<bool>,
+}
+
+impl ModeState {
+    /// A snapshot with `active` as the active mode and `predicates[i]` the
+    /// cached result of predicate `i`.
+    pub fn new(active: impl Into<String>, predicates: Vec<bool>) -> ModeState {
+        ModeState { active: active.into(), predicates }
+    }
+
+    /// The active mode's name.
+    pub fn active(&self) -> &str {
+        &self.active
+    }
+
+    /// The cached result of predicate `i`; `false` when it is absent (errored,
+    /// timed out, or out of range).
+    pub fn predicate(&self, i: usize) -> bool {
+        self.predicates.get(i).copied().unwrap_or(false)
+    }
+}
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    bindings: HashMap<GestureKey, Action>,
+    pub(crate) bindings: HashMap<GestureKey, Action>,
     /// Bare-button bindings (the `[buttons]` section): a controller button
     /// pressed *without* the guide modifier emits a raw evdev keycode. Distinct
     /// from `bindings`, which are guide chords. Maps the button to its `KEY_*`
     /// code; the default maps the D-pad to the arrow keys.
-    buttons: HashMap<report::Button, u16>,
+    pub(crate) buttons: HashMap<report::Button, u16>,
     /// OSK-helper buttons (the `[osk_buttons]` section): while the on-screen
     /// keyboard is up, these buttons send a raw key THROUGH the OSK (its uinput
     /// types it), Deck-style. Default: `Y` = Space, `X` = Backspace. Distinct
     /// from `buttons`, which fire only when the OSK is down.
-    osk_buttons: HashMap<report::Button, u16>,
+    pub(crate) osk_buttons: HashMap<report::Button, u16>,
     /// Whether hyprpad should take ownership of the puck's lizard mode and keep
     /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
     /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
-    own_lizard: bool,
+    pub(crate) own_lizard: bool,
     /// Trackpad-cursor smoothing knobs (`[cursor]`/`[damping]` section).
-    cursor: CursorConfig,
+    pub(crate) cursor: CursorConfig,
     /// Left-trackpad scroll knobs (`[scroll]` section).
-    scroll: ScrollConfig,
+    pub(crate) scroll: ScrollConfig,
     /// Haptic-feedback knobs (`[haptics]` section).
-    haptics: HapticsConfig,
+    pub(crate) haptics: HapticsConfig,
     /// Virtual-gamepad knobs (`[gamepad]` section).
-    gamepad: GamepadConfig,
+    pub(crate) gamepad: GamepadConfig,
+
+    // --- Modality (Lua front-end only; empty from TOML) --------------------
+    /// The declared modes, **in definition order** — the order the rules are
+    /// evaluated in, first match wins. Empty for a TOML config, which puts
+    /// [`crate::mode::ModeEngine`] into its built-in game/desktop behaviour.
+    pub(crate) modes: Vec<ModeDef>,
+    /// The mode chosen when no rule matches (`h.default_mode "desktop"`).
+    pub(crate) default_mode: Option<String>,
+    /// Per-binding guards, keyed exactly like `bindings`. A missing entry means
+    /// [`Guard::Always`].
+    pub(crate) binding_guards: HashMap<GestureKey, Guard>,
+    /// Per-binding guards for the bare-button (`[buttons]`) map.
+    pub(crate) button_guards: HashMap<report::Button, Guard>,
+    /// Per-binding guards for the OSK-helper (`[osk_buttons]`) map.
+    pub(crate) osk_button_guards: HashMap<report::Button, Guard>,
+    /// The guard on the cursor "virtual binding" (`h.cursor { only_in = … }`).
+    pub(crate) cursor_guard: Guard,
+    /// The guard on the scroll "virtual binding" (`h.scroll { only_in = … }`).
+    pub(crate) scroll_guard: Guard,
+    /// The live Lua state behind a `config.lua`, holding the mode rules and
+    /// `:when` predicates. `None` for a TOML config. Shared (`Rc`) because
+    /// `Config` is `Clone` and the interpreter must not be duplicated;
+    /// single-threaded by construction — only the daemon loop touches it.
+    pub(crate) lua: Option<Rc<crate::lua_config::LuaRuntime>>,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -855,6 +1039,10 @@ impl Config {
             scroll,
             haptics,
             gamepad,
+            // The TOML dialect declares no modes and no guards: everything is
+            // unguarded, and an empty mode list is the signal that
+            // `ModeEngine` should keep its built-in game/desktop behaviour.
+            ..Config::default()
         })
     }
 
@@ -863,34 +1051,60 @@ impl Config {
         Config::from_toml_str(DEFAULT_TOML).expect("built-in default config is valid")
     }
 
-    /// The path the user config is read from:
+    /// The config directory: `$XDG_CONFIG_HOME/hyprpad`, or
+    /// `~/.config/hyprpad` when `XDG_CONFIG_HOME` is unset. `None` only if
+    /// neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    pub fn config_dir() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(std::path::PathBuf::from(dir).join("hyprpad"));
+        }
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        Some(std::path::PathBuf::from(home).join(".config/hyprpad"))
+    }
+
+    /// The path the TOML user config is read from:
     /// `$XDG_CONFIG_HOME/hyprpad/config.toml`, or `~/.config/hyprpad/config.toml`
     /// when `XDG_CONFIG_HOME` is unset. Returns `None` only if neither
     /// `XDG_CONFIG_HOME` nor `HOME` is set.
     pub fn config_path() -> Option<std::path::PathBuf> {
-        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Some(std::path::PathBuf::from(dir).join("hyprpad/config.toml"));
-        }
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-        Some(std::path::PathBuf::from(home).join(".config/hyprpad/config.toml"))
+        Some(Config::config_dir()?.join("config.toml"))
     }
 
-    /// Load the user config from [`config_path`](Self::config_path), falling
-    /// back to [`load_default`](Self::load_default) when the file is absent
-    /// (or when no config directory can be resolved).
+    /// The path the **Lua** user config is read from:
+    /// `$XDG_CONFIG_HOME/hyprpad/config.lua`, or `~/.config/hyprpad/config.lua`.
+    /// When this file exists it wins over `config.toml`.
+    pub fn lua_config_path() -> Option<std::path::PathBuf> {
+        Some(Config::config_dir()?.join("config.lua"))
+    }
+
+    /// The config file [`load`](Self::load) would actually read, and which
+    /// front-end it would use — for the daemon's startup banner and for
+    /// diagnostics. `None` when neither file exists (built-in defaults).
+    pub fn active_config_path() -> Option<(std::path::PathBuf, ConfigFormat)> {
+        pick_front_end(&Config::config_dir()?)
+    }
+
+    /// Load the user config, preferring `config.lua` (the Lua front-end) over
+    /// `config.toml` (the TOML front-end) and falling back to
+    /// [`load_default`](Self::load_default) when neither exists (or when no
+    /// config directory can be resolved).
     ///
-    /// Returns an error only when the file is *present but malformed*, so the
-    /// caller can surface a real misconfiguration rather than silently ignoring
-    /// it.
+    /// Returns an error only when the chosen file is *present but malformed*,
+    /// so the caller can surface a real misconfiguration rather than silently
+    /// ignoring it — and, crucially, so the reload path
+    /// (`crate::run::resolve_reload`) can keep the last-good config instead of
+    /// running blind.
     pub fn load() -> Result<Config, String> {
-        let Some(path) = Config::config_path() else {
-            return Ok(Config::load_default());
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Config::from_toml_str(&text)
-                .map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::load_default()),
-            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        match Config::active_config_path() {
+            Some((path, ConfigFormat::Lua)) => crate::lua_config::load_file(&path),
+            Some((path, ConfigFormat::Toml)) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    Config::from_toml_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::load_default()),
+                Err(e) => Err(format!("reading {}: {e}", path.display())),
+            },
+            None => Ok(Config::load_default()),
         }
     }
 
@@ -900,14 +1114,7 @@ impl Config {
     /// `GuideLeave` — always resolve to `None`. A bare `GuideLeave` maps to the
     /// optional `guide_tap` binding, and `GuideHold` to `guide_hold`.
     pub fn resolve(&self, ev: &gesture::GestureEvent) -> Action {
-        use gesture::GestureEvent as E;
-        let key = match ev {
-            E::GuideChord(b) => GestureKey::Chord(*b),
-            E::GuideStickFlick { stick, dir } => GestureKey::Flick(*stick, *dir),
-            E::GuideLeave { was_chorded: false } => GestureKey::Tap,
-            E::GuideHold => GestureKey::Hold,
-            E::GuideEnter | E::GuideLeave { was_chorded: true } => return Action::None,
-        };
+        let Some(key) = GestureKey::of(ev) else { return Action::None };
         self.bindings.get(&key).cloned().unwrap_or(Action::None)
     }
 
@@ -967,6 +1174,139 @@ impl Config {
     pub fn gamepad(&self) -> &GamepadConfig {
         &self.gamepad
     }
+
+    // --- Modality ---------------------------------------------------------
+
+    /// The declared modes, in definition order (the rule evaluation order).
+    /// Empty for a TOML config — see [`crate::mode::ModeEngine`].
+    pub fn modes(&self) -> &[ModeDef] {
+        &self.modes
+    }
+
+    /// The mode selected when no rule matches. `"desktop"` unless the config
+    /// said otherwise with `h.default_mode`.
+    pub fn default_mode(&self) -> &str {
+        self.default_mode.as_deref().unwrap_or("desktop")
+    }
+
+    /// The live Lua state, when this config came from the Lua front-end.
+    pub fn lua(&self) -> Option<&crate::lua_config::LuaRuntime> {
+        self.lua.as_deref()
+    }
+
+    /// Whether resolving modes needs the focused window's **pid** — i.e.
+    /// whether a `config.lua` with real rules is in play. The daemon only pays
+    /// for the extra `j/activewindow` round trip on a focus change when this is
+    /// true.
+    pub fn needs_focus_pid(&self) -> bool {
+        self.lua.is_some() && !self.modes.is_empty()
+    }
+
+    /// The guard on a gesture binding, or [`Guard::Always`] when it carries
+    /// none. Lifecycle events that can never be bound also read `Always` — they
+    /// resolve to [`Action::None`] anyway.
+    pub fn gesture_guard(&self, ev: &gesture::GestureEvent) -> &Guard {
+        match GestureKey::of(ev) {
+            Some(k) => self.binding_guards.get(&k).unwrap_or(&ALWAYS),
+            None => &ALWAYS,
+        }
+    }
+
+    /// Resolve a gesture to its action **in a given mode**: exactly
+    /// [`resolve`](Self::resolve), except that a binding whose guard does not
+    /// pass yields [`Action::None`].
+    pub fn resolve_in(&self, ev: &gesture::GestureEvent, st: &ModeState) -> Action {
+        if self.gesture_guard(ev).allows(st) {
+            self.resolve(ev)
+        } else {
+            Action::None
+        }
+    }
+
+    /// The bare-button map filtered to the bindings live in `st`. Built on a
+    /// **mode transition**, never per frame, and handed to
+    /// `crate::run::drive_buttons` in place of [`buttons`](Self::buttons).
+    pub fn buttons_in(&self, st: &ModeState) -> HashMap<report::Button, u16> {
+        filter_buttons(&self.buttons, &self.button_guards, st)
+    }
+
+    /// The OSK-helper map filtered to the bindings live in `st`.
+    pub fn osk_buttons_in(&self, st: &ModeState) -> HashMap<report::Button, u16> {
+        filter_buttons(&self.osk_buttons, &self.osk_button_guards, st)
+    }
+
+    /// Whether the right pad drives the desktop cursor in `st`
+    /// (`h.cursor { only_in = { "desktop" } }`).
+    pub fn cursor_enabled_in(&self, st: &ModeState) -> bool {
+        self.cursor_guard.allows(st)
+    }
+
+    /// Whether the left pad scrolls in `st` (`h.scroll { only_in = … }`).
+    pub fn scroll_enabled_in(&self, st: &ModeState) -> bool {
+        self.scroll_guard.allows(st)
+    }
+
+    /// Every `:when` predicate index the config uses, so the mode engine knows
+    /// how large a result vector to build. One past the highest index in use.
+    pub fn predicate_slots(&self) -> usize {
+        let guards = self
+            .binding_guards
+            .values()
+            .chain(self.button_guards.values())
+            .chain(self.osk_button_guards.values())
+            .chain([&self.cursor_guard, &self.scroll_guard]);
+        let from_guards = guards.filter_map(|g| match g {
+            Guard::When(i) => Some(*i + 1),
+            _ => None,
+        });
+        let from_modes = self.modes.iter().filter_map(|m| m.rule.map(|i| i + 1));
+        from_guards.chain(from_modes).max().unwrap_or(0)
+    }
+}
+
+/// Which front-end [`Config::load`] used (or would use).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigFormat {
+    /// `config.lua`, via [`crate::lua_config`].
+    Lua,
+    /// `config.toml`, via [`Config::from_toml_str`].
+    Toml,
+}
+
+impl std::fmt::Display for ConfigFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConfigFormat::Lua => "lua",
+            ConfigFormat::Toml => "toml",
+        })
+    }
+}
+
+/// Which config file in `dir` wins, and which front-end reads it.
+///
+/// `config.lua` beats `config.toml` when both exist, so migrating is "write the
+/// Lua file", and rolling back is "rename it". Split out from
+/// [`Config::active_config_path`] so the precedence is testable against a
+/// scratch directory rather than the process environment.
+fn pick_front_end(dir: &std::path::Path) -> Option<(std::path::PathBuf, ConfigFormat)> {
+    let lua = dir.join("config.lua");
+    if lua.exists() {
+        return Some((lua, ConfigFormat::Lua));
+    }
+    let toml = dir.join("config.toml");
+    toml.exists().then_some((toml, ConfigFormat::Toml))
+}
+
+/// Drop the button bindings whose guard does not pass in `st`.
+fn filter_buttons(
+    map: &HashMap<report::Button, u16>,
+    guards: &HashMap<report::Button, Guard>,
+    st: &ModeState,
+) -> HashMap<report::Button, u16> {
+    map.iter()
+        .filter(|(b, _)| guards.get(b).unwrap_or(&ALWAYS).allows(st))
+        .map(|(b, c)| (*b, *c))
+        .collect()
 }
 
 /// Parse a floating-point config value, rejecting non-finite results so a
@@ -1711,5 +2051,76 @@ rumble_intensity = 0.25
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_lua_wins_over_config_toml_when_both_exist() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyprpad-front-end-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Neither file: built-in defaults.
+        assert_eq!(pick_front_end(&dir), None);
+
+        // TOML only.
+        std::fs::write(dir.join("config.toml"), "").unwrap();
+        assert_eq!(
+            pick_front_end(&dir),
+            Some((dir.join("config.toml"), ConfigFormat::Toml))
+        );
+
+        // Both: the Lua front-end wins, so migrating is "write the file" and
+        // rolling back is "rename it".
+        std::fs::write(dir.join("config.lua"), "").unwrap();
+        assert_eq!(
+            pick_front_end(&dir),
+            Some((dir.join("config.lua"), ConfigFormat::Lua))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_mode_and_clear_mode_parse_from_the_toml_grammar_too() {
+        assert_eq!(Action::parse("set_mode game"), Ok(Action::SetMode("game".into())));
+        assert_eq!(Action::parse("mode desktop"), Ok(Action::SetMode("desktop".into())));
+        assert_eq!(Action::parse("clear_mode"), Ok(Action::ClearMode));
+        assert!(Action::parse("set_mode").is_err());
+    }
+
+    #[test]
+    fn guards_default_to_always_and_a_toml_config_declares_none() {
+        let c = Config::load_default();
+        assert!(c.modes().is_empty(), "TOML declares no modes");
+        assert_eq!(c.default_mode(), "desktop");
+        assert!(c.lua().is_none());
+        assert!(!c.needs_focus_pid());
+        assert_eq!(c.predicate_slots(), 0);
+
+        // Everything is live in any mode, which is what makes adopting the mode
+        // engine a no-op for an existing config.
+        let anywhere = ModeState::new("whatever", vec![]);
+        assert_eq!(c.buttons_in(&anywhere), *c.buttons());
+        assert_eq!(c.osk_buttons_in(&anywhere), *c.osk_buttons());
+        assert!(c.cursor_enabled_in(&anywhere) && c.scroll_enabled_in(&anywhere));
+        assert_eq!(c.gesture_guard(&GestureEvent::GuideChord(Button::A)), &Guard::Always);
+    }
+
+    #[test]
+    fn guard_semantics() {
+        let desktop = ModeState::new("desktop", vec![true, false]);
+        assert!(Guard::Always.allows(&desktop));
+        assert!(Guard::OnlyIn(vec!["desktop".into()]).allows(&desktop));
+        assert!(!Guard::OnlyIn(vec!["game".into()]).allows(&desktop));
+        assert!(Guard::NotIn(vec!["game".into()]).allows(&desktop));
+        assert!(!Guard::NotIn(vec!["desktop".into()]).allows(&desktop));
+        assert!(Guard::When(0).allows(&desktop));
+        assert!(!Guard::When(1).allows(&desktop));
+        // A predicate whose result never arrived (it errored or timed out) is
+        // "no match", never "yes by default".
+        assert!(!Guard::When(9).allows(&desktop));
     }
 }

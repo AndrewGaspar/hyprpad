@@ -51,6 +51,105 @@ guide-release behaviour above means it is unlikely to be needed.
 Details and the rejected alternatives are in
 [docs/06-recommendation.md](docs/06-recommendation.md).
 
+## Configuring the daemon
+
+hyprpad reads **one** of two config files from `~/.config/hyprpad/`, and
+`config.lua` wins when both exist:
+
+| file | front-end | when to use it |
+|---|---|---|
+| `config.lua` | embedded Lua 5.4 (`mlua`, vendored) | you want **modes** — context-selected controller behaviour |
+| `config.toml` | the built-in flat TOML dialect | everything else; nothing about it changed |
+
+Both produce the same internal config, so nothing downstream knows which ran.
+`config/config.lua` in this repo is a ready-to-copy sample. See
+[docs/research/lua-config.md](docs/research/lua-config.md) for why the second
+front-end exists (short version: **mode selection is logic, not data**) and
+[docs/13-modality-design.md](docs/13-modality-design.md) for the model.
+
+### The `hyprpad` API
+
+The one global is `hyprpad` (bind it to `h`). It mirrors the ergonomics of the
+owner's HypXRland `hl`/`o` config; it does **not** depend on or share a file
+with the compositor's Lua state.
+
+```lua
+local h = hyprpad
+
+h.daemon  { own_lizard = true }
+h.cursor  { sens = 0.06, hysteresis = 0.0008, only_in = { "desktop" } }
+h.scroll  { mode = "circular", only_in = { "desktop" } }
+h.haptics { cursor_spacing_px = 96 }
+h.gamepad { enabled = true }
+
+h.bind("guide+r1", "Workspace right", h.workspace "+1")  -- desc is optional
+h.bind("guide+x",  h.exec "omarchy-menu")
+h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
+h.bind("guide+y",  h.keyboard { mode = "split" })
+h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button
+h.osk_button("y",   h.key "space")                       -- only while the OSK is up
+```
+
+Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
+`h.keyboard`, `h.key`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`, `h.none`.
+A plain string (`"workspace +1"`) works too — it is parsed by the same grammar
+the TOML file uses.
+
+### Modes and guards
+
+A **mode** is a named context chosen by a predicate. Rules run in definition
+order, first match wins, and **only on a context change** — a focus change, a
+fullscreen change, a manual override, a reload. Never per input frame.
+
+```lua
+h.mode("game", { forward = true }).when(function(ctx)
+  return ctx.focus.class:lower():match("^steam_app_") ~= nil
+end)
+h.mode("claude").when(function(ctx)          -- Claude Code in a terminal:
+  return ctx.focus:process_tree_has("claude") -- same class as any terminal, so
+end)                                          -- look inside the window
+h.mode("desktop")
+h.default_mode "desktop"
+```
+
+`ctx.focus` carries `class`, `title`, `pid`, `fullscreen`, and the
+`process_tree_has` method (a cached `/proc` descendant walk).
+
+Every binding then decides for itself where it is live — **guards are per
+binding, not per category**:
+
+```lua
+h.button("a", h.key "enter"):only_in("desktop")
+h.bind("guide+l1", h.workspace "-1"):not_in("game")
+h.bind("guide+i", h.exec "…"):when(function(ctx) return ctx.focus.pid ~= nil end)
+```
+
+Unguarded means live everywhere, which is why the guide chords survive a
+fullscreen game — hyprpad's escape hatch. "Game passthrough" is not a category
+switch; it is *"nothing but the guide chords is live in `game`"*.
+
+Resolution precedence: **manual override** (`h.set_mode` / `h.clear_mode` bound
+to a chord) → **first matching rule** → **`default_mode`**. On any mode
+transition the daemon runs the same clean handoff a controller disconnect does:
+held clicks and keys released, the virtual pad neutralled, dampers reset.
+
+### Guardrails
+
+A config that is a program can hang or throw. The Lua front-end copies the
+design the owner already proved in HypXRland's `src/config/lua/ConfigManager.cpp`:
+
+* **Compile before anything is swapped.** The whole file is compiled with
+  `into_function()` before a line of it executes, so a syntax error is reported
+  with its line number and nothing was applied.
+* **Fresh state every load.** Each load builds a new interpreter and a new
+  config; nothing is mutated in place.
+* **An instruction-count watchdog** (`lua_sethook`'s mlua equivalent) with the
+  same per-context budgets: 1500 ms for a config load, 100 ms for a predicate.
+  A `while true do end` in a rule is cut and counts as *no match*.
+* **Last-good retention.** Any failure — syntax, runtime, a guard naming a mode
+  nobody declared — leaves the running config untouched and logs the reason.
+  `hyprpad reload` can never leave the daemon input dead.
+
 ## Documents
 
 | | |

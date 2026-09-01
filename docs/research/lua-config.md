@@ -455,6 +455,22 @@ focus/process/state with per-mode overrides (docs/13 Phase 2–3) → Lua (D2/B)
 else (dependency weight, "matching Hyprland", reload safety) is secondary to that one
 call.
 
+**Measured cost (2026-09-01, branch `feat-lua-config`, VERIFIED).** The note above
+asked for the build-time and binary-size delta from vendored `lua54` before committing.
+Release binaries built back to back on the Framework 16 with a warm cargo cache:
+
+| | `hyprpad` (release, `lto = true`) |
+|---|---|
+| before (`master`) | 1,141,824 B |
+| after (`+ mlua 0.10.5, lua54 + vendored`) | 1,781,504 B |
+| **delta** | **+639,680 B (+56%)** |
+
+The vendored `liblua5.4.a` is 681 KB before LTO. Cold-build cost is the one-off
+compile of PUC Lua's C sources plus `mlua`/`mlua-sys` (~15 s on this machine, inside
+the existing wayland build); incremental rebuilds of the crate itself are unchanged.
+`vendored` means no system Lua and no `-dev` package, so the daemon stays a single
+self-contained binary — which was the condition for accepting the dependency at all.
+
 **Next step:** Prototype D2 behind a build/runtime flag — add `mlua` (`lua54`,`vendored`),
 load a `config.lua` that reads the *existing* tables into today's `Config` struct, port the
 docs/13 modes as `mode(name).when(fn)` with the `/proc`-walk hidden behind a
