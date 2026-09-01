@@ -146,3 +146,6 @@ h.bind("guide+view",        "Cheat sheet",         h.exec "hyprpad-cheatsheet to
 -- mid-match), and to hand it back:
 -- h.bind("guide+l4", "Force desktop mode", h.set_mode "desktop")
 -- h.bind("guide+l5", "Back to automatic",  h.clear_mode())
+
+-- R4 grip: screenshot (fullscreen = no picker to drag through).
+h.bind("guide+r4", "Screenshot", h.exec "omarchy screenshot fullscreen")   -- one press, whole screen; use "windows"/"region" for a picker
