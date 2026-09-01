@@ -286,6 +286,34 @@ pub fn run() -> std::io::Result<()> {
     // `windowtitle` event can be attributed), which title form this compositor
     // speaks, and when its process tree may next be re-walked.
     let mut watch = FocusWatch::new();
+
+    // Seed focus from the compositor at startup. The event socket only tells us
+    // about *changes*, so without this a daemon (re)started while a game or
+    // Big Picture is already focused would sit in the default mode — and keep
+    // driving the desktop cursor into the game — until the next alt-tab. Same
+    // for title-rescan attribution, which keys on the focused address. Only
+    // when modes are declared (a plain TOML config never needs focus).
+    if config.needs_focus_pid() {
+        match hypr.active_window() {
+            Ok(info) if !info.class.is_empty() => {
+                watch.address = info.address.clone();
+                let focus = crate::mode::Focus {
+                    class: info.class.clone(),
+                    title: info.title,
+                    pid: info.pid,
+                    fullscreen: info.fullscreen,
+                };
+                let _ = modes.context_changed(&config, focus);
+                eprintln!(
+                    "hyprpad: focus seeded from activewindow ({}), mode '{}'",
+                    info.class,
+                    modes.active()
+                );
+            }
+            Ok(_) => {} // focus on the desktop: the default mode is already right
+            Err(e) => eprintln!("warning: could not seed focus from activewindow ({e})"),
+        }
+    }
     loop {
         // The periodic process-tree rescan (`process_rescan_ms`), the title-less
         // half of noticing a program that starts under the focused window.

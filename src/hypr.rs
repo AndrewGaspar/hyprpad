@@ -177,11 +177,7 @@ impl Hypr {
     /// declares modes ([`crate::config::Config::needs_focus_pid`]).
     pub fn active_window(&self) -> io::Result<ActiveWindowInfo> {
         let json = self.query("activewindow")?;
-        Ok(ActiveWindowInfo {
-            pid: json_number(&json, "pid").map(|n| n as i32),
-            fullscreen: json_number(&json, "fullscreen").is_some_and(|n| n != 0),
-            title: json_string(&json, "title").unwrap_or_default(),
-        })
+        Ok(parse_active_window(&json))
     }
 
     /// Fire-and-forget exec of a shell command, detached from our stdio. A
@@ -235,6 +231,11 @@ pub struct ActiveWindowInfo {
     pub fullscreen: bool,
     /// Its title as of this query. Empty when the reply carries none.
     pub title: String,
+    /// Its window class. Empty when focus is on the desktop (no window).
+    pub class: String,
+    /// Its window address in the event-socket form (no `0x` prefix), so it
+    /// compares directly against `activewindowv2` / `windowtitle` addresses.
+    pub address: String,
 }
 
 /// Pull a top-level numeric field out of a Hyprland JSON reply.
@@ -429,6 +430,23 @@ fn rel_arg(n: i32) -> String {
     }
 }
 
+/// Parse a `j/activewindow` reply into the fields the modality layer needs.
+/// Pure, so it is tested against a captured live reply.
+fn parse_active_window(json: &str) -> ActiveWindowInfo {
+    ActiveWindowInfo {
+        pid: json_number(json, "pid").map(|n| n as i32),
+        fullscreen: json_number(json, "fullscreen").is_some_and(|n| n != 0),
+        title: json_string(json, "title").unwrap_or_default(),
+        class: json_string(json, "class").unwrap_or_default(),
+        // The JSON reply spells the address `0x55d…`; the event socket
+        // (`activewindowv2>>55d…`, `windowtitle>>55d…`) omits the `0x`.
+        // Normalize to the event form so the two compare directly.
+        address: json_string(json, "address")
+            .map(|a| a.trim_start_matches("0x").to_string())
+            .unwrap_or_default(),
+    }
+}
+
 /// Ensure an address carries the `0x` prefix (event wire form omits it).
 fn norm_addr(s: &str) -> String {
     if s.is_empty() || s.starts_with("0x") {
@@ -446,6 +464,22 @@ fn lua_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup focus seed needs `class` (what the game-mode predicate
+    /// matches) and `address` in the event-socket form (what title-rescan
+    /// attribution compares against) — both parsed from the live reply.
+    #[test]
+    fn active_window_parses_class_and_event_form_address() {
+        let info = parse_active_window(ACTIVE_WINDOW_JSON);
+        assert_eq!(info.class, "foot");
+        assert_eq!(info.address, "55d89bdb6a70", "0x prefix must be stripped");
+        assert_eq!(info.title, "◑ hyprpad");
+        assert_eq!(info.pid, Some(3996259));
+        assert!(!info.fullscreen);
+        // No window focused: empty class, empty address, nothing to seed.
+        let none = parse_active_window("{}");
+        assert!(none.class.is_empty() && none.address.is_empty());
+    }
 
     /// A real `j/activewindow` reply from the live compositor (Hyprland 0.56.2,
     /// HypXRland fork), trimmed to the fields this module reads plus enough
