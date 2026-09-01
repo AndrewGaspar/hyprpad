@@ -548,6 +548,10 @@ fn reset_frame_state(
             ptr.button(PointerButton::Left, false);
             cursor.left_down = false;
         }
+        if cursor.right_down {
+            ptr.button(PointerButton::Right, false);
+            cursor.right_down = false;
+        }
     }
     *engine = GestureEngine::new();
     cursor.damper.reset();
@@ -580,6 +584,9 @@ struct CursorState {
     sens: f64,
     /// Whether the synthetic left mouse button is currently held.
     left_down: bool,
+    /// Whether the synthetic right mouse button is currently held (full left
+    /// trigger pull → right click on the desktop).
+    right_down: bool,
     /// Pixels of cursor travel accumulated toward the next haptic texture tick
     /// (`[haptics] cursor` / `cursor_spacing_px`). Reset on lift so a re-touch
     /// starts a fresh spacing.
@@ -592,6 +599,7 @@ impl CursorState {
             damper: damper_from(cfg),
             sens: cfg.sens,
             left_down: false,
+            right_down: false,
             travel_px: 0.0,
         }
     }
@@ -627,6 +635,10 @@ fn drive_cursor(
         if st.left_down {
             ptr.button(PointerButton::Left, false);
             st.left_down = false;
+        }
+        if st.right_down {
+            ptr.button(PointerButton::Right, false);
+            st.right_down = false;
         }
         st.damper.reset();
         st.travel_px = 0.0;
@@ -666,6 +678,13 @@ fn drive_cursor(
     if want_down != st.left_down {
         ptr.button(PointerButton::Left, want_down);
         st.left_down = want_down;
+    }
+
+    // A full left-trigger pull is a right click.
+    let want_right = frame.pressed(report::Button::TriggerL2Full);
+    if want_right != st.right_down {
+        ptr.button(PointerButton::Right, want_right);
+        st.right_down = want_right;
     }
 }
 
