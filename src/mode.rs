@@ -1,0 +1,661 @@
+//! Modality: which named context the controller is in, and what that makes live.
+//!
+//! This subsumes [`crate::arbitrate`]'s binary "is a game focused" gate and
+//! generalizes it per docs/13, with the owner's decisions of 2026-09-01 baked
+//! in:
+//!
+//! * **A mode is a named context, nothing more.** It carries a selection rule
+//!   and a `forward` flag; it does *not* carry category switches.
+//! * **Guards are per binding, not per category.** Every `h.bind` / `h.button`
+//!   / `h.osk_button`, and the `h.cursor` / `h.scroll` "virtual bindings",
+//!   decide for themselves where they are live ([`crate::config::Guard`]).
+//!   "Game passthrough" is then *"nothing but the guide chords is guarded into
+//!   `game`"*, expressed one binding at a time.
+//! * **Fullscreen is not a game trigger.** `ctx.focus.fullscreen` is available
+//!   to a rule that explicitly wants it; nothing ships using it.
+//! * **A manual override is first class** and beats the rules.
+//!
+//! ## Resolution
+//!
+//! ```text
+//! manual override  >  first matching mode rule (definition order)  >  default_mode
+//! ```
+//!
+//! Rules and `:when` guards are Lua predicates, and they run **on a context
+//! change only** — a focus change, a fullscreen change, a manual override, a
+//! config reload. Never per input frame: the resolved mode, the guard results,
+//! and the filtered button maps are all cached in this struct, and the
+//! per-frame handlers only read them.
+//!
+//! ## The built-in behaviour
+//!
+//! A config that declares no modes at all — every `config.toml`, and a
+//! `config.lua` that never calls `h.mode` — gets the daemon's original
+//! behaviour: a `game` mode selected by [`Arbiter`]'s window-class match, with
+//! the cursor, scroll and bare buttons live only on the desktop and the guide
+//! chords live everywhere. So adopting the Lua front-end is opt-in twice over:
+//! once for the file, once for the modes.
+
+use crate::arbitrate::Arbiter;
+use crate::config::{Config, ModeState};
+use crate::gesture::GestureEvent;
+use crate::report;
+use std::collections::HashMap;
+
+/// The name the built-in (no modes declared) behaviour uses for "a game window
+/// holds focus", and the name a `config.lua` conventionally gives the same
+/// mode. Only the built-in path depends on the spelling.
+pub const BUILTIN_GAME: &str = "game";
+
+/// The name the built-in behaviour uses for "ordinary desktop use", and the
+/// default `default_mode`.
+pub const BUILTIN_DESKTOP: &str = "desktop";
+
+/// The observable world a mode rule selects on: the focused window.
+///
+/// Fed by `activewindow` from the compositor's event socket (class, title) plus
+/// a one-shot `j/activewindow` query for the fields the event stream does not
+/// carry (pid, fullscreen). Reaches Lua as `ctx.focus`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Focus {
+    /// The focused window's class, or empty when focus is on the desktop.
+    pub class: String,
+    /// The focused window's title.
+    pub title: String,
+    /// The focused window's pid, when known. `None` means the daemon did not
+    /// (or could not) ask — `ctx.focus:process_tree_has(..)` then answers
+    /// `false` rather than guessing.
+    pub pid: Option<i32>,
+    /// Whether the focused window is fullscreen. **Not** a game signal: it is
+    /// available to a rule that asks for it and nothing more (docs/13 decision
+    /// #2 — a fullscreen video is not a game).
+    pub fullscreen: bool,
+}
+
+/// Tracks context, resolves the active mode, and caches everything the
+/// per-frame handlers need to know about it.
+#[derive(Debug)]
+pub struct ModeEngine {
+    focus: Focus,
+    /// The manual override, top of the precedence. `Some` until a
+    /// [`crate::config::Action::ClearMode`].
+    manual: Option<String>,
+    /// The built-in game-class matcher, used only when the config declares no
+    /// modes. Keeping the original type here is deliberate: the no-modes path
+    /// is *literally* the behaviour it always had, not a re-implementation.
+    arbiter: Arbiter,
+    /// The resolved snapshot every guard is evaluated against.
+    state: ModeState,
+    /// The active mode hands raw input to the virtual gamepad.
+    forwards: bool,
+    cursor: bool,
+    scroll: bool,
+    buttons: HashMap<report::Button, u16>,
+    osk_buttons: HashMap<report::Button, u16>,
+}
+
+impl ModeEngine {
+    /// Build an engine for `config` and resolve the initial mode (no window
+    /// focused yet, so the default mode unless a rule matches an empty focus).
+    pub fn new(config: &Config) -> ModeEngine {
+        let mut me = ModeEngine {
+            focus: Focus::default(),
+            manual: None,
+            arbiter: Arbiter::new(),
+            state: ModeState::default(),
+            forwards: false,
+            cursor: true,
+            scroll: true,
+            buttons: HashMap::new(),
+            osk_buttons: HashMap::new(),
+        };
+        me.refresh(config);
+        me
+    }
+
+    // --- context changes (each returns "did the active mode change?") -----
+
+    /// The focused window changed. Returns whether that moved the active mode,
+    /// which the caller answers with the clean handoff.
+    ///
+    /// The focused window's fullscreen state is carried over; use
+    /// [`context_changed`](Self::context_changed) when the caller knows it, so
+    /// the rules see one complete new context rather than two partial ones.
+    pub fn focus_changed(
+        &mut self,
+        config: &Config,
+        class: &str,
+        title: &str,
+        pid: Option<i32>,
+    ) -> bool {
+        self.context_changed(
+            config,
+            Focus {
+                class: class.to_string(),
+                title: title.to_string(),
+                pid,
+                fullscreen: self.focus.fullscreen,
+            },
+        )
+    }
+
+    /// Replace the whole focus context and re-resolve **once**.
+    ///
+    /// One call, one re-resolve: a predicate must never see a half-updated
+    /// context (the new window's pid against the old window's class), and a
+    /// transient mismatch must never be reported as a mode transition and
+    /// trigger a spurious handoff.
+    pub fn context_changed(&mut self, config: &Config, focus: Focus) -> bool {
+        self.arbiter.focus_changed(&focus.class);
+        self.arbiter.set_fullscreen(focus.fullscreen);
+        self.focus = focus;
+        self.refresh(config)
+    }
+
+    /// The focused window's fullscreen state changed.
+    pub fn set_fullscreen(&mut self, config: &Config, on: bool) -> bool {
+        self.arbiter.set_fullscreen(on);
+        self.focus.fullscreen = on;
+        self.refresh(config)
+    }
+
+    /// Force `name` as the active mode, overriding the rules
+    /// ([`crate::config::Action::SetMode`]).
+    pub fn set_mode(&mut self, config: &Config, name: &str) -> bool {
+        self.manual = Some(name.to_string());
+        // The built-in path has no mode table to consult, so tell the arbiter
+        // directly: forcing anything but `game` is the "force desktop" override
+        // it already models.
+        self.arbiter.set_force_desktop(name != BUILTIN_GAME);
+        self.refresh(config)
+    }
+
+    /// Drop the manual override so the rules decide again
+    /// ([`crate::config::Action::ClearMode`]).
+    pub fn clear_mode(&mut self, config: &Config) -> bool {
+        self.manual = None;
+        self.arbiter.set_force_desktop(false);
+        self.refresh(config)
+    }
+
+    /// Re-resolve against a freshly loaded config (the `hyprpad reload` path).
+    ///
+    /// The context is kept — the same window is still focused — but every rule
+    /// and guard is re-evaluated against the new config, and a manual override
+    /// naming a mode the new config does not declare is dropped rather than
+    /// stranding the daemon in a mode that no longer exists.
+    pub fn reconfigure(&mut self, config: &Config) -> bool {
+        if let Some(name) = self.manual.clone() {
+            if !config.modes().is_empty() && !config.modes().iter().any(|m| m.name == name) {
+                eprintln!(
+                    "hyprpad: manual mode override '{name}' is not declared by the new config; \
+                     dropping it"
+                );
+                self.manual = None;
+                self.arbiter.set_force_desktop(false);
+            }
+        }
+        self.refresh(config)
+    }
+
+    // --- reads (per frame; all cached) ------------------------------------
+
+    /// The active mode's name.
+    pub fn active(&self) -> &str {
+        self.state.active()
+    }
+
+    /// The resolved snapshot, for `Config::resolve_in` and friends.
+    pub fn state(&self) -> &ModeState {
+        &self.state
+    }
+
+    /// Whether the active mode hands raw input to the game
+    /// (`h.mode("game", { forward = true })`, or the built-in game match).
+    pub fn forwards(&self) -> bool {
+        self.forwards
+    }
+
+    /// Whether the ambient desktop layer has actually let go of the pads in
+    /// this mode — i.e. neither the cursor nor scroll is live.
+    ///
+    /// This is the mode model's spelling of the old `Arbiter::suppressed()`,
+    /// and the second half of the forwarding gate: forwarding requires both
+    /// that the mode *wants* it and that the desktop layer has yielded, which
+    /// is what keeps ranks 3 and 4 of the precedence mutually exclusive
+    /// (see `crate::run::gamepad_forwarding`).
+    pub fn desktop_yielded(&self) -> bool {
+        !self.cursor && !self.scroll
+    }
+
+    /// Whether the right pad drives the desktop cursor in this mode.
+    pub fn cursor_enabled(&self) -> bool {
+        self.cursor
+    }
+
+    /// Whether the left pad scrolls in this mode.
+    pub fn scroll_enabled(&self) -> bool {
+        self.scroll
+    }
+
+    /// The bare-button bindings live in this mode.
+    pub fn buttons(&self) -> &HashMap<report::Button, u16> {
+        &self.buttons
+    }
+
+    /// The OSK-helper bindings live in this mode.
+    pub fn osk_buttons(&self) -> &HashMap<report::Button, u16> {
+        &self.osk_buttons
+    }
+
+    /// Whether the binding on `ev` is live in this mode.
+    ///
+    /// `guide_scoped` is the caller's "this gesture carries the guide
+    /// modifier" judgement, which the built-in path honours exactly as the
+    /// original `arbiter.suppressed() && !is_guide_scoped(..)` line did. With
+    /// declared modes the per-binding guard decides instead — including for
+    /// guide chords, which is the whole point of per-binding granularity.
+    pub fn allows_gesture(&self, config: &Config, ev: &GestureEvent, guide_scoped: bool) -> bool {
+        if config.modes().is_empty() {
+            return guide_scoped || !self.arbiter.suppressed();
+        }
+        config.gesture_guard(ev).allows(&self.state)
+    }
+
+    // --- resolution -------------------------------------------------------
+
+    /// Re-resolve the active mode and rebuild every cached view. Returns
+    /// whether the active mode actually changed.
+    fn refresh(&mut self, config: &Config) -> bool {
+        let before = self.state.active().to_string();
+
+        if config.modes().is_empty() {
+            self.refresh_builtin(config);
+        } else {
+            self.refresh_declared(config);
+        }
+
+        let changed = self.state.active() != before;
+        if changed && self.forwards && !self.desktop_yielded() {
+            // A mode that forwards while the cursor or scroll is still live
+            // would have two layers driving at once, so the forwarding gate
+            // holds off — silently, which would be a mystery. Say so.
+            eprintln!(
+                "warning: mode '{}' sets forward = true but leaves the cursor/scroll live; \
+                 guard them (h.cursor {{ only_in = {{ \"desktop\" }} }}) or the virtual \
+                 gamepad will not engage",
+                self.state.active()
+            );
+        }
+        changed
+    }
+
+    /// The no-modes-declared path: today's `Arbiter` behaviour, expressed in
+    /// the mode vocabulary.
+    fn refresh_builtin(&mut self, config: &Config) {
+        let game = match self.manual.as_deref() {
+            Some(name) => name == BUILTIN_GAME,
+            None => self.arbiter.suppressed(),
+        };
+        let active = match (&self.manual, game) {
+            (Some(name), _) => name.clone(),
+            (None, true) => BUILTIN_GAME.to_string(),
+            (None, false) => BUILTIN_DESKTOP.to_string(),
+        };
+        self.state = ModeState::new(active, Vec::new());
+        self.cursor = !game;
+        self.scroll = !game;
+        self.forwards = game;
+        self.buttons = if game { HashMap::new() } else { config.buttons().clone() };
+        self.osk_buttons = config.osk_buttons().clone();
+    }
+
+    /// The declared-modes path: evaluate every predicate once, pick a mode,
+    /// then filter every binding through its guard.
+    fn refresh_declared(&mut self, config: &Config) {
+        // One pass over the predicates, so a predicate shared by a rule and a
+        // guard runs exactly once per context change.
+        let slots = config.predicate_slots();
+        let mut results = vec![false; slots];
+        if let Some(rt) = config.lua() {
+            for (i, slot) in results.iter_mut().enumerate() {
+                *slot = rt.eval_predicate(i, &self.focus);
+            }
+        }
+
+        // Precedence: manual override > first matching rule > default_mode.
+        let active = match &self.manual {
+            Some(name) => name.clone(),
+            None => config
+                .modes()
+                .iter()
+                .find(|m| m.rule.is_some_and(|i| results.get(i).copied().unwrap_or(false)))
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| config.default_mode().to_string()),
+        };
+
+        self.forwards = config
+            .modes()
+            .iter()
+            .find(|m| m.name == active)
+            .is_some_and(|m| m.forward);
+
+        self.state = ModeState::new(active, results);
+        self.cursor = config.cursor_enabled_in(&self.state);
+        self.scroll = config.scroll_enabled_in(&self.state);
+        self.buttons = config.buttons_in(&self.state);
+        self.osk_buttons = config.osk_buttons_in(&self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Action;
+    use crate::lua_config::load_str;
+    use crate::report::Button;
+
+    fn lua(src: &str) -> Config {
+        load_str(src, "test.lua").expect("config should load")
+    }
+
+    /// The shape the shipped sample uses: a game mode selected by class, with
+    /// the ambient handlers guarded onto the desktop and the chords unguarded.
+    const GAME_CONFIG: &str = r#"
+        local h = hyprpad
+        h.mode("game", { forward = true }).when(function(ctx)
+          return ctx.focus.class:match("^steam_app_") ~= nil
+              or ctx.focus.class == "steam"
+        end)
+        h.mode("claude").when(function(ctx)
+          return ctx.focus:process_tree_has("definitely-not-running-anywhere")
+        end)
+        h.mode("desktop")
+        h.default_mode "desktop"
+
+        h.cursor { only_in = { "desktop" } }
+        h.scroll { only_in = { "desktop" } }
+        h.button("dpad_up", h.key "up"):only_in("desktop")
+        h.osk_button("y", h.key "space")
+        h.bind("guide+r1", h.workspace "+1")
+        h.bind("guide+l1", h.workspace "-1"):not_in("game")
+    "#;
+
+    #[test]
+    fn no_modes_declared_keeps_the_original_arbiter_behaviour() {
+        let c = Config::load_default();
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.active(), BUILTIN_DESKTOP);
+        assert!(m.cursor_enabled() && m.scroll_enabled() && !m.forwards());
+        assert_eq!(m.buttons().len(), c.buttons().len());
+
+        assert!(m.focus_changed(&c, "steam_app_413080", "Portal 2", None));
+        assert_eq!(m.active(), BUILTIN_GAME);
+        assert!(!m.cursor_enabled() && !m.scroll_enabled());
+        assert!(m.forwards() && m.desktop_yielded());
+        assert!(m.buttons().is_empty());
+
+        assert!(m.focus_changed(&c, "foot", "shell", None));
+        assert_eq!(m.active(), BUILTIN_DESKTOP);
+        assert!(!m.forwards());
+    }
+
+    #[test]
+    fn the_builtin_path_still_lets_guide_chords_through_a_game() {
+        let c = Config::load_default();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "gamescope", "", None);
+        let chord = GestureEvent::GuideChord(Button::BumperR1);
+        assert!(m.allows_gesture(&c, &chord, true), "guide chords survive a game");
+        assert!(!m.allows_gesture(&c, &chord, false), "ambient gestures do not");
+    }
+
+    #[test]
+    fn declared_modes_resolve_first_match_in_definition_order() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.active(), "desktop", "no rule matches an empty focus");
+
+        assert!(m.focus_changed(&c, "steam_app_413080", "Portal 2", None));
+        assert_eq!(m.active(), "game");
+
+        assert!(m.focus_changed(&c, "org.mozilla.firefox", "web", None));
+        assert_eq!(m.active(), "desktop");
+
+        assert!(!m.focus_changed(&c, "foot", "shell", None), "desktop -> desktop is no change");
+    }
+
+    #[test]
+    fn a_matching_rule_beats_the_default_and_the_default_catches_the_rest() {
+        let c = lua(
+            r#"
+            hyprpad.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class == "steam"
+            end)
+            hyprpad.mode("desktop")
+            hyprpad.default_mode "desktop"
+            "#,
+        );
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam", "Steam", None);
+        assert_eq!(m.active(), "game");
+        m.focus_changed(&c, "anything-else", "", None);
+        assert_eq!(m.active(), "desktop");
+    }
+
+    #[test]
+    fn the_manual_override_beats_a_matching_rule() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam_app_1", "", None);
+        assert_eq!(m.active(), "game");
+
+        // Force the desktop back over a running game...
+        assert!(m.set_mode(&c, "desktop"));
+        assert_eq!(m.active(), "desktop");
+        assert!(m.cursor_enabled() && !m.forwards());
+
+        // ...and it sticks across a focus change, because it is an override.
+        m.focus_changed(&c, "steam_app_2", "", None);
+        assert_eq!(m.active(), "desktop");
+
+        // Clearing it hands control back to the rules, which still match.
+        assert!(m.clear_mode(&c));
+        assert_eq!(m.active(), "game");
+        assert!(m.forwards());
+    }
+
+    #[test]
+    fn the_manual_override_works_on_the_builtin_path_too() {
+        let c = Config::load_default();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam_app_1", "", None);
+        assert!(m.forwards());
+        m.set_mode(&c, BUILTIN_DESKTOP);
+        assert_eq!(m.active(), BUILTIN_DESKTOP);
+        assert!(m.cursor_enabled() && !m.forwards());
+        m.clear_mode(&c);
+        assert!(m.forwards());
+    }
+
+    #[test]
+    fn guards_gate_bindings_per_thing_not_per_category() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "shell", None);
+
+        // Desktop: everything live.
+        assert!(m.cursor_enabled() && m.scroll_enabled());
+        assert_eq!(m.buttons().get(&Button::DpadUp), Some(&103));
+        assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperL1), true));
+
+        m.focus_changed(&c, "steam_app_1", "", None);
+        // Game: the ambient handlers are off, the guarded chord is off, and the
+        // unguarded chord — the escape hatch — is still live.
+        assert!(!m.cursor_enabled() && !m.scroll_enabled());
+        assert!(m.buttons().is_empty());
+        assert!(!m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperL1), true));
+        assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperR1), true));
+        // An unguarded osk_button is live everywhere, which is the point of
+        // per-binding granularity: `osk` is not a category that switches.
+        assert_eq!(m.osk_buttons().get(&Button::Y), Some(&57));
+    }
+
+    #[test]
+    fn a_guarded_binding_resolves_to_none_rather_than_firing() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam_app_1", "", None);
+        assert_eq!(
+            c.resolve_in(&GestureEvent::GuideChord(Button::BumperL1), m.state()),
+            Action::None
+        );
+        assert_ne!(
+            c.resolve_in(&GestureEvent::GuideChord(Button::BumperR1), m.state()),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn a_runaway_rule_does_not_wedge_resolution() {
+        let c = lua(
+            r#"
+            hyprpad.mode("spin").when(function(ctx) while true do end end)
+            hyprpad.mode("desktop")
+            hyprpad.default_mode "desktop"
+            "#,
+        );
+        let t0 = std::time::Instant::now();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "", None);
+        // Cut by the watchdog, counted as no match, so the default wins.
+        assert_eq!(m.active(), "desktop");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn reconfigure_re_resolves_against_the_new_rules() {
+        let old = lua(
+            r#"
+            hyprpad.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class == "steam"
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&old);
+        m.focus_changed(&old, "steam", "Steam", None);
+        assert_eq!(m.active(), "game");
+
+        // A reload whose rules no longer match this window moves us out.
+        let new = lua(
+            r#"
+            hyprpad.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class == "gamescope"
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        assert!(m.reconfigure(&new));
+        assert_eq!(m.active(), "desktop");
+    }
+
+    #[test]
+    fn reconfigure_drops_an_override_the_new_config_no_longer_declares() {
+        let old = lua(r#"hyprpad.mode("cinema") hyprpad.mode("desktop")"#);
+        let mut m = ModeEngine::new(&old);
+        m.set_mode(&old, "cinema");
+        assert_eq!(m.active(), "cinema");
+
+        let new = lua(r#"hyprpad.mode("desktop")"#);
+        m.reconfigure(&new);
+        assert_eq!(m.active(), "desktop");
+    }
+
+    #[test]
+    fn fullscreen_is_available_to_a_rule_but_triggers_nothing_by_itself() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "mpv", "Big Buck Bunny", None);
+        assert!(!m.set_fullscreen(&c, true), "fullscreen alone is not a game");
+        assert_eq!(m.active(), "desktop");
+
+        let opt_in = lua(
+            r#"
+            hyprpad.mode("cinema").when(function(ctx) return ctx.focus.fullscreen end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&opt_in);
+        m.focus_changed(&opt_in, "mpv", "", None);
+        assert_eq!(m.active(), "desktop");
+        assert!(m.set_fullscreen(&opt_in, true));
+        assert_eq!(m.active(), "cinema");
+    }
+
+    #[test]
+    fn the_shipped_sample_config_delivers_the_game_passthrough() {
+        // End to end on the file the owner will actually drop in: the game
+        // classes select `game`, everything ambient goes quiet, the guide
+        // chords survive, and the pad is handed to the game.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/config.lua"
+        ))
+        .expect("config/config.lua");
+        let c = load_str(&src, "config/config.lua").expect("sample config should load");
+        let mut m = ModeEngine::new(&c);
+
+        m.focus_changed(&c, "foot", "ajg@framework", None);
+        assert_eq!(m.active(), "desktop");
+        assert!(m.cursor_enabled() && m.scroll_enabled() && !m.forwards());
+        assert_eq!(m.buttons().len(), 6, "d-pad + A + B");
+
+        for class in [
+            "steam_app_413080",
+            "steam_proton_x",
+            "gamescope",
+            "steam",
+            "steamwebhelper",
+            "Steam_App_570", // the class match is case-insensitive
+        ] {
+            m.focus_changed(&c, class, "", None);
+            assert_eq!(m.active(), "game", "class {class} should select game mode");
+            assert!(!m.cursor_enabled() && !m.scroll_enabled(), "{class}");
+            assert!(m.buttons().is_empty(), "{class}");
+            assert!(m.forwards() && m.desktop_yielded(), "{class}");
+            // The escape hatch: every guide chord still resolves.
+            assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperR1), true));
+            assert_ne!(
+                c.resolve_in(&GestureEvent::GuideChord(Button::Y), m.state()),
+                Action::None,
+                "guide+Y must still raise the keyboard over a game"
+            );
+            // ...and so do the OSK helpers it needs once it is up.
+            assert_eq!(m.osk_buttons().get(&Button::Y), Some(&57));
+        }
+
+        // A fullscreen video is not a game (docs/13 decision #2).
+        m.focus_changed(&c, "mpv", "Big Buck Bunny", None);
+        m.set_fullscreen(&c, true);
+        assert_eq!(m.active(), "desktop");
+        assert!(m.cursor_enabled() && !m.forwards());
+    }
+
+    #[test]
+    fn a_forwarding_mode_that_leaves_the_cursor_live_does_not_claim_the_pad() {
+        // The gate needs both halves; this is the case the warning is about.
+        let c = lua(
+            r#"
+            hyprpad.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class == "steam"
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "steam", "", None);
+        assert!(m.forwards());
+        assert!(!m.desktop_yielded(), "cursor is unguarded, so the desktop still holds the pads");
+    }
+}

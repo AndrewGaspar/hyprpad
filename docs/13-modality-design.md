@@ -191,6 +191,51 @@ pad, reset dampers) so nothing strands across a mode switch.
 model; it stays only as the conceptual bridge from today's binary arbiter. The
 final schema is deferred to the config-format (Lua vs TOML) recommendation.
 
+## Implemented shape (branch `feat-lua-config`)
+
+The config-format question landed on `docs/research/lua-config.md`'s option D2,
+so the schema above is superseded by the Lua one. What shipped:
+
+- `src/mode.rs` — `ModeEngine`, which subsumes `Arbiter` as the daemon's gate.
+  It *embeds* an `Arbiter` for the built-in path, so a config that declares no
+  modes (every `config.toml`) keeps today's behaviour exactly rather than a
+  re-implementation of it.
+- `src/lua_config.rs` — the `config.lua` front-end and the `hyprpad` API.
+- `src/config.rs` — `ModeDef`, `Guard`, `ModeState`, `Action::SetMode` /
+  `Action::ClearMode`, and the dual-front-end `Config::load`.
+- `config/config.lua` — the owner's live `config.toml` translated 1:1, plus the
+  game mode, the guards, and a commented Claude-Code mode.
+
+Schema, in the shape the owner's decisions asked for:
+
+```lua
+h.mode("game", { forward = true }).when(function(ctx)
+  return ctx.focus.class:lower():match("^steam_app_") ~= nil
+end)
+h.mode("claude").when(function(ctx) return ctx.focus:process_tree_has("claude") end)
+h.mode("desktop")
+h.default_mode "desktop"
+
+h.cursor { only_in = { "desktop" } }              -- ambient handlers are guardable
+h.button("a", h.key "enter"):only_in("desktop")   -- per binding, not per category
+h.bind("guide+r1", h.workspace "+1")              -- unguarded: the escape hatch
+h.bind("guide+view", h.set_mode "desktop")        -- manual override, first class
+```
+
+Deltas from the proposal above, all following from the owner's decisions:
+
+| proposed | shipped |
+|---|---|
+| category flags per mode (`cursor = false` …) | **gone** — a mode is a name + rule + `forward`; every binding carries its own guard |
+| `focus_fullscreen` as a game trigger | **dropped** — `ctx.focus.fullscreen` exists, nothing ships using it |
+| `[[mode_when]]` glob lists | Lua predicates over `ctx` |
+| per-mode binding *overrides* | not built — guards cover the near-term need; a mode that wants a different action for the same chord still needs this (see open items) |
+| `focus_process` glob condition | `ctx.focus:process_tree_has(name)`, cached per focused pid |
+
+Still open: the slow-timer `/proc` re-walk (so starting `claude` in an
+already-focused terminal switches mode without a refocus), per-mode binding
+overrides, and the further conditions (process_running, time, battery).
+
 ## Open questions for the owner (superseded — see decisions above)
 
 1. **Category granularity** — is the six-category set (cursor/scroll/buttons/
