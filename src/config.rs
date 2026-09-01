@@ -389,6 +389,11 @@ pub struct Config {
     /// from `bindings`, which are guide chords. Maps the button to its `KEY_*`
     /// code; the default maps the D-pad to the arrow keys.
     buttons: HashMap<report::Button, u16>,
+    /// OSK-helper buttons (the `[osk_buttons]` section): while the on-screen
+    /// keyboard is up, these buttons send a raw key THROUGH the OSK (its uinput
+    /// types it), Deck-style. Default: `Y` = Space, `X` = Backspace. Distinct
+    /// from `buttons`, which fire only when the OSK is down.
+    osk_buttons: HashMap<report::Button, u16>,
     /// Whether hyprpad should take ownership of the puck's lizard mode and keep
     /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
     /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
@@ -423,6 +428,13 @@ dpad_down = "key down"
 dpad_left = "key left"
 dpad_right = "key right"
 
+# OSK helper buttons: while the on-screen keyboard is up, these send a raw key
+# THROUGH the OSK (its virtual keyboard types it), like the Steam Deck's
+# keyboard chords. Y taps Space, X taps Backspace — no cursor hunting.
+[osk_buttons]
+y = "key space"
+x = "key backspace"
+
 # Left trackpad scrolls the desktop (ambient) layer; the right pad keeps driving
 # the cursor. All knobs are tunable starting points.
 [scroll]
@@ -439,6 +451,7 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Result<Config, String> {
         let mut bindings = HashMap::new();
         let mut buttons = HashMap::new();
+        let mut osk_buttons = HashMap::new();
         let mut own_lizard = false;
         let mut cursor = CursorConfig::default();
         let mut scroll = ScrollConfig::default();
@@ -481,6 +494,25 @@ impl Config {
                         _ => {
                             return Err(format!(
                                 "line {lineno}: [buttons] values must be a 'key <name>' action"
+                            ));
+                        }
+                    }
+                }
+                // OSK helper buttons: while the on-screen keyboard is up, the
+                // button sends its key THROUGH the OSK (Deck-style Y=Space,
+                // X=Backspace). Same button names and `key <name>` values.
+                "osk_buttons" => {
+                    let button = parse_button(&unquote(k).trim().to_ascii_lowercase())
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    let action = Action::parse(&unquote(v))
+                        .map_err(|e| format!("line {lineno}: {e}"))?;
+                    match action {
+                        Action::Key(code) => {
+                            osk_buttons.insert(button, code);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "line {lineno}: [osk_buttons] values must be a 'key <name>' action"
                             ));
                         }
                     }
@@ -559,7 +591,7 @@ impl Config {
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, buttons, own_lizard, cursor, scroll })
+        Ok(Config { bindings, buttons, osk_buttons, own_lizard, cursor, scroll })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -630,6 +662,13 @@ impl Config {
     /// default maps the D-pad to the arrow keys.
     pub fn buttons(&self) -> &HashMap<report::Button, u16> {
         &self.buttons
+    }
+
+    /// The OSK helper buttons (`[osk_buttons]` section): while the on-screen
+    /// keyboard is up, each of these taps its key through the OSK's virtual
+    /// keyboard (Deck-style; default `Y` = Space, `X` = Backspace).
+    pub fn osk_buttons(&self) -> &HashMap<report::Button, u16> {
+        &self.osk_buttons
     }
 
     /// Whether hyprpad should take ownership of the puck's lizard mode

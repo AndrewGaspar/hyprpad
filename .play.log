@@ -1,5 +1,9 @@
 hyprpad: config loaded from /home/ajg/.config/hyprpad/config.toml
+hyprpad: pidfile /run/user/1000/hyprpad.pid (reload with `hyprpad reload`)
 hyprpad: 5 controller node(s), Hyprland IPC connected
 hyprpad: lizard-mode ownership on; taking over the puck's firmware kbd/mouse
 hyprpad: virtual pointer ready (right trackpad drives the cursor)
+hyprpad: virtual keyboard ready (bare D-pad drives the arrow keys)
 hyprpad: lizard mode disabled on the puck (owning it)
+hyprpad: config reloaded
+warning: lizard-mode disable pending: no controller to configure: all 5 puck node(s) STALLed (controller asleep or disconnected) (retrying)

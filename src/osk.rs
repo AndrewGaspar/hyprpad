@@ -82,6 +82,13 @@ fn commit_cmd(pad: OskPad) -> String {
     format!("commit {}", pad.wire())
 }
 
+/// Format a `key` command line: the OSK taps this raw evdev keycode on its
+/// virtual keyboard. Used by the Deck-style helper buttons (`[osk_buttons]`,
+/// e.g. Y = Space) so common keys need no cursor hunting.
+fn key_cmd(keycode: u16) -> String {
+    format!("key {keycode}")
+}
+
 /// A live handle to the on-screen keyboard child process.
 ///
 /// Construct once, up front — nothing is spawned until the first
@@ -151,6 +158,16 @@ impl OskHandle {
             return;
         }
         self.send(&commit_cmd(pad));
+    }
+
+    /// Tap a raw evdev keycode through the OSK's virtual keyboard (the
+    /// `[osk_buttons]` Deck-style helpers, e.g. Y = Space, X = Backspace).
+    /// Ignored unless the keyboard is shown.
+    pub fn key(&mut self, keycode: u16) {
+        if !self.active {
+            return;
+        }
+        self.send(&key_cmd(keycode));
     }
 
     /// Ensure a child is running; returns whether we have a usable control

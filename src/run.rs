@@ -264,7 +264,7 @@ pub fn run() -> std::io::Result<()> {
                     // desktop cursor and scroll released (guide/suppressed = true
                     // forces the drop-and-forget branch of `drive_cursor` /
                     // `drive_scroll`).
-                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route, now);
+                    route_osk(&mut osk, &frame, &prev_frame, &mut osk_route, config.osk_buttons(), now);
                     if let Some(ptr) = pointer.as_mut() {
                         drive_cursor(ptr, &frame, &mut cursor, true, true, now);
                         drive_scroll(ptr, &frame, &mut scroll, true, true, now);
@@ -1058,6 +1058,7 @@ fn route_osk(
     frame: &report::Frame,
     prev: &report::Frame,
     st: &mut OskRoute,
+    osk_buttons: &HashMap<report::Button, u16>,
     now: Instant,
 ) {
     use report::Button::*;
@@ -1075,12 +1076,19 @@ fn route_osk(
     route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.right, now);
 
     // Commit on click-down (the Deck commits on click, not release). A full
-    // trigger pull on the same side is an alternate commit.
+    // trigger pull on the same side is an alternate commit. Other buttons may be
+    // Deck-style helpers (`[osk_buttons]`, e.g. Y = Space, X = Backspace): they
+    // tap their key through the OSK's virtual keyboard. Dismiss (B/Menu) and the
+    // commit buttons take precedence over a helper binding.
     for b in frame.edges_down(prev) {
         match b {
             PadLeftClick | TriggerL2Full => osk.commit(OskPad::Left),
             PadRightClick | TriggerR2Full => osk.commit(OskPad::Right),
-            _ => {}
+            _ => {
+                if let Some(&code) = osk_buttons.get(&b) {
+                    osk.key(code);
+                }
+            }
         }
     }
 }
