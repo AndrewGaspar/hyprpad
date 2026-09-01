@@ -55,6 +55,7 @@
 //! itself is sound; only the focus outcome could not be demonstrated in that
 //! environment.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -180,6 +181,24 @@ impl Hypr {
         Ok(parse_active_window(&json))
     }
 
+    /// The namespaces of every layer-shell surface currently on screen, from
+    /// `j/layers`.
+    ///
+    /// The startup counterpart of [`HyprEvent::Layer`]: the event socket
+    /// announces only *changes*, so a daemon (re)started while the cheat sheet
+    /// — or, in future, the OSK — is already up would otherwise never know it
+    /// is there, and would sit in the wrong mode until the overlay was closed
+    /// and reopened. Called once, at startup, and only when a config actually
+    /// declares modes.
+    ///
+    /// Verified against the live compositor: the reply nests
+    /// monitor → `levels` → level → an array of surfaces, each with a
+    /// `"namespace"`, and the cheat sheet shows up as `hyprpad-cheatsheet` on
+    /// level 3 alongside `omarchy-bar` and `omarchy-background`.
+    pub fn open_layers(&self) -> io::Result<BTreeSet<String>> {
+        Ok(parse_layer_namespaces(&self.query("layers")?))
+    }
+
     /// Fire-and-forget exec of a shell command, detached from our stdio. A
     /// short-lived reaper thread waits on the child so it never lingers as a
     /// zombie; if the daemon exits first the child is simply reparented and
@@ -266,8 +285,17 @@ fn json_number(json: &str, field: &str) -> Option<i64> {
 /// `"initialTitle":`.
 fn json_string(json: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\":");
-    let rest = json[json.find(&needle)? + needle.len()..].trim_start();
-    let mut chars = rest.strip_prefix('"')?.chars();
+    json_string_at(&json[json.find(&needle)? + needle.len()..])
+}
+
+/// Read the JSON string value that starts at `rest` (leading whitespace
+/// allowed), undoing the two escapes Hyprland's writer emits.
+///
+/// Split out of [`json_string`] because a `j/layers` reply carries the *same*
+/// field many times over and [`parse_layer_namespaces`] wants every one of
+/// them, not the first.
+fn json_string_at(rest: &str) -> Option<String> {
+    let mut chars = rest.trim_start().strip_prefix('"')?.chars();
     let mut out = String::new();
     while let Some(c) = chars.next() {
         match c {
@@ -277,6 +305,30 @@ fn json_string(json: &str, field: &str) -> Option<String> {
         }
     }
     None // unterminated string: a truncated reply, not a title
+}
+
+/// Every `namespace` in a `j/layers` reply, deduplicated and sorted.
+///
+/// Same four-line-scanner ethos as [`json_string`], one `find` per hit: the
+/// reply's nesting (monitor → `levels` → level → surfaces) carries no
+/// information we want, because *every* object in it is a layer surface, so the
+/// open namespaces are simply every `"namespace"` field in the document. A
+/// nameless surface is dropped — there is nothing a rule could ask about it.
+///
+/// Crate-visible so [`crate::mode`]'s startup-seed test can drive the whole
+/// path — captured reply in, resolved mode out — rather than hand-writing the
+/// set this produces and hoping the two agree.
+pub(crate) fn parse_layer_namespaces(json: &str) -> BTreeSet<String> {
+    const NEEDLE: &str = "\"namespace\":";
+    let mut out = BTreeSet::new();
+    let mut rest = json;
+    while let Some(at) = rest.find(NEEDLE) {
+        rest = &rest[at + NEEDLE.len()..];
+        if let Some(ns) = json_string_at(rest).filter(|ns| !ns.is_empty()) {
+            out.insert(ns);
+        }
+    }
+    out
 }
 
 /// A parsed line from the `.socket2.sock` event stream.
@@ -326,6 +378,25 @@ pub enum HyprEvent {
     CloseWindow { address: String },
     /// The active workspace changed. `workspace>>name`.
     Workspace { name: String },
+    /// A layer-shell surface appeared or disappeared:
+    ///
+    /// ```text
+    /// openlayer>>hyprpad-cheatsheet
+    /// closelayer>>hyprpad-cheatsheet
+    /// ```
+    ///
+    /// Captured verbatim from the live compositor by toggling the cheat sheet.
+    /// The wire carries the **namespace only** — no address, nothing else —
+    /// which is why [`crate::mode::Context`] tracks a set of names rather than
+    /// a map of surfaces.
+    ///
+    /// This is what makes an overlay a *context*. The same capture shows the
+    /// sheet taking keyboard focus with **no** `activewindow` line behind it
+    /// (the focus event fires only on the way back out, when the sheet closes),
+    /// so a focus-only engine is blind to it: hyprpad's own cheat sheet is up,
+    /// modal, and swallowing the keyboard, and nothing else on the event stream
+    /// says so.
+    Layer { namespace: String, open: bool },
     /// Any event not modelled above, passed through verbatim.
     Other { name: String, data: String },
 }
@@ -400,6 +471,17 @@ fn parse_event(line: &str) -> Option<HyprEvent> {
         "workspace" => HyprEvent::Workspace {
             name: data.to_string(),
         },
+        // The namespace is taken verbatim: it is matched against the name a
+        // widget registered with (`hyprpad-cheatsheet`) and against the
+        // `"namespace"` field of a `j/layers` reply, and neither trims.
+        "openlayer" => HyprEvent::Layer {
+            namespace: data.to_string(),
+            open: true,
+        },
+        "closelayer" => HyprEvent::Layer {
+            namespace: data.to_string(),
+            open: false,
+        },
         _ => HyprEvent::Other {
             name: name.to_string(),
             data: data.to_string(),
@@ -460,6 +542,64 @@ fn norm_addr(s: &str) -> String {
 fn lua_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
+
+/// A real `j/layers` reply captured from the live compositor with the cheat
+/// sheet **up** — verbatim, including the empty levels and the compositor's own
+/// indentation, so the shape (monitor → `levels` → level → surfaces) is exactly
+/// what the daemon will meet at startup.
+///
+/// At module scope, and crate-visible, because [`crate::mode`]'s startup-seed
+/// test drives the same capture through the same parser: one fixture, one
+/// answer, no chance of the two drifting apart.
+#[cfg(test)]
+pub(crate) const CAPTURED_LAYERS_JSON: &str = r#"{
+"eDP-2": {
+    "levels": {
+
+        "0": [
+                {
+                    "address": "0x55d89c104290",
+                    "x": 0,
+                    "y": 0,
+                    "w": 2048,
+                    "h": 1280,
+                    "alpha": 1,
+                    "depth": 0.000,
+                    "namespace": "omarchy-background",
+                    "pid": 3229091
+                }
+        ],
+        "1": [
+],
+        "2": [
+                {
+                    "address": "0x55d89c41ff70",
+                    "x": 0,
+                    "y": 0,
+                    "w": 2048,
+                    "h": 26,
+                    "alpha": 1,
+                    "depth": 0.800,
+                    "namespace": "omarchy-bar",
+                    "pid": 3229091
+                }
+        ],
+        "3": [
+                {
+                    "address": "0x55d89c436500",
+                    "x": 0,
+                    "y": 0,
+                    "w": 2048,
+                    "h": 1280,
+                    "alpha": 1,
+                    "depth": 0.800,
+                    "namespace": "hyprpad-cheatsheet",
+                    "pid": 3229091
+                }
+        ]
+    }
+}
+}"#;
 
 #[cfg(test)]
 mod tests {
@@ -656,6 +796,79 @@ mod tests {
             parse_event("workspace>>7"),
             Some(HyprEvent::Workspace { name: "7".into() })
         );
+    }
+
+    /// Both lines exactly as the live compositor emitted them while the cheat
+    /// sheet was toggled on and off (`socat` on `.socket2.sock`, HypXRland /
+    /// Hyprland 0.56.2).
+    #[test]
+    fn parses_both_layer_lines() {
+        assert_eq!(
+            parse_event("openlayer>>hyprpad-cheatsheet"),
+            Some(HyprEvent::Layer {
+                namespace: "hyprpad-cheatsheet".into(),
+                open: true,
+            })
+        );
+        assert_eq!(
+            parse_event("closelayer>>hyprpad-cheatsheet"),
+            Some(HyprEvent::Layer {
+                namespace: "hyprpad-cheatsheet".into(),
+                open: false,
+            })
+        );
+        // The namespace is the whole payload, verbatim — no address follows it,
+        // and nothing is trimmed off it.
+        assert_eq!(
+            parse_event("openlayer>>hyprpad-osk"),
+            Some(HyprEvent::Layer {
+                namespace: "hyprpad-osk".into(),
+                open: true,
+            })
+        );
+        assert_eq!(
+            parse_event("closelayer>>"),
+            Some(HyprEvent::Layer {
+                namespace: String::new(),
+                open: false,
+            })
+        );
+    }
+
+
+    #[test]
+    fn reads_every_open_namespace_out_of_a_layers_reply() {
+        let open = parse_layer_namespaces(CAPTURED_LAYERS_JSON);
+        assert_eq!(
+            open.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["hyprpad-cheatsheet", "omarchy-background", "omarchy-bar"],
+            "every surface in the reply, whatever level it sits on"
+        );
+        assert!(open.contains("hyprpad-cheatsheet"), "the seed a mode rule asks about");
+
+        // The same session with the sheet closed: the third level is empty, so
+        // the sheet is simply absent.
+        let closed = CAPTURED_LAYERS_JSON.replace(
+            r#"                {
+                    "address": "0x55d89c436500",
+                    "x": 0,
+                    "y": 0,
+                    "w": 2048,
+                    "h": 1280,
+                    "alpha": 1,
+                    "depth": 0.800,
+                    "namespace": "hyprpad-cheatsheet",
+                    "pid": 3229091
+                }
+"#,
+            "",
+        );
+        assert!(!parse_layer_namespaces(&closed).contains("hyprpad-cheatsheet"));
+        assert_eq!(parse_layer_namespaces(&closed).len(), 2);
+
+        // A monitorless session, and a nameless surface, seed nothing.
+        assert!(parse_layer_namespaces("{}").is_empty());
+        assert!(parse_layer_namespaces(r#"{"namespace": ""}"#).is_empty());
     }
 
     #[test]

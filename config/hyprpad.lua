@@ -13,7 +13,14 @@
 --
 -- Everything below the bindings is the modality layer (docs/13). Its rules and
 -- guards are Lua predicates that run ONLY on a context change — a focus change,
--- a fullscreen change, a manual override, a reload — never per input frame.
+-- a fullscreen change, an overlay opening or closing, a manual override, a
+-- reload — never per input frame.
+--
+-- A rule sees `ctx.focus` (the focused window: `.class`, `.title`, `.pid`,
+-- `.fullscreen`, `:process_tree_has("claude")`) and `ctx.layers` (the
+-- layer-shell overlays on screen: `:has("hyprpad-cheatsheet")`, `:list()`,
+-- and `ipairs`-able). Overlays are how hyprpad's own windowless UI — the cheat
+-- sheet, the on-screen keyboard — becomes something a rule can select on.
 
 local h = hyprpad
 
@@ -23,6 +30,15 @@ local h = hyprpad
 -- A mode carries nothing but its name, its rule, and whether it forwards raw
 -- input to the game. What is LIVE in a mode is decided per binding, below.
 -- ---------------------------------------------------------------------------
+
+-- The cheat sheet is modal while it's up: B closes it (it listens for Escape).
+--
+-- FIRST, above even `game`: the sheet is an overlay drawn over whatever is
+-- focused, including a game, and while it is up it owns the keyboard. Layer
+-- surfaces do not raise an `activewindow` event, so `ctx.layers` is the only
+-- thing that can see it — that is what makes this a mode rather than a special
+-- case wired into the daemon.
+h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatsheet") end)
 
 -- Game / Steam Big Picture. Steam launches native and Proton titles as
 -- `steam_app_<id>`; gamescope and Big Picture (`steamwebhelper`) are matched
@@ -101,6 +117,12 @@ h.button("dpad_left",  h.key "left"):only_in("desktop")
 h.button("dpad_right", h.key "right"):only_in("desktop")
 h.button("a", h.key "enter"):only_in("desktop")     -- A = Enter/confirm
 h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
+
+-- The same button, a different meaning in a different mode. The cheat sheet has
+-- keyboard focus and closes on Escape, so B dismisses it — and the two never
+-- collide, because a mode is exclusive: under the sheet we are in `cheatsheet`,
+-- never in `desktop`.
+h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
 
 -- While the on-screen keyboard is up, these tap keys THROUGH the OSK
 -- (Deck-style helpers) so you never hunt for them with a cursor. Unguarded on

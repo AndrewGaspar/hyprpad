@@ -176,6 +176,24 @@ impl Sheet {
             }
         }
 
+        // A button bound once per mode contributes one row per binding, each
+        // carrying its own guard: `b` reads as Backspace on the desktop and as
+        // "Close cheat sheet" under the sheet, and the mode rows below sort the
+        // two into the modes they are live in.
+        for alt in &c.button_alts {
+            entries.push(entry(
+                Section::Button,
+                button_name(alt.button).to_string(),
+                button_name(alt.button).to_string(),
+                button_label(alt.button),
+                None,
+                button_rank(alt.button),
+                &Action::Key(alt.code),
+                alt.desc.as_ref(),
+                Some(&alt.guard),
+            ));
+        }
+
         // The trackpads' ambient behaviour. Not a binding you press, but the
         // diagram has two pads on it and a sheet that leaves them blank is
         // lying about the biggest two controls on the puck.

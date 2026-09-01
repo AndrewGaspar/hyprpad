@@ -56,7 +56,18 @@
 //! `ctx` carries `ctx.focus.class`, `.title`, `.pid`, `.fullscreen`, and the
 //! method `ctx.focus:process_tree_has("claude")`, which walks the focused
 //! window's `/proc` descendants (the Claude-Code-in-a-terminal detection of
-//! docs/13). See [`crate::mode`] for how a mode is resolved.
+//! docs/13). It also carries `ctx.layers` — the layer-shell overlays on
+//! screen, which is how a rule sees hyprpad's *own* windowless UI:
+//!
+//! ```lua
+//! h.mode("cheatsheet").when(function(ctx)
+//!   return ctx.layers:has("hyprpad-cheatsheet")
+//! end)
+//! ```
+//!
+//! `ctx.layers` is an array of namespaces (so `ipairs` and `#` work) with
+//! `:has(name)` and `:list()` on it. See [`crate::mode`] for how a mode is
+//! resolved.
 //!
 //! ## Guardrails (the non-negotiable part)
 //!
@@ -78,11 +89,11 @@
 //! `string` are all there, as the owner's own configs use them).
 
 use crate::config::{
-    Action, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig, ModeDef, ScrollConfig,
-    ScrollMode,
+    Action, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig, ModeDef,
+    ScrollConfig, ScrollMode,
 };
 use crate::config::{key_code, parse_button, GestureKey};
-use crate::mode::Focus;
+use crate::mode::Context;
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value, VmState};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -182,9 +193,9 @@ impl LuaRuntime {
     /// the watchdog cuts off, counts as *no match* and logs once — the docs/13
     /// rule, and the reason a runaway `while true do end` in a rule cannot wedge
     /// the input loop.
-    pub fn eval_predicate(&self, id: usize, focus: &Focus) -> bool {
+    pub fn eval_predicate(&self, id: usize, cx: &Context) -> bool {
         let Some(f) = self.predicates.get(id) else { return false };
-        let ctx = match self.build_ctx(focus) {
+        let ctx = match self.build_ctx(cx) {
             Ok(t) => t,
             Err(e) => {
                 self.complain(id, &e.to_string());
@@ -215,20 +226,68 @@ impl LuaRuntime {
     }
 
     /// Build the `ctx` table handed to a predicate: `ctx.focus.{class,title,
-    /// pid,fullscreen}` plus the `process_tree_has` method.
-    fn build_ctx(&self, focus: &Focus) -> mlua::Result<Table> {
+    /// pid,fullscreen}` plus the `process_tree_has` method, and `ctx.layers`.
+    fn build_ctx(&self, cx: &Context) -> mlua::Result<Table> {
         let f = self.lua.create_table()?;
-        f.set("class", focus.class.as_str())?;
-        f.set("title", focus.title.as_str())?;
-        match focus.pid {
+        f.set("class", cx.focus.class.as_str())?;
+        f.set("title", cx.focus.title.as_str())?;
+        match cx.focus.pid {
             Some(pid) => f.set("pid", pid)?,
             None => f.set("pid", Value::Nil)?,
         }
-        f.set("fullscreen", focus.fullscreen)?;
-        f.set("process_tree_has", self.proc_fn(focus.pid)?)?;
+        f.set("fullscreen", cx.focus.fullscreen)?;
+        f.set("process_tree_has", self.proc_fn(cx.focus.pid)?)?;
         let ctx = self.lua.create_table()?;
         ctx.set("focus", f)?;
+        ctx.set("layers", self.layers_table(cx)?)?;
         Ok(ctx)
+    }
+
+    /// The `ctx.layers` table: the layer-shell namespaces currently on screen.
+    ///
+    /// It is an *array* of names, so `ipairs(ctx.layers)` and `#ctx.layers`
+    /// work on it directly, with two methods hung off it:
+    ///
+    /// ```lua
+    /// ctx.layers:has("hyprpad-cheatsheet")  -- the one a rule actually wants
+    /// ctx.layers:list()                     -- a fresh copy, sorted
+    /// ```
+    ///
+    /// Cheap enough to build per re-resolve: a session has a handful of
+    /// overlays (three here — the bar, the background and the sheet), and this
+    /// runs on a context change, never per frame.
+    fn layers_table(&self, cx: &Context) -> mlua::Result<Table> {
+        let t = self.lua.create_sequence_from(cx.layers.iter().map(String::as_str))?;
+        let names = cx.layers.clone();
+        let listed = names.clone();
+        // Both call forms, as with `process_tree_has`: `layers:has(..)` passes
+        // the table as the first argument, `layers.has(..)` does not, so the
+        // last string argument is the one being asked about and neither
+        // spelling is a silent mismatch.
+        t.set(
+            "has",
+            self.lua.create_function(move |_, args: MultiValue| {
+                let needle = args
+                    .iter()
+                    .rev()
+                    .find_map(|v| v.as_str().map(|s| s.to_string()))
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "layers:has needs a namespace to look for, e.g. \
+                             ctx.layers:has(\"hyprpad-cheatsheet\")"
+                                .to_string(),
+                        )
+                    })?;
+                Ok(names.contains(needle.as_str()))
+            })?,
+        )?;
+        t.set(
+            "list",
+            self.lua.create_function(move |lua, _: MultiValue| {
+                lua.create_sequence_from(listed.iter().map(String::as_str))
+            })?,
+        )?;
+        Ok(t)
     }
 
     /// The `ctx.focus:process_tree_has(pattern)` closure, bound to this
@@ -476,6 +535,22 @@ fn finish(
         }
     }
 
+    // A button bound twice with nothing to tell the two bindings apart is a
+    // config bug rather than a second binding: modes are what make an alternate
+    // reachable, so an unguarded one can never win. Name it instead of letting
+    // it read as bound.
+    for s in &b.slots {
+        if let Slot::ButtonAlt(i, name) = s {
+            if b.button_alts.get(*i).is_some_and(|a| matches!(a.guard, Guard::Always)) {
+                eprintln!(
+                    "warning: button '{name}' is bound more than once and the later binding \
+                     carries no guard, so only the first is live; guard them into different \
+                     modes (h.button(\"{name}\", …):only_in(\"cheatsheet\"))"
+                );
+            }
+        }
+    }
+
     let runtime = LuaRuntime {
         lua,
         predicates: std::mem::take(&mut b.predicates),
@@ -500,6 +575,7 @@ fn finish(
         default_mode: Some(default),
         binding_guards: b.binding_guards,
         button_guards: b.button_guards,
+        button_alts: b.button_alts,
         osk_button_guards: b.osk_button_guards,
         binding_descs: b.binding_descs,
         button_descs: b.button_descs,
@@ -555,6 +631,8 @@ struct Build {
     binding_guards: HashMap<GestureKey, Guard>,
     buttons: HashMap<crate::report::Button, u16>,
     button_guards: HashMap<crate::report::Button, Guard>,
+    /// Bindings for a button `buttons` already binds, in declaration order.
+    button_alts: Vec<ButtonAlt>,
     osk_buttons: HashMap<crate::report::Button, u16>,
     osk_button_guards: HashMap<crate::report::Button, Guard>,
     /// The optional description each binding was declared with, keyed exactly
@@ -584,6 +662,10 @@ struct Build {
 enum Slot {
     Binding(GestureKey, String),
     Button(crate::report::Button, String),
+    /// A re-binding of an already-bound button, by its index in
+    /// [`Build::button_alts`] — the guard lands on the alternate, never on the
+    /// binding it sits beside.
+    ButtonAlt(usize, String),
     OskButton(crate::report::Button, String),
     Cursor,
     Scroll,
@@ -607,6 +689,11 @@ impl Build {
             Some(Slot::Button(b, _)) => {
                 self.button_guards.insert(b, g);
             }
+            Some(Slot::ButtonAlt(i, _)) => {
+                if let Some(alt) = self.button_alts.get_mut(i) {
+                    alt.guard = g;
+                }
+            }
             Some(Slot::OskButton(b, _)) => {
                 self.osk_button_guards.insert(b, g);
             }
@@ -628,6 +715,9 @@ impl Build {
             let (label, g) = match s {
                 Slot::Binding(k, name) => (format!("binding '{name}'"), self.binding_guards.get(k)),
                 Slot::Button(b, name) => (format!("button '{name}'"), self.button_guards.get(b)),
+                Slot::ButtonAlt(i, name) => {
+                    (format!("button '{name}'"), self.button_alts.get(*i).map(|a| &a.guard))
+                }
                 Slot::OskButton(b, name) => {
                     (format!("osk_button '{name}'"), self.osk_button_guards.get(b))
                 }
@@ -938,6 +1028,21 @@ fn bind_fn(
                     )));
                 };
                 match kind {
+                    // A button bound a *second* time is the same button meaning
+                    // something else in another mode — `b` is backspace on the
+                    // desktop and escape under the cheat sheet — so it becomes
+                    // an alternate rather than overwriting the first binding.
+                    // Modes are exclusive, so only one of them is ever live.
+                    BindKind::Button if b.buttons.contains_key(&btn) => {
+                        let at = b.button_alts.len();
+                        b.button_alts.push(ButtonAlt {
+                            button: btn,
+                            code,
+                            guard: Guard::Always,
+                            desc,
+                        });
+                        b.slot(Slot::ButtonAlt(at, key))
+                    }
                     BindKind::Button => {
                         b.buttons.insert(btn, code);
                         if let Some(d) = desc {
@@ -1446,10 +1551,25 @@ mod tests {
     use super::*;
     use crate::config::{ModeState, WorkspaceTarget};
     use crate::gesture::GestureEvent;
+    use crate::mode::Focus;
     use crate::report::Button;
 
     fn load(src: &str) -> Config {
         load_str(src, "test.lua").expect("config should load")
+    }
+
+    /// A context in which only the focused window is interesting — most of
+    /// them, since `ctx.layers` has its own tests.
+    fn focused(focus: Focus) -> Context {
+        Context { focus, layers: Default::default() }
+    }
+
+    /// A context in which only the overlays are interesting.
+    fn showing(namespaces: &[&str]) -> Context {
+        Context {
+            focus: Focus::default(),
+            layers: namespaces.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     fn desktop() -> ModeState {
@@ -1643,7 +1763,7 @@ mod tests {
         );
         let rt = c.lua().unwrap();
         let rule = c.modes()[0].rule.unwrap();
-        let focus = Focus { pid: Some(std::process::id() as i32), ..Focus::default() };
+        let focus = focused(Focus { pid: Some(std::process::id() as i32), ..Focus::default() });
         assert!(!rt.eval_predicate(rule, &focus), "nothing by that name yet");
 
         use std::os::unix::process::CommandExt;
@@ -1847,15 +1967,108 @@ mod tests {
             "#,
         );
         let rt = c.lua().expect("lua runtime");
-        let steam = Focus { class: "steam_app_413080".into(), ..Focus::default() };
+        let steam = focused(Focus { class: "steam_app_413080".into(), ..Focus::default() });
         assert!(rt.eval_predicate(c.modes()[0].rule.unwrap(), &steam));
         assert!(!rt.eval_predicate(c.modes()[1].rule.unwrap(), &steam));
 
-        let fs = Focus { class: "mpv".into(), fullscreen: true, ..Focus::default() };
+        let fs = focused(Focus { class: "mpv".into(), fullscreen: true, ..Focus::default() });
         assert!(rt.eval_predicate(c.modes()[1].rule.unwrap(), &fs));
 
-        let titled = Focus { title: "hyprpad".into(), ..Focus::default() };
+        let titled = focused(Focus { title: "hyprpad".into(), ..Focus::default() });
         assert!(rt.eval_predicate(c.modes()[2].rule.unwrap(), &titled));
+    }
+
+    /// `ctx.layers` is the overlay half of the context, and it has to be usable
+    /// as *both* a set (`:has`) and a list (`ipairs`, `#`, `:list()`) — a rule
+    /// that wants to know whether the sheet is up, and one that wants to see
+    /// what is on screen, are both reasonable things to write.
+    #[test]
+    fn predicates_see_the_open_overlays() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("sheet").when(function(ctx)
+              return ctx.layers:has("hyprpad-cheatsheet")
+            end)
+            h.mode("dot").when(function(ctx)
+              return ctx.layers.has("hyprpad-cheatsheet")  -- the non-method form
+            end)
+            h.mode("counted").when(function(ctx) return #ctx.layers == 2 end)
+            h.mode("listed").when(function(ctx)
+              return table.concat(ctx.layers:list(), ",") == "omarchy-bar,zzz"
+            end)
+            h.mode("iterated").when(function(ctx)
+              for _, ns in ipairs(ctx.layers) do
+                if ns:match("^omarchy%-") then return true end
+              end
+              return false
+            end)
+            h.mode("desktop")
+            "#,
+        );
+        let rt = c.lua().expect("lua runtime");
+        let rule = |i: usize| c.modes()[i].rule.unwrap();
+
+        let sheet = showing(&["hyprpad-cheatsheet"]);
+        assert!(rt.eval_predicate(rule(0), &sheet), "method call form");
+        assert!(rt.eval_predicate(rule(1), &sheet), "dot call form");
+
+        // Nothing open: every overlay rule is simply false, not an error.
+        let bare = Context::default();
+        assert!(!rt.eval_predicate(rule(0), &bare));
+        assert!(!rt.eval_predicate(rule(4), &bare));
+
+        // A list, in sorted order, however the namespaces arrived.
+        let two = showing(&["zzz", "omarchy-bar"]);
+        assert!(rt.eval_predicate(rule(2), &two), "# counts the array part");
+        assert!(rt.eval_predicate(rule(3), &two), ":list() is sorted");
+        assert!(rt.eval_predicate(rule(4), &two), "ipairs walks it");
+    }
+
+    /// The same button, bound once per mode. A single binding per button was
+    /// enough while a button meant one thing everywhere; the cheat sheet is the
+    /// case that breaks it — `b` is Backspace on the desktop and Escape under
+    /// the sheet — and the second binding must not quietly replace the first.
+    #[test]
+    fn a_button_can_mean_something_else_in_another_mode() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("cheatsheet").when(function(ctx)
+              return ctx.layers:has("hyprpad-cheatsheet")
+            end)
+            h.mode("desktop")
+            h.button("b", h.key "backspace"):only_in("desktop")
+            h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
+            "#,
+        );
+        let sheet = ModeState::new("cheatsheet", vec![]);
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&14), "Backspace");
+        assert_eq!(c.buttons_in(&sheet).get(&Button::B), Some(&1), "Escape");
+        assert_eq!(c.buttons_in(&sheet).len(), 1, "and nothing else is live there");
+
+        // The alternate is a binding in its own right, description and all, so
+        // `hyprpad bindings` can print it.
+        assert_eq!(c.button_alts.len(), 1);
+        assert_eq!(c.button_alts[0].desc.as_deref(), Some("Close cheat sheet"));
+        // The base map — the unguarded view the no-modes path uses — keeps the
+        // binding that was declared first.
+        assert_eq!(c.buttons().get(&Button::B), Some(&14));
+    }
+
+    #[test]
+    fn an_unguarded_re_binding_loses_to_the_one_it_was_written_beside() {
+        // Nothing tells these two apart, so the second can never be live. It is
+        // a config bug; the loader warns and keeps the first.
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("desktop")
+            h.button("b", h.key "backspace")
+            h.button("b", h.key "escape")
+            "#,
+        );
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&14));
     }
 
     #[test]
@@ -1867,9 +2080,9 @@ mod tests {
             "#,
         );
         let rt = c.lua().unwrap();
-        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Focus::default()));
+        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
         // And again — the failure is logged once but stays non-fatal.
-        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Focus::default()));
+        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
     }
 
     #[test]
@@ -1882,7 +2095,7 @@ mod tests {
         );
         let rt = c.lua().unwrap();
         let t0 = Instant::now();
-        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Focus::default()));
+        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
         let took = t0.elapsed();
         assert!(
             took < PREDICATE_TIMEOUT * 5,
@@ -1916,7 +2129,7 @@ mod tests {
         );
         let rt = c.lua().unwrap();
         for _ in 0..5 {
-            assert!(rt.eval_predicate(c.modes()[0].rule.unwrap(), &Focus::default()));
+            assert!(rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
         }
     }
 
@@ -1945,13 +2158,13 @@ mod tests {
             "#,
         );
         let rt = c.lua().unwrap();
-        let focus = Focus { pid: Some(me), ..Focus::default() };
+        let focus = focused(Focus { pid: Some(me), ..Focus::default() });
         assert!(rt.eval_predicate(c.modes()[0].rule.unwrap(), &focus), "method call form");
         assert!(rt.eval_predicate(c.modes()[1].rule.unwrap(), &focus), "dot call form");
         assert!(!rt.eval_predicate(c.modes()[2].rule.unwrap(), &focus));
 
         // No pid (focus lost to the desktop) is simply "no match", not an error.
-        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Focus::default()));
+        assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
 
         let _ = child.kill();
         let _ = child.wait();
