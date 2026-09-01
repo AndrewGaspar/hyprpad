@@ -16,6 +16,7 @@
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
 //! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
+//! | `[gamepad]` | the virtual pad fed to games under focus, and its rumble back-channel ([`GamepadConfig`]) |
 //!
 //! [`DEFAULT_TOML`] carries the built-in defaults and doubles as living
 //! documentation of every knob.
@@ -471,6 +472,74 @@ impl Default for HapticsConfig {
     }
 }
 
+/// Which puck report the game-rumble back-channel drives (`[gamepad]
+/// rumble_mode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RumbleMode {
+    /// The puck's own force-feedback report, `0x80`
+    /// ([`crate::haptics::Haptics::rumble`]) — a faithful replay of what
+    /// `hid-steam` sends for an `FF_RUMBLE` effect. The default.
+    #[default]
+    Native,
+    /// Approximate the rumble with trains of the `0x81` pulse instead. A hedge:
+    /// the `0x81` pulse is the report hyprpad has actually exercised on this
+    /// unit, whereas `0x80` has only ever been replayed from the kernel source
+    /// (`hid-generic` binds the puck here, so the in-kernel rumble path has
+    /// never run on it). If `native` turns out inert on-device, this still buzzes.
+    Pulse,
+}
+
+impl RumbleMode {
+    fn parse(s: &str) -> Result<RumbleMode, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" | "rumble" | "ff" => Ok(RumbleMode::Native),
+            "pulse" | "pulses" | "approx" => Ok(RumbleMode::Pulse),
+            other => Err(format!("unknown rumble mode '{other}' (native|pulse)")),
+        }
+    }
+}
+
+/// Virtual-gamepad knobs (the `[gamepad]` config section).
+///
+/// The Tier-1 keystone: hyprpad owns the real puck, so Steam and games are fed a
+/// synthesized Xbox-360-class pad ([`crate::gamepad`]) whenever a game holds
+/// focus. All of these are read *per frame* by the daemon, so `hyprpad reload`
+/// takes effect on the next report with nothing to rebuild.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GamepadConfig {
+    /// Master switch. Default **`true`** — this is the point of the project. It
+    /// costs a non-gamer nothing: the uinput device is created lazily, on the
+    /// first frame a game-classed window actually holds focus.
+    pub enabled: bool,
+    /// Forward the guide (Steam) button to the virtual pad as `BTN_MODE`.
+    /// Default **`false`**: docs/08's input contract makes `Guide` hyprpad's
+    /// global modifier, and a chord must never also reach the game. Turn it on
+    /// to hand Steam's overlay its own button back.
+    pub forward_guide: bool,
+    /// Forward a game's force-feedback rumble to the puck's actuators. Default
+    /// `true`.
+    pub rumble: bool,
+    /// Which report carries it. Default [`RumbleMode::Native`].
+    pub rumble_mode: RumbleMode,
+    /// Scale applied to both `FF_RUMBLE` magnitudes before they reach the puck.
+    /// `1.0` passes a game's request through unchanged (which is what
+    /// `hid-steam` does); `0` or below silences rumble — use `rumble = false` to
+    /// switch it off properly. Default `1.0`.
+    pub rumble_intensity: f64,
+}
+
+impl Default for GamepadConfig {
+    fn default() -> GamepadConfig {
+        GamepadConfig {
+            enabled: true,
+            forward_guide: false,
+            rumble: true,
+            rumble_mode: RumbleMode::Native,
+            rumble_intensity: 1.0,
+        }
+    }
+}
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -497,6 +566,8 @@ pub struct Config {
     scroll: ScrollConfig,
     /// Haptic-feedback knobs (`[haptics]` section).
     haptics: HapticsConfig,
+    /// Virtual-gamepad knobs (`[gamepad]` section).
+    gamepad: GamepadConfig,
 }
 
 /// The built-in default bindings, in the config's own TOML dialect. Loaded by
@@ -552,6 +623,18 @@ buttons = false             # tick on a bare-button ([buttons]) press edge
 cursor = true               # texture-tick the right pad as it drives the desktop cursor
 cursor_spacing_px = 64      # pixels of cursor travel per texture tick (smaller = finer)
 intensity = 1.0             # pulse-width scale; 1.0 = the kernel's calibrated widths
+
+# The virtual gamepad (docs/06 Tier 1). hyprpad owns the real controller, so
+# Steam and games are fed a synthesized Xbox-360-class pad instead — but ONLY
+# while a game-classed window holds focus, and never while the guide button is
+# held or the on-screen keyboard is up. The device is created lazily on the first
+# such frame, so a session that never plays a game never creates one.
+[gamepad]
+enabled = true              # master switch for the whole forwarding path
+forward_guide = false       # send the guide button to the game as BTN_MODE (it is hyprpad's modifier)
+rumble = true               # forward a game's force feedback to the puck's actuators
+rumble_mode = native        # native (the puck's 0x80 rumble report) | pulse (approximate with 0x81 trains)
+rumble_intensity = 1.0      # scale on both FF magnitudes; 1.0 passes the game's request through
 "#;
 
 impl Config {
@@ -564,6 +647,7 @@ impl Config {
         let mut cursor = CursorConfig::default();
         let mut scroll = ScrollConfig::default();
         let mut haptics = HapticsConfig::default();
+        let mut gamepad = GamepadConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -729,10 +813,49 @@ impl Config {
                         }
                     }
                 }
+                // Virtual-gamepad knobs: the master switch, whether the guide
+                // button reaches the game, and the rumble back-channel.
+                "gamepad" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    let flag = |slot: &mut bool| -> Result<(), String> {
+                        *slot = parse_bool(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        Ok(())
+                    };
+                    match key.as_str() {
+                        "enabled" | "enable" | "on" => flag(&mut gamepad.enabled)?,
+                        "forward_guide" | "guide" | "forward_steam" => {
+                            flag(&mut gamepad.forward_guide)?;
+                        }
+                        "rumble" | "force_feedback" | "ff" => flag(&mut gamepad.rumble)?,
+                        "rumble_mode" | "mode" => {
+                            gamepad.rumble_mode = RumbleMode::parse(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "rumble_intensity" | "rumble_strength" | "rumble_gain" => {
+                            gamepad.rumble_intensity = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [gamepad] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
-        Ok(Config { bindings, buttons, osk_buttons, own_lizard, cursor, scroll, haptics })
+        Ok(Config {
+            bindings,
+            buttons,
+            osk_buttons,
+            own_lizard,
+            cursor,
+            scroll,
+            haptics,
+            gamepad,
+        })
     }
 
     /// The built-in defaults encoding the vision's core gestures.
@@ -836,6 +959,13 @@ impl Config {
     /// retunes the feel live.
     pub fn haptics(&self) -> &HapticsConfig {
         &self.haptics
+    }
+
+    /// The virtual-gamepad knobs (`[gamepad]` section); defaults from
+    /// [`GamepadConfig::default`]. Read per frame by the daemon so a reload
+    /// retunes forwarding and rumble with no restart.
+    pub fn gamepad(&self) -> &GamepadConfig {
+        &self.gamepad
     }
 }
 
@@ -1476,6 +1606,74 @@ intensity = 0.5
         assert!(Config::from_toml_str("[haptics]\nwiggle = true\n")
             .unwrap_err()
             .contains("unknown [haptics] setting"));
+    }
+
+    #[test]
+    fn gamepad_defaults_and_parse() {
+        // The built-in default config reproduces GamepadConfig::default exactly
+        // (its `[gamepad]` block is living documentation of the defaults).
+        let d = Config::load_default();
+        assert_eq!(d.gamepad(), &GamepadConfig::default());
+        // Forwarding is ON by default — it is the point of the project, and it
+        // costs a non-gamer nothing because the device is created lazily. The
+        // guide button is NOT forwarded: docs/08 makes it hyprpad's modifier.
+        assert!(d.gamepad().enabled);
+        assert!(!d.gamepad().forward_guide);
+        assert!(d.gamepad().rumble);
+        assert_eq!(d.gamepad().rumble_mode, RumbleMode::Native);
+        assert_eq!(d.gamepad().rumble_intensity, 1.0);
+
+        // A `[gamepad]` section overrides individual knobs; bindings still parse.
+        let c = Config::from_toml_str(
+            r#"
+[gamepad]
+enabled = true
+forward_guide = true
+rumble = false
+rumble_mode = pulse
+rumble_intensity = 0.25
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert!(c.gamepad().forward_guide);
+        assert!(!c.gamepad().rumble);
+        assert_eq!(c.gamepad().rumble_mode, RumbleMode::Pulse);
+        assert_eq!(c.gamepad().rumble_intensity, 0.25);
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // The master switch and the key aliases; unspecified knobs keep their
+        // defaults.
+        let c = Config::from_toml_str("[gamepad]\nenabled = off\n").unwrap();
+        assert!(!c.gamepad().enabled);
+        assert!(c.gamepad().rumble, "untouched knobs keep the default");
+        let c = Config::from_toml_str("[gamepad]\nguide = yes\nff = no\nrumble_gain = 2\n").unwrap();
+        assert!(c.gamepad().forward_guide);
+        assert!(!c.gamepad().rumble);
+        assert_eq!(c.gamepad().rumble_intensity, 2.0);
+        assert_eq!(
+            Config::from_toml_str("[gamepad]\nmode = native\n").unwrap().gamepad().rumble_mode,
+            RumbleMode::Native
+        );
+
+        // Bad values and unknown keys are reported, not silently ignored — a
+        // typo must never leave the gamepad half-configured.
+        assert!(Config::from_toml_str("[gamepad]\nenabled = maybe\n")
+            .unwrap_err()
+            .contains("boolean"));
+        assert!(Config::from_toml_str("[gamepad]\nrumble_intensity = hard\n")
+            .unwrap_err()
+            .contains("expected a number"));
+        assert!(Config::from_toml_str("[gamepad]\nrumble_mode = shake\n")
+            .unwrap_err()
+            .contains("unknown rumble mode"));
+        assert!(Config::from_toml_str("[gamepad]\nturbo = true\n")
+            .unwrap_err()
+            .contains("unknown [gamepad] setting"));
     }
 
     #[test]

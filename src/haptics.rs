@@ -31,6 +31,19 @@
 //! [`Feel`] values are the kernel's own calibrated mode-switch feedback (a
 //! 400 µs single tick; a 500 µs on/off train for the buzz) and its derivatives.
 //!
+//! ## The second report: game rumble
+//!
+//! The pulses above are hyprpad's own UI feedback. A *game's* force feedback is
+//! a different report on the same wire — `REPORT_ID_HAPTIC_RUMBLE` (`0x80`), 10
+//! bytes, `struct steam_ibex_haptic_rumble` — driven through [`Haptics::rumble`]
+//! by the virtual-gamepad bridge ([`crate::gamepad`]). Both share this module's
+//! one writer thread and node set, so the two never open the puck twice.
+//!
+//! Rumble is rate-limited by its caller, not here: `hid-steam` throttles to
+//! 20 Hz and re-sends every 50 ms while active, because the controller restarts
+//! its haptic pattern on each packet. See [`Haptics::rumble`] and
+//! `run::drive_rumble`.
+//!
 //! ## Which node, concurrency, sleep, and never being fatal
 //!
 //! hidraw is not exclusive, so writing output reports works while another
@@ -71,8 +84,21 @@ use std::time::{Duration, Instant};
 /// `REPORT_ID_HAPTIC_PULSE` (kernel `hid-steam.c`). Byte 0 of the output report.
 const REPORT_ID_HAPTIC_PULSE: u8 = 0x81;
 
+/// `REPORT_ID_HAPTIC_RUMBLE` (kernel `hid-steam.c`). Byte 0 of the *rumble*
+/// output report — the force-feedback path a game drives, as opposed to the
+/// discrete UI pulses above. See [`Haptics::rumble`].
+const REPORT_ID_HAPTIC_RUMBLE: u8 = 0x80;
+
 /// One pulse on the wire: report id + `steam_ibex_haptic_pulse` (7 bytes).
 const PULSE_LEN: usize = 8;
+
+/// One rumble on the wire: report id + `steam_ibex_haptic_rumble` (9 bytes).
+const RUMBLE_LEN: usize = 10;
+
+/// The widest output report the writer thread carries. Every queued report is
+/// padded to this and written `len` bytes long, because the two report ids have
+/// different fixed sizes and the kernel sends each at its own exact length.
+const MAX_REPORT_LEN: usize = RUMBLE_LEN;
 
 /// Depth of the queue between the daemon and the device-writer thread. Deep
 /// enough to absorb a burst (a fast circular scroll, a two-thumb key crossing)
@@ -165,15 +191,69 @@ fn wire_side(pad: Pad) -> u8 {
     }
 }
 
+/// One output report queued for the writer thread: its bytes, padded to
+/// [`MAX_REPORT_LEN`], plus the length actually written. The kernel sends each
+/// report id at its own fixed size (8 for `0x81`, 10 for `0x80`) and neither is
+/// zero-padded, so the length travels with the bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OutReport {
+    bytes: [u8; MAX_REPORT_LEN],
+    len: usize,
+}
+
+impl OutReport {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 /// Build the 8-byte `0x81` pulse output report (all fields little-endian).
-fn build_pulse(pad: Pad, on_us: u16, off_us: u16, count: u16) -> [u8; PULSE_LEN] {
-    let mut b = [0u8; PULSE_LEN];
+fn build_pulse(pad: Pad, on_us: u16, off_us: u16, count: u16) -> OutReport {
+    let mut b = [0u8; MAX_REPORT_LEN];
     b[0] = REPORT_ID_HAPTIC_PULSE;
     b[1] = wire_side(pad);
     b[2..4].copy_from_slice(&on_us.to_le_bytes());
     b[4..6].copy_from_slice(&off_us.to_le_bytes());
     b[6..8].copy_from_slice(&count.to_le_bytes());
-    b
+    OutReport { bytes: b, len: PULSE_LEN }
+}
+
+/// The per-side gain bytes the kernel hard-codes on **every** rumble it sends —
+/// `steam_haptic_rumble(steam, 0, left, right, 2, 0)` in both the rumble work
+/// item and the 20 Hz coalescing one. There is no comment explaining the
+/// asymmetry; the only gain documentation in the driver (on the *pulse* command)
+/// describes gain as decibels in `-24..=+6`, which would make these `+2 dB` and
+/// `0 dB`. Mirrored verbatim rather than reinterpreted.
+const RUMBLE_LEFT_GAIN: u8 = 2;
+const RUMBLE_RIGHT_GAIN: u8 = 0;
+
+/// The `intensity` field, which the driver leaves at `0` on every call.
+const RUMBLE_INTENSITY: u16 = 0;
+
+/// Build the 10-byte `0x80` rumble output report.
+///
+/// Layout (`struct steam_ibex_haptic_rumble`, all little-endian):
+/// `[0x80, type, intensity:le16, left.speed:le16, left.gain, right.speed:le16,
+/// right.gain]`. `type` is never assigned by the driver (the struct comes from
+/// `kzalloc`), so it is always `0`.
+///
+/// **The `side` XOR does not apply here** — unlike `steam_haptic_pulse`,
+/// `steam_haptic_rumble` has no `pad ^= 1`; left and right are named fields.
+///
+/// `left_speed` is the FF `strong_magnitude` and `right_speed` the
+/// `weak_magnitude`, passed through with **no scaling whatsoever** — the driver
+/// stores `effect->u.rumble.strong_magnitude` / `weak_magnitude` and hands them
+/// straight to this report.
+fn build_rumble(left_speed: u16, right_speed: u16) -> OutReport {
+    let mut b = [0u8; MAX_REPORT_LEN];
+    b[0] = REPORT_ID_HAPTIC_RUMBLE;
+    b[1] = 0; // `type`, left zero by the driver
+    b[2..4].copy_from_slice(&RUMBLE_INTENSITY.to_le_bytes());
+    b[4..6].copy_from_slice(&left_speed.to_le_bytes());
+    b[6] = RUMBLE_LEFT_GAIN;
+    b[7..9].copy_from_slice(&right_speed.to_le_bytes());
+    b[9] = RUMBLE_RIGHT_GAIN;
+    OutReport { bytes: b, len: RUMBLE_LEN }
 }
 
 /// Apply the `[haptics] intensity` scale to a feel's pulse width, clamped to a
@@ -196,7 +276,7 @@ fn scale_on_us(on_us: u16, intensity: f64) -> u16 {
 pub struct Haptics {
     /// Queue into the device-writer thread. Bounded, and fed with `try_send` so
     /// the daemon's main loop never blocks on a USB transfer.
-    tx: mpsc::SyncSender<[u8; PULSE_LEN]>,
+    tx: mpsc::SyncSender<OutReport>,
     /// Whether a dropped pulse has already been logged, so a wedged writer does
     /// not spam the log at the tick rate.
     warned_full: bool,
@@ -206,7 +286,7 @@ impl Haptics {
     /// Spawn the device-writer thread and return a handle to it. The thread
     /// parks on the queue and opens nothing until the first pulse arrives.
     pub fn new() -> Haptics {
-        let (tx, rx) = mpsc::sync_channel::<[u8; PULSE_LEN]>(QUEUE_DEPTH);
+        let (tx, rx) = mpsc::sync_channel::<OutReport>(QUEUE_DEPTH);
         std::thread::spawn(move || writer_loop(&rx));
         Haptics { tx, warned_full: false }
     }
@@ -220,10 +300,7 @@ impl Haptics {
         if on_us == 0 {
             return; // scaled to nothing: don't bother the device
         }
-        if self.tx.try_send(build_pulse(pad, on_us, off_us, count)).is_err() && !self.warned_full {
-            eprintln!("warning: haptics queue full (device slow or gone); dropping pulses");
-            self.warned_full = true;
-        }
+        self.queue(build_pulse(pad, on_us, off_us, count));
     }
 
     /// A single short tick — key crossing, scroll detent, bare-button press.
@@ -240,6 +317,45 @@ impl Haptics {
     pub fn buzz(&mut self, pad: Pad, intensity: f64) {
         self.play(Feel::Buzz, pad, intensity);
     }
+
+    /// Fire an explicit `0x81` pulse train. The escape hatch from the fixed
+    /// [`Feel`] shapes, used by the gamepad bridge's pulse-mode rumble
+    /// approximation, which needs a width and repeat count derived from a game's
+    /// force-feedback magnitude rather than one of the calibrated UI feels.
+    /// `on_us` is clamped exactly like a scaled feel's.
+    pub fn pulse(&mut self, pad: Pad, on_us: u16, off_us: u16, count: u16) {
+        let on_us = on_us.min(ON_US_MAX);
+        if on_us == 0 || count == 0 {
+            return;
+        }
+        self.queue(build_pulse(pad, on_us, off_us, count));
+    }
+
+    /// Drive the puck's **force-feedback rumble** (`0x80`) — the game-facing
+    /// channel, distinct from the discrete UI pulses above.
+    ///
+    /// `left_speed` is the `FF_RUMBLE` `strong_magnitude` and `right_speed` the
+    /// `weak_magnitude`, both `0..=65535`, passed through unscaled exactly as
+    /// `hid-steam`'s `steam_play_effect` does. Zero on both stops the rumble;
+    /// there is no separate stop command.
+    ///
+    /// **Rate-limit this.** The kernel throttles rumble to 20 Hz and re-sends
+    /// the same packet every 50 ms while either magnitude is non-zero, because
+    /// the controller restarts its haptic pattern on every packet — back-to-back
+    /// writes make it stutter or cut out. The caller owns that clock
+    /// (`run::drive_rumble`); this method just queues what it is given.
+    pub fn rumble(&mut self, left_speed: u16, right_speed: u16) {
+        self.queue(build_rumble(left_speed, right_speed));
+    }
+
+    /// Queue one built report for the writer thread, warning once if the queue
+    /// is full rather than blocking the daemon's loop on a USB transfer.
+    fn queue(&mut self, report: OutReport) {
+        if self.tx.try_send(report).is_err() && !self.warned_full {
+            eprintln!("warning: haptics queue full (device slow or gone); dropping pulses");
+            self.warned_full = true;
+        }
+    }
 }
 
 impl Default for Haptics {
@@ -250,10 +366,10 @@ impl Default for Haptics {
 
 /// The device-writer thread: drain queued pulse reports and write each one to
 /// the puck. Ends when the last [`Haptics`] handle drops (daemon exit).
-fn writer_loop(rx: &mpsc::Receiver<[u8; PULSE_LEN]>) {
+fn writer_loop(rx: &mpsc::Receiver<OutReport>) {
     let mut dev = PuckWriter::new();
     for report in rx {
-        dev.write_report(&report);
+        dev.write_report(report.as_slice());
     }
 }
 
@@ -303,11 +419,12 @@ impl PuckWriter {
         PuckWriter { fds: Vec::new(), last_open: None, warned: false, announced: false }
     }
 
-    /// Write one 8-byte output report to every node in the current set.
+    /// Write one output report (8 bytes for a pulse, 10 for a rumble) to every
+    /// node in the current set.
     ///
     /// A node that errors is dropped; when the set empties — the controller went
     /// away — the next pulse re-opens, at most once per [`REOPEN_INTERVAL`].
-    fn write_report(&mut self, report: &[u8; PULSE_LEN]) {
+    fn write_report(&mut self, report: &[u8]) {
         if !self.ensure_open() {
             return;
         }
@@ -397,10 +514,11 @@ mod tests {
     #[test]
     fn pulse_report_is_eight_bytes_with_the_pulse_id() {
         // The kernel sends exactly 8 bytes (`hid_hw_output_report(..., 8)`) —
-        // NOT zero-padded to 64 like the feature frames in `lizard.rs`.
+        // NOT zero-padded to 64 like the feature frames in `lizard.rs`, and NOT
+        // padded out to the wider rumble report's length either.
         let r = build_pulse(Pad::Right, 0x0190, 0, 1);
-        assert_eq!(r.len(), 8);
-        assert_eq!(r[0], 0x81); // REPORT_ID_HAPTIC_PULSE
+        assert_eq!(r.as_slice().len(), 8);
+        assert_eq!(r.as_slice()[0], 0x81); // REPORT_ID_HAPTIC_PULSE
     }
 
     #[test]
@@ -410,16 +528,16 @@ mod tests {
         assert_eq!(wire_side(Pad::Left), 1);
         assert_eq!(wire_side(Pad::Right), 0);
         assert_eq!(wire_side(Pad::Both), 2);
-        assert_eq!(build_pulse(Pad::Left, 1, 2, 3)[1], 1);
-        assert_eq!(build_pulse(Pad::Right, 1, 2, 3)[1], 0);
-        assert_eq!(build_pulse(Pad::Both, 1, 2, 3)[1], 2);
+        assert_eq!(build_pulse(Pad::Left, 1, 2, 3).as_slice()[1], 1);
+        assert_eq!(build_pulse(Pad::Right, 1, 2, 3).as_slice()[1], 0);
+        assert_eq!(build_pulse(Pad::Both, 1, 2, 3).as_slice()[1], 2);
     }
 
     #[test]
     fn fields_are_little_endian_in_the_documented_slots() {
         // on_us = 0x0190, off_us = 0x012C, count = 0x0002.
         let r = build_pulse(Pad::Right, 0x0190, 0x012C, 0x0002);
-        assert_eq!(r, [0x81, 0x00, 0x90, 0x01, 0x2C, 0x01, 0x02, 0x00]);
+        assert_eq!(r.as_slice(), [0x81, 0x00, 0x90, 0x01, 0x2C, 0x01, 0x02, 0x00]);
     }
 
     #[test]
@@ -429,7 +547,7 @@ mod tests {
         let (on, off, count) = Feel::Tick.pulse();
         assert_eq!((on, off, count), (0x0190, 0x0000, 0x0001));
         let r = build_pulse(Pad::Right, on, off, count);
-        assert_eq!(r, [0x81, 0x00, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00]);
+        assert_eq!(r.as_slice(), [0x81, 0x00, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00]);
     }
 
     #[test]
@@ -438,7 +556,7 @@ mod tests {
         assert_eq!((on, off, count), (0x0258, 0x012C, 0x0002));
         // Left pad -> wire side 1; 600 µs on, 300 µs off, twice.
         let r = build_pulse(Pad::Left, on, off, count);
-        assert_eq!(r, [0x81, 0x01, 0x58, 0x02, 0x2C, 0x01, 0x02, 0x00]);
+        assert_eq!(r.as_slice(), [0x81, 0x01, 0x58, 0x02, 0x2C, 0x01, 0x02, 0x00]);
         // A click is strictly longer/repeated versus a tick — the only knobs
         // the IBEX pulse struct exposes (there is no gain field).
         let (tick_on, _, tick_count) = Feel::Tick.pulse();
@@ -450,7 +568,7 @@ mod tests {
         let (on, off, count) = Feel::Buzz.pulse();
         assert_eq!((on, off, count), (0x01F4, 0x01F4, 0x000A));
         let r = build_pulse(Pad::Both, on, off, count);
-        assert_eq!(r, [0x81, 0x02, 0xF4, 0x01, 0xF4, 0x01, 0x0A, 0x00]);
+        assert_eq!(r.as_slice(), [0x81, 0x02, 0xF4, 0x01, 0xF4, 0x01, 0x0A, 0x00]);
         // ~10 on/off cycles of 500 µs each ≈ a 10 ms brrr.
         assert!(u32::from(count) * (u32::from(on) + u32::from(off)) / 1000 >= 9);
     }
@@ -511,7 +629,59 @@ mod tests {
         // the rhythm, or a "louder" click would become a different feel.
         let (on, off, count) = Feel::Click.pulse();
         let r = build_pulse(Pad::Left, scale_on_us(on, 2.0), off, count);
-        assert_eq!(&r[4..8], &[0x2C, 0x01, 0x02, 0x00]);
-        assert_eq!(u16::from_le_bytes([r[2], r[3]]), 1200);
+        let b = r.as_slice();
+        assert_eq!(&b[4..8], &[0x2C, 0x01, 0x02, 0x00]);
+        assert_eq!(u16::from_le_bytes([b[2], b[3]]), 1200);
+    }
+
+    #[test]
+    fn rumble_report_mirrors_the_kernels_ibex_force_feedback_packet() {
+        // `steam_haptic_rumble(steam, intensity=0, left, right, left_gain=2,
+        // right_gain=0)` — the constants are the driver's, on every call, for
+        // both the immediate and the 20 Hz coalescing work item.
+        let r = build_rumble(0xBEEF, 0x1234);
+        assert_eq!(r.as_slice().len(), 10, "the kernel sends exactly 10 bytes");
+        assert_eq!(
+            r.as_slice(),
+            [
+                0x80, // REPORT_ID_HAPTIC_RUMBLE
+                0x00, // type: never assigned by the driver (kzalloc'd)
+                0x00, 0x00, // intensity: the driver always passes 0
+                0xEF, 0xBE, // left.speed  = strong_magnitude, LE, unscaled
+                0x02, // left.gain: the driver's hard-coded 2
+                0x34, 0x12, // right.speed = weak_magnitude, LE, unscaled
+                0x00, // right.gain: the driver's hard-coded 0
+            ]
+        );
+    }
+
+    #[test]
+    fn rumble_has_no_side_xor_and_stops_with_zero_magnitudes() {
+        // Unlike `steam_haptic_pulse`, `steam_haptic_rumble` has no `pad ^= 1`:
+        // left and right are named struct fields, so a strong-only effect must
+        // land in the LEFT slot and leave the right one alone.
+        let b = build_rumble(u16::MAX, 0);
+        assert_eq!(&b.as_slice()[4..6], &[0xFF, 0xFF], "strong -> left.speed");
+        assert_eq!(&b.as_slice()[7..9], &[0x00, 0x00], "weak stays zero");
+        // There is no dedicated stop command: zero magnitudes are the stop, and
+        // the gain bytes stay at the driver's constants even then.
+        assert_eq!(
+            build_rumble(0, 0).as_slice(),
+            [0x80, 0, 0, 0, 0, 0, 0x02, 0, 0, 0x00]
+        );
+    }
+
+    #[test]
+    fn raw_pulse_entry_point_clamps_and_refuses_nothing_pulses() {
+        // The gamepad bridge's pulse-mode rumble derives its own widths, so the
+        // raw entry point must apply the same ceiling a scaled feel gets.
+        let mut h = Haptics::new();
+        // Nothing to fire: neither of these should reach the queue (a zero-width
+        // or zero-count pulse is silence, and would only cost a USB transfer).
+        h.pulse(Pad::Left, 0, 0, 4);
+        h.pulse(Pad::Left, 400, 0, 0);
+        // A sane one does. The clamp is shared with `scale_on_us`, so a caller
+        // asking for a 10 ms "pulse" gets the 2 ms ceiling instead.
+        assert_eq!(scale_on_us(ON_US_MAX, 4.0), ON_US_MAX);
     }
 }

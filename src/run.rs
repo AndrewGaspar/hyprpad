@@ -1,16 +1,38 @@
 //! The daemon pipeline: passive controller tap -> gesture recognition ->
-//! config lookup -> game-focus gate -> Hyprland dispatch.
+//! config lookup -> game-focus gate -> Hyprland dispatch, or forwarding to the
+//! virtual gamepad a focused game sees.
 //!
 //! Two threads feed one loop. `hidraw::read_all` streams raw reports (merged
 //! across the puck's pairing slots); `hypr::subscribe` streams compositor
 //! events. The main loop owns the [`GestureEngine`], [`Config`], and
 //! [`Arbiter`], and executes [`Action`]s via [`Hypr`].
+//!
+//! ## Who owns the controller on any given frame
+//!
+//! Four layers claim the same device; [`gamepad_forwarding`] is the single place
+//! the precedence is written down, and [`crate::gamepad`]'s module docs explain
+//! why it is ordered this way. Highest first:
+//!
+//! 1. **Guide** — `guide_active()`. Every per-frame handler drops out while the
+//!    guide button is held, in a game as much as on the desktop.
+//! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
+//! 3. **Game forwarding** — [`drive_gamepad`], when a game holds focus and
+//!    neither layer above is claiming.
+//! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`drive_buttons`],
+//!    already self-suppressing via `arbiter.suppressed()`.
+//!
+//! Ranks 3 and 4 are mutually exclusive by construction: `suppressed()` is true
+//! exactly when `game_focused()` is. On every transition *out* of rank 3 the
+//! virtual pad is sent one `neutral()` report and the rumble is stopped, so a
+//! game is never left holding input hyprpad has stopped feeding it.
 
 use crate::arbitrate::Arbiter;
 use crate::config::{
-    Action, Config, CursorConfig, HapticsConfig, ScrollConfig, ScrollMode, WorkspaceTarget,
+    Action, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode, ScrollConfig,
+    ScrollMode, WorkspaceTarget,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
+use crate::gamepad::{self, VirtualGamepad};
 use crate::gesture::{GestureEngine, GestureEvent};
 // `Pad` is renamed: this module already talks about `report::Pad` (a pad
 // *position*), while the haptics one names an *actuator*.
@@ -182,6 +204,18 @@ pub fn run() -> std::io::Result<()> {
     // logged-once no-ops inside the module, never fatal here.
     let mut haptics = Haptics::new();
 
+    // The virtual gamepad games see (docs/06 Tier 1). Built empty: the uinput
+    // device is created on the first frame a game-classed window actually holds
+    // focus, so a session that never plays a game never creates one — and a
+    // machine with no `/dev/uinput` warns once and carries on with the whole
+    // desktop layer intact.
+    let mut gamepad = GamepadState::new();
+    if config.gamepad().enabled {
+        eprintln!("hyprpad: virtual gamepad armed (created on first game focus)");
+    } else {
+        eprintln!("hyprpad: virtual gamepad disabled by config ([gamepad] enabled = false)");
+    }
+
     let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
     let mut engine = GestureEngine::new();
     let mut arbiter = Arbiter::new();
@@ -258,6 +292,10 @@ pub fn run() -> std::io::Result<()> {
                     &mut prev_frame,
                     pointer.as_mut(),
                 );
+                // Same contract for the game: a vanished controller must not
+                // leave the virtual pad holding its last frame, or a rumble
+                // running with nothing left to stop it.
+                gamepad.release(&mut haptics);
                 waiting = true;
                 next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
             }
@@ -344,10 +382,32 @@ pub fn run() -> std::io::Result<()> {
                     buttons_active,
                     &mut hx,
                 );
+                // The other side of the same gate: what the desktop layer gives
+                // up, the game gets. Rank 3 of the precedence in the module
+                // docs — and the falling edge of this gate is what guarantees a
+                // game never sees a stuck stick.
+                let forwarding = gamepad_forwarding(
+                    config.gamepad().enabled,
+                    arbiter.game_focused(),
+                    arbiter.suppressed(),
+                    engine.guide_active(),
+                    osk.is_active(),
+                );
+                drive_gamepad(
+                    &mut gamepad,
+                    &frame,
+                    config.gamepad(),
+                    forwarding,
+                    hx.dev,
+                    now,
+                );
                 prev_frame = frame;
             }
         }
     }
+    // On the way out: release the pad and silence any rumble, before `Drop`
+    // destroys the device and the game sees it unplug.
+    gamepad.release(&mut haptics);
     Ok(())
 }
 
@@ -848,6 +908,272 @@ fn drive_buttons(
             hx.fire(Haptic::Button, button_pad(btn));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The virtual gamepad: forwarding under focus, and rumble back to the puck.
+// ---------------------------------------------------------------------------
+
+/// How often a non-zero rumble command is (re-)written to the puck, and the
+/// minimum gap between any two rumble writes.
+///
+/// This is `hid-steam`'s own `HZ / 20`. The driver rate-limits rumble to 20 Hz
+/// *and* re-sends the same packet every 50 ms while either magnitude is
+/// non-zero, because "the controller resets the haptic pattern every time it
+/// receives a rumble packet, leading to weird discontinuities or sometimes
+/// cutting out entirely". Matching it is not an optimisation — it is what makes
+/// rumble feel continuous.
+const RUMBLE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Narrowest and widest `on_us` the pulse-mode rumble approximation will use, in
+/// µs. The floor is [`Feel::Texture`]'s width (the faintest pulse the daemon
+/// fires) and the ceiling [`Feel::Click`]'s, so a game's rumble spans exactly
+/// the range of feels the device is already known to produce.
+const PULSE_ON_MIN: u16 = 200;
+const PULSE_ON_MAX: u16 = 600;
+
+/// Whether the virtual gamepad should be forwarding this frame.
+///
+/// The single expression of the precedence documented at the top of this module
+/// and in [`crate::gamepad`]: **guide > OSK > game-forwarding > desktop**.
+///
+/// * `guide_active` — the guide layer owns the controller globally, in a game
+///   just as on the desktop. `Guide+R1` must switch workspace mid-game.
+/// * `osk_active` — the on-screen keyboard owns both pads. `Guide+Y` is meant to
+///   raise it over a game, and while it is up the game gets a neutral pad rather
+///   than the thumb movements aimed at the keyboard.
+/// * `desktop_suppressed` — `Arbiter::suppressed()`, which is `game_focused()`
+///   unless the reserved manual desktop override is on. Consulting it as well as
+///   `game_focused` is what keeps ranks 3 and 4 mutually exclusive: if the
+///   override ever forces the desktop layer live over a game, forwarding yields
+///   rather than both driving at once.
+///
+/// Pure, so the whole gate is unit-testable without a device or a compositor.
+fn gamepad_forwarding(
+    enabled: bool,
+    game_focused: bool,
+    desktop_suppressed: bool,
+    guide_active: bool,
+    osk_active: bool,
+) -> bool {
+    enabled && game_focused && desktop_suppressed && !guide_active && !osk_active
+}
+
+/// Cross-frame state for the virtual gamepad: the lazily-created device, the
+/// edge-detection flag behind the neutral-on-transition guarantee, and the
+/// rumble command last written to the puck.
+struct GamepadState {
+    /// The uinput device. `None` until the first frame that actually wants to
+    /// forward — or forever, if creation failed.
+    pad: Option<VirtualGamepad>,
+    /// Whether creation has been attempted, so a failure warns exactly once
+    /// instead of on every frame of every game.
+    tried: bool,
+    /// Whether the previous frame was forwarding. The falling edge of this flag
+    /// is the neutral-on-transition guarantee.
+    forwarding: bool,
+    /// The `(strong, weak)` magnitudes last written to the puck, and when — the
+    /// two halves of the 20 Hz coalescing clock.
+    rumble: (u16, u16),
+    rumble_sent: Option<Instant>,
+    /// The report form `rumble` was written in. Tracked separately from the
+    /// config so a live reload that switches `rumble_mode` can stop the running
+    /// rumble in the form that started it (see [`drive_rumble`]).
+    rumble_mode: RumbleMode,
+}
+
+impl GamepadState {
+    fn new() -> GamepadState {
+        GamepadState {
+            pad: None,
+            tried: false,
+            forwarding: false,
+            rumble: (0, 0),
+            rumble_sent: None,
+            rumble_mode: RumbleMode::default(),
+        }
+    }
+
+    /// Give up the controller: neutral the pad and stop any rumble, without
+    /// destroying the device.
+    ///
+    /// [`drive_gamepad`] already does this on every in-session transition; this
+    /// is for the two events that bypass the per-frame path entirely — the
+    /// controller disconnecting, and the daemon exiting.
+    fn release(&mut self, haptics: &mut Haptics) {
+        if let Some(pad) = self.pad.as_mut() {
+            pad.neutral();
+        }
+        self.forwarding = false;
+        self.stop_rumble(haptics);
+    }
+
+    /// Stop whatever rumble is running, in the form it was started in.
+    fn stop_rumble(&mut self, haptics: &mut Haptics) {
+        if self.rumble != (0, 0) {
+            emit_rumble(haptics, self.rumble_mode, (0, 0));
+            self.rumble = (0, 0);
+            self.rumble_sent = None;
+        }
+    }
+}
+
+/// Forward one frame to the virtual gamepad, or release it.
+///
+/// While `forwarding`, every frame becomes one SYN-terminated report on the
+/// virtual pad (only the axes and buttons that changed are written). On the
+/// frame `forwarding` goes false — for *any* reason: the game lost focus, the
+/// guide button went down, the on-screen keyboard came up, the config was
+/// reloaded with `enabled = false` — the pad is neutralled exactly once.
+///
+/// The device is created here rather than at startup, on the first frame that
+/// wants it, so a session that never focuses a game never creates one. Games
+/// discover it through the usual udev hotplug path.
+fn drive_gamepad(
+    st: &mut GamepadState,
+    frame: &report::Frame,
+    cfg: &GamepadConfig,
+    forwarding: bool,
+    haptics: &mut Haptics,
+    now: Instant,
+) {
+    if forwarding {
+        if st.pad.is_none() && !st.tried {
+            st.tried = true;
+            match VirtualGamepad::new() {
+                Ok(pad) => {
+                    eprintln!(
+                        "hyprpad: virtual gamepad created (045e:028e); forwarding under game focus"
+                    );
+                    st.pad = Some(pad);
+                }
+                Err(e) => eprintln!("warning: no virtual gamepad ({e}); games get no input"),
+            }
+        }
+        if let Some(pad) = st.pad.as_mut() {
+            pad.apply(frame, cfg.forward_guide);
+        }
+        st.forwarding = true;
+    } else if st.forwarding {
+        // The falling edge, and the only place it is handled.
+        if let Some(pad) = st.pad.as_mut() {
+            pad.neutral();
+        }
+        st.forwarding = false;
+    }
+    drive_rumble(st, cfg, forwarding, haptics, now);
+}
+
+/// Carry the game's force feedback back to the real controller for one frame.
+///
+/// The magnitudes come from the virtual pad's force-feedback reader thread
+/// ([`crate::gamepad`]), already scaled by whatever `FF_GAIN` the client set;
+/// this applies the `[gamepad] rumble_intensity` knob on top, gates on
+/// forwarding, and enforces the 20 Hz clock.
+fn drive_rumble(
+    st: &mut GamepadState,
+    cfg: &GamepadConfig,
+    forwarding: bool,
+    haptics: &mut Haptics,
+    now: Instant,
+) {
+    // A live reload can switch the report form under a running rumble. The new
+    // form has no way to stop what the old one started (a `0x80` zero does not
+    // end a pulse train, and no pulse ends a native rumble), so stop it in its
+    // own form first and start clean.
+    if cfg.rumble_mode != st.rumble_mode {
+        st.stop_rumble(haptics);
+        st.rumble_mode = cfg.rumble_mode;
+    }
+
+    // Not forwarding, or rumble switched off: the target is silence. Reading the
+    // knobs per frame is what makes `hyprpad reload` take effect on the next one.
+    let want = match st.pad.as_ref() {
+        Some(pad) if forwarding && cfg.rumble => {
+            let (strong, weak) = pad.rumble().magnitudes();
+            (
+                gamepad::scale_magnitude(strong, cfg.rumble_intensity),
+                gamepad::scale_magnitude(weak, cfg.rumble_intensity),
+            )
+        }
+        _ => (0, 0),
+    };
+    if !rumble_due(want, st.rumble, st.rumble_sent, now) {
+        return;
+    }
+    st.rumble = want;
+    st.rumble_sent = Some(now);
+    emit_rumble(haptics, cfg.rumble_mode, want);
+}
+
+/// Whether a rumble command goes out on this frame.
+///
+/// Mirrors `hid-steam`'s coalescing: at most one write per [`RUMBLE_INTERVAL`],
+/// and a *repeat* write every interval while the rumble is non-zero (the
+/// controller needs the refresh). A change arriving inside the window is simply
+/// picked up by the next refresh, exactly as the driver's cached magnitudes are.
+///
+/// **A stop is the one exception** and goes out immediately: a rumble left
+/// running is the single failure a player actually feels, so it is never made to
+/// wait for the clock. Pure, so the whole policy is unit-testable.
+fn rumble_due(
+    want: (u16, u16),
+    sent: (u16, u16),
+    last_sent: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if want == (0, 0) {
+        return sent != (0, 0);
+    }
+    match last_sent {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= RUMBLE_INTERVAL,
+    }
+}
+
+/// Write one rumble command to the puck in the configured form.
+fn emit_rumble(haptics: &mut Haptics, mode: RumbleMode, (strong, weak): (u16, u16)) {
+    match mode {
+        // The puck's own force-feedback report, byte-for-byte what `hid-steam`
+        // sends for an `FF_RUMBLE` effect.
+        RumbleMode::Native => haptics.rumble(strong, weak),
+        // The approximation: a train of the `0x81` pulse under each thumb, sized
+        // to fill one refresh window so consecutive windows run together. There
+        // is no "stop a train" report and none is needed — a train that is not
+        // re-fired simply runs out inside the window, which is why silence here
+        // is the absence of a write rather than a write of zero.
+        RumbleMode::Pulse => {
+            for (pad, magnitude) in [(HapticPad::Left, strong), (HapticPad::Right, weak)] {
+                if let Some((on_us, off_us, count)) = pulse_train(magnitude) {
+                    haptics.pulse(pad, on_us, off_us, count);
+                }
+            }
+        }
+    }
+}
+
+/// Map one `FF_RUMBLE` magnitude to a `0x81` pulse train filling one
+/// [`RUMBLE_INTERVAL`], as `(on_us, off_us, count)`. `None` for silence.
+///
+/// **A starting point, not a calibration.** Strength on this device is pulse
+/// width — the IBEX pulse struct has no gain field — so the magnitude is scaled
+/// across [`PULSE_ON_MIN`]..[`PULSE_ON_MAX`] at a 50 % duty cycle (the shape of
+/// the kernel's own mode-switch buzz), and the repeat count is whatever fills
+/// the refresh window. It will not feel like a real rumble motor; it exists so
+/// that if the `0x80` report turns out inert on this unit, a game still gets
+/// *something* under the thumbs. Pure, for testability.
+fn pulse_train(magnitude: u16) -> Option<(u16, u16, u16)> {
+    if magnitude == 0 {
+        return None;
+    }
+    let span = u32::from(PULSE_ON_MAX - PULSE_ON_MIN);
+    let on_us = PULSE_ON_MIN + ((u32::from(magnitude) * span) / u32::from(u16::MAX)) as u16;
+    // 50 % duty: on and off equal, so the train is a continuous buzz rather than
+    // a string of distinguishable ticks.
+    let off_us = on_us;
+    let period_us = u32::from(on_us) + u32::from(off_us);
+    let count = (RUMBLE_INTERVAL.as_micros() as u32 / period_us).clamp(1, u32::from(u16::MAX));
+    Some((on_us, off_us, count as u16))
 }
 
 /// Whether to take ownership of the puck's lizard mode. Enabled by the
@@ -1665,6 +1991,154 @@ mod tests {
         st.reconfigure(&cfg);
         assert_eq!(st.sens, 0.2);
         assert!(st.left_down, "reconfigure must not clear a held click");
+    }
+
+    #[test]
+    fn gamepad_gate_encodes_the_precedence_model() {
+        // The everyday case: a game has focus, nothing above it is claiming.
+        assert!(gamepad_forwarding(true, true, true, false, false));
+        // Rank 4 only: no game focused, so the desktop layer keeps the pads and
+        // the virtual pad stays neutral.
+        assert!(!gamepad_forwarding(true, false, false, false, false));
+        // Rank 1 beats rank 3: the guide layer works *in* a game, and while it
+        // is held the game gets nothing — that is the docs/08 input contract.
+        assert!(!gamepad_forwarding(true, true, true, true, false));
+        // Rank 2 beats rank 3: `Guide+Y` raises the keyboard over a game, and
+        // while it is up the pads aim at keys, not at the game.
+        assert!(!gamepad_forwarding(true, true, true, false, true));
+        // Both at once is still off.
+        assert!(!gamepad_forwarding(true, true, true, true, true));
+        // The config master switch overrides everything below it.
+        assert!(!gamepad_forwarding(false, true, true, false, false));
+    }
+
+    #[test]
+    fn gamepad_gate_yields_to_a_forced_desktop_layer() {
+        // `Arbiter::set_force_desktop` keeps `game_focused()` true while turning
+        // `suppressed()` off — the reserved manual override. Ranks 3 and 4 must
+        // stay mutually exclusive: if the desktop is forced live over a game,
+        // forwarding yields rather than both driving the controller at once.
+        let mut a = Arbiter::new();
+        a.focus_changed("steam_app_413080");
+        assert!(gamepad_forwarding(true, a.game_focused(), a.suppressed(), false, false));
+        a.set_force_desktop(true);
+        assert!(a.game_focused() && !a.suppressed());
+        assert!(!gamepad_forwarding(true, a.game_focused(), a.suppressed(), false, false));
+    }
+
+    /// Drive `st` through one frame at the given gate, with no real device
+    /// (`tried` pre-set so nothing is created) and a haptics handle that opens
+    /// nothing until a pulse is queued.
+    fn step(st: &mut GamepadState, hap: &mut Haptics, forwarding: bool, now: Instant) {
+        drive_gamepad(
+            st,
+            &report::Frame::default(),
+            &GamepadConfig::default(),
+            forwarding,
+            hap,
+            now,
+        );
+    }
+
+    #[test]
+    fn gamepad_tracks_the_forwarding_edge_for_neutral_on_transition() {
+        let mut st = GamepadState { tried: true, ..GamepadState::new() };
+        let mut hap = Haptics::new();
+        let t = Instant::now();
+
+        // Nothing focused: no edge to report, and nothing is claimed.
+        step(&mut st, &mut hap, false, t);
+        assert!(!st.forwarding);
+        // A game takes focus: forwarding latches on.
+        step(&mut st, &mut hap, true, t);
+        assert!(st.forwarding);
+        // Still forwarding next frame — no spurious re-transition.
+        step(&mut st, &mut hap, true, t);
+        assert!(st.forwarding);
+        // Guide goes down (or the OSK comes up, or focus leaves — the gate does
+        // not say which): the falling edge fires exactly once and latches off.
+        step(&mut st, &mut hap, false, t);
+        assert!(!st.forwarding, "the falling edge must release the pad");
+        step(&mut st, &mut hap, false, t);
+        assert!(!st.forwarding, "and must not re-fire while still released");
+        // Guide comes back up mid-game: forwarding resumes.
+        step(&mut st, &mut hap, true, t);
+        assert!(st.forwarding);
+        // `release` is the out-of-band path (disconnect / daemon exit) and does
+        // the same thing without waiting for a frame.
+        st.release(&mut hap);
+        assert!(!st.forwarding);
+    }
+
+    #[test]
+    fn rumble_mode_change_stops_the_running_rumble_in_its_own_form() {
+        // A live reload that flips `rumble_mode` under a running rumble must not
+        // strand it: the new form has no stop for what the old one started.
+        let mut st = GamepadState { tried: true, ..GamepadState::new() };
+        let mut hap = Haptics::new();
+        st.rumble = (40_000, 10_000);
+        st.rumble_sent = Some(Instant::now());
+        assert_eq!(st.rumble_mode, RumbleMode::Native);
+
+        let pulse = GamepadConfig { rumble_mode: RumbleMode::Pulse, ..GamepadConfig::default() };
+        drive_rumble(&mut st, &pulse, false, &mut hap, Instant::now());
+        assert_eq!(st.rumble, (0, 0), "the old form's rumble must be stopped");
+        assert_eq!(st.rumble_mode, RumbleMode::Pulse, "and the new form adopted");
+        assert!(st.rumble_sent.is_none());
+    }
+
+    #[test]
+    fn rumble_is_coalesced_at_20hz_but_stops_immediately() {
+        let t = Instant::now();
+        // Nothing commanded and nothing outstanding: no write at all.
+        assert!(!rumble_due((0, 0), (0, 0), None, t));
+        // The first non-zero command goes out at once.
+        assert!(rumble_due((30_000, 0), (0, 0), None, t));
+        // A change inside the window waits — the kernel caches magnitudes the
+        // same way; writing back-to-back makes the controller stutter.
+        assert!(!rumble_due((40_000, 0), (30_000, 0), Some(t), t));
+        // Once the window elapses it goes out, change or not: a *non-zero*
+        // rumble needs the 50 ms refresh or the controller lets it lapse.
+        let later = t + RUMBLE_INTERVAL;
+        assert!(rumble_due((40_000, 0), (30_000, 0), Some(t), later));
+        assert!(rumble_due((30_000, 0), (30_000, 0), Some(t), later));
+        // A stop never waits for the clock — a stuck rumble is the one failure a
+        // player actually feels.
+        assert!(rumble_due((0, 0), (30_000, 0), Some(t), t));
+        // But a stop is sent once, not on every subsequent frame.
+        assert!(!rumble_due((0, 0), (0, 0), Some(t), later));
+    }
+
+    #[test]
+    fn pulse_train_fills_one_refresh_window_and_scales_with_magnitude() {
+        // Silence produces no train at all: an un-refreshed train simply runs
+        // out, so "stop" here is the absence of a write.
+        assert_eq!(pulse_train(0), None);
+
+        let (on_min, off_min, count_min) = pulse_train(1).unwrap();
+        let (on_max, off_max, count_max) = pulse_train(u16::MAX).unwrap();
+        // Strength is pulse width on this device, so magnitude spans the
+        // texture..click range and nothing else changes shape.
+        assert_eq!(on_min, PULSE_ON_MIN);
+        assert_eq!(on_max, PULSE_ON_MAX);
+        assert!(on_max > on_min, "a harder rumble must be a wider pulse");
+        // 50 % duty in both cases.
+        assert_eq!((on_min, off_min), (on_min, on_min));
+        assert_eq!((on_max, off_max), (on_max, on_max));
+        // And every train fills one refresh window, so consecutive windows run
+        // together into a continuous buzz rather than a string of ticks.
+        for (on, off, count) in [(on_min, off_min, count_min), (on_max, off_max, count_max)] {
+            let span_us = u32::from(count) * (u32::from(on) + u32::from(off));
+            let window_us = RUMBLE_INTERVAL.as_micros() as u32;
+            assert!(
+                span_us > window_us / 2 && span_us <= window_us,
+                "a {on}/{off}x{count} train spans {span_us} µs of a {window_us} µs window"
+            );
+        }
+        // A narrower pulse needs more cycles to fill the same window, and every
+        // train has at least one cycle (a count of 0 would be a silent write).
+        assert!(count_min > count_max);
+        assert!(count_max >= 1);
     }
 
     #[test]

@@ -3,12 +3,14 @@
 //! The binary (`main.rs`) declares its own `mod report; mod hidraw;` for the
 //! passive monitor. This library re-exports the same low-level modules plus the
 //! higher-level layers — [`gesture`] recognition, [`config`] bindings,
-//! [`arbitrate`] game-focus gating, and [`hypr`] compositor IPC — so unit and
-//! integration tests and the daemon front-end build against them.
+//! [`arbitrate`] game-focus gating, [`gamepad`] the virtual pad games see, and
+//! [`hypr`] compositor IPC — so unit and integration tests and the daemon
+//! front-end build against them.
 
 pub mod arbitrate;
 pub mod config;
 pub mod filter;
+pub mod gamepad;
 pub mod gesture;
 pub mod haptics;
 pub mod hidraw;
