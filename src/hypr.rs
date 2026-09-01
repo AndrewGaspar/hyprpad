@@ -159,7 +159,7 @@ impl Hypr {
         self.request(&format!("j/{command}"))
     }
 
-    /// The focused window's `pid` and fullscreen state, from
+    /// The focused window's `pid`, fullscreen state and current title, from
     /// `j/activewindow`.
     ///
     /// The `activewindow` **event** carries only class and title, so this fills
@@ -168,13 +168,19 @@ impl Hypr {
     /// opt-in rule reads. Verified against the live compositor: the reply has
     /// `"pid": <n>` and `"fullscreen": <n>` (0 = not fullscreen).
     ///
-    /// Called on a focus change only — never per frame — and only when a config
-    /// actually declares modes ([`crate::config::Config::needs_focus_pid`]).
+    /// `title` is the *live* title, which is why the title-rescan path reads it
+    /// too: a compositor that emits only the bare `windowtitle>>ADDRESS` form
+    /// says a window was renamed without saying to what.
+    ///
+    /// Called on a focus change (and, on such a compositor, on a rename of the
+    /// focused window) — never per frame — and only when a config actually
+    /// declares modes ([`crate::config::Config::needs_focus_pid`]).
     pub fn active_window(&self) -> io::Result<ActiveWindowInfo> {
         let json = self.query("activewindow")?;
         Ok(ActiveWindowInfo {
             pid: json_number(&json, "pid").map(|n| n as i32),
             fullscreen: json_number(&json, "fullscreen").is_some_and(|n| n != 0),
+            title: json_string(&json, "title").unwrap_or_default(),
         })
     }
 
@@ -219,13 +225,16 @@ impl Hypr {
 }
 
 /// The fields of `j/activewindow` the modality layer needs, and which the
-/// `activewindow` event does not carry.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `activewindow` event does not carry (or, for `title`, does not carry on a
+/// `windowtitle` rename).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActiveWindowInfo {
     /// The focused window's process id.
     pub pid: Option<i32>,
     /// Whether it is fullscreen (any non-zero Hyprland fullscreen state).
     pub fullscreen: bool,
+    /// Its title as of this query. Empty when the reply carries none.
+    pub title: String,
 }
 
 /// Pull a top-level numeric field out of a Hyprland JSON reply.
@@ -247,6 +256,28 @@ fn json_number(json: &str, field: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
+/// Pull a top-level string field out of a Hyprland JSON reply, undoing the two
+/// escapes its writer emits (`\"` and `\\`).
+///
+/// Same four-line-scanner ethos as [`json_number`], and safe against the
+/// neighbouring `initialTitle` / `initialClass` fields because the needle
+/// carries the opening quote: `"title":` is not a substring of
+/// `"initialTitle":`.
+fn json_string(json: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":");
+    let rest = json[json.find(&needle)? + needle.len()..].trim_start();
+    let mut chars = rest.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => out.push(chars.next()?),
+            _ => out.push(c),
+        }
+    }
+    None // unterminated string: a truncated reply, not a title
+}
+
 /// A parsed line from the `.socket2.sock` event stream.
 ///
 /// Addresses are normalized to the `0x…` form used by the JSON queries and by
@@ -266,6 +297,20 @@ pub enum HyprEvent {
     ActiveWindow { class: String, title: String, pid: Option<i32> },
     /// Keyboard focus moved, address form. `activewindowv2>>address`.
     ActiveWindowV2 { address: String },
+    /// A window renamed itself. Both wire forms land here, distinguished by
+    /// whether the new title was on the line:
+    ///
+    /// ```text
+    /// windowtitle>>55d89beaf480              -> title: None
+    /// windowtitlev2>>55d89beaf480,⠙ ds-decomp -> title: Some("⠙ ds-decomp")
+    /// ```
+    ///
+    /// Captured from the live compositor (HypXRland, Hyprland 0.56.2), which
+    /// emits **both**, in that order, for every rename. This is the event that
+    /// makes a program started inside an already-focused terminal — `claude` in
+    /// a shell — visible to the mode rules without a refocus, because starting
+    /// it is what renames the terminal.
+    WindowTitle { address: String, title: Option<String> },
     /// The active window's fullscreen state changed. `fullscreen>>0|1`
     /// (any non-zero state is `true`).
     Fullscreen(bool),
@@ -325,6 +370,18 @@ fn parse_event(line: &str) -> Option<HyprEvent> {
         "activewindowv2" => HyprEvent::ActiveWindowV2 {
             address: norm_addr(data),
         },
+        "windowtitle" => HyprEvent::WindowTitle {
+            address: norm_addr(data.trim()),
+            title: None,
+        },
+        "windowtitlev2" => {
+            // address,title — a title may itself contain commas, so split once.
+            let (address, title) = data.split_once(',').unwrap_or((data, ""));
+            HyprEvent::WindowTitle {
+                address: norm_addr(address),
+                title: Some(title.to_string()),
+            }
+        }
         "fullscreen" => HyprEvent::Fullscreen(data.trim() != "0"),
         "openwindow" => {
             // address,workspace,class,title — title may contain commas.
@@ -453,6 +510,54 @@ mod tests {
                 class: "foot".into(),
                 title: String::new(),
                 pid: None,
+            })
+        );
+    }
+
+    #[test]
+    fn reads_the_title_out_of_an_active_window_reply() {
+        assert_eq!(json_string(ACTIVE_WINDOW_JSON, "title").as_deref(), Some("◑ hyprpad"));
+        // `"title":` must not be found inside `"initialTitle":`.
+        let with_initial = ACTIVE_WINDOW_JSON
+            .replace("\"title\":", "\"initialTitle\": \"foot\",\n    \"title\":");
+        assert_eq!(json_string(&with_initial, "title").as_deref(), Some("◑ hyprpad"));
+        // Escapes are undone; a missing or unterminated field is `None`.
+        let quoted = ACTIVE_WINDOW_JSON.replace("◑ hyprpad", "a \\\"b\\\" c");
+        assert_eq!(json_string(&quoted, "title").as_deref(), Some(r#"a "b" c"#));
+        assert_eq!(json_string(ACTIVE_WINDOW_JSON, "nosuchfield"), None);
+        assert_eq!(json_string(ACTIVE_WINDOW_JSON, "pid"), None);
+    }
+
+    /// Both wire forms, exactly as captured from the live compositor.
+    #[test]
+    fn parses_both_window_title_forms() {
+        assert_eq!(
+            parse_event("windowtitle>>55d89beaf480"),
+            Some(HyprEvent::WindowTitle {
+                address: "0x55d89beaf480".into(),
+                title: None,
+            })
+        );
+        assert_eq!(
+            parse_event("windowtitlev2>>55d89beaf480,⠙ ds-decomp"),
+            Some(HyprEvent::WindowTitle {
+                address: "0x55d89beaf480".into(),
+                title: Some("⠙ ds-decomp".into()),
+            })
+        );
+        // A renamed-to-nothing window, and a title carrying commas.
+        assert_eq!(
+            parse_event("windowtitlev2>>abc,"),
+            Some(HyprEvent::WindowTitle {
+                address: "0xabc".into(),
+                title: Some(String::new()),
+            })
+        );
+        assert_eq!(
+            parse_event("windowtitlev2>>abc,Doc, v2, final — Chrome"),
+            Some(HyprEvent::WindowTitle {
+                address: "0xabc".into(),
+                title: Some("Doc, v2, final — Chrome".into()),
             })
         );
     }

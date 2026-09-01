@@ -29,7 +29,7 @@
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
 //! | `[buttons]` | bare buttons -> raw keys (D-pad = arrows by default) |
 //! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
-//! | `[daemon]` | daemon-wide switches (`own_lizard`) |
+//! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
 //! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
@@ -700,6 +700,13 @@ impl ModeState {
     }
 }
 
+/// Default `process_rescan_ms`: how often the focused window's process tree is
+/// re-walked when a mode rule actually asks about it. The walk is a handful of
+/// `/proc` reads, so twice a second is imperceptible either way — fast enough
+/// that a program which renames nothing is noticed while the user is still
+/// reaching for the controller, cheap enough to leave on.
+pub const DEFAULT_PROCESS_RESCAN_MS: u64 = 500;
+
 /// A set of gesture bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -720,6 +727,17 @@ pub struct Config {
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
     pub(crate) own_lizard: bool,
+    /// Whether a `windowtitle` event on the **focused** window re-resolves the
+    /// modes (`rescan_on_title_change` in `[daemon]` / `h.daemon`). `None` is
+    /// the default, which is *on*: it is the event-driven half of noticing a
+    /// program that starts inside an already-focused terminal, and it polls
+    /// nothing. Read per event, so a reload retunes it.
+    pub(crate) rescan_on_title_change: Option<bool>,
+    /// How often the focused window's process tree may be re-walked, in
+    /// milliseconds; `0` disables the sweep (`process_rescan_ms`). `None` is the
+    /// default, [`DEFAULT_PROCESS_RESCAN_MS`]. Read per tick, so a reload
+    /// retunes it.
+    pub(crate) process_rescan_ms: Option<u64>,
     /// Trackpad-cursor smoothing knobs (`[cursor]`/`[damping]` section).
     pub(crate) cursor: CursorConfig,
     /// Left-trackpad scroll knobs (`[scroll]` section).
@@ -828,6 +846,8 @@ impl Config {
         let mut buttons = HashMap::new();
         let mut osk_buttons = HashMap::new();
         let mut own_lizard = false;
+        let mut rescan_on_title_change = None;
+        let mut process_rescan_ms = None;
         let mut cursor = CursorConfig::default();
         let mut scroll = ScrollConfig::default();
         let mut haptics = HapticsConfig::default();
@@ -901,6 +921,18 @@ impl Config {
                         "own_lizard" => {
                             own_lizard = parse_bool(&unquote(v))
                                 .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "rescan_on_title_change" => {
+                            rescan_on_title_change = Some(
+                                parse_bool(&unquote(v))
+                                    .map_err(|e| format!("line {lineno}: {e}"))?,
+                            );
+                        }
+                        "process_rescan_ms" => {
+                            process_rescan_ms = Some(
+                                parse_millis(&unquote(v))
+                                    .map_err(|e| format!("line {lineno}: {e}"))?,
+                            );
                         }
                         other => {
                             return Err(format!(
@@ -1035,6 +1067,8 @@ impl Config {
             buttons,
             osk_buttons,
             own_lizard,
+            rescan_on_title_change,
+            process_rescan_ms,
             cursor,
             scroll,
             haptics,
@@ -1158,6 +1192,19 @@ impl Config {
     /// section; default `false`.
     pub fn own_lizard(&self) -> bool {
         self.own_lizard
+    }
+
+    /// Whether a rename of the focused window re-resolves the modes
+    /// (`rescan_on_title_change` in the `[daemon]` section); default `true`.
+    pub fn rescan_on_title_change(&self) -> bool {
+        self.rescan_on_title_change.unwrap_or(true)
+    }
+
+    /// How often the focused window's process tree may be re-walked, in
+    /// milliseconds (`process_rescan_ms` in the `[daemon]` section); default
+    /// [`DEFAULT_PROCESS_RESCAN_MS`], `0` = off.
+    pub fn process_rescan_ms(&self) -> u64 {
+        self.process_rescan_ms.unwrap_or(DEFAULT_PROCESS_RESCAN_MS)
     }
 
     /// The trackpad-cursor smoothing/damping knobs (`[cursor]`/`[damping]`
@@ -1334,6 +1381,14 @@ fn parse_f64(s: &str) -> Result<f64, String> {
         Ok(v) if v.is_finite() => Ok(v),
         _ => Err(format!("expected a number, got '{t}'")),
     }
+}
+
+/// Parse a whole number of milliseconds (`0` = off), rejecting the negative and
+/// fractional values a timer cannot mean.
+fn parse_millis(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    t.parse::<u64>()
+        .map_err(|_| format!("expected a whole number of milliseconds (0 = off), got '{t}'"))
 }
 
 /// Parse a boolean config value: `true`/`false`, `1`/`0`, `yes`/`no`,
@@ -1772,6 +1827,41 @@ r1 = "key pageup"
         assert!(Config::from_toml_str("[daemon]\nnope = true\n")
             .unwrap_err()
             .contains("unknown [daemon] setting"));
+    }
+
+    #[test]
+    fn the_rescan_knobs_default_on_and_parse() {
+        // Defaults: the event-driven title path on, the sweep at half a second.
+        let d = Config::load_default();
+        assert!(d.rescan_on_title_change());
+        assert_eq!(d.process_rescan_ms(), DEFAULT_PROCESS_RESCAN_MS);
+        assert_eq!(d.process_rescan_ms(), 500);
+
+        let c = Config::from_toml_str(
+            "[daemon]\nrescan_on_title_change = false\nprocess_rescan_ms = 250\n",
+        )
+        .unwrap();
+        assert!(!c.rescan_on_title_change());
+        assert_eq!(c.process_rescan_ms(), 250);
+
+        // `0` is off, and the boolean's other spellings work here too.
+        assert_eq!(
+            Config::from_toml_str("[daemon]\nprocess_rescan_ms = 0\n").unwrap().process_rescan_ms(),
+            0
+        );
+        assert!(Config::from_toml_str("[daemon]\nrescan_on_title_change = on\n")
+            .unwrap()
+            .rescan_on_title_change());
+
+        // Values a timer cannot mean are reported, not rounded.
+        for bad in ["-1", "0.5", "soon"] {
+            assert!(
+                Config::from_toml_str(&format!("[daemon]\nprocess_rescan_ms = {bad}\n"))
+                    .unwrap_err()
+                    .contains("whole number of milliseconds"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

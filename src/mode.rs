@@ -22,8 +22,9 @@
 //! ```
 //!
 //! Rules and `:when` guards are Lua predicates, and they run **on a context
-//! change only** — a focus change, a fullscreen change, a manual override, a
-//! config reload. Never per input frame: the resolved mode, the guard results,
+//! change only** — a focus change, a rename of the focused window, a fullscreen
+//! change, a manual override, a config reload, or the periodic process-tree
+//! rescan. Never per input frame: the resolved mode, the guard results,
 //! and the filtered button maps are all cached in this struct, and the
 //! per-frame handlers only read them.
 //!
@@ -55,7 +56,8 @@ pub const BUILTIN_DESKTOP: &str = "desktop";
 ///
 /// Fed by `activewindow` from the compositor's event socket (class, title) plus
 /// a one-shot `j/activewindow` query for the fields the event stream does not
-/// carry (pid, fullscreen). Reaches Lua as `ctx.focus`.
+/// carry (pid, fullscreen), and kept current under a *still-focused* window by
+/// `windowtitle` ([`ModeEngine::title_changed`]). Reaches Lua as `ctx.focus`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Focus {
     /// The focused window's class, or empty when focus is on the desktop.
@@ -152,6 +154,66 @@ impl ModeEngine {
         self.refresh(config)
     }
 
+    /// The focused window **renamed itself** (Hyprland's `windowtitle` event)
+    /// without focus moving.
+    ///
+    /// This is the case a focus-only engine cannot see: starting `claude` in an
+    /// already-focused terminal changes nothing about *which* window is focused,
+    /// only what it is called and what runs under it. So the new title is
+    /// adopted and the focused window's process-tree cache is dropped — the
+    /// rename is the compositor telling us the tree probably moved — and the
+    /// rules run again exactly as they do on a focus change.
+    ///
+    /// A rename to the title we already hold is not a context change and
+    /// re-resolves nothing, which is what makes the compositor's two events per
+    /// rename (`windowtitle` then `windowtitlev2`) cost one re-resolve.
+    pub fn title_changed(&mut self, config: &Config, title: &str) -> bool {
+        if self.focus.title == title {
+            return false;
+        }
+        self.focus.title = title.to_string();
+        self.forget_process_tree(config);
+        self.refresh(config)
+    }
+
+    /// Re-walk the focused window's process tree and re-resolve — the periodic
+    /// `process_rescan_ms` sweep, for the programs that start without renaming
+    /// anything.
+    ///
+    /// A no-op (and no `/proc` read at all) unless [`process_rescan_useful`]
+    /// says a walk could change an answer.
+    ///
+    /// [`process_rescan_useful`]: Self::process_rescan_useful
+    pub fn rescan_processes(&mut self, config: &Config) -> bool {
+        if !self.process_rescan_useful(config) {
+            return false;
+        }
+        self.forget_process_tree(config);
+        self.refresh(config)
+    }
+
+    /// Whether re-walking the focused window's process tree could change the
+    /// resolution — the gate the daemon's rescan timer is armed behind.
+    ///
+    /// Three ways to answer no, all of them free: no declared modes (the
+    /// built-in path selects on window class alone), no predicate anywhere in
+    /// the config that mentions `process_tree_has`, or no focused pid to walk
+    /// from. The owner's rule is that a config which never asks about processes
+    /// never polls for them.
+    pub fn process_rescan_useful(&self, config: &Config) -> bool {
+        self.focus.pid.is_some()
+            && !config.modes().is_empty()
+            && config.lua().is_some_and(|rt| rt.walks_process_tree())
+    }
+
+    /// Drop the focused window's cached `/proc` walk, so the next predicate that
+    /// asks re-reads it. No-op for a TOML config (no Lua, no walk).
+    fn forget_process_tree(&self, config: &Config) {
+        if let Some(rt) = config.lua() {
+            rt.forget_process_tree();
+        }
+    }
+
     /// The focused window's fullscreen state changed.
     pub fn set_fullscreen(&mut self, config: &Config, on: bool) -> bool {
         self.arbiter.set_fullscreen(on);
@@ -208,6 +270,13 @@ impl ModeEngine {
     /// The resolved snapshot, for `Config::resolve_in` and friends.
     pub fn state(&self) -> &ModeState {
         &self.state
+    }
+
+    /// The focused window's title as the rules last saw it. The daemon compares
+    /// against it to tell a real rename from a repeat of the one it already
+    /// holds.
+    pub fn focus_title(&self) -> &str {
+        &self.focus.title
     }
 
     /// Whether the active mode hands raw input to the game
@@ -640,6 +709,127 @@ mod tests {
         m.set_fullscreen(&c, true);
         assert_eq!(m.active(), "desktop");
         assert!(m.cursor_enabled() && !m.forwards());
+    }
+
+    /// The gap this whole path exists to close: `claude` starts in the terminal
+    /// that already has focus, so no focus event ever fires — only a rename.
+    #[test]
+    fn a_title_change_on_the_focused_window_re_resolves() {
+        let c = lua(
+            r#"
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus.title:match("claude") ~= nil
+            end)
+            hyprpad.mode("desktop")
+            hyprpad.default_mode "desktop"
+            "#,
+        );
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "ajg@framework:~/code/hyprpad", None);
+        assert_eq!(m.active(), "desktop");
+
+        // The terminal renames itself the moment the program starts.
+        assert!(m.title_changed(&c, "claude — hyprpad"));
+        assert_eq!(m.active(), "claude");
+
+        // The compositor sends two events per rename; the second is not a
+        // context change and must not re-resolve (or re-run the handoff).
+        assert!(!m.title_changed(&c, "claude — hyprpad"));
+
+        // And the way back out is the same event.
+        assert!(m.title_changed(&c, "ajg@framework:~/code/hyprpad"));
+        assert_eq!(m.active(), "desktop");
+    }
+
+    #[test]
+    fn a_title_change_that_matches_nothing_moves_no_mode() {
+        let c = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "shell", None);
+        assert!(!m.title_changed(&c, "a different shell"));
+        assert_eq!(m.active(), "desktop");
+    }
+
+    /// The title-less case: a program that starts under the focused window
+    /// without renaming it. The periodic sweep re-walks `/proc` and the rule
+    /// flips — the same transition a focus change would have produced.
+    #[test]
+    fn the_periodic_rescan_sees_a_child_process_appear() {
+        let c = lua(
+            r#"
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus:process_tree_has("hyprpad-rescan-probe")
+            end)
+            hyprpad.mode("desktop")
+            hyprpad.default_mode "desktop"
+            "#,
+        );
+        let mut m = ModeEngine::new(&c);
+        // Pretend this test process is the focused window.
+        let me = std::process::id() as i32;
+        m.focus_changed(&c, "foot", "shell", Some(me));
+        assert_eq!(m.active(), "desktop", "nothing is running under us yet");
+        assert!(m.process_rescan_useful(&c), "the rule walks the tree, so the sweep is armed");
+
+        // The walk matches on `"<comm> <cmdline>"`, so a `sleep` wearing the
+        // probe's name as its `argv[0]` is a distinguishable stand-in for the
+        // program the owner actually cares about — no such binary required.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg0("hyprpad-rescan-probe")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+
+        // `spawn` returns as soon as the fork happens; the child may not have
+        // exec'd yet, so give the rescan a few tries rather than racing it.
+        let mut flipped = false;
+        for _ in 0..50 {
+            flipped = m.rescan_processes(&c);
+            if flipped {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(flipped, "the rescan must see the new child");
+        assert_eq!(m.active(), "claude");
+        // A second rescan with nothing new is not a transition.
+        assert!(!m.rescan_processes(&c));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn the_rescan_never_walks_for_a_config_that_never_asks() {
+        // No mention of `process_tree_has` anywhere: nothing a walk could
+        // change, so the daemon must never arm the timer.
+        let title_only = lua(
+            r#"
+            hyprpad.mode("claude").when(function(ctx)
+              return ctx.focus.title:match("claude") ~= nil
+            end)
+            hyprpad.mode("desktop")
+            "#,
+        );
+        let mut m = ModeEngine::new(&title_only);
+        m.focus_changed(&title_only, "foot", "shell", Some(std::process::id() as i32));
+        assert!(!m.process_rescan_useful(&title_only));
+        assert!(!m.rescan_processes(&title_only));
+
+        // A TOML config (no Lua at all, built-in class matching) likewise.
+        let toml = Config::load_default();
+        let mut m = ModeEngine::new(&toml);
+        m.focus_changed(&toml, "foot", "shell", Some(std::process::id() as i32));
+        assert!(!m.process_rescan_useful(&toml));
+
+        // And a config that *does* ask still needs a pid to walk from.
+        let walker = lua(GAME_CONFIG);
+        let mut m = ModeEngine::new(&walker);
+        m.focus_changed(&walker, "foot", "shell", None);
+        assert!(!m.process_rescan_useful(&walker), "no focused pid, nothing to walk");
+        m.focus_changed(&walker, "foot", "shell", Some(std::process::id() as i32));
+        assert!(m.process_rescan_useful(&walker));
     }
 
     #[test]
