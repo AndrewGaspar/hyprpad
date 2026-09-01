@@ -1,6 +1,22 @@
-# Wired Triton (28de:1302) capture — uhid impersonation blueprint
+# Wired Steam Controller (28de:1302) capture — uhid impersonation blueprint
 
-Captured 2026-09-01 from the owner's puck plugged in by USB cable.
+**IMPORTANT hardware correction (2026-09-01):** this `1302` descriptor was captured
+from a *separate* single-interface Steam Controller ("the controller"), NOT the
+2026 puck. Confirmed by re-enumerating with the puck cabled:
+
+- **The puck** = `28de:1304`, product "Steam Controller Puck", serial FXB99614031B4,
+  **7 USB interfaces → 5 hidraw slots** (phys input2..input6), *wired or wireless*.
+  This is what hyprpad owns. Cloning ITS identity via uhid fails the interface-number
+  slot test (SDL gates 1304 on interface 2..5; uhid has no interface).
+- **"The controller"** = `28de:1302`, single interface 0, serial FXA9961402A6C.
+  Its descriptor is the one saved here — the SDL WIRED branch takes it with no
+  interface test, which is why it's the impersonation identity of choice.
+
+**Architecture consequence:** present Steam a `1302` (single-interface) identity it
+will happily drive, and RELAY underneath to the real `1304` puck. Steam thinks
+`1302`; hardware is `1304`; hyprpad translates input reports in and feature reports
+out. Open question for the build: how cleanly the puck's `0x42` report + its feature
+set map onto the `1302` protocol Steam will speak — TBD after the decisive test.
 
 ## uhid CREATE2 fields (present the fake as this)
 - bus: BUS_USB (0x03) for the descriptor's origin; **create the virtual device on
