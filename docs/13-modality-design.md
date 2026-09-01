@@ -165,7 +165,33 @@ pad, reset dampers) so nothing strands across a mode switch.
 - **Phase 3:** manual override actions, per-mode binding overrides, further
   conditions (process_running, time, battery).
 
-## Open questions for the owner
+## Owner decisions (2026-09-01) — these reshape the design
+
+1. **Per-binding gating, NOT categories.** The owner wants granularity below the
+   six-category level: each binding/input decides for itself whether it's active
+   in a given context — not "game mode turns off the `cursor` category." This
+   largely dissolves the category model: a **mode becomes a named context/tag**,
+   and **every binding carries an optional guard** (which modes/conditions it's
+   active under). The "game passthrough" is then "no binding except guide chords
+   is tagged active in `game`," expressed per-binding rather than per-category.
+   → This is exactly the structure that is painful in declarative TOML and
+   natural as a **per-binding Lua predicate**, so the concrete schema is now
+   COUPLED to the config-format decision (see `docs/research/lua-config.md`,
+   in progress). Do not lock a per-binding TOML schema until that lands.
+2. **Fullscreen ≠ game.** Drop `focus_fullscreen` as a game trigger; it's a wrong
+   classification (fullscreen video, etc.). Keep it available only if some future
+   mode explicitly wants it, but it is not part of the game rule.
+3. **Claude detection: implementer's call** (owner has no preference; "finnicky
+   by design"). Default to the `focus_process` tree-walk on `claude`, title match
+   as a cheap optional add; keep expectations low on reliability.
+4. **Manual override: yes.** A binding can force a mode (over the context rules),
+   and pop back. Keep this a first-class part of the resolution precedence.
+
+**Consequence:** the category table above is superseded by a per-binding-guard
+model; it stays only as the conceptual bridge from today's binary arbiter. The
+final schema is deferred to the config-format (Lua vs TOML) recommendation.
+
+## Open questions for the owner (superseded — see decisions above)
 
 1. **Category granularity** — is the six-category set (cursor/scroll/buttons/
    chords/osk/forward) the right resolution, or do you want per-binding gating
