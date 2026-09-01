@@ -22,7 +22,7 @@ set -euo pipefail
 PLUGIN_ID="hyprpad.cheatsheet"
 PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
 # The repo copy: this script lives in scripts/, the plugin in shell/.
-DEFAULT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/shell/$PLUGIN_ID"
+DEFAULT_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/shell/$PLUGIN_ID"
 
 die() { echo "hyprpad-cheatsheet: $*" >&2; exit 1; }
 
