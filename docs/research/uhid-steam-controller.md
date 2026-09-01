@@ -946,3 +946,327 @@ then `0x12f0`. The log names each. That single sitting settles the architecture.
   (steam-for-linux#13250) are cases where *firmware update worked but the
   controller was not detected*, i.e. it is the separate USB-subsystem path. A uhid
   device will be invisible to it; that appears to be harmless. **INFERRED.**
+
+---
+
+## Addendum: InputPlumber's proven recipe + why our passive probe was inconclusive
+
+*Produced 2026-09-01. Trigger: a live probe today created a uhid `28de:1302`
+device (real 372-byte wired-Triton descriptor, `BUS_VIRTUAL`) that DID enumerate
+as `/dev/hidrawN` with `HID_ID=0006:000028DE:00001302` and got `uaccess` from
+Valve's rule — but Steam sent only zero feature/output reports and logged nothing
+for it. The test was confounded: `/proc/*/fd` showed **Steam held no hidraw open
+at all, not even the real puck**, so Steam's controller subsystem was engaging
+nothing. This addendum resolves "will Steam adopt a uhid Steam Controller" from
+the proven reference implementation rather than from that inconclusive probe.*
+
+**New verification basis.** **VERIFIED(ip-src)** = InputPlumber `main` raw source
+read today via `raw.githubusercontent.com/ShadowBlip/InputPlumber/main/…`:
+`src/input/target/steam_deck_uhid.rs`, `src/input/target/mod.rs`,
+`src/drivers/steam_deck/report_descriptor.rs`, `src/drivers/steam_deck/mod.rs`.
+**VERIFIED(sdl)** = `libsdl-org/SDL` `main` read today:
+`src/joystick/hidapi/SDL_hidapi_steamdeck.c`,
+`src/joystick/hidapi/SDL_hidapi_steam_triton.c`.
+
+### A.0 The single most important correction to §0–§9
+
+**InputPlumber does not clone the Steam Controller (1102/1142) OR the Triton
+(1302/1304). It emulates the Steam *Deck* controller protocol under a *non-Deck*
+PID, and it is anything but passive: it streams a fresh input report every 4 ms
+*and* answers the control-channel GET_REPORT handshake with specific canned
+bytes.** Our probe did neither. So the probe did not test the thing the reference
+implementation proves is necessary. Detail below.
+
+### A.1 The exact target InputPlumber exposes (VERIFIED ip-src)
+
+`steamos-manager` selects the target string `"deck-uhid"` (existing doc §3.4).
+`src/input/target/mod.rs` maps that string to `SteamDeckUhidDevice::new()` with
+driver options **`poll_rate: Duration::from_millis(4)` (250 Hz), `buffer_size:
+2048`**. The device is created in `create_virtual_device` (VERIFIED ip-src,
+`steam_deck_uhid.rs`) with **exactly** this `uhid_virt::CreateParams`:
+
+```rust
+CreateParams {
+    name: config.name.clone(),          // per-handheld, e.g. "Steam Controller" / "…Controller"
+    phys: String::from(""),             // empty
+    uniq: String::from(""),             // empty  ← note: NOT a serial (contrast §3.3)
+    bus:  Bus::USB,                     // BUS_USB 0x03 — NOT BUS_VIRTUAL (our probe used 0x06)
+    vendor:  VID as u32,                // VID = 0x28de   (drivers/steam_deck/mod.rs)
+    product: config.product_id.to_u32(),
+    version: 0x1000,                    // 4096
+    country: 0,
+    rd_data: CONTROLLER_DESCRIPTOR.to_vec(),
+}
+```
+
+`ProductId` (VERIFIED ip-src, `drivers/steam_deck/mod.rs`) — none of these is the
+real Deck `0x1205`; the enum exists precisely so a virtual device avoids the
+`bInterfaceNumber` gate (existing doc §3.2/§4.6):
+
+```rust
+pub const VID: u16 = 0x28de;
+pub enum ProductId {                 // to_u16()/to_u32() provided
+    SteamDeck        = 0x1205,        // the "true" PID — used only for the vhci/VCHI target
+    Generic          = 0x12f0,        // the generic uhid PID (Path B in §8.1.2)
+    MsiClaw          = 0x12fa,
+    LenovoLegionGo2  = 0x12fb,
+    ZotacZone        = 0x12fc,
+    AsusRogAlly      = 0x12fd,
+    LenovoLegionGo   = 0x12fe,
+    LenovoLegionGoS  = 0x12ff,
+}
+```
+
+**The report descriptor is 38 bytes, pure vendor page, NO report IDs**
+(VERIFIED ip-src, `report_descriptor.rs` — matches the "38-byte `06 FF FF`" the
+existing doc cited second-hand from hhd, now confirmed byte-for-byte in
+InputPlumber):
+
+```rust
+pub const CONTROLLER_DESCRIPTOR: [u8; 38] = [
+    0x06,0xff,0xff, 0x09,0x01, 0xa1,0x01,     // Usage Page 0xFFFF, Usage 0x01, Collection(App)
+    0x09,0x02, 0x09,0x03, 0x15,0x00, 0x26,0xff,0x00, 0x75,0x08, 0x95,0x40, 0x81,0x02, // Input:  64 bytes
+    0x09,0x06, 0x09,0x07, 0x15,0x00, 0x26,0xff,0x00, 0x75,0x08, 0x95,0x40, 0xb1,0x02, // Feature:64 bytes
+    0xc0,                                     // End Collection
+];
+```
+
+Consequence for §1.3: because there are **no `REPORT_ID` items**, all three
+`UHID_START` `dev_flags` numbered-report bits are **unset** for the Deck target,
+so reports are **unprefixed** on the wire. (This is the opposite of a cloned real
+`1302` descriptor, which carries report IDs and therefore all three flags set —
+§1.3 still holds for Path A; the Deck path just happens to be report-ID-free.)
+
+### A.2 It streams continuously — and for the Deck protocol that is mandatory
+
+**VERIFIED(ip-src).** `SteamDeckUhidDevice::poll()` — invoked by the target driver
+on every 4 ms tick — calls `self.write_state()?` **unconditionally**, after
+servicing any inbound UHID events. `write_state()` packs the current
+`PackedInputDataReport` (whose `frame` field is bumped `frame.wrapping_add(1)`
+each write) and does `device.write(&data)` (`UHID_INPUT`). `write_event()` only
+mutates internal state; **the wire write happens on the timer, not on input
+change**. So the device emits ~250 input reports/second whether or not anything
+moved. This is a live keepalive, exactly what our passive fake lacked.
+
+**Why the stream is load-bearing (VERIFIED sdl):** SDL's Steam *Deck* hidapi
+backend gates detection on a live report —
+`src/joystick/hidapi/SDL_hidapi_steamdeck.c` `InitDevice`:
+
+```c
+size = SDL_hid_read_timeout(device->dev, data, sizeof(data), 16);
+if (size == 0)
+    return false;      // no report within 16 ms → device rejected outright
+```
+
+So a **passive** Deck-protocol device is rejected before anything else is even
+examined. This is the single cleanest explanation of "a passive fake is ignored"
+for Path B.
+
+**Contrast, and it matters for Path A (VERIFIED sdl):** SDL's *Triton* backend,
+`SDL_hidapi_steam_triton.c` `HIDAPI_DriverSteamTriton_InitDevice`, does **not**
+read at init for a wired unit — it sets the name and returns
+`HIDAPI_DriverSteamTriton_SetControllerConnected(device, true)`; the only read is
+later in `UpdateDevice`. So under **SDL**, a wired `0x1302` needs *no* input
+stream to be enumerated. **But Steam's own client uses its native "V1 HID protocol
+via USB" driver for the Triton, not SDL** (existing doc §3.3), and that driver's
+stream requirement is **UNPROVEN**. The safe reading of the reference impl is:
+assume Steam's client wants a live stream too, and stream regardless.
+
+### A.3 The GET_REPORT handshake it answers — the likely real reason passivity fails
+
+**VERIFIED(ip-src).** On the control channel, `SteamDeckUhidDevice` answers three
+GET_REPORT (feature) requests with canned data via
+`device.write_get_report_reply(id, 0, data)` — i.e. `err=0` plus a fixed payload,
+selected by a `current_report` field that a prior SET_REPORT can switch:
+
+- **`GetAttributesValues`** — the attributes blob. Reply (padded to 64):
+  ```
+  0x00, <GetAttributesValues>, 0x2d, 0x01, 0x05, 0x12, 0x00, 0x00, 0x02, 0x00,
+  0x00, 0x00, 0x00, 0x0a, 0x2b, 0x12, 0xa9, 0x62, 0x04, 0xad, 0xf1, 0xe4, 0x65,
+  0x09, 0x2e, 0x00, 0x00, 0x00, 0x0b, 0xa0, 0x0f, 0x00, 0x00, 0x0d, 0x00, 0x00,
+  0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, /* …zeros… */
+  ```
+  In-source comment, verbatim: *"No idea what these bytes mean, but this is what
+  is sent from the real device."* (`0x2d` = 45 = payload length; the body is a run
+  of `attr_id, u32` TLVs — `0x01,0x02,0x0a,0x09,0x0b,0x0d,0x0c,0x0e` — the same
+  attribute-id encoding §4.3 sketched from hhd, now confirmed as literal bytes.)
+- **`GetStringAttribute`** (serial): `[0x00, <type>, 0x14, 0x01]` + serial bytes,
+  resized to 64. Default `serial_number = "1NPU7PLUMB3R"`.
+- **`GetChipId`**: `[0x00, <type>, 0x11, 0x00]` + 15-byte `chip_id`
+  (`[0,1,2,3,4,5,6,7,8,9,0,1,2,3,4]`), resized to 64.
+
+**This is the handshake a passive fake cannot pass.** A device that replies to
+every GET_REPORT with `err=0, size=0` (as our probe did) hands Steam an empty
+attributes/serial/chipid blob. InputPlumber demonstrates that a *specific,
+correctly-framed* reply is part of what Steam consumes on a Valve controller.
+Whether Steam *hard-rejects* an empty reply or merely logs and tolerates it (the
+existing doc §3.3 notes `Deck Controller PCB Serial# invalid: NA` is *survived*
+for the real Triton) is the open margin — but the reference impl never leaves
+these empty, so neither should the probe.
+
+### A.4 How it handles SET_REPORT / OUTPUT (VERIFIED ip-src)
+
+It **decodes-and-translates the known ones, swallows the rest** — it does **not**
+forward to a physical device (InputPlumber synthesises from *other* hardware):
+
+- `TriggerRumbleCommand` → unpack `PackedRumbleReport` → emit
+  `OutputEvent::SteamDeckRumble` (routed to the source device's FF).
+- `TriggerHapticCommand` → unpack `PackedHapticReport` → emit
+  `OutputEvent::SteamDeckHaptics` (`Haptic::TrackpadLeft/Right`).
+- Everything else: `log::trace!("Got SetReport for ReportType we aren't handling:
+  …")` — swallowed. A SET_REPORT can also switch `current_report` so the next
+  GET_REPORT returns the matching canned blob. `lizard_mode_enabled` is tracked as
+  a bool, not forwarded.
+
+For hyprpad this is the one place the recipe *differs by design*: hyprpad has the
+real puck behind the clone, so §4.3's **relay** policy is strictly better than
+InputPlumber's translate-or-swallow — but InputPlumber proves the *minimum* Steam
+needs is "accept the write and reply success promptly," which the relay also does.
+
+### A.5 What triggers Steam to (re)detect — resolves the "holds nothing open" state
+
+**Detection path (VERIFIED local, from §3.1's symbol dump + INFERRED assembly):**
+`steamclient.so` imports both `udev_enumerate_scan_devices` (a one-shot scan at
+Steam startup) **and** `udev_monitor_new_from_netlink` +
+`udev_monitor_filter_add_match_subsystem_devtype` (a live hotplug monitor filtered
+on `hidraw`). So Steam adopts a hidraw node in exactly two situations: (1) it
+existed and was permitted at Steam's own startup scan, or (2) a udev **`add`**
+uevent for a `hidraw` device arrives on the netlink monitor while Steam runs.
+
+**Does `UHID_CREATE2` fire that uevent? Yes (VERIFIED kernel, existing doc §1.2 +
+standard driver-model behaviour).** `uhid_dev_create2` → `hid_add_device`
+(deferred to a workqueue) → `device_add` on the HID device → `KOBJ_ADD` uevent;
+`hid-generic` then binds → `hidraw_connect` → `device_create` for `/dev/hidrawN` →
+a second `KOBJ_ADD` uevent with `SUBSYSTEM=hidraw`. That second event is exactly
+what Steam's monitor is filtered for. **This is not theoretical: it is the
+mechanism by which SteamOS's runtime target switch works** — `steamos-manager`
+tells InputPlumber to switch to `"deck-uhid"`, InputPlumber tears down and
+recreates its uhid device, and Steam adopts the new virtual controller **live,
+without a Steam restart** (existing doc §3.4, VERIFIED ip). A uhid device is
+therefore detectable after Steam is up *provided Steam's monitor is running and
+the node gets `uaccess`* — which Valve's `KERNELS=="000[356]:28DE:*"` rule grants.
+
+**So the "Steam holds nothing open, not even the puck" state is almost certainly
+not a detection-plumbing failure — it is Steam not being in a controller-engaging
+state at all** (next section). If it *were* a plumbing failure, `udevadm trigger
+--action=add` on the virtual node, or a create-after-Steam-is-up, re-fires the
+`add` and forces a re-scan.
+
+### A.6 Is there a Steam setting gating this? (plausible root cause of "empty list")
+
+**Yes, and it is the leading explanation for zero engagement.** Steam only holds a
+controller's hidraw open **while it is actively running Steam Input on it**, and
+that is gated by toggles, not just detection:
+
+- **Settings → Controller** has the global Steam Input enablement and a "Detected
+  Controllers" list. If Steam Input is off (or the specific device family's
+  support is off), Steam may enumerate but not grab.
+- **Per-game** "Manage → Controller Options" is `Default / Enabled / Disabled /
+  Forced On`; `Disabled` (or a desktop with no game focused and desktop-config
+  Steam Input off) yields exactly "nothing open."
+- Desktop vs Big Picture differs: BPM is far more aggressive about grabbing.
+
+**How to check / force a detecting state (do this BEFORE trusting any negative):**
+open **Settings → Controller**, confirm the real puck appears in "Detected
+Controllers" and Steam Input is enabled; put a game in the foreground with
+controller option **Forced On**, or enter **Big Picture**. The definitive baseline
+is behavioural, not UI: with hyprpad **not** owning the puck and no fake present,
+does `controller.txt` log `!! Steam controller device opened for index N` and does
+`/proc/<steam>/fd` show the puck's `/dev/hidrawN`? **If Steam will not grab the
+real puck, it will not grab the fake, and the probe proves nothing.** That gate is
+the confound we hit.
+
+### A.7 1302 vs 1304 vs the InputPlumber/Deck target — recommendation
+
+- **`1304` is out** — the `bInterfaceNumber` slot gate, unchanged (§3.2).
+- **InputPlumber's actual choice is the Deck protocol under `0x12f0`/`0x12fx`,
+  `BUS_USB`, VID `0x28de`, 38-byte vendor descriptor, streamed at 250 Hz, with the
+  three canned GET_REPORT replies.** This is the *proven-in-production* path
+  (SteamOS ships it). Its cost for hyprpad is real: transcode the puck's `0x42`
+  into the Deck `PackedInputDataReport`, synthesise the attribute/serial/chipid
+  replies, and translate Steam's Deck rumble/haptic SET_REPORTs into IBEX
+  `0x80`/`0x81` — and it forfeits the free-gyro/trackpad passthrough.
+- **`1302` remains the least-translation target for hyprpad**, *because hyprpad
+  owns the real Triton* — if Steam's native client driver adopts a parentless
+  `1302`, Steam speaks the exact IBEX protocol hyprpad already relays (`0x42` in,
+  `0x01` feature, `0x80/0x81` out), so trackpads/gyro/haptics pass through for
+  free. The InputPlumber recipe does not change this recommendation; it *sharpens
+  the requirements on the `1302` attempt*: stream continuously, and answer the
+  GET_REPORT handshake with real (relayed) data rather than empty replies. In
+  other words, the reference impl says the probe's **passivity**, not its identity,
+  is the more likely culprit — but only a corrected probe (A.8) separates the two.
+
+Net recommendation, unchanged in direction but firmer: **build Path A on `1302`,
+but the client must (1) stream input at ~250 Hz from device-create onward and
+(2) answer every GET_REPORT with relayed puck data (never `size=0`).** Keep Path B
+(`0x12f0`, Deck) as the SteamOS-proven fallback, for which A.1–A.4 are now a
+copy-able spec.
+
+### A.8 The one decisive experiment (confound-controlled)
+
+Replaces §9's probe with three gates the original lacked — a *detecting-state*
+baseline, a *live stream*, and *answered handshakes*. All in one Steam session.
+
+1. **Prove Steam is engaging controllers (the gate we skipped).** Stop hyprpad;
+   ensure the real puck is visible + permitted. Launch Steam. Enable Steam Input
+   (Settings → Controller); foreground a game with controller option **Forced On**
+   (or use Big Picture). **Confirm** `controller.txt` logs `!! Steam controller
+   device opened for index N` for the real puck **and** `/proc/<steam-pid>/fd`
+   contains its `/dev/hidrawN`. **Do not proceed until this holds** — this is the
+   step whose absence invalidated today's probe.
+2. **Create an *active* fake, while Steam is already up** (so the `add` uevent hits
+   the live monitor). Use `bus=BUS_USB(0x03)` (not `BUS_VIRTUAL`), `vendor=0x28DE`,
+   `product=0x1302`, `version=307`, `name="Steam Controller"`,
+   `uniq="FXA9961402A6C"`, `phys="hyprpad"`, `rd_data` = the real wired-`1302`
+   descriptor (§9 step 0). Then, unlike the passive probe:
+   - **Stream** a valid `0x42` report continuously at ~250 Hz from the moment of
+     create — copy the real puck's frames (guide bit cleared) or emit a neutral
+     frame with an incrementing sequence byte. This clears any SDL-style 16 ms read
+     gate and mimics InputPlumber's unconditional per-tick write.
+   - **Answer every `UHID_GET_REPORT`** immediately by relaying to the real puck
+     (`HIDIOCGFEATURE`) — or, if the puck is absent, with correctly-*framed* canned
+     data à la A.3 (right length byte, right leading `report_id`/`type`), never
+     `size=0`. **Answer every `UHID_SET_REPORT`** with `err=0`. Never let the 5 s
+     kernel timeout fire (§1.2).
+3. **Read the verdict** in `controller.txt` + `/proc/*/fd`:
+
+   | Observation | Meaning |
+   |---|---|
+   | `Local Device Found / type: 28de 1302 / path: /dev/hidrawN`, `Interface: -1`, `Controller uses V1 HID protocol via USB` | enumerated; the `-1` question answered |
+   | **`!! Steam controller device opened for index N`** + `/proc/<steam>/fd` holds the fake's `/dev/hidrawN` | **PROVEN: Steam adopts it** |
+   | `CGetControllerInfoWorkItem` / `CExitLizardModeWorkItem` / `SET_REPORT` with the lizard `0x87` arriving on the uhid fd | Steam is actively driving it — dispositive |
+   | Enumerated but never opened, *while the real puck IS opened in the same session* | identity/parentless-ness rejected → A/B to `product=0x12f0` (Deck) with the A.1–A.4 stream+handshake and retest |
+   | Nothing, and the real puck is ALSO not opened | still not a detecting state — return to step 1; the result is again meaningless |
+
+   Run it once as `1302`, then (device destroyed/recreated) as `12f0` with the Deck
+   descriptor + streamed `PackedInputDataReport` + the three canned replies. That
+   A/B, in one Steam sitting that has *already been shown to grab the real puck*,
+   settles the architecture.
+
+### A.9 Bottom line
+
+- **(a) Exact recipe to copy (the proven one, `deck-uhid`):** `uhid_virt`
+  `CreateParams { bus: Bus::USB, vendor: 0x28de, product: 0x12f0 (Generic; or a
+  `0x12fx` per-handheld), version: 0x1000, country: 0, name: "…Controller",
+  phys: "", uniq: "", rd_data: 38-byte vendor descriptor (A.1) }`; a target driver
+  polling at **4 ms** that writes the current 64-byte input report **every tick**
+  (frame counter `wrapping_add(1)`, no report-ID prefix); GET_REPORT answered with
+  the canned `GetAttributesValues` / `GetStringAttribute` (`"1NPU7PLUMB3R"`) /
+  `GetChipId` blobs (A.3); SET_REPORT rumble/haptic decoded, everything else
+  swallowed with `err=0`. For hyprpad's *relay* variant, keep this shape but swap
+  the `1302` identity + real descriptor and relay GET/SET to the puck.
+- **(b) Why our passive `1302` probe got zero engagement:** the dominant cause is
+  that **Steam was not in a controller-engaging state** — it held no hidraw open at
+  all, not even the real puck, so it was adopting *nothing*; the fake never got a
+  fair test (A.5/A.6). Secondarily, even in a detecting state the fake violated
+  **both** invariants the reference implementation shows are required of a virtual
+  Valve controller: it **streamed no input** (fatal at SDL's 16 ms Deck gate; risk
+  unproven but plausible for Steam's Triton client driver) and it **answered every
+  GET_REPORT empty** instead of with framed attribute/serial/chipid data. It also
+  used `BUS_VIRTUAL` rather than InputPlumber's `BUS_USB`. The zero feature/output
+  reports we watched were kernel/startup noise, not Steam driving the device.
+- **(c) The one decisive experiment:** A.8 — first *prove Steam grabs the real
+  puck this session*, then present an **active** `1302` fake (stream ~250 Hz +
+  answer GET/SET) created while Steam is live, and look for `!! Steam controller
+  device opened for index N` plus the fake's fd in `/proc/<steam>/fd`. That is the
+  single run that converts "probably" to "proven," with the confound removed.
