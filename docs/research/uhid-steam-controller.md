@@ -1270,3 +1270,36 @@ baseline, a *live stream*, and *answered handshakes*. All in one Steam session.
   answer GET/SET) created while Steam is live, and look for `!! Steam controller
   device opened for index N` plus the fake's fd in `/proc/<steam>/fd`. That is the
   single run that converts "probably" to "proven," with the confound removed.
+
+---
+
+## PROVEN on-device (2026-09-01): Steam adopts the active uhid fake
+
+Ran `scratchpad/uhid_active_probe.py` (InputPlumber deck-uhid clone: BUS_USB,
+28de:12f0, 38B descriptor, 250Hz input stream from create, answered GET_REPORT)
+against a normal UNMASKED Steam that had already grabbed the real puck (baseline:
+5 puck fds, "device opened index 0-4 via Dongle"). Result — unambiguous adoption:
+
+- `~/.local/share/Steam/logs/controller.txt`:
+  - `type: 28de 12f0`
+  - `!! Steam controller device opened for index 5.`
+  - `Controller has an Invalid or missing unit serial number, setting to '28de-12f0-3147b8f'`
+  - `ConfigSet - found config set file on-disk: configset_neptune.vdf` (Steam loaded
+    the **Steam Deck** Steam Input config for it) + a per-device
+    `configset_28de-12f0-3147b8f.vdf`.
+- Steam held the fake's hidraw node open (6th fd, alongside the puck's 5).
+- The probe's uhid fd received **39 SET_REPORT** from Steam — `SetSettingsValues`
+  (0x87) lizard/config writes — i.e. Steam actively CONFIGURING and DRIVING the
+  virtual device as a real Steam Controller. Steam Settings→Controller also listed it.
+
+Conclusion: **the uhid mechanism works end to end.** The two fixes over the earlier
+passive 1302 probe were load-bearing: (1) stream valid input at 250Hz from create,
+(2) answer the GET_REPORT handshake. BUS must be BUS_USB, not BUS_VIRTUAL.
+
+Steam adopted it as a **Deck (12f0 / neptune)**, which delivers the full Steam Input
+value stack (gyro, trackpads, per-game configs, haptics) — arguably a better target
+than the 1302 Triton for feature completeness. Product build (`src/uhid.rs`): relay
+the real 1304 puck's input INTO the fake, relay/interpret Steam's feature writes
+(0x87 lizard, haptics) back onto the real puck, and hide the real puck from Steam so
+it sees only the fake. Steam's writes are Deck-format; hyprpad translates to the
+puck's protocol (or acts on intent, since it already owns lizard/haptics).
