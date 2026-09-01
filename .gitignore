@@ -10,3 +10,6 @@ target/
 /target
 target/
 osk/target/
+.play.log
+.exit.log
+.dbg.log
