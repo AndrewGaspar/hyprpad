@@ -45,6 +45,19 @@ h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatshee
 -- too, which is what fixes the double-input seen in Big Picture.
 --
 -- Deliberately NOT triggered by fullscreen: a fullscreen video is not a game.
+-- Omarchy's transient, keyboard-owning shell surfaces (ALLOWLIST -- omarchy-bar and
+-- omarchy-background are always present and must never match). While one is up,
+-- B = Escape (closes any of them; the menu closes from any depth). The menu is
+-- mouse-driven and arrow/Enter-navigable, so the cursor, scroll, D-pad and A stay live.
+h.mode("omarchy-ui").when(function(ctx)
+  for _, ns in ipairs({ "omarchy-menu", "omarchy-keyboard-panel", "omarchy-clipboard",
+                        "omarchy-emojis", "omarchy-image-selector", "omarchy-reminders",
+                        "omarchy-polkit", "omarchy-network-qr" }) do
+    if ctx.layers:has(ns) then return true end
+  end
+  return false
+end)
+
 h.mode("game", { forward = true }).when(function(ctx)
   local c = ctx.focus.class:lower()
   return c:match("^steam_app_") ~= nil
@@ -92,14 +105,14 @@ h.cursor {
   one_euro_beta = 1.0,
   one_euro_d_cutoff = 1.0,
   hysteresis = 0.0008,
-  only_in = { "desktop" },
+  only_in = { "desktop", "omarchy-ui" },
 }
 
 h.scroll {
   mode = "circular",
   sensitivity = 1.0,
   circular_step_degrees = 15.0,
-  only_in = { "desktop" },
+  only_in = { "desktop", "omarchy-ui" },
 }
 
 h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
@@ -111,11 +124,11 @@ h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
 -- is what hands them to the game under a game-classed window.
 -- ---------------------------------------------------------------------------
 
-h.button("dpad_up",    h.key "up"):only_in("desktop")
-h.button("dpad_down",  h.key "down"):only_in("desktop")
-h.button("dpad_left",  h.key "left"):only_in("desktop")
-h.button("dpad_right", h.key "right"):only_in("desktop")
-h.button("a", h.key "enter"):only_in("desktop")     -- A = Enter/confirm
+h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui")
+h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui")
+h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui")
+h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui")
+h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui")     -- A = Enter/confirm
 h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
 
 -- The same button, a different meaning in a different mode. The cheat sheet has
@@ -123,6 +136,7 @@ h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
 -- collide, because a mode is exclusive: under the sheet we are in `cheatsheet`,
 -- never in `desktop`.
 h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
+h.button("b", "Back / close", h.key "escape"):only_in("omarchy-ui")
 
 -- While the on-screen keyboard is up, these tap keys THROUGH the OSK
 -- (Deck-style helpers) so you never hunt for them with a cursor. Unguarded on

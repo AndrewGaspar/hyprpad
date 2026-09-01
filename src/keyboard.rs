@@ -73,7 +73,7 @@ pub struct VirtualKeyboard {
 }
 
 impl VirtualKeyboard {
-    /// Create the uinput device, register the standard key range (`1..=127`,
+    /// Create the uinput device, register the standard key range (`1..=255`,
     /// which covers the arrow and navigation keys the bare-button table emits —
     /// `KEY_UP` = 103 … `KEY_PAGEDOWN` = 109 all sit inside it), and wait
     /// ~200 ms for Hyprland/libinput to enumerate it before any keystroke.
@@ -92,7 +92,7 @@ impl VirtualKeyboard {
             set_bit(fd, UI_SET_EVBIT, EV_SYN as libc::c_int)?;
             // Register the standard key range so every code the bare-button
             // key-name table can produce is deliverable.
-            for code in 1..=127i32 {
+            for code in 1..=255i32 {
                 set_bit(fd, UI_SET_KEYBIT, code)?;
             }
 

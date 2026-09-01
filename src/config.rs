@@ -317,7 +317,8 @@ pub(crate) fn key_code(name: &str) -> Result<u16, String> {
         "backspace" => 14,  // KEY_BACKSPACE
         "space" => 57,      // KEY_SPACE
         "tab" => 15,        // KEY_TAB
-        "escape" | "esc" => 1, // KEY_ESC
+        "escape" | "esc" => 1,
+        "back" => 158, // KEY_BACK -> XF86Back: the standard "back" key (Omarchy menu end state) // KEY_ESC
         "home" => 102,      // KEY_HOME
         "end" => 107,       // KEY_END
         "pageup" | "pgup" => 104, // KEY_PAGEUP
@@ -1808,7 +1809,7 @@ mod tests {
         assert_eq!(key_code("pgdn"), Ok(109));
         // Every arrow/nav code stays inside the range keyboard.rs registers.
         for name in ["up", "down", "left", "right", "home", "end", "pageup", "pagedown"] {
-            assert!(key_code(name).unwrap() <= 127);
+            assert!(key_code(name).unwrap() <= 255);
         }
         // An unknown name is a reported error, not a silent default.
         assert!(key_code("f13").unwrap_err().contains("unknown key"));
