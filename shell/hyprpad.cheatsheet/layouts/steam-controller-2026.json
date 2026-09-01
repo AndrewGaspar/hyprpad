@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "id": "steam-controller-2026",
+  "name": "Steam Controller",
+  "subtitle": "2026 \"puck\"",
+
+  "_comment": [
+    "A LAYOUT is all the widget knows about a controller: a front-view drawing,",
+    "the viewBox that drawing is authored in, and where each of hyprpad's logical",
+    "controls sits inside it. Adding Xbox / PlayStation / Switch Pro / Steam Deck",
+    "is a matter of dropping another file in this directory — Panel.qml reads",
+    "every *.json here and never names a controller.",
+    "",
+    "`art` is tried in order, first hit wins. `steam` resolves against the local",
+    "Steam install (STEAM_ROOT, else ~/.local/share/Steam) and is NEVER copied",
+    "into this repo — see ../art/LICENSES.md. `bundled` resolves against the",
+    "plugin directory and always exists, so the sheet is never artless.",
+    "",
+    "Control ids are exactly the ones `hyprpad bindings --json` emits in each",
+    "entry's `control` field. `x`/`y` are the leader-line anchor in viewBox",
+    "coordinates; `side` picks the callout column. `hidden` marks a control a",
+    "front view cannot actually show (triggers, grips) so the widget can draw",
+    "its leader dashed rather than implying you can see it."
+  ],
+
+  "viewBox": { "width": 456, "height": 320 },
+
+  "art": [
+    {
+      "source": "steam",
+      "path": "steamui/images/controller/controller_config_controller_triton.svg",
+      "credit": "Valve — read from the local Steam install, never redistributed"
+    },
+    {
+      "source": "bundled",
+      "path": "art/steam-controller-2026.svg",
+      "credit": "hyprpad's own schematic"
+    }
+  ],
+
+  "controls": {
+    "l2":          { "x": 66,    "y": 26,    "side": "left",  "hidden": true },
+    "l1":          { "x": 92.8,  "y": 16.8,  "side": "left" },
+    "view":        { "x": 147.4, "y": 43.6,  "side": "left" },
+    "dpad_up":     { "x": 91.5,  "y": 52,    "side": "left" },
+    "dpad_left":   { "x": 68,    "y": 75.5,  "side": "left" },
+    "dpad_right":  { "x": 115,   "y": 75.5,  "side": "left" },
+    "dpad_down":   { "x": 91.5,  "y": 99,    "side": "left" },
+    "lstick":      { "x": 162.1, "y": 108.8, "side": "left" },
+    "l3":          { "x": 162.1, "y": 108.8, "side": "left" },
+    "lpad":        { "x": 141.1, "y": 193.5, "side": "left" },
+    "lpad_click":  { "x": 141.1, "y": 193.5, "side": "left" },
+    "l4":          { "x": 62,    "y": 235,   "side": "left",  "hidden": true },
+    "l5":          { "x": 105,   "y": 268,   "side": "left",  "hidden": true },
+
+    "r2":          { "x": 390,   "y": 26,    "side": "right", "hidden": true },
+    "r1":          { "x": 362.5, "y": 16.8,  "side": "right" },
+    "menu":        { "x": 307.9, "y": 43.6,  "side": "right" },
+    "y":           { "x": 367.1, "y": 49.5,  "side": "right" },
+    "x":           { "x": 341.1, "y": 76,    "side": "right" },
+    "b":           { "x": 393.1, "y": 76,    "side": "right" },
+    "a":           { "x": 367.1, "y": 101.5, "side": "right" },
+    "rstick":      { "x": 293.1, "y": 108.8, "side": "right" },
+    "r3":          { "x": 293.1, "y": 108.8, "side": "right" },
+    "rpad":        { "x": 314.1, "y": 193.5, "side": "right" },
+    "rpad_click":  { "x": 314.1, "y": 193.5, "side": "right" },
+    "r4":          { "x": 394,   "y": 235,   "side": "right", "hidden": true },
+    "r5":          { "x": 350,   "y": 268,   "side": "right", "hidden": true },
+
+    "quickaccess": { "x": 227.6, "y": 194.7, "side": "right" },
+    "steam":       { "x": 227.5, "y": 76,    "side": "right" }
+  },
+
+  "_glyphs_comment": [
+    "The chip drawn at the head of each callout. `image` is a path inside the",
+    "plugin — here Kenney's CC0 Input Prompts (art/kenney/LICENSE.txt) — and",
+    "`text` is what the widget draws if the file is missing, so a layout that",
+    "ships no art at all still reads correctly.",
+    "",
+    "This map plus `controls` is the whole of what makes a layout controller-",
+    "SPECIFIC. A PlayStation layout points the same control ids at Kenney's",
+    "ps5_button_cross.svg and friends, a Nintendo one swaps A and B, and",
+    "Panel.qml does not change."
+  ],
+  "glyphs": {
+    "a":           { "image": "art/kenney/steam_button_a.svg",                "text": "A" },
+    "b":           { "image": "art/kenney/steam_button_b.svg",                "text": "B" },
+    "x":           { "image": "art/kenney/steam_button_x.svg",                "text": "X" },
+    "y":           { "image": "art/kenney/steam_button_y.svg",                "text": "Y" },
+    "dpad_up":     { "image": "art/kenney/steam_dpad_up.svg",                 "text": "Up" },
+    "dpad_down":   { "image": "art/kenney/steam_dpad_down.svg",               "text": "Dn" },
+    "dpad_left":   { "image": "art/kenney/steam_dpad_left.svg",               "text": "Lt" },
+    "dpad_right":  { "image": "art/kenney/steam_dpad_right.svg",              "text": "Rt" },
+    "l1":          { "image": "art/kenney/steam_lb.svg",                      "text": "L1" },
+    "r1":          { "image": "art/kenney/steam_rb.svg",                      "text": "R1" },
+    "l2":          { "image": "art/kenney/steam_lt.svg",                      "text": "L2" },
+    "r2":          { "image": "art/kenney/steam_rt.svg",                      "text": "R2" },
+    "l4":          { "image": "art/kenney/controller_button_l4.svg",          "text": "L4" },
+    "l5":          { "image": "art/kenney/controller_button_l5.svg",          "text": "L5" },
+    "r4":          { "image": "art/kenney/controller_button_r4.svg",          "text": "R4" },
+    "r5":          { "image": "art/kenney/controller_button_r5.svg",          "text": "R5" },
+    "l3":          { "image": "art/kenney/steam_stick_l_press.svg",           "text": "L3" },
+    "r3":          { "image": "art/kenney/steam_stick_l_press.svg",           "text": "R3" },
+    "lstick":      { "image": "art/kenney/steam_stick.svg",                   "text": "LS" },
+    "rstick":      { "image": "art/kenney/steam_stick.svg",                   "text": "RS" },
+    "lpad":        { "image": "art/kenney/steam_button_lp.svg",               "text": "LP" },
+    "rpad":        { "image": "art/kenney/steam_button_rp.svg",               "text": "RP" },
+    "lpad_click":  { "image": "art/kenney/steam_button_lp.svg",               "text": "LP" },
+    "rpad_click":  { "image": "art/kenney/steam_button_rp.svg",               "text": "RP" },
+    "menu":        { "image": "art/kenney/controller_button_options.svg",     "text": "Menu" },
+    "view":        { "image": "art/kenney/controller_button_view.svg",        "text": "View" },
+    "quickaccess": { "image": "art/kenney/controller_button_quickaccess.svg", "text": "QAM" },
+    "steam":       { "image": "art/kenney/controller_icon.svg",               "text": "Steam" }
+  }
+}

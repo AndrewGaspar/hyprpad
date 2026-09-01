@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "hyprpad.cheatsheet",
+  "name": "hyprpad cheat sheet",
+  "version": "1.0.0",
+  "author": "Andrew Gaspar",
+  "license": "MIT",
+  "description": "A controller bindings cheat sheet for hyprpad: the live config drawn onto a controller diagram, summoned by a guide chord.",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}

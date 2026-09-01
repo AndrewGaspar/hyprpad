@@ -761,6 +761,18 @@ pub struct Config {
     pub(crate) button_guards: HashMap<report::Button, Guard>,
     /// Per-binding guards for the OSK-helper (`[osk_buttons]`) map.
     pub(crate) osk_button_guards: HashMap<report::Button, Guard>,
+
+    // --- Descriptions (Lua front-end only; empty from TOML) ----------------
+    /// The optional human description a `config.lua` gave a binding —
+    /// `h.bind("guide+r1", "Workspace right", …)`. Keyed exactly like
+    /// `bindings`; a missing entry means the cheat sheet derives a label from
+    /// the action instead ([`crate::bindings_sheet`]). Never consulted by the
+    /// input path: this is documentation, not behaviour.
+    pub(crate) binding_descs: HashMap<GestureKey, String>,
+    /// Descriptions for the bare-button (`[buttons]`) map.
+    pub(crate) button_descs: HashMap<report::Button, String>,
+    /// Descriptions for the OSK-helper (`[osk_buttons]`) map.
+    pub(crate) osk_button_descs: HashMap<report::Button, String>,
     /// The guard on the cursor "virtual binding" (`h.cursor { only_in = … }`).
     pub(crate) cursor_guard: Guard,
     /// The guard on the scroll "virtual binding" (`h.scroll { only_in = … }`).
@@ -1085,6 +1097,16 @@ impl Config {
         Config::from_toml_str(DEFAULT_TOML).expect("built-in default config is valid")
     }
 
+    /// The config *home*: `$XDG_CONFIG_HOME`, or `~/.config` when it is unset.
+    /// `None` only if neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    pub fn config_home() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(std::path::PathBuf::from(dir));
+        }
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        Some(std::path::PathBuf::from(home).join(".config"))
+    }
+
     /// The config directory: `$XDG_CONFIG_HOME/hyprpad`, or
     /// `~/.config/hyprpad` when `XDG_CONFIG_HOME` is unset. `None` only if
     /// neither `XDG_CONFIG_HOME` nor `HOME` is set.
@@ -1340,7 +1362,7 @@ impl std::fmt::Display for ConfigFormat {
     }
 }
 
-/// Which config file in `dir` wins, and which front-end reads it.
+/// Which config file wins, and which front-end reads it.
 ///
 /// `config.lua` beats `config.toml` when both exist, so migrating is "write the
 /// Lua file", and rolling back is "rename it". Split out from

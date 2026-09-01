@@ -1,5 +1,5 @@
 use hyprpad::report::Frame;
-use hyprpad::{hidraw, run, setup};
+use hyprpad::{bindings_sheet, hidraw, run, setup};
 use std::io::Write;
 use std::time::Instant;
 
@@ -11,6 +11,21 @@ fn main() {
         // its config live, by sending it SIGHUP. `kill -HUP <pid>` also works.
         Some("reload") => run::reload().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
         Some("monitor") => monitor(),
+        // `bindings [--json]`: print the current bindings — the cheat sheet's
+        // data source. Reads the config the daemon would read, so it is safe to
+        // run while `hyprpad run` owns the device.
+        Some("bindings") => {
+            let json = match args.get(2).map(String::as_str) {
+                None => false,
+                Some("--json") => true,
+                Some(other) => {
+                    eprintln!("hyprpad bindings: unknown argument {other:?}");
+                    eprintln!("usage: hyprpad bindings [--json]");
+                    std::process::exit(2);
+                }
+            };
+            bindings_sheet::run(json).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
+        }
         Some("setup") => {
             // `setup [--revert]`: install (or uninstall) the masked-Steam hook.
             let revert = match args.get(2).map(String::as_str) {
@@ -25,10 +40,11 @@ fn main() {
             setup::run(revert).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
         }
         _ => {
-            eprintln!("usage: hyprpad <run|reload|monitor|setup>");
+            eprintln!("usage: hyprpad <run|reload|bindings|monitor|setup>");
             eprintln!();
             eprintln!("  run              drive Hyprland from the controller (gestures -> dispatch)");
             eprintln!("  reload           tell the running daemon to re-read its config (SIGHUP)");
+            eprintln!("  bindings [--json] print the current bindings (the cheat sheet's data)");
             eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
             eprintln!("  setup [--revert] install (or remove) the masked-Steam launcher hook");
             std::process::exit(2);

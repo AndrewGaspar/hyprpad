@@ -1,0 +1,100 @@
+<!--
+  hyprpad's own schematic of the 2026 Steam Controller ("puck"/Triton).
+
+  Drawn from scratch for this repo, so it ships and redistributes under the
+  repo's licence — unlike Valve's own diagram, which the widget prefers when
+  the local Steam install has it but never copies (see ../art/LICENSES.md).
+
+  The viewBox and every control's centre are deliberately IDENTICAL to
+  Valve's `controller_config_controller_triton.svg`, so one coordinate map in
+  layouts/steam-controller-2026.json anchors callouts on either drawing.
+
+  Strokes are `white`, exactly as Valve's file draws them, so ONE recolour path
+  in the widget themes either drawing (see Diagram.qml).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 456 320" width="456" height="320"
+     fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"
+     stroke-linecap="round">
+
+  <!-- Shoulder ridges (L1/R1 bumpers), drawn above the body so the controls a
+       front view cannot show still have something to point at. -->
+  <path d="M56 30 q4 -26 37 -26 q33 0 37 26" stroke-width="3"/>
+  <path d="M326 30 q4 -26 37 -26 q33 0 37 26" stroke-width="3"/>
+  <!-- Trigger hints (L2/R2), tucked behind the bumpers. -->
+  <path d="M44 34 q2 -18 16 -22" stroke-width="2" stroke-dasharray="4 4"/>
+  <path d="M412 34 q-2 -18 -16 -22" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <!-- Body: a wide shell with two grips, matching the official outline's
+       proportions (top edge y=10, grips reaching y=317). -->
+  <path d="M228 10
+           C 288 10 344 12 376 19
+           C 396 23 408 34 415 52
+           C 428 85 442 150 450 202
+           C 455 234 458 278 433 302
+           C 421 313 406 318 391 317
+           C 380 316 372 311 365 303
+           C 357 294 352 279 343 268
+           C 337 262 332 261 326 261
+           C 293 261 261 260 228 260
+           C 195 260 163 261 130 261
+           C 124 261 119 262 113 268
+           C 104 279  99 294  91 303
+           C  84 311  76 316  65 317
+           C  50 318  35 313  23 302
+           C  -2 278   1 234   6 202
+           C  14 150  28  85  41  52
+           C  48  34  60  23  80  19
+           C 112  12 168  10 228  10 Z" stroke-width="3"/>
+
+  <!-- Grip inner edges, echoing the official drawing's handle lines. -->
+  <path d="M129 123 C 104 150 84 200 76 250 C 71 278 68 296 66 310"/>
+  <path d="M327 123 C 352 150 372 200 380 250 C 385 278 388 296 390 310"/>
+
+  <!-- D-pad: centre (91.5, 75.5), 61 x 67. -->
+  <path d="M78 42 h27 a6 6 0 0 1 6 6 v14 a6 6 0 0 0 6 6 h4
+           a6 6 0 0 1 6 6 v14 a6 6 0 0 1 -6 6 h-4
+           a6 6 0 0 0 -6 6 v14 a6 6 0 0 1 -6 6 h-27
+           a6 6 0 0 1 -6 -6 v-14 a6 6 0 0 0 -6 -6 h-4
+           a6 6 0 0 1 -6 -6 v-14 a6 6 0 0 1 6 -6 h4
+           a6 6 0 0 0 6 -6 v-14 a6 6 0 0 1 6 -6 z"/>
+
+  <!-- Sticks: (162.1, 108.8) and (293.1, 108.8), r 34.5 outer / 20.75 inner. -->
+  <circle cx="162.1" cy="108.8" r="34.5"/>
+  <circle cx="162.1" cy="108.8" r="20.75"/>
+  <circle cx="293.1" cy="108.8" r="34.5"/>
+  <circle cx="293.1" cy="108.8" r="20.75"/>
+  <!-- The bar between them, as on the official drawing. -->
+  <path d="M194 121.4 H 260"/>
+
+  <!-- Face buttons: Y (367.1,49.5) X (341.1,76) B (393.1,76) A (367.1,101.5). -->
+  <circle cx="367.1" cy="49.5" r="13.5"/>
+  <circle cx="341.1" cy="76" r="13.5"/>
+  <circle cx="393.1" cy="76" r="13.5"/>
+  <circle cx="367.1" cy="101.5" r="13.5"/>
+
+  <!-- Trackpads: rounded squares, 93 x 93, tilted ~10 degrees outward,
+       centred on (141.1, 193.5) and (314.1, 193.5). -->
+  <rect x="-46.5" y="-46.5" width="93" height="93" rx="16"
+        transform="translate(141.1 193.5) rotate(9.87)"/>
+  <rect x="-46.5" y="-46.5" width="93" height="93" rx="16"
+        transform="translate(314.1 193.5) rotate(-9.87)"/>
+
+  <!-- Steam / guide button, (227.5, 76). -->
+  <circle cx="227.5" cy="76" r="14"/>
+  <circle cx="231.9" cy="72.6" r="2.5"/>
+  <path d="M217 80 a11 11 0 0 0 15 4"/>
+
+  <!-- View (147.4, 43.6) and Menu (307.9, 43.6), drawn as the official pills. -->
+  <rect x="132" y="33.5" width="31" height="20" rx="10"/>
+  <path d="M139.2 40.6 H 152"/>
+  <path d="M139.2 46.6 H 149"/>
+  <rect x="292.5" y="33.5" width="31" height="20" rx="10"/>
+  <path d="M299.7 40.6 H 316"/>
+  <path d="M299.7 46.6 H 316"/>
+
+  <!-- Quick Access, (227.6, 194.7): the three-dot pill. -->
+  <rect x="211" y="185" width="33" height="19" rx="9.5"/>
+  <circle cx="221.4" cy="194.7" r="1.6" fill="white"/>
+  <circle cx="227.6" cy="194.7" r="1.6" fill="white"/>
+  <circle cx="233.8" cy="194.7" r="1.6" fill="white"/>
+</svg>

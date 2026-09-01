@@ -130,10 +130,19 @@ h.bind("guide+l2",          "Previous tab",        h.dispatch "hl.dsp.group.prev
 h.bind("guide+r2",          "Next tab",            h.dispatch "hl.dsp.group.next()")
 h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" })
 
+-- View is the "show me the map" key: it raises the cheat sheet — this very
+-- file, drawn onto a controller diagram. The descriptions above are what it
+-- prints, so a binding with no description reads as a guess (`hyprpad bindings`
+-- shows the same table in a terminal).
+--
+-- Needs the Quickshell widget installed once: `scripts/hyprpad-cheatsheet
+-- install`, which prints the two steps it will not take for you.
+h.bind("guide+view",        "Cheat sheet",         h.exec "hyprpad-cheatsheet toggle")
+
 -- ---------------------------------------------------------------------------
 -- Manual override (docs/13 decision #4). Beats the focus rules until cleared.
 --
 -- Uncomment to force the desktop layer live over a game (to answer a message
 -- mid-match), and to hand it back:
--- h.bind("guide+view", "Force desktop mode", h.set_mode "desktop")
--- h.bind("guide+l5",   "Back to automatic",  h.clear_mode())
+-- h.bind("guide+l4", "Force desktop mode", h.set_mode "desktop")
+-- h.bind("guide+l5", "Back to automatic",  h.clear_mode())

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# hyprpad-managed
+#
+# Install and drive the hyprpad controller cheat sheet.
+#
+#   hyprpad-cheatsheet install [--from DIR]   copy the plugin into Omarchy
+#   hyprpad-cheatsheet toggle                 show it, or hide it if it is up
+#   hyprpad-cheatsheet show | hide
+#   hyprpad-cheatsheet status                 what is installed and reachable
+#   hyprpad-cheatsheet uninstall              remove the installed copy
+#
+# `toggle` is what the guide chord runs, via the daemon's `h.exec`. It is a
+# one-line wrapper over Omarchy's own plugin IPC — kept as a script so the
+# binding in config.lua stays short and stable even if the IPC spelling moves.
+#
+# Nothing here edits a generated config. `install` copies the plugin and then
+# PRINTS the two things only the owner should decide: turning the plugin on in
+# their shell.json, and the binding to add to their hyprpad config.
+
+set -euo pipefail
+
+PLUGIN_ID="hyprpad.cheatsheet"
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
+# The repo copy: this script lives in scripts/, the plugin in shell/.
+DEFAULT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/shell/$PLUGIN_ID"
+
+die() { echo "hyprpad-cheatsheet: $*" >&2; exit 1; }
+
+have_shell() { command -v omarchy-shell >/dev/null 2>&1; }
+
+ipc() {
+  have_shell || die "omarchy-shell not found — is this an Omarchy session?"
+  omarchy-shell shell "$@"
+}
+
+cmd_install() {
+  local src="$DEFAULT_SRC"
+  if [[ ${1:-} == --from ]]; then
+    src="${2:-}"
+    [[ -n $src ]] || die "--from needs a directory"
+  fi
+  [[ -f "$src/manifest.json" ]] || die "no manifest.json in $src"
+
+  mkdir -p "$(dirname "$PLUGIN_DIR")"
+  rm -rf "$PLUGIN_DIR"
+  cp -r "$src" "$PLUGIN_DIR"
+  echo "installed  $PLUGIN_DIR"
+
+  if command -v omarchy >/dev/null 2>&1; then
+    omarchy plugin validate "$PLUGIN_DIR" && echo "validated  ok"
+  fi
+  # Saving under plugins/ hot-reloads the shell; nudge it anyway so a fresh
+  # install is visible without waiting on the watcher.
+  have_shell && ipc rescanPlugins >/dev/null 2>&1 || true
+
+  echo
+  echo "ACTION REQUIRED — two things this script will not do for you:"
+  echo
+  echo "1. Turn the plugin on. It has to be listed in your shell.json, which is"
+  echo "   yours to edit; Omarchy's own CLI does it safely:"
+  echo
+  echo "       omarchy plugin enable $PLUGIN_ID"
+  echo
+  echo "2. Bind a chord to it, in your hyprpad config"
+  echo "   (~/.config/hypr/hyprpad.lua, else ~/.config/hyprpad/config.lua):"
+  echo
+  echo "       h.bind(\"guide+view\", \"Cheat sheet\", h.exec \"hyprpad-cheatsheet toggle\")"
+  echo
+  echo "   then:  hyprpad reload"
+  echo
+  echo "   The TOML front-end spells the same binding:"
+  echo "       \"guide+view\" = \"exec hyprpad-cheatsheet toggle\""
+  echo
+
+  cmd_status
+}
+
+cmd_uninstall() {
+  if [[ -d $PLUGIN_DIR ]]; then
+    rm -rf "$PLUGIN_DIR"
+    echo "removed    $PLUGIN_DIR"
+    have_shell && ipc rescanPlugins >/dev/null 2>&1 || true
+  else
+    echo "absent     $PLUGIN_DIR (nothing to remove)"
+  fi
+  echo
+  echo "Also drop the plugin from shell.json if you turned it on:"
+  echo "    omarchy plugin disable $PLUGIN_ID"
+}
+
+# The sheet re-runs `hyprpad bindings --json` on every summon, so the binary
+# has to be reachable from the shell's environment, not just from a login
+# shell. Report on that explicitly — it is the one failure the widget cannot
+# fix for itself.
+cmd_status() {
+  echo "status:"
+  if [[ -d $PLUGIN_DIR ]]; then
+    echo "  plugin    $PLUGIN_DIR"
+  else
+    echo "  plugin    NOT INSTALLED (run: hyprpad-cheatsheet install)"
+  fi
+
+  if command -v hyprpad >/dev/null 2>&1; then
+    echo "  hyprpad   $(command -v hyprpad)"
+    if hyprpad bindings --json >/dev/null 2>&1; then
+      echo "  bindings  ok"
+    else
+      echo "  bindings  FAILED — this hyprpad has no 'bindings' subcommand?"
+    fi
+  else
+    echo "  hyprpad   NOT ON PATH — the sheet will show an error until it is."
+    echo "            Symlink your build, e.g."
+    echo "              ln -s \"\$PWD/target/release/hyprpad\" ~/.local/bin/hyprpad"
+    echo "            or set HYPRPAD_BIN in the shell's environment."
+  fi
+
+  if have_shell; then
+    local listed
+    listed=$(omarchy-shell shell listPlugins 2>/dev/null || true)
+    if [[ $listed == *"\"$PLUGIN_ID\""* ]]; then
+      if [[ $listed == *"\"$PLUGIN_ID\",\"name\""* || $listed == *"$PLUGIN_ID"* ]]; then
+        echo "  shell     plugin is registered"
+      fi
+    else
+      echo "  shell     plugin NOT registered (run: omarchy plugin enable $PLUGIN_ID)"
+    fi
+  else
+    echo "  shell     omarchy-shell not found"
+  fi
+}
+
+case "${1:-toggle}" in
+  install)   shift; cmd_install "$@" ;;
+  uninstall) cmd_uninstall ;;
+  status)    cmd_status ;;
+  toggle)    ipc toggle "$PLUGIN_ID" '{}' >/dev/null ;;
+  show)      ipc summon "$PLUGIN_ID" '{}' >/dev/null ;;
+  hide)      ipc hide   "$PLUGIN_ID" >/dev/null ;;
+  -h|--help|help)
+    sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command '${1}' (want: install|uninstall|status|toggle|show|hide)" ;;
+esac
