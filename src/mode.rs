@@ -600,10 +600,10 @@ mod tests {
         // chords survive, and the pad is handed to the game.
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/config/config.lua"
+            "/config/hyprpad.lua"
         ))
-        .expect("config/config.lua");
-        let c = load_str(&src, "config/config.lua").expect("sample config should load");
+        .expect("config/hyprpad.lua");
+        let c = load_str(&src, "config/hyprpad.lua").expect("sample config should load");
         let mut m = ModeEngine::new(&c);
 
         m.focus_changed(&c, "foot", "ajg@framework", None);

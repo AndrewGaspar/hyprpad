@@ -1790,14 +1790,14 @@ mod tests {
 
     #[test]
     fn the_ported_sample_config_matches_the_toml_it_replaces() {
-        // `config/config.lua` is the shipped translation of the owner's live
+        // `config/hyprpad.lua` is the shipped translation of the owner's live
         // `config.toml`; the two must agree binding for binding.
         let lua_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/config/config.lua"
+            "/config/hyprpad.lua"
         ))
-        .expect("config/config.lua");
-        let lua = load_str(&lua_src, "config/config.lua").expect("sample config should load");
+        .expect("config/hyprpad.lua");
+        let lua = load_str(&lua_src, "config/hyprpad.lua").expect("sample config should load");
         let toml = Config::from_toml_str(SAMPLE_TOML).expect("sample toml");
 
         assert_eq!(lua.own_lizard(), toml.own_lizard());
@@ -1839,7 +1839,7 @@ mod tests {
     }
 
     /// The owner's live `~/.config/hyprpad/config.toml`, verbatim, as the
-    /// reference the shipped `config/config.lua` is checked against.
+    /// reference the shipped `config/hyprpad.lua` is checked against.
     const SAMPLE_TOML: &str = r#"
 [daemon]
 own_lizard = true
