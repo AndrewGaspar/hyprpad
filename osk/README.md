@@ -63,6 +63,42 @@ light and deterministic. The research flags CPU rendering as the weak point for
 Deck-grade animated cursors/glow (§8); a GPU path is a deliberate later decision
 (§4.7, deferred).
 
+### Frame pacing — draw *when* the display is ready, not per command
+
+The daemon forwards `cursor <L|R>` at roughly the controller's report rate
+(~250 Hz per pad). Drawing a full software frame on **every** command pegs a core
+and, worse, commits far faster than the display refresh — the flicker/flash the
+per-pad cursors showed live. The draw path is therefore decoupled from the
+command stream:
+
+* **Dirty, not draw.** A `cursor`/highlight/shift/layer/reflow change only marks
+  the affected panel `dirty`; it never draws inline. A move that changes neither
+  the focused key nor the cursor's **integer** pixel is dropped outright (a
+  render-side dedup on top of the daemon's `%.4f` one), so sub-pixel churn costs
+  nothing.
+* **Paced by the poll loop.** Each wakeup, `render_tick` draws a dirty panel at
+  most once per `MIN_FRAME` (~165 Hz cap, this display's max). A burst of ~250 Hz
+  updates thus coalesces to one draw per display frame.
+* **Frame callbacks, with a timer fallback.** After a draw the surface requests a
+  `wl_surface.frame` callback and the panel waits for it — the standard Wayland
+  way to pace to the compositor's refresh and to stop when the surface is
+  occluded. But a compositor is *not obliged* to send the callback when it is not
+  repainting the surface (Hyprland withholds it from an OVERLAY layer sitting
+  under a full-screen overlay), which would freeze the cursors. So the poll
+  `timeout` also carries a `FRAME_FALLBACK` (~11 ms) deadline: if the callback
+  has not arrived by then, the panel draws anyway. A fresh callback is requested
+  only when none is outstanding, so the never-answered case does not pile up
+  `wl_callback` objects. When nothing is dirty the loop blocks (0 % CPU).
+* **Buffer-release discipline.** Every draw goes into a **fresh** `SlotPool`
+  buffer attached via `Buffer::attach_to` (which `activate()`s it), so SCTK holds
+  the slot until the compositor sends `wl_buffer.release`; `create_buffer` then
+  always lands on a slot that is *not* on screen. Attaching the raw `wl_buffer`
+  directly (as the kickoff did) bypassed that tracking and recycled a slot
+  mid-scanout — a second, independent source of tearing.
+
+Net effect under a ~250 Hz dual-pad stream: full-core CPU (≈99 %, ≈94 % split)
+drops to ≈13 % (≈17 % split), with no visible flashing.
+
 ## Architecture
 
 | Module | Responsibility |
