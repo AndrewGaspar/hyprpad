@@ -95,6 +95,11 @@ enum Input {
 }
 
 pub fn run() -> std::io::Result<()> {
+    // Advertise our PID before anything that can block, so `hyprpad reload` /
+    // `status` can find a daemon that is still waiting for its controller. The
+    // guard removes the pidfile on the clean-return and panic paths.
+    let _pidfile = PidFile::create();
+
     // Wait for the controller rather than exiting when it isn't there yet. The
     // loop below already survives the puck *leaving*; this makes startup
     // symmetric, so a daemon launched at login (or restarted while the puck is
@@ -160,7 +165,6 @@ pub fn run() -> std::io::Result<()> {
     // guard removes the pidfile on the clean-return and panic paths (a
     // signal-driven exit via `std::process::exit` leaves it, but `hyprpad
     // reload` treats a stale pidfile — a pid that is gone — as "not running").
-    let _pidfile = PidFile::create();
 
     let hypr = Hypr::connect()?;
     eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
