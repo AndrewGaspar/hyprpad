@@ -4,8 +4,9 @@
 //! control channel described in `osk/src/control.rs`: a line-based text protocol
 //! we speak on the child's **stdin** (`hyprpad-osk --stdin`). The vocabulary is
 //! the dual-trackpad one the OSK already understands — `show`, `hide`,
-//! `cursor <L|R> <nx> <ny>`, `commit <L|R>`, `quit` — so the daemon forwards
-//! each pad's absolute cursor and its click independently.
+//! `cursor <L|R> <nx> <ny>`, `commit <L|R>`, `key <code>`, `shift down|up`,
+//! `quit` — so the daemon forwards each pad's absolute cursor and its click
+//! independently, and holds Shift for exactly as long as a trigger is pulled.
 //!
 //! ## The back-channel (child stdout -> daemon)
 //!
@@ -137,6 +138,14 @@ fn commit_cmd(pad: OskPad) -> String {
     format!("commit {}", pad.wire())
 }
 
+/// Format a `shift down` / `shift up` command line: the OSK holds a momentary
+/// Shift for as long as the daemon says it is down (the `osk shift` binding —
+/// L2 by default), forcing the shifted legends and output without touching its
+/// own one-shot/caps latch.
+fn shift_cmd(down: bool) -> String {
+    format!("shift {}", if down { "down" } else { "up" })
+}
+
 /// Format a `key` command line: the OSK taps this raw evdev keycode on its
 /// virtual keyboard. Used by the Deck-style helper buttons (`[osk_buttons]`,
 /// e.g. Y = Space) so common keys need no cursor hunting.
@@ -231,6 +240,17 @@ impl OskHandle {
             return;
         }
         self.send(&commit_cmd(pad));
+    }
+
+    /// Hold (`true`) or release (`false`) the keyboard's momentary Shift — the
+    /// `osk shift` binding, a trigger by default. Ignored unless the keyboard
+    /// is shown; the keyboard drops a held shift on `hide` itself, so a release
+    /// that arrives after a dismiss has nothing to undo.
+    pub fn hold_shift(&mut self, down: bool) {
+        if !self.active {
+            return;
+        }
+        self.send(&shift_cmd(down));
     }
 
     /// Tap a raw evdev keycode through the OSK's virtual keyboard (the
@@ -449,6 +469,15 @@ mod tests {
         assert_eq!(it.next().unwrap().parse::<f32>().unwrap(), 0.25);
         assert_eq!(it.next().unwrap().parse::<f32>().unwrap(), -0.75);
         assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn shift_and_key_cmds_match_the_osk_grammar() {
+        // `shift down|up` is the OSK's held-shift command (osk/src/control.rs),
+        // distinct from the latch levels `off|oneshot|stuck|on`.
+        assert_eq!(shift_cmd(true), "shift down");
+        assert_eq!(shift_cmd(false), "shift up");
+        assert_eq!(key_cmd(57), "key 57");
     }
 
     #[test]

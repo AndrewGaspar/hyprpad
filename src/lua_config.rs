@@ -38,7 +38,9 @@
 //! h.button("dpad_up", h.key "up")       -- bare button, no guide modifier; held with it
 //! h.button("r2",      h.mouse "left")   -- a mouse button, through the pointer
 //! h.button("l5",      h.exec "voxtype record toggle") -- any other action fires once, on press
-//! h.osk_button("y",   h.key "space")    -- only while the OSK is up; keys only
+//! h.osk_button("y",   h.key "space")    -- only while the OSK is up: a key typed through it…
+//! h.osk_button("l2",  h.osk "shift")    -- …or one of its own actions (commit|shift|dismiss),
+//!                                       -- layered over the built-in Deck map; h.none() drops one
 //!
 //! -- Modes: a mode is a NAMED CONTEXT selected by a predicate. Rules run in
 //! -- definition order, first match wins, and only on a context change.
@@ -92,9 +94,9 @@
 
 use crate::config::{
     Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
-    ModeDef, ScrollConfig, ScrollMode,
+    ModeDef, OskAction, ScrollConfig, ScrollMode,
 };
-use crate::config::{is_mouse_code, key_code, mouse_code, parse_button, GestureKey};
+use crate::config::{key_code, mouse_code, parse_button, GestureKey};
 use crate::mode::Context;
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value, VmState};
 use std::cell::{Cell, RefCell};
@@ -637,7 +639,7 @@ struct Build {
     button_guards: HashMap<crate::report::Button, Guard>,
     /// Bindings for a button `buttons` already binds, in declaration order.
     button_alts: Vec<ButtonAlt>,
-    osk_buttons: HashMap<crate::report::Button, u16>,
+    osk_buttons: HashMap<crate::report::Button, OskAction>,
     osk_button_guards: HashMap<crate::report::Button, Guard>,
     /// The optional description each binding was declared with, keyed exactly
     /// like the maps above. Documentation only — read by `hyprpad bindings`,
@@ -811,6 +813,9 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("clear_mode", action_nullary(lua, "clear_mode")?)?;
     h.set("none", action_nullary(lua, "none")?)?;
     h.set("keyboard", keyboard_ctor(lua)?)?;
+    // The on-screen keyboard's own actions — `h.osk "commit"|"shift"|"dismiss"`
+    // — only mean something on `h.osk_button` (`value_to_osk_action`).
+    h.set("osk", action_ctor(lua, "osk", "keyboard action")?)?;
 
     lua.globals().set("hyprpad", h)?;
     Ok(())
@@ -1020,11 +1025,10 @@ fn bind_fn(
             Some(third) => (Some(string_arg(second, "the description")?), third),
             None => (None, second.ok_or_else(|| err("h.bind needs an action"))?),
         };
-        let action = value_to_action(&value)?;
-
         let mut b = build.borrow_mut();
         let slot = match kind {
             BindKind::Gesture => {
+                let action = value_to_action(&value)?;
                 let k = GestureKey::parse(&key).map_err(err)?;
                 b.bindings.insert(k, action);
                 if let Some(d) = desc {
@@ -1037,6 +1041,7 @@ fn bind_fn(
             // edge (`ButtonAction::classify`, the same sort the TOML parser
             // does).
             BindKind::Button => {
+                let action = value_to_action(&value)?;
                 let btn = parse_button(&key.trim().to_ascii_lowercase()).map_err(err)?;
                 let what = ButtonAction::classify(action)
                     .map_err(|e| err(format!("{e} (button '{key}')")))?;
@@ -1065,26 +1070,13 @@ fn bind_fn(
                     }
                 }
             }
-            // An OSK helper types a key by name through the on-screen
-            // keyboard's own virtual keyboard, so a key is all it can be.
+            // The on-screen keyboard's table has its own action set: a key
+            // typed through the keyboard, or one of its three verbs.
             BindKind::OskButton => {
                 let btn = parse_button(&key.trim().to_ascii_lowercase()).map_err(err)?;
-                let Action::Key(code) = action else {
-                    return Err(err(format!(
-                        "h.osk_button values must be a key, e.g. h.key \"space\" \
-                         (got {action:?} for '{key}')"
-                    )));
-                };
-                // A mouse button has no meaning there either (and the OSK
-                // already owns the pad clicks as key commits). Same rule as
-                // the TOML parser.
-                if is_mouse_code(code) {
-                    return Err(err(format!(
-                        "h.osk_button sends keys through the on-screen keyboard; a mouse \
-                         button makes no sense there — bind '{key}' with h.button instead"
-                    )));
-                }
-                b.osk_buttons.insert(btn, code);
+                let what = value_to_osk_action(&value)
+                    .map_err(|e| err(format!("{e} (osk_button '{key}')")))?;
+                b.osk_buttons.insert(btn, what);
                 if let Some(d) = desc {
                     b.osk_button_descs.insert(btn, d);
                 }
@@ -1493,6 +1485,12 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
                     Action::parse(&format!("{verb} {arg}")).map_err(err)
                 }
                 "move_to_workspace" => Action::parse(&format!("movetoworkspace {arg}")).map_err(err),
+                // The keyboard's own verbs are `h.osk_button` bindings, live
+                // only while it is up; a chord or a bare button is not.
+                "osk" => Err(err(format!(
+                    "h.osk \"{arg}\" is an on-screen keyboard binding — it belongs on \
+                     h.osk_button, not on h.bind or h.button"
+                ))),
                 other => Err(err(format!("unknown action '{other}'"))),
             }
         }
@@ -1501,6 +1499,44 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
             other.type_name()
         ))),
     }
+}
+
+/// Turn a Lua value into an [`OskAction`] — what `h.osk_button` takes. The same
+/// two spellings as [`value_to_action`]: a constructor table (`h.key "space"`,
+/// `h.osk "shift"`, `h.none()`) or a plain string in the TOML grammar
+/// (`"key space"`, `"osk shift"`, `"none"`), both read by [`OskAction::parse`]
+/// so the two front-ends cannot drift on what the keyboard's table means.
+fn value_to_osk_action(v: &Value) -> Result<OskAction, String> {
+    let text = match v {
+        Value::String(s) => s.to_str().map_err(|e| e.to_string())?.to_string(),
+        Value::Table(t) => {
+            let verb: Option<String> = t.get(ACTION_TAG).map_err(|e| e.to_string())?;
+            let arg: String = t
+                .get::<Option<String>>("arg")
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            match verb.as_deref() {
+                Some(v @ ("key" | "mouse" | "osk" | "none")) => format!("{v} {arg}"),
+                Some(other) => {
+                    return Err(format!(
+                        "h.osk_button values must be a key (h.key \"space\") or one of the \
+                         keyboard's own actions (h.osk \"commit\"|\"shift\"|\"dismiss\"), \
+                         got h.{other}"
+                    ))
+                }
+                None => {
+                    return Err("that table is not an action — use h.key, h.osk or h.none".into())
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "expected an action (e.g. h.key \"space\"), got {}",
+                other.type_name()
+            ))
+        }
+    };
+    OskAction::parse(&text)
 }
 
 // --- small value helpers ---------------------------------------------------
@@ -1598,7 +1634,7 @@ fn unknown_key(section: &str, got: &str, want: &[&str]) -> mlua::Error {
 mod tests {
     use super::*;
     use crate::config::ButtonAction::{Fire, Hold};
-    use crate::config::{ModeState, WorkspaceTarget};
+    use crate::config::{ModeState, OskAction, WorkspaceTarget};
     use crate::gesture::GestureEvent;
     use crate::mode::Focus;
     use crate::report::Button;
@@ -1725,8 +1761,49 @@ mod tests {
         );
         assert_eq!(c.buttons().get(&Button::DpadUp), Some(&Hold(103)));
         assert_eq!(c.buttons().get(&Button::A), Some(&Hold(28)));
-        assert_eq!(c.osk_buttons().get(&Button::Y), Some(&57));
+        assert_eq!(c.osk_buttons().get(&Button::Y), Some(&OskAction::Key(57)));
         assert!(c.buttons().get(&Button::Y).is_none());
+    }
+
+    #[test]
+    fn an_osk_button_takes_the_keyboards_own_actions_over_the_built_ins() {
+        use OskAction::{Commit, Dismiss, Key, Shift};
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.osk_button("l2", h.osk "shift")
+            h.osk_button("r2", "osk commit")                 -- the TOML grammar, as a string
+            h.osk_button("b", "Put it away", h.osk "dismiss")
+            h.osk_button("menu", h.none())                   -- drop the built-in
+            h.osk_button("l1", h.key "tab")
+            "#,
+        );
+        let raw = c.osk_buttons();
+        assert_eq!(raw.get(&Button::TriggerL2Full), Some(&Shift));
+        assert_eq!(raw.get(&Button::TriggerR2Full), Some(&Commit));
+        assert_eq!(raw.get(&Button::B), Some(&Dismiss));
+        assert_eq!(raw.get(&Button::Menu), Some(&OskAction::None));
+        assert_eq!(raw.get(&Button::BumperL1), Some(&Key(15)));
+        assert_eq!(c.osk_button_descs.get(&Button::B).map(String::as_str), Some("Put it away"));
+
+        // Layered over the built-ins: Menu is gone, R2 is a commit now, and
+        // the untouched built-ins (pad clicks, Y, X) are still there.
+        let st = ModeState::new(c.default_mode(), Vec::new());
+        let live = c.osk_buttons_in(&st);
+        assert_eq!(live.get(&Button::Menu), None);
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&Commit));
+        assert_eq!(live.get(&Button::PadRightClick), Some(&Commit));
+        assert_eq!(live.get(&Button::Y), Some(&Key(57)));
+        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15)));
+
+        // The keyboard's verbs mean nothing on a chord or a bare button.
+        let e = load_str(r#"hyprpad.bind("guide+a", hyprpad.osk "commit")"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.osk_button"), "{e}");
+        let e = load_str(r#"hyprpad.button("a", hyprpad.osk "shift")"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.osk_button"), "{e}");
+        let e = load_str(r#"hyprpad.osk_button("a", hyprpad.osk "frobnicate")"#, "t.lua").unwrap_err();
+        assert!(e.contains("commit|shift|dismiss"), "{e}");
+        assert!(e.contains("'a'"), "should name the button: {e}");
     }
 
     #[test]
@@ -1774,8 +1851,8 @@ mod tests {
 
     #[test]
     fn an_osk_button_bound_to_a_non_key_action_is_an_error() {
-        // The OSK helpers type through the keyboard's own uinput, so they stay
-        // keys-only even though a bare button now takes anything.
+        // The keyboard's table takes a key typed through it or one of its own
+        // verbs, not a chord's actions — even though a bare button takes anything.
         let e = load_str(r#"hyprpad.osk_button("y", hyprpad.exec "foo")"#, "t.lua").unwrap_err();
         assert!(e.contains("h.osk_button values must be a key"), "{e}");
         assert!(e.contains("'y'"), "should name the button: {e}");

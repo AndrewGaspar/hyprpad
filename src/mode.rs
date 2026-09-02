@@ -40,7 +40,7 @@
 //! once for the file, once for the modes.
 
 use crate::arbitrate::Arbiter;
-use crate::config::{ButtonAction, Config, ModeState};
+use crate::config::{ButtonAction, Config, ModeState, OskAction};
 use crate::gesture::GestureEvent;
 use crate::report;
 use std::collections::{BTreeSet, HashMap};
@@ -126,7 +126,7 @@ pub struct ModeEngine {
     cursor_guide: bool,
     scroll: bool,
     buttons: HashMap<report::Button, ButtonAction>,
-    osk_buttons: HashMap<report::Button, u16>,
+    osk_buttons: HashMap<report::Button, OskAction>,
 }
 
 impl ModeEngine {
@@ -411,8 +411,10 @@ impl ModeEngine {
         &self.buttons
     }
 
-    /// The OSK-helper bindings live in this mode.
-    pub fn osk_buttons(&self) -> &HashMap<report::Button, u16> {
+    /// What the buttons do while the on-screen keyboard is up, in this mode:
+    /// the built-in Deck map with the config's `osk_buttons` layered over it
+    /// ([`Config::osk_buttons_in`]).
+    pub fn osk_buttons(&self) -> &HashMap<report::Button, OskAction> {
         &self.osk_buttons
     }
 
@@ -477,7 +479,9 @@ impl ModeEngine {
         self.scroll = !game;
         self.forwards = game;
         self.buttons = if game { HashMap::new() } else { config.buttons().clone() };
-        self.osk_buttons = config.osk_buttons().clone();
+        // The keyboard's table is the same in both modes (a TOML config has
+        // no guards), and it is the layered map, not the config's raw entries.
+        self.osk_buttons = config.osk_buttons_in(&self.state);
     }
 
     /// The declared-modes path: evaluate every predicate once, pick a mode,
@@ -718,7 +722,7 @@ mod tests {
         assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperR1), true));
         // An unguarded osk_button is live everywhere, which is the point of
         // per-binding granularity: `osk` is not a category that switches.
-        assert_eq!(m.osk_buttons().get(&Button::Y), Some(&57));
+        assert_eq!(m.osk_buttons().get(&Button::Y), Some(&OskAction::Key(57)));
     }
 
     #[test]
@@ -884,7 +888,7 @@ mod tests {
                 "guide+Y must still raise the keyboard over a game"
             );
             // ...and so do the OSK helpers it needs once it is up.
-            assert_eq!(m.osk_buttons().get(&Button::Y), Some(&57));
+            assert_eq!(m.osk_buttons().get(&Button::Y), Some(&OskAction::Key(57)));
         }
 
         // A fullscreen video is not a game (docs/13 decision #2).

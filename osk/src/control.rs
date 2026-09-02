@@ -18,7 +18,8 @@
 //! hide                             # DESTROY the surface(s) — never just unmap
 //! cursor <L|R> <nx> <ny>           # pad absolute position, each axis in [-1,1]
 //! commit <L|R>                     # commit the key under that pad's cursor (click-down)
-//! shift <off|oneshot|stuck|on>     # set the shift/caps state directly (on = stuck/caps)
+//! shift <off|oneshot|stuck|on>     # set the latched shift/caps state (on = stuck/caps)
+//! shift <down|up>                  # hold / release a physical Shift (momentary; the latch is untouched)
 //! layer <base|symbols|toggle>      # switch the base QWERTY ↔ numeric/symbols page
 //! reflow <on|off>                  # displace (on) vs overlay/float (off); recreates surfaces
 //! key <keycode>                    # commit a raw evdev keycode directly (test/daemon)
@@ -49,8 +50,12 @@ pub enum Command {
     Cursor { pad: Pad, nx: f32, ny: f32 },
     /// Commit the key currently under `pad`'s cursor (trackpad click-down).
     Commit { pad: Pad },
-    /// Set the shift/caps state directly so the daemon can drive it.
+    /// Set the latched shift/caps state directly so the daemon can drive it.
     Shift { state: ShiftState },
+    /// Hold (`down`) or release (`up`) a physical Shift: the daemon's held
+    /// trigger. Momentary — forces the shifted level while down and leaves the
+    /// latched state alone ([`crate::layout::ShiftModel`]).
+    ShiftHeld { down: bool },
     /// Switch the active key layer. `None` means toggle to the other layer.
     Layer { target: Option<Layer> },
     /// Switch the surface policy: `true` = displace (exclusive zone), `false` =
@@ -104,7 +109,12 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 Some("oneshot") | Some("one") => ShiftState::OneShot,
                 // `on`/`caps`/`stuck` all mean the locked level.
                 Some("stuck") | Some("on") | Some("caps") => ShiftState::Stuck,
-                Some(other) => return Err(format!("bad shift '{other}' (want off|oneshot|stuck|on)")),
+                // The physical, momentary shift is a separate bit from the latch.
+                Some("down") | Some("hold") => return Ok(Command::ShiftHeld { down: true }),
+                Some("up") | Some("release") => return Ok(Command::ShiftHeld { down: false }),
+                Some(other) => {
+                    return Err(format!("bad shift '{other}' (want off|oneshot|stuck|on, or down|up)"))
+                }
             };
             Ok(Command::Shift { state })
         }
@@ -366,6 +376,11 @@ mod tests {
         assert_eq!(parse("shift on"), Ok(Command::Shift { state: ShiftState::Stuck }));
         assert_eq!(parse("shift off"), Ok(Command::Shift { state: ShiftState::Off }));
         assert!(parse("shift sideways").is_err());
+        // The held shift is its own command, not a latch level.
+        assert_eq!(parse("shift down"), Ok(Command::ShiftHeld { down: true }));
+        assert_eq!(parse("shift up"), Ok(Command::ShiftHeld { down: false }));
+        assert_eq!(parse("shift hold"), Ok(Command::ShiftHeld { down: true }));
+        assert_eq!(parse("shift release"), Ok(Command::ShiftHeld { down: false }));
         assert_eq!(parse("layer symbols"), Ok(Command::Layer { target: Some(Layer::Symbols) }));
         assert_eq!(parse("layer base"), Ok(Command::Layer { target: Some(Layer::Base) }));
         assert_eq!(parse("layer toggle"), Ok(Command::Layer { target: None }));

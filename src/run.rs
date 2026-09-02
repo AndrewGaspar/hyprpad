@@ -80,10 +80,28 @@
 //! A hold spent this way — a chord, or the pad moving the cursor — is
 //! *consumed* ([`GestureEngine::consume_hold`]): its release is never handed on
 //! as the bare guide tap Steam acts on.
+//!
+//! ## Layer transitions: a held button never leaks into the next layer
+//!
+//! Every layer acts on **press edges only**, and never on the frame it became
+//! live. A button that is physically down when ownership of the controller
+//! changes hands — B, still held from closing the keyboard, as the desktop's
+//! bare bindings reopen; the Y of the `guide+Y` chord that raised the
+//! keyboard, as the keyboard starts routing; A, still held after the guide was
+//! released first; R1, still held while a mode flips away and straight back —
+//! is by construction down on the previous frame from then on, so it is not an
+//! edge and does nothing until it is released and pressed again. The frame a
+//! transition lands on is suppressed outright: [`ButtonKeys::reconcile`] and
+//! [`OskRoute::step`] both remember whether they were live last frame, and
+//! [`ButtonKeys::release_all`] (every mode handoff, reload and disconnect)
+//! resets that memory. That covers a gate that opens and a press that lands
+//! in the same report, and a handoff that runs between two reports. The price
+//! is that a key held straight through a guide tap does not resume on its
+//! own — it wants a fresh press.
 
 use crate::config::{
-    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode,
-    ScrollConfig, ScrollMode, WorkspaceTarget,
+    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, OskAction,
+    RumbleMode, ScrollConfig, ScrollMode, WorkspaceTarget,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gamepad::{self, VirtualGamepad};
@@ -622,39 +640,48 @@ pub fn run() -> std::io::Result<()> {
                         drive_cursor(ptr, &frame, &mut cursor, false, &mut hx, now);
                         drive_scroll(ptr, &frame, &mut scroll, true, true, &mut hx, now);
                     }
-                } else if let Some(ptr) = pointer.as_mut() {
-                    // Ambient (non-guide) layer: the RIGHT pad drives the cursor
-                    // and the LEFT pad drives scroll. The guide layer takes both
-                    // pads away — except where `h.cursor { guide_in = … }` keeps
-                    // the right pad a mouse under a held guide — and the active
-                    // mode decides each independently, via that handler's own
-                    // guard (`h.cursor { only_in = … }`).
-                    let guide = engine.guide_active();
-                    let moved = drive_cursor(
-                        ptr,
-                        &frame,
-                        &mut cursor,
-                        cursor_active(guide, modes.cursor_enabled(), modes.cursor_guide_enabled()),
-                        &mut hx,
-                        now,
-                    );
-                    // A hold spent on pointing is not a bare tap: once the pad
-                    // has moved the cursor under the guide, its release must
-                    // not reach Steam as the guide button (docs/research/
-                    // text-scrub.md §5) — the same rule a chord's recognition
-                    // applies.
-                    if guide && moved {
-                        engine.consume_hold();
+                } else {
+                    // The keyboard is down — or went down this frame by a
+                    // toggle rather than its own dismiss binding. Forget its
+                    // routing state, so the next show starts as a fresh layer
+                    // and a still-held Shift button is not remembered as
+                    // holding it. A no-op when it was already down.
+                    osk_route.disarm();
+                    if let Some(ptr) = pointer.as_mut() {
+                        // Ambient (non-guide) layer: the RIGHT pad drives the
+                        // cursor and the LEFT pad drives scroll. The guide layer
+                        // takes both pads away — except where `h.cursor
+                        // { guide_in = … }` keeps the right pad a mouse under a
+                        // held guide — and the active mode decides each
+                        // independently, via that handler's own guard
+                        // (`h.cursor { only_in = … }`).
+                        let guide = engine.guide_active();
+                        let moved = drive_cursor(
+                            ptr,
+                            &frame,
+                            &mut cursor,
+                            cursor_active(guide, modes.cursor_enabled(), modes.cursor_guide_enabled()),
+                            &mut hx,
+                            now,
+                        );
+                        // A hold spent on pointing is not a bare tap: once the
+                        // pad has moved the cursor under the guide, its release
+                        // must not reach Steam as the guide button
+                        // (docs/research/text-scrub.md §5) — the same rule a
+                        // chord's recognition applies.
+                        if guide && moved {
+                            engine.consume_hold();
+                        }
+                        drive_scroll(
+                            ptr,
+                            &frame,
+                            &mut scroll,
+                            guide,
+                            !modes.scroll_enabled(),
+                            &mut hx,
+                            now,
+                        );
                     }
-                    drive_scroll(
-                        ptr,
-                        &frame,
-                        &mut scroll,
-                        guide,
-                        !modes.scroll_enabled(),
-                        &mut hx,
-                        now,
-                    );
                 }
                 // Bare-button bindings that are *held* (D-pad -> arrows, pad
                 // click / triggers -> mouse clicks by default; each code goes
@@ -670,6 +697,7 @@ pub fn run() -> std::io::Result<()> {
                     &mut keyboard,
                     pointer.as_mut(),
                     &frame,
+                    &prev_frame,
                     modes.buttons(),
                     &mut button_keys,
                     buttons_active,
@@ -748,8 +776,8 @@ fn forward_osk_events(events: mpsc::Receiver<OskEvent>, tx: mpsc::Sender<Input>)
 enum Haptic {
     /// An OSK cursor crossed onto a new key (reported by the child).
     Crossing,
-    /// An OSK key was committed (pad click, trigger, or an `[osk_buttons]`
-    /// helper).
+    /// An OSK key was committed: a pad click typed the key under its cursor,
+    /// or an `[osk_buttons]` binding typed a key through the keyboard.
     Commit,
     /// A guide chord or stick flick resolved to an action.
     Gesture,
@@ -1189,11 +1217,19 @@ fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: boo
 /// edge is.
 struct ButtonKeys {
     held: HashMap<report::Button, u16>,
+    /// Whether the bare-button layer was live at the end of the last
+    /// [`reconcile`](Self::reconcile), with no transition since. A press is
+    /// honoured only when this was already true: the frame the gate opens on
+    /// — or the first frame after a handoff, a reload, a disconnect
+    /// ([`release_all`](Self::release_all)) — presses nothing, so a button
+    /// still held from the previous layer waits for a fresh press (module
+    /// docs, "Layer transitions").
+    open: bool,
 }
 
 impl ButtonKeys {
     fn new() -> ButtonKeys {
-        ButtonKeys { held: HashMap::new() }
+        ButtonKeys { held: HashMap::new(), open: false }
     }
 
     /// Reconcile the desired key state against what is held, returning the
@@ -1203,16 +1239,21 @@ impl ButtonKeys {
     /// feedback on the side of the controller it sits on.
     ///
     /// When `active` is false (guide/OSK), every held key is released.
-    /// Otherwise each `Hold`-bound button that is physically down but not yet
-    /// held presses its key, and each held key whose button lifted — **or
-    /// whose binding has gone away or changed**, which is what a mode
-    /// transition or a reload looks like from here — releases. Releases are
-    /// emitted before presses. `Fire` bindings are not this function's: they
-    /// have no held state ([`fire_edges`]).
-    fn reconcile<F: Fn(report::Button) -> bool>(
+    /// Otherwise each held key whose button lifted — **or whose binding has
+    /// gone away or changed**, which is what a mode transition or a reload
+    /// looks like from here — releases, and each `Hold`-bound button on a
+    /// **press edge** (down now per `pressed`, up last frame per
+    /// `was_pressed`) presses its key — provided the layer was already live
+    /// last frame. A button that is down when the gate opens, or that a
+    /// handoff released while it stayed down, is down on the previous frame
+    /// from then on and so never an edge: it presses again only after a
+    /// release. Releases are emitted before presses. `Fire` bindings are not
+    /// this function's: they have no held state ([`fire_edges`]).
+    fn reconcile<F: Fn(report::Button) -> bool, G: Fn(report::Button) -> bool>(
         &mut self,
         bindings: &HashMap<report::Button, ButtonAction>,
         pressed: F,
+        was_pressed: G,
         active: bool,
     ) -> Vec<(report::Button, u16, bool)> {
         let mut events = Vec::new();
@@ -1226,11 +1267,15 @@ impl ButtonKeys {
             }
             keep
         });
-        // Press bound buttons that are down but not yet held — only when open.
-        if active {
+        // Press only on a fresh edge, and only once the layer has been live for
+        // a whole frame: a button already down when it became live — or pressed
+        // on the very frame it did — waits for its release.
+        let settled = active && self.open;
+        self.open = active;
+        if settled {
             for (&btn, what) in bindings {
                 let ButtonAction::Hold(code) = *what else { continue };
-                if pressed(btn) && !self.held.contains_key(&btn) {
+                if pressed(btn) && !was_pressed(btn) && !self.held.contains_key(&btn) {
                     events.push((btn, code, true));
                     self.held.insert(btn, code);
                 }
@@ -1240,12 +1285,16 @@ impl ButtonKeys {
     }
 
     /// Release every held key and mouse button immediately, outside the
-    /// per-frame reconcile.
+    /// per-frame reconcile, and mark a transition.
     ///
     /// Used by the mode-transition handoff and the disconnect path: `reconcile`
     /// would get there on the next report anyway, but "no key is stranded
     /// across a mode switch" should not depend on another report arriving —
-    /// and after a disconnect none will.
+    /// and after a disconnect none will. The transition mark is what keeps a
+    /// button that is *still down* from pressing again on the next frame: a
+    /// Tab that walks the bar's panels flips the mode away and back within a
+    /// few milliseconds, each flip running this, and without the mark one tap
+    /// became two or three.
     fn release_all(
         &mut self,
         kbd: &mut Option<VirtualKeyboard>,
@@ -1254,6 +1303,7 @@ impl ButtonKeys {
         for (_, code) in self.held.drain() {
             emit_button_code(kbd, pointer.as_deref_mut(), code, false);
         }
+        self.open = false;
     }
 }
 
@@ -1361,26 +1411,30 @@ fn emit_button_code(
 }
 
 /// Drive the *held* bare-button bindings ([`ButtonAction::Hold`]) for a single
-/// frame: press each bound button's key or mouse button on its down edge and
-/// release it on its up edge, subject to `active` (the guide/OSK/suppressed
-/// gate, mirroring [`drive_cursor`]). Each code is routed to the device it
-/// belongs to ([`route`]); a missing keyboard or pointer silences the codes
-/// that would have gone to it and nothing else, so the pad click still clicks
-/// on a box with no uinput. The bindings that *fire* are [`fire_buttons`]'s.
+/// frame: press each bound button's key or mouse button on its down edge
+/// (against `prev`) and release it on its up edge, subject to `active` (the
+/// guide/OSK/suppressed gate, mirroring [`drive_cursor`]). Each code is routed
+/// to the device it belongs to ([`route`]); a missing keyboard or pointer
+/// silences the codes that would have gone to it and nothing else, so the pad
+/// click still clicks on a box with no uinput. The bindings that *fire* are
+/// [`fire_buttons`]'s.
 ///
 /// Feedback fires on the **press edge only** ([`Haptic::Button`], off by
 /// default): a held D-pad auto-repeats in the kernel — which produces no further
 /// events here, so a repeat never buzzes — and a release is not a keystroke.
+#[allow(clippy::too_many_arguments)]
 fn drive_buttons(
     kbd: &mut Option<VirtualKeyboard>,
     mut pointer: Option<&mut VirtualPointer>,
     frame: &report::Frame,
+    prev: &report::Frame,
     bindings: &HashMap<report::Button, ButtonAction>,
     st: &mut ButtonKeys,
     active: bool,
     hx: &mut HapticCtx,
 ) {
-    for (btn, code, pressed) in st.reconcile(bindings, |b| frame.pressed(b), active) {
+    let events = st.reconcile(bindings, |b| frame.pressed(b), |b| prev.pressed(b), active);
+    for (btn, code, pressed) in events {
         emit_button_code(kbd, pointer.as_deref_mut(), code, pressed);
         if pressed {
             hx.fire(Haptic::Button, button_pad(btn));
@@ -2302,12 +2356,21 @@ fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode, reflow: bool) {
     }
 }
 
-/// Cross-frame state for OSK-active pad routing: a smoothing damper plus the
-/// last sent (rounded) position for each pad, so identical positions aren't
-/// re-sent every 4 ms frame.
+/// Cross-frame state for OSK-active routing: a smoothing damper plus the last
+/// sent (rounded) position for each pad, so identical positions aren't re-sent
+/// every 4 ms frame; and the keyboard layer's own press-edge memory, so a
+/// button held across its rise or fall never leaks (module docs, "Layer
+/// transitions").
 struct OskRoute {
     left: OskPadState,
     right: OskPadState,
+    /// Whether the keyboard's layer routed the previous frame. The first frame
+    /// after a show acts on no button: whatever is down then — the Y of the
+    /// `guide+Y` that raised it — waits for a fresh press.
+    live: bool,
+    /// The buttons currently holding Shift (`osk shift`), in press order:
+    /// Shift goes down with the first and comes up with the last.
+    shift_holders: Vec<report::Button>,
 }
 
 /// One OSK pad's routing state: its smoothing damper and the last position sent
@@ -2318,18 +2381,118 @@ struct OskPadState {
     last_sent: Option<(f32, f32)>,
 }
 
+/// What one frame of the keyboard's layer asks the daemon to do, decided by
+/// [`OskRoute::step`] and carried out by [`route_osk`] — split so the edge and
+/// hold logic is unit-testable without a keyboard child or a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OskOp {
+    /// Tap a raw key through the keyboard, with the hand the button is under
+    /// (for the commit click).
+    Key(u16, HapticPad),
+    /// Type the key under this pad's cursor.
+    Commit(OskPad),
+    /// The first Shift-bound button went down.
+    ShiftDown,
+    /// The last Shift-bound button came up (or the keyboard is closing).
+    ShiftUp,
+    /// Close the keyboard.
+    Dismiss,
+}
+
 impl OskRoute {
     fn new(cfg: &CursorConfig) -> OskRoute {
         OskRoute {
             left: OskPadState::new(cfg),
             right: OskPadState::new(cfg),
+            live: false,
+            shift_holders: Vec::new(),
         }
     }
 
-    /// Forget both pads (on dismiss), resetting their filter state.
+    /// Forget both pads' smoothing state (a mode handoff, a disconnect). The
+    /// layer's press-edge memory and its Shift holders survive: the keyboard
+    /// is still up, and a trigger still pulled is still holding Shift.
     fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+    }
+
+    /// The keyboard went down: forget everything, so the next show is a fresh
+    /// layer that acts on nothing until a frame has passed. Called on every
+    /// frame the keyboard is not up, so it is a no-op once disarmed.
+    fn disarm(&mut self) {
+        if !self.live {
+            return;
+        }
+        self.reset();
+        self.live = false;
+        self.shift_holders.clear();
+    }
+
+    /// Decide one frame of the keyboard's button layer. Pure: what to send,
+    /// from what changed between `prev` and `frame` under `bindings` (the
+    /// layered map, [`crate::config::Config::osk_buttons_in`]).
+    ///
+    /// Releases are honoured on every frame — Shift comes up when the last
+    /// button holding it lifts, whatever else is going on. Presses are
+    /// honoured only on a press edge, and only once this layer routed the
+    /// previous frame too: the frame the keyboard came up on acts on nothing,
+    /// so the button that raised it is not also its first keystroke. A
+    /// `Dismiss` ends the frame's processing (and this layer): any held Shift
+    /// is released first, and the route is disarmed for the next show.
+    fn step(
+        &mut self,
+        frame: &report::Frame,
+        prev: &report::Frame,
+        bindings: &HashMap<report::Button, OskAction>,
+    ) -> Vec<OskOp> {
+        let mut ops = Vec::new();
+        let settled = self.live;
+        self.live = true;
+
+        let was_holding = !self.shift_holders.is_empty();
+        self.shift_holders.retain(|&b| frame.pressed(b));
+        if was_holding && self.shift_holders.is_empty() {
+            ops.push(OskOp::ShiftUp);
+        }
+        if !settled {
+            return ops;
+        }
+
+        for b in frame.edges_down(prev) {
+            match bindings.get(&b) {
+                Some(OskAction::Key(code)) => ops.push(OskOp::Key(*code, button_pad(b))),
+                Some(OskAction::Commit) => ops.push(OskOp::Commit(commit_pad(b))),
+                Some(OskAction::Shift) => {
+                    if self.shift_holders.is_empty() {
+                        ops.push(OskOp::ShiftDown);
+                    }
+                    self.shift_holders.push(b);
+                }
+                Some(OskAction::Dismiss) => {
+                    if !self.shift_holders.is_empty() {
+                        ops.push(OskOp::ShiftUp);
+                    }
+                    ops.push(OskOp::Dismiss);
+                    self.disarm();
+                    break;
+                }
+                Some(OskAction::None) | None => {}
+            }
+        }
+        ops
+    }
+}
+
+/// Which pad's cursor an `osk commit` on `b` types under: the pad on the same
+/// side of the puck as the button ([`button_pad`]). The pad clicks are the
+/// obvious case; a commit rebound to a grip or a bumper reads the pad under
+/// that hand, and one on a face button the right pad. The guide button belongs
+/// to neither hand and reads the right pad, like the face cluster.
+fn commit_pad(b: report::Button) -> OskPad {
+    match button_pad(b) {
+        HapticPad::Left => OskPad::Left,
+        HapticPad::Right | HapticPad::Both => OskPad::Right,
     }
 }
 
@@ -2344,60 +2507,47 @@ impl OskPadState {
     }
 }
 
-/// Route one frame to the on-screen keyboard while it owns the pads:
-/// each pad's absolute position becomes a `cursor L|R`, a pad click (or a full
-/// trigger pull) commits the key under it, and `B`/`Menu` dismiss the keyboard.
+/// Route one frame to the on-screen keyboard while it owns the pads: each
+/// pad's absolute position becomes a `cursor L|R`, and the buttons do what the
+/// keyboard's table says ([`crate::config::OskAction`] — by default the Deck's
+/// map: pad clicks commit the key under that pad's cursor, L2 holds Shift, R2
+/// is Enter, Y Space, X Backspace, and B or Menu close it). The decisions are
+/// [`OskRoute::step`]'s; this carries them out.
 ///
-/// Every commit gets a haptic click on the committing side ([`Haptic::Commit`]).
-/// The lighter per-key-crossing tick is *not* fired here: only the OSK child
-/// knows where the key boundaries are, so it reports crossings back and the loop
-/// answers them (`Input::Osk`).
+/// Every commit — a pad click or a key typed through the keyboard — gets a
+/// haptic click on its side ([`Haptic::Commit`]). The lighter per-key-crossing
+/// tick is *not* fired here: only the OSK child knows where the key boundaries
+/// are, so it reports crossings back and the loop answers them (`Input::Osk`).
 fn route_osk(
     osk: &mut OskHandle,
     frame: &report::Frame,
     prev: &report::Frame,
     st: &mut OskRoute,
-    osk_buttons: &HashMap<report::Button, u16>,
+    osk_buttons: &HashMap<report::Button, OskAction>,
     hx: &mut HapticCtx,
     now: Instant,
 ) {
     use report::Button::*;
-
-    // Dismiss on B or Menu (edge-down): hide and leave OSK-active mode.
-    if frame.edges_down(prev).any(|b| matches!(b, B | Menu)) {
-        osk.hide();
-        st.reset();
-        return;
-    }
 
     // Move each pad's cursor first, so a click on the same frame commits the key
     // actually under the finger. Only while touched, and only on change.
     route_pad(osk, OskPad::Left, frame.pressed(PadLeftTouch), frame.left_pad, &mut st.left, now);
     route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.right, now);
 
-    // Commit on click-down (the Deck commits on click, not release). A full
-    // trigger pull on the same side is an alternate commit. Other buttons may be
-    // Deck-style helpers (`[osk_buttons]`, e.g. Y = Space, X = Backspace): they
-    // tap their key through the OSK's virtual keyboard. Dismiss (B/Menu) and the
-    // commit buttons take precedence over a helper binding.
-    for b in frame.edges_down(prev) {
-        match b {
-            PadLeftClick | TriggerL2Full => {
-                osk.commit(OskPad::Left);
-                hx.fire(Haptic::Commit, HapticPad::Left);
+    // Commit on click-down (the Deck commits on click, not release).
+    for op in st.step(frame, prev, osk_buttons) {
+        match op {
+            OskOp::Key(code, hand) => {
+                osk.key(code);
+                hx.fire(Haptic::Commit, hand);
             }
-            PadRightClick | TriggerR2Full => {
-                osk.commit(OskPad::Right);
-                hx.fire(Haptic::Commit, HapticPad::Right);
+            OskOp::Commit(pad) => {
+                osk.commit(pad);
+                hx.fire(Haptic::Commit, haptic_pad(pad));
             }
-            _ => {
-                if let Some(&code) = osk_buttons.get(&b) {
-                    osk.key(code);
-                    // A helper (Y = Space, X = Backspace) is a commit too — click
-                    // under the hand whose button it is.
-                    hx.fire(Haptic::Commit, button_pad(b));
-                }
-            }
+            OskOp::ShiftDown => osk.hold_shift(true),
+            OskOp::ShiftUp => osk.hold_shift(false),
+            OskOp::Dismiss => osk.hide(),
         }
     }
 }
@@ -2720,26 +2870,33 @@ mod tests {
         report::Frame { buttons: bits, ..report::Frame::default() }
     }
 
+    /// A `ButtonKeys` whose layer has already been live for a frame, so a press
+    /// edge presses — what every test wants unless it is about the transition.
+    fn live() -> ButtonKeys {
+        ButtonKeys { held: HashMap::new(), open: true }
+    }
+
+    /// "Nothing was down" — the `was_pressed` of a fresh press, or the
+    /// `pressed` of a frame with everything released.
+    fn none(_: report::Button) -> bool {
+        false
+    }
+
     #[test]
     fn bare_button_presses_on_down_and_releases_on_up() {
         use report::Button::*;
         use ButtonAction::Hold;
         let bindings = HashMap::from([(DpadUp, Hold(103)), (DpadDown, Hold(108))]);
-        let mut st = ButtonKeys::new();
+        let mut st = live();
+        let up = |b: report::Button| b == DpadUp;
         // DpadUp goes down while active: press KEY_UP, nothing for the unpressed
         // DpadDown. The originating button rides along for the haptic side.
-        assert_eq!(
-            st.reconcile(&bindings, |b| b == DpadUp, true),
-            vec![(DpadUp, 103, true)]
-        );
+        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
         // Held and still down next frame: no repeated event (the kernel repeats)
         // — which is also why a held arrow cannot buzz per repeat.
-        assert!(st.reconcile(&bindings, |b| b == DpadUp, true).is_empty());
+        assert!(st.reconcile(&bindings, up, up, true).is_empty());
         // Lifts: release KEY_UP, held set empties.
-        assert_eq!(
-            st.reconcile(&bindings, |_| false, true),
-            vec![(DpadUp, 103, false)]
-        );
+        assert_eq!(st.reconcile(&bindings, none, up, true), vec![(DpadUp, 103, false)]);
         assert!(st.held.is_empty());
     }
 
@@ -2747,26 +2904,26 @@ mod tests {
     fn bare_button_gate_off_releases_and_suppresses() {
         use report::Button::*;
         let bindings = HashMap::from([(DpadUp, ButtonAction::Hold(103))]);
-        let mut st = ButtonKeys::new();
+        let mut st = live();
+        let up = |b: report::Button| b == DpadUp;
         // Press while active.
-        assert_eq!(
-            st.reconcile(&bindings, |b| b == DpadUp, true),
-            vec![(DpadUp, 103, true)]
-        );
+        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
         // The gate closes (guide/OSK/game) while the D-pad is still held: the key
         // is released cleanly rather than left stuck down.
-        assert_eq!(
-            st.reconcile(&bindings, |b| b == DpadUp, false),
-            vec![(DpadUp, 103, false)]
-        );
+        assert_eq!(st.reconcile(&bindings, up, up, false), vec![(DpadUp, 103, false)]);
         assert!(st.held.is_empty());
         // Still held but gated off: no new press (the chord/game gets it instead).
-        assert!(st.reconcile(&bindings, |b| b == DpadUp, false).is_empty());
-        // Gate reopens while still held: re-press so the arrow resumes.
-        assert_eq!(
-            st.reconcile(&bindings, |b| b == DpadUp, true),
-            vec![(DpadUp, 103, true)]
-        );
+        assert!(st.reconcile(&bindings, up, up, false).is_empty());
+        // Gate reopens while still held: NOT re-pressed. The button was down
+        // when this layer became live again, so it waits for a fresh press —
+        // the rule that keeps B from typing Backspace after closing the
+        // keyboard. The arrow does not resume on its own.
+        assert!(st.reconcile(&bindings, up, up, true).is_empty());
+        assert!(st.reconcile(&bindings, up, up, true).is_empty());
+        assert!(st.held.is_empty());
+        // Release and press again: the arrow is back.
+        assert!(st.reconcile(&bindings, none, up, true).is_empty());
+        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
     }
 
     #[test]
@@ -2778,18 +2935,260 @@ mod tests {
             (DpadLeft, Hold(105)),
             (GripL5, Fire(Action::Exec("true".into()))),
         ]);
-        let mut st = ButtonKeys::new();
+        let mut st = live();
         // An unbound button (A) produces nothing.
-        assert!(st.reconcile(&bindings, |b| b == A, true).is_empty());
+        assert!(st.reconcile(&bindings, |b| b == A, none, true).is_empty());
         // Nor does a button whose binding fires rather than holds: nothing is
         // pressed for it, and nothing is remembered as held.
-        assert!(st.reconcile(&bindings, |b| b == GripL5, true).is_empty());
+        assert!(st.reconcile(&bindings, |b| b == GripL5, none, true).is_empty());
         assert!(st.held.is_empty());
         // Two bound buttons down at once: both press (HashMap order is arbitrary).
-        let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, true);
+        let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, none, true);
         ev.sort_by_key(|&(_, code, _)| code);
         assert_eq!(ev, vec![(DpadUp, 103, true), (DpadLeft, 105, true)]);
         assert_eq!(st.held.len(), 2);
+    }
+
+    #[test]
+    fn a_button_held_across_a_gate_opening_waits_for_a_fresh_press() {
+        // B is Backspace on the desktop and closes the keyboard while it is
+        // up. The press that closes it must not ALSO type a Backspace — not on
+        // the frame the gate reopens (B is a genuine press edge there: it went
+        // down this frame, under the keyboard, and `route_osk` closed the
+        // keyboard before the bare layer ran), nor while B stays down.
+        use report::Button::*;
+        let bindings = HashMap::from([(B, ButtonAction::Hold(14))]);
+        let mut st = live();
+        let b = |x: report::Button| x == B;
+        // Keyboard up: the layer is gated.
+        assert!(st.reconcile(&bindings, none, none, false).is_empty());
+        // B goes down and closes the keyboard in this same frame: the gate is
+        // open again by the time the bare layer runs, with B a fresh edge.
+        assert!(st.reconcile(&bindings, b, none, true).is_empty(), "the closing press must not type");
+        // Still down on the next frames: still nothing.
+        assert!(st.reconcile(&bindings, b, b, true).is_empty());
+        assert!(st.reconcile(&bindings, b, b, true).is_empty());
+        assert!(st.held.is_empty());
+        // Released, then a fresh press: Backspace works again.
+        assert!(st.reconcile(&bindings, none, b, true).is_empty());
+        assert_eq!(st.reconcile(&bindings, b, none, true), vec![(B, 14, true)]);
+        assert_eq!(st.reconcile(&bindings, none, b, true), vec![(B, 14, false)]);
+        // And the daemon starts gated, so a button held while it comes up
+        // (or while the controller reconnects) is not a keystroke either.
+        let mut fresh = ButtonKeys::new();
+        assert!(fresh.reconcile(&bindings, b, none, true).is_empty());
+        assert!(fresh.reconcile(&bindings, b, b, true).is_empty());
+    }
+
+    #[test]
+    fn a_chord_button_released_after_the_guide_does_not_fire_its_bare_binding() {
+        // guide+A fires a chord; the guide is let go FIRST, with A still held.
+        // The bare layer's gate opens on a button already down: no Enter until
+        // A is released and pressed again. Same for a fired binding.
+        use report::Button::*;
+        let held = HashMap::from([(A, ButtonAction::Hold(28))]);
+        let mut st = live();
+        let a = |x: report::Button| x == A;
+        // Guide held: the layer is gated; A goes down under it (the chord).
+        assert!(st.reconcile(&held, none, none, false).is_empty());
+        assert!(st.reconcile(&held, a, none, false).is_empty());
+        // Guide released, A still down.
+        assert!(st.reconcile(&held, a, a, true).is_empty());
+        assert!(st.reconcile(&held, a, a, true).is_empty());
+        // Fresh press: Enter.
+        assert!(st.reconcile(&held, none, a, true).is_empty());
+        assert_eq!(st.reconcile(&held, a, none, true), vec![(A, 28, true)]);
+
+        // The fired kind: under the guide the press is swallowed rather than
+        // deferred, and once the gate opens A is down on both frames — not
+        // an edge.
+        let go = Action::Exec("true".into());
+        let fired = HashMap::from([(A, ButtonAction::Fire(go.clone()))]);
+        let idle = report::Frame::default();
+        let down = frame_of(&[A]);
+        assert!(fire_edges(&fired, &down, &idle, false).is_empty(), "under the guide");
+        assert!(fire_edges(&fired, &down, &down, true).is_empty(), "guide released, A still down");
+        assert_eq!(fire_edges(&fired, &down, &idle, true), vec![(A, go)], "a fresh press");
+    }
+
+    #[test]
+    fn a_button_held_across_a_mode_handoff_presses_exactly_once() {
+        // Reported live: R1 = Tab only in `omarchy-ui`. Tab walks the bar's
+        // panels; every panel shares one layer namespace, so a switch closes
+        // and reopens it and the mode flips omarchy-ui -> desktop ->
+        // omarchy-ui within a few ms, each flip running the handoff
+        // (`release_all`). With R1 still physically down, the next reconcile
+        // used to see "bound, down, not held" and press Tab again: one tap
+        // became two or three.
+        use report::Button::*;
+        let ui = HashMap::from([(BumperR1, ButtonAction::Hold(15))]);
+        let desktop: HashMap<report::Button, ButtonAction> = HashMap::new();
+        let mut st = live();
+        let r1 = |x: report::Button| x == BumperR1;
+        // The tap: a press edge in omarchy-ui. The ONE press of this test.
+        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, 15, true)]);
+        // Tab reaches the bar; the panel layer closes: handoff to the desktop,
+        // where R1 is unbound. The handoff releases Tab (no device here, so
+        // the held set just empties) and marks the transition.
+        st.release_all(&mut None, None);
+        assert!(st.held.is_empty());
+        assert!(st.reconcile(&desktop, r1, r1, true).is_empty());
+        // The next panel opens: handoff back to omarchy-ui, R1 bound again and
+        // STILL down. Nothing may press.
+        st.release_all(&mut None, None);
+        assert!(st.reconcile(&ui, r1, r1, true).is_empty());
+        assert!(st.reconcile(&ui, r1, r1, true).is_empty());
+        // Two flips between two reports, the same.
+        st.release_all(&mut None, None);
+        st.release_all(&mut None, None);
+        assert!(st.reconcile(&ui, r1, r1, true).is_empty());
+        assert!(st.held.is_empty());
+        // Release, press again: the second tap is a second Tab.
+        assert!(st.reconcile(&ui, none, r1, true).is_empty());
+        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, 15, true)]);
+
+        // A fired binding across the same handoff: the press edge fired once,
+        // and after the flip R1 is down on both frames — not an edge.
+        let go = Action::Exec("true".into());
+        let fired = HashMap::from([(BumperR1, ButtonAction::Fire(go.clone()))]);
+        let down = frame_of(&[BumperR1]);
+        assert_eq!(fire_edges(&fired, &down, &report::Frame::default(), true), vec![(BumperR1, go)]);
+        assert!(fire_edges(&fired, &down, &down, true).is_empty());
+    }
+
+    /// The Deck map as the keyboard's layer sees it: the built-ins with the
+    /// default config's (identical) `y`/`x` over them.
+    fn deck_map() -> HashMap<report::Button, OskAction> {
+        Config::load_default().osk_buttons_in(&crate::config::ModeState::new("desktop", vec![]))
+    }
+
+    #[test]
+    fn the_keyboard_layer_ignores_the_button_that_raised_it_until_a_fresh_press() {
+        // guide+Y raises the keyboard, and Y is also Space on it. The Y still
+        // held from the chord must not type a Space — not on the frame the
+        // keyboard came up (Y is a press edge there), nor while it stays down.
+        // Released and pressed again, it is Space.
+        use report::Button::*;
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let guide = frame_of(&[Steam]);
+        let chord = frame_of(&[Steam, Y]);
+        // The frame the chord landed on: the keyboard is up, routing starts.
+        assert!(st.step(&chord, &guide, &bindings).is_empty(), "the raising press must not type");
+        assert!(st.step(&chord, &chord, &bindings).is_empty());
+        // Guide let go, Y still down; then Y let go.
+        let y = frame_of(&[Y]);
+        assert!(st.step(&y, &chord, &bindings).is_empty());
+        let idle = report::Frame::default();
+        assert!(st.step(&idle, &y, &bindings).is_empty());
+        // A fresh press: Space, clicked under the right hand.
+        assert_eq!(st.step(&y, &idle, &bindings), vec![OskOp::Key(57, HapticPad::Right)]);
+        assert!(st.step(&y, &y, &bindings).is_empty(), "held: no repeat");
+    }
+
+    #[test]
+    fn the_keyboard_layer_routes_the_decks_map() {
+        use report::Button::*;
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = report::Frame::default();
+        assert!(st.step(&idle, &idle, &bindings).is_empty(), "the first frame settles the layer");
+
+        // Pad clicks commit under their own pad; X is Backspace, under the
+        // right hand; R2 is Enter, not a commit.
+        let lclick = frame_of(&[PadLeftClick]);
+        let rclick = frame_of(&[PadRightClick]);
+        assert_eq!(st.step(&lclick, &idle, &bindings), vec![OskOp::Commit(OskPad::Left)]);
+        assert_eq!(st.step(&rclick, &lclick, &bindings), vec![OskOp::Commit(OskPad::Right)]);
+        assert_eq!(st.step(&frame_of(&[X]), &rclick, &bindings), vec![OskOp::Key(14, HapticPad::Right)]);
+        assert_eq!(
+            st.step(&frame_of(&[TriggerR2Full]), &idle, &bindings),
+            vec![OskOp::Key(28, HapticPad::Right)]
+        );
+
+        // L2 holds Shift: down with the pull, nothing while held, up with the
+        // release. A commit in between is just a commit — the keyboard applies
+        // the shift.
+        let l2 = frame_of(&[TriggerL2Full]);
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        assert!(st.step(&l2, &l2, &bindings).is_empty());
+        let l2_click = frame_of(&[TriggerL2Full, PadRightClick]);
+        assert_eq!(st.step(&l2_click, &l2, &bindings), vec![OskOp::Commit(OskPad::Right)]);
+        assert!(st.step(&l2, &l2_click, &bindings).is_empty());
+        assert_eq!(st.step(&idle, &l2, &bindings), vec![OskOp::ShiftUp]);
+
+        // B closes it — releasing a held Shift first — and disarms the layer.
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        let l2_b = frame_of(&[TriggerL2Full, B]);
+        assert_eq!(st.step(&l2_b, &l2, &bindings), vec![OskOp::ShiftUp, OskOp::Dismiss]);
+        assert!(!st.live && st.shift_holders.is_empty());
+        // Shown again with L2 still pulled: the first frame acts on nothing,
+        // and L2 is not remembered as holding Shift.
+        assert!(st.step(&l2, &l2_b, &bindings).is_empty());
+        assert!(st.step(&l2, &l2, &bindings).is_empty());
+        assert!(st.step(&idle, &l2, &bindings).is_empty(), "nothing to release");
+        // Menu closes it too; an unbound button (a grip) does nothing.
+        assert_eq!(st.step(&frame_of(&[Menu]), &idle, &bindings), vec![OskOp::Dismiss]);
+        st.step(&idle, &idle, &bindings);
+        assert!(st.step(&frame_of(&[GripL5]), &idle, &bindings).is_empty());
+    }
+
+    #[test]
+    fn two_shift_buttons_hold_one_shift() {
+        // Shift goes down with the first holder and up with the last: a config
+        // binding both triggers to `osk shift` gets one Shift, not a flicker.
+        use report::Button::*;
+        let bindings = HashMap::from([
+            (TriggerL2Full, OskAction::Shift),
+            (TriggerR2Full, OskAction::Shift),
+            (Menu, OskAction::Dismiss),
+        ]);
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = report::Frame::default();
+        st.step(&idle, &idle, &bindings);
+        let l2 = frame_of(&[TriggerL2Full]);
+        let both = frame_of(&[TriggerL2Full, TriggerR2Full]);
+        let r2 = frame_of(&[TriggerR2Full]);
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        assert!(st.step(&both, &l2, &bindings).is_empty());
+        assert!(st.step(&r2, &both, &bindings).is_empty(), "one holder left");
+        assert_eq!(st.step(&idle, &r2, &bindings), vec![OskOp::ShiftUp]);
+        // Swapping holders within one frame: up for the old, down for the new.
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        assert_eq!(st.step(&r2, &l2, &bindings), vec![OskOp::ShiftUp, OskOp::ShiftDown]);
+    }
+
+    #[test]
+    fn a_mode_handoff_keeps_the_keyboard_layer_but_a_toggle_forgets_it() {
+        // `reset` (a handoff while typing) keeps the layer live and its Shift
+        // holder — the keyboard is still up and the trigger still pulled;
+        // `disarm` (the keyboard went down) forgets both.
+        use report::Button::*;
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = report::Frame::default();
+        let l2 = frame_of(&[TriggerL2Full]);
+        st.step(&idle, &idle, &bindings);
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        st.reset();
+        assert!(st.live && st.shift_holders == vec![TriggerL2Full]);
+        assert_eq!(st.step(&idle, &l2, &bindings), vec![OskOp::ShiftUp], "the release is still seen");
+        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        st.disarm();
+        assert!(!st.live && st.shift_holders.is_empty());
+        assert!(st.step(&idle, &l2, &bindings).is_empty());
+    }
+
+    #[test]
+    fn a_commit_reads_the_pad_under_the_same_hand() {
+        use report::Button::*;
+        assert_eq!(commit_pad(PadLeftClick), OskPad::Left);
+        assert_eq!(commit_pad(PadRightClick), OskPad::Right);
+        assert_eq!(commit_pad(TriggerL2Full), OskPad::Left);
+        assert_eq!(commit_pad(GripL5), OskPad::Left);
+        assert_eq!(commit_pad(A), OskPad::Right);
+        assert_eq!(commit_pad(BumperR1), OskPad::Right);
+        assert_eq!(commit_pad(Steam), OskPad::Right);
     }
 
     #[test]
@@ -3086,17 +3485,18 @@ mod tests {
         // without waiting for another report to arrive.
         let cfg = Config::load_default();
         let mut m = ModeEngine::new(&cfg);
-        let mut keys = ButtonKeys::new();
+        let mut keys = live();
+        let up = |b: report::Button| b == report::Button::DpadUp;
 
         // Desktop: D-pad up is bound, press it.
-        let down = keys.reconcile(m.buttons(), |b| b == report::Button::DpadUp, true);
+        let down = keys.reconcile(m.buttons(), up, none, true);
         assert_eq!(down, vec![(report::Button::DpadUp, 103, true)]);
 
         // A game takes focus. The map goes empty, so the held key releases even
         // though the button is still physically down.
         m.focus_changed(&cfg, "steam_app_413080", "", None);
-        let up = keys.reconcile(m.buttons(), |b| b == report::Button::DpadUp, true);
-        assert_eq!(up, vec![(report::Button::DpadUp, 103, false)]);
+        let released = keys.reconcile(m.buttons(), up, up, true);
+        assert_eq!(released, vec![(report::Button::DpadUp, 103, false)]);
         assert!(keys.held.is_empty());
     }
 
@@ -3107,14 +3507,14 @@ mod tests {
         // it must still clear the held set — mouse codes included, with no
         // pointer to send their release to.
         use ButtonAction::Hold;
-        let mut keys = ButtonKeys::new();
+        let mut keys = live();
         let map = HashMap::from([
             (report::Button::DpadUp, Hold(103)),
             (report::Button::A, Hold(28)),
             (report::Button::TriggerR2Full, Hold(PointerButton::Left.evdev())),
             (report::Button::TriggerL2Full, Hold(PointerButton::Right.evdev())),
         ]);
-        keys.reconcile(&map, |_| true, true);
+        keys.reconcile(&map, |_| true, none, true);
         assert_eq!(keys.held.len(), 4);
         keys.release_all(&mut None, None);
         assert!(keys.held.is_empty());
@@ -3122,7 +3522,7 @@ mod tests {
         // The same with no devices on the per-frame path: `drive_buttons` must
         // not bail out when the keyboard is missing, because the pointer may
         // still be there (and vice versa) — the held set tracks either way.
-        let mut keys = ButtonKeys::new();
+        let mut keys = live();
         let mut kbd: Option<VirtualKeyboard> = None;
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
@@ -3136,9 +3536,10 @@ mod tests {
             buttons: (1 << bit(report::Button::TriggerR2Full)) | (1 << bit(report::Button::DpadUp)),
             ..report::Frame::default()
         };
-        drive_buttons(&mut kbd, None, &frame, &map, &mut keys, true, &mut hx);
+        let idle = report::Frame::default();
+        drive_buttons(&mut kbd, None, &frame, &idle, &map, &mut keys, true, &mut hx);
         assert_eq!(keys.held.len(), 2);
-        drive_buttons(&mut kbd, None, &report::Frame::default(), &map, &mut keys, true, &mut hx);
+        drive_buttons(&mut kbd, None, &idle, &frame, &map, &mut keys, true, &mut hx);
         assert!(keys.held.is_empty());
     }
 

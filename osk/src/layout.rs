@@ -139,6 +139,74 @@ impl ShiftState {
     }
 }
 
+/// The shift level as the keyboard actually applies it: the **latched** state
+/// the on-screen Shift/Caps keys drive ([`ShiftState`]), plus a **held** bit for
+/// a physical button the daemon is holding down as Shift — the Deck's L2, and
+/// the `Held` member of osk-technology.md §4.6's bitfield that the three-state
+/// enum alone leaves out.
+///
+/// Held shift is momentary and orthogonal to the latch: while the bit is set
+/// every legend draws shifted and every character commits shifted, and clearing
+/// it leaves the latched state exactly as it was. A one-shot latched *under* a
+/// held shift still clears after the next character, as on the Deck ("after any
+/// character, OneShot→Off, Held bit preserved"), so releasing the button never
+/// reveals a surprise capital.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ShiftModel {
+    /// What the on-screen Shift/Caps keys (or the daemon's `shift <state>`
+    /// command) have latched.
+    pub latched: ShiftState,
+    /// A physical Shift button is being held (`shift down` … `shift up`).
+    pub held: bool,
+}
+
+impl ShiftModel {
+    /// Is a shift level in effect — held or latched — so letters draw and commit
+    /// uppercase and symbol keys their shifted glyph?
+    pub fn is_active(self) -> bool {
+        self.held || self.latched.is_active()
+    }
+
+    /// Is the *locked* (Caps) level latched? Lights the Caps key specifically; a
+    /// held shift does not count, since it is not a toggle.
+    pub fn caps_active(self) -> bool {
+        self.latched.caps_active()
+    }
+
+    /// The level after committing one character: the latch's own rule
+    /// ([`ShiftState::after_char`]), the held bit untouched.
+    pub fn after_char(self) -> ShiftModel {
+        ShiftModel { latched: self.latched.after_char(), held: self.held }
+    }
+
+    /// Tapping the on-screen Shift key cycles the latch ([`ShiftState::cycle_shift`]).
+    pub fn tap_shift(self) -> ShiftModel {
+        ShiftModel { latched: self.latched.cycle_shift(), held: self.held }
+    }
+
+    /// Tapping Caps toggles the latch's locked level ([`ShiftState::toggle_caps`]).
+    pub fn tap_caps(self) -> ShiftModel {
+        ShiftModel { latched: self.latched.toggle_caps(), held: self.held }
+    }
+
+    /// Set the latch directly (the `shift <off|oneshot|stuck>` command).
+    pub fn with_latched(self, latched: ShiftState) -> ShiftModel {
+        ShiftModel { latched, held: self.held }
+    }
+
+    /// Press or release the held shift (the `shift down` / `shift up` commands).
+    pub fn with_held(self, held: bool) -> ShiftModel {
+        ShiftModel { latched: self.latched, held }
+    }
+
+    /// Whether committing `key` types its shifted glyph: the live level, or the
+    /// key's own `force_shift` (a symbols-layer `!` is Shift+1 whatever the
+    /// level says).
+    pub fn commits_shifted(self, key: &Key) -> bool {
+        self.is_active() || key.force_shift
+    }
+}
+
 /// Which key layer is active: the base QWERTY page or the numeric/symbols page
 /// (the Deck's `?123`, osk-technology.md §4.6 "Layers"). Both are built from the
 /// same [`Key`] model and share the exact same grid geometry.
@@ -834,6 +902,46 @@ mod tests {
         // is_active drives legends+commit; caps_active lights the Caps key only.
         assert!(!ShiftState::Off.is_active() && ShiftState::OneShot.is_active() && ShiftState::Stuck.is_active());
         assert!(!ShiftState::OneShot.caps_active() && ShiftState::Stuck.caps_active());
+    }
+
+    #[test]
+    fn held_shift_forces_the_level_without_touching_the_latch() {
+        let a = Key::c("a", "A", 30, Hand::Left, 2);
+        let bang = Key::sym("!", 2, true, Hand::Left, 0);
+        let off = ShiftModel::default();
+        assert!(!off.is_active() && !off.commits_shifted(&a));
+        // A forced-shift symbol key is shifted whatever the level says.
+        assert!(off.commits_shifted(&bang));
+
+        // Held: shifted output and legends, nothing latched, and letting go puts
+        // the level back exactly where it was.
+        let held = off.with_held(true);
+        assert!(held.is_active() && held.commits_shifted(&a));
+        assert!(!held.caps_active(), "a held shift is not a caps lock");
+        assert_eq!(held.latched, ShiftState::Off);
+        assert_eq!(held.after_char(), held, "holding shift is not a one-shot");
+        assert_eq!(held.with_held(false), off);
+
+        // A one-shot latched under a held shift still clears after the next
+        // character (Deck: OneShot→Off, Held preserved) — the level stays
+        // active only because the button is still down.
+        let both = held.tap_shift();
+        assert_eq!(both.latched, ShiftState::OneShot);
+        let after = both.after_char();
+        assert_eq!(after, ShiftModel { latched: ShiftState::Off, held: true });
+        assert!(after.is_active());
+        assert!(!after.with_held(false).is_active());
+
+        // Caps latched under a held shift survives the release.
+        let caps = held.tap_caps();
+        assert!(caps.caps_active());
+        assert!(caps.with_held(false).is_active());
+        assert_eq!(caps.with_held(false).latched, ShiftState::Stuck);
+        // And the direct set (`shift <state>`) leaves the held bit alone.
+        assert_eq!(
+            held.with_latched(ShiftState::Stuck),
+            ShiftModel { latched: ShiftState::Stuck, held: true }
+        );
     }
 
     #[test]

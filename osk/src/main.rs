@@ -109,7 +109,8 @@ fn print_help() {
            hide                                    DESTROY the surface(s)\n\
            cursor <L|R> <nx> <ny>                  pad absolute pos, axes in [-1,1]\n\
            commit <L|R>                            commit key under that pad's cursor\n\
-           shift <off|oneshot|stuck|on>            set the shift/caps state\n\
+           shift <off|oneshot|stuck|on>            set the latched shift/caps state\n\
+           shift <down|up>                         hold / release a physical Shift (momentary)\n\
            layer <base|symbols|toggle>            switch QWERTY <-> numeric/symbols\n\
            reflow <on|off>                         displace (on) vs overlay/float (off)\n\
            key <keycode>                           commit a raw evdev keycode\n\
