@@ -88,6 +88,10 @@ h.gamepad { enabled = true }
 h.bind("guide+r1", "Workspace right", h.workspace "+1")  -- desc is optional
 h.bind("guide+menu", h.exec "omarchy-menu")
 h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
+h.bind("guide+x",  "New workspace",      h.dispatch 'hl.dsp.focus({ workspace = "emptyn" })')
+h.bind("guide+stick_down", "Previous workspace", h.dispatch 'hl.dsp.focus({ workspace = "previous" })')
+h.bind("guide+dpad_down",  "Window to new workspace", h.dispatch 'hl.dsp.window.move({ workspace = "emptyn", follow = true })')
+h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button
 h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
@@ -120,6 +124,10 @@ Never per input frame.
 h.mode("game", { forward = true }).when(function(ctx)
   return ctx.focus.class:lower():match("^steam_app_") ~= nil
 end)
+h.mode("browser").when(function(ctx)         -- a window class, like `game`:
+  local c = ctx.focus.class:lower()           -- Chrome, and Omarchy's web apps
+  return c == "google-chrome" or c:match("^chrome%-") ~= nil
+end)
 h.mode("claude").when(function(ctx)          -- Claude Code in a terminal:
   return ctx.focus:process_tree_has("claude") -- same class as any terminal, so
 end)                                          -- look inside the window
@@ -144,7 +152,10 @@ h.button("b", h.key "backspace"):only_in("desktop")
 h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
 ```
 
-Modes are exclusive, so at most one of them is ever live.
+Modes are exclusive, so at most one of them is ever live. The sample's
+`browser` mode (Google Chrome, and Omarchy's `chrome-*` web apps) exists so
+browser-only bindings have a context to be guarded into; the desktop guards list
+it as well, so a browser behaves exactly like the desktop until those land.
 
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:
@@ -244,7 +255,7 @@ exactly as long as the daemon does:
 
 ```json
 {"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
- "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
+ "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "browser", "desktop", "osk"],
  "updated": 1725230000}
 ```
 
