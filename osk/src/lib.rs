@@ -27,6 +27,9 @@
 //!   XWayland included; adapted from the parent crate's proven `src/output.rs`).
 //! * [`control`] — the line-based control channel (unix socket or stdin) the
 //!   hyprpad daemon drives, with a dual-trackpad-shaped vocabulary.
+//! * [`predict`] — word completion and next-word prediction: the mmap'd
+//!   unigram/bigram model, the composition buffer of what the keyboard typed,
+//!   and the personal word cache (`docs/research/osk-prediction.md` phase 1).
 //! * [`app`] — binds the globals, owns the live surfaces, and runs the poll
 //!   loop that services Wayland and the control channel together.
 
@@ -34,6 +37,7 @@ pub mod app;
 pub mod control;
 pub mod layout;
 pub mod output;
+pub mod predict;
 pub mod render;
 pub mod surface;
 pub mod theme;

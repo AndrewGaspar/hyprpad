@@ -1,0 +1,12 @@
+hyprpad-osk English prediction model.
+
+Unigram frequencies from wordfreq (large_en), Robyn Speer et al.,
+https://github.com/rspeer/wordfreq — data licensed CC BY-SA 4.0.
+Word validity and casing from SCOWL / Hunspell en_US as distributed with
+LibreOffice, https://github.com/LibreOffice/dictionaries — MIT-like licence.
+Bigram successor counts from the Leipzig Corpora Collection (English news),
+Universitat Leipzig, https://wortschatz.uni-leipzig.de/ — CC BY 4.0.
+
+This derived model is licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)
+because wordfreq's data is share-alike. The hyprpad-osk program that reads it is
+licensed MIT OR Apache-2.0 and is unaffected.
