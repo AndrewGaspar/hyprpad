@@ -105,6 +105,20 @@ Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
 (`"workspace +1"`) works too — it is parsed by the same grammar the TOML file
 uses.
 
+`h.workspace` and `h.move_to_workspace` take a **Hyprland workspace selector**.
+`+1`/`-1` step to the next/previous *existing* workspace (Hyprland's `e±n`,
+which wraps), and a bare number is a workspace **id** (`h.workspace(3)` goes to
+workspace 3, creating it if need be). Everything else is passed to the
+compositor verbatim, so the whole selector grammar is available:
+`h.workspace "emptyn"` (first empty workspace to the right, `max+1` if none is
+free), `"empty"`, `"emptym"`, `"previous"`, `"next"`, `"r+1"`, `"m-1"`,
+`"special"`, `"special:term"`. A *named* workspace is spelled out —
+`h.workspace "name:foo"` — because a bare word is a **selector, not a name**.
+The `guide+x` / `guide+stick_down` / `guide+dpad_down` lines above therefore
+also read `h.workspace "emptyn"`, `h.workspace "previous"` and
+`h.move_to_workspace "emptyn"`. (See `docs/research/empty-workspace.md` for what
+each selector resolves to.)
+
 The mouse buttons are bare-button bindings like any other. `h.mouse "left"`
 (`left|right|middle`; `"mouse left"` or `"click left"` in TOML) is a `h.key`
 whose evdev code names a mouse button, and the daemon clicks it through the
