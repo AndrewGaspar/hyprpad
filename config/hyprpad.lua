@@ -136,7 +136,7 @@ h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
 -- collide, because a mode is exclusive: under the sheet we are in `cheatsheet`,
 -- never in `desktop`.
 h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
-h.button("b", "Back / close", h.key "escape"):only_in("omarchy-ui")
+h.button("b", "Back (closes at top level)", h.key "back"):only_in("omarchy-ui")
 
 -- The sheet has one tab per mode — what the pad does in THAT context, and
 -- nothing else — and pages through them on Left/Right. The bumpers are the

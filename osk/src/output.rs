@@ -96,7 +96,7 @@ impl VirtualKeyboard {
             set_bit(fd, UI_SET_EVBIT, EV_SYN as libc::c_int)?;
             // Register the standard key range so both `type_text` and arbitrary
             // `key()`/`tap()` calls in this range are deliverable.
-            for code in 1..=127i32 {
+            for code in 1..=255i32 {
                 set_bit(fd, UI_SET_KEYBIT, code)?;
             }
 
