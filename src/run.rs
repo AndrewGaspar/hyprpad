@@ -365,11 +365,9 @@ pub fn run() -> std::io::Result<()> {
             if modes.rescan_processes(&config) {
                 eprintln!("hyprpad: mode -> {} (process rescan)", modes.active());
                 mode_handoff(
-                    &mut engine,
                     &mut cursor,
                     &mut scroll,
                     &mut osk_route,
-                    &mut prev_frame,
                     pointer.as_mut(),
                     &mut button_keys,
                     &mut keyboard,
@@ -463,12 +461,10 @@ pub fn run() -> std::io::Result<()> {
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());
                     mode_handoff(
-                        &mut engine,
-                        &mut cursor,
+                            &mut cursor,
                         &mut scroll,
                         &mut osk_route,
-                        &mut prev_frame,
-                        pointer.as_mut(),
+                            pointer.as_mut(),
                         &mut button_keys,
                         &mut keyboard,
                         &mut gamepad,
@@ -503,12 +499,10 @@ pub fn run() -> std::io::Result<()> {
                     // Same handoff as a context-driven transition.
                     eprintln!("hyprpad: mode -> {} (manual)", modes.active());
                     mode_handoff(
-                        &mut engine,
-                        &mut cursor,
+                            &mut cursor,
                         &mut scroll,
                         &mut osk_route,
-                        &mut prev_frame,
-                        pointer.as_mut(),
+                            pointer.as_mut(),
                         &mut button_keys,
                         &mut keyboard,
                         &mut gamepad,
@@ -733,6 +727,24 @@ fn reset_frame_state(
     prev_frame: &mut report::Frame,
     pointer: Option<&mut VirtualPointer>,
 ) {
+    release_outputs(cursor, scroll, osk_route, pointer);
+    // Forgetting held buttons is right ONLY here: the device went away, so
+    // whatever was held is gone too. A mode transition must never do this
+    // (see `mode_handoff`).
+    *engine = GestureEngine::new();
+    *prev_frame = report::Frame::default();
+}
+
+/// Release everything the desktop layer is *outputting* — held synthetic mouse
+/// buttons, and the cursor/scroll/OSK smoothing state (so nothing differences
+/// across a gap) — WITHOUT touching gesture edge state. This is the safe half of
+/// a reset: it changes what we emit, not what we think is pressed.
+fn release_outputs(
+    cursor: &mut CursorState,
+    scroll: &mut ScrollState,
+    osk_route: &mut OskRoute,
+    pointer: Option<&mut VirtualPointer>,
+) {
     if let Some(ptr) = pointer {
         if cursor.left_down {
             ptr.button(PointerButton::Left, false);
@@ -743,11 +755,9 @@ fn reset_frame_state(
             cursor.right_down = false;
         }
     }
-    *engine = GestureEngine::new();
     cursor.damper.reset();
     scroll.reset();
     osk_route.reset();
-    *prev_frame = report::Frame::default();
 }
 
 /// The clean handoff a mode transition runs, wherever the transition came from
@@ -760,18 +770,22 @@ fn reset_frame_state(
 /// transition can never come with a subtly different way of *making* one.
 #[allow(clippy::too_many_arguments)]
 fn mode_handoff(
-    engine: &mut GestureEngine,
     cursor: &mut CursorState,
     scroll: &mut ScrollState,
     osk_route: &mut OskRoute,
-    prev_frame: &mut report::Frame,
     pointer: Option<&mut VirtualPointer>,
     button_keys: &mut ButtonKeys,
     keyboard: &mut Option<VirtualKeyboard>,
     gamepad: &mut GamepadState,
     haptics: &mut Haptics,
 ) {
-    reset_frame_state(engine, cursor, scroll, osk_route, prev_frame, pointer);
+    // Outputs only. The gesture engine and `prev_frame` are deliberately NOT
+    // reset: a transition is usually *caused* by a chord (guide+view opens the
+    // sheet, whose layer flips the mode), and that chord is still physically
+    // held. Resetting edge state would make it look freshly pressed on the next
+    // frame -> fire again -> toggle the overlay closed -> flip back -> reset ->
+    // ... an open/close loop for as long as the chord is held (observed live).
+    release_outputs(cursor, scroll, osk_route, pointer);
     button_keys.release_all(keyboard);
     gamepad.release(haptics);
 }
