@@ -76,7 +76,7 @@ h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatshee
 h.mode("omarchy-ui").when(function(ctx)
   for _, ns in ipairs({ "omarchy-menu", "omarchy-keyboard-panel", "omarchy-clipboard",
                         "omarchy-emojis", "omarchy-image-selector", "omarchy-reminders",
-                        "omarchy-polkit", "omarchy-network-qr" }) do
+                        "omarchy-polkit", "omarchy-network-qr", "omarchy-bar-nav" }) do
     if ctx.layers:has(ns) then return true end
   end
   return false
@@ -189,13 +189,14 @@ h.button("b", "Back (closes at top level)", h.key "back"):only_in("omarchy-ui")
 h.button("l1", "Previous sheet tab", h.key "left"):only_in("cheatsheet")
 h.button("r1", "Next sheet tab", h.key "right"):only_in("cheatsheet")
 
--- Bar panels (docs/research/bar-navigation.md, phase 0). Every panel the bar
--- opens shares the `omarchy-keyboard-panel` layer — already in the `omarchy-ui`
--- allowlist above — and Tab inside one closes it and opens its neighbour, so
--- R1 walks the ring that `guide+dpad_up` (below) opens: Agents, Bluetooth,
--- Network, Audio, Display, Power — and Shift+Tab on L1 walks it backwards.
--- The bumpers' second alternate, and as exclusive as the first: under a panel
--- we are in `omarchy-ui`, never in `cheatsheet`.
+-- Bar panels (docs/research/bar-navigation.md). Every panel the bar opens shares
+-- the `omarchy-keyboard-panel` layer — already in the `omarchy-ui` allowlist
+-- above — and Tab inside one closes it and opens its neighbour, so R1 walks the
+-- panel ring: Agents, Bluetooth, Network, Audio, Display, Power — and Shift+Tab
+-- on L1 walks it backwards. The same two keys step the ICON ring that
+-- `guide+dpad_up` (below) raises, so the bumpers mean the same thing at both
+-- levels. The bumpers' second alternate, and as exclusive as the first: under a
+-- panel we are in `omarchy-ui`, never in `cheatsheet`.
 h.button("l1", "Previous panel", h.key "shift+tab"):only_in("omarchy-ui")
 h.button("r1", "Next panel", h.key "tab"):only_in("omarchy-ui")
 
@@ -258,10 +259,22 @@ h.bind("guide+rpad_click",  "Click (guide mouse)", h.mouse "left"):only_in("game
 -- along to the new one.
 h.bind("guide+dpad_down",   h.move_to_workspace "emptyn")
 
--- Up to the bar (docs/research/bar-navigation.md, phase 0): opens the first
--- panel of the bar's right section; R1 then walks the rest, the D-pad and A
--- drive the panel, B closes it.
-h.bind("guide+dpad_up",     "Bar panels",          h.exec "omarchy-shell -q shell togglePanelAt right 1")
+-- Up to the bar (docs/research/bar-navigation.md, phase 1): raises the focus
+-- ring over the bar's own icons. The ring lives in the `hyprpad.status` widget
+-- and maps a keyboard-focused layer surface named `omarchy-bar-nav` while it is
+-- up — which is the ONLY thing the daemon has to know. That namespace is in the
+-- `omarchy-ui` allowlist above, so from the moment the ring appears the pad is
+-- already sending the right keys: D-pad -> arrows walk it, A -> Enter activates
+-- the focused widget (the same call a mouse click makes), B -> Back leaves.
+--
+-- So this one chord is the whole cost on the controller map. Nothing below the
+-- entry needs a binding of its own: the ring reads the keys the pad was already
+-- sending in `omarchy-ui`.
+--
+-- Once a panel opens, the ring hands the keyboard over and the panel behaves as
+-- it always has (R1 = Tab walks to the next panel); B closes it and the ring
+-- comes back, B again leaves the bar.
+h.bind("guide+dpad_up",     "Bar ring",            h.exec "omarchy-shell -q hyprpad.status navEnter")
 
 -- View is the "show me the map" key: it raises the cheat sheet — this very
 -- file, drawn onto a controller diagram. The descriptions above are what it
