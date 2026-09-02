@@ -216,12 +216,21 @@ BarWidget {
     // registration, the theme's colour animation — is why it is still here.
     labelVisible: false
     hasVisualContent: true
-    tooltipText: root.controller + " — " + root.modeLabel + " (click for the cheat sheet)"
+    tooltipText: root.controller + " — " + root.modeLabel
+      + " (click for the cheat sheet, right-click to turn the controller off)"
     fixedWidth: root.vertical
       ? -1 : Math.max(12, content.implicitWidth + button.scaledHorizontalMargin * 2)
     fixedHeight: root.vertical
       ? Math.max(12, content.implicitHeight + button.scaledVerticalPadding * 2) : -1
-    onPressed: root.openCheatSheet()
+    // `WidgetButton` emits `pressed(int button)` and its MouseArea accepts all
+    // three buttons, so the widget gets a second, deliberate gesture for free:
+    // left click still opens the cheat sheet, right click turns the controller
+    // off. Not a confirmation menu — choosing the right button IS the
+    // deliberation (docs/research/guide-hold-poweroff.md §3.B).
+    onPressed: function(button) {
+      if (button === Qt.RightButton) root.turnControllerOff()
+      else root.openCheatSheet()
+    }
 
     Row {
       id: content
@@ -274,5 +283,14 @@ BarWidget {
   // one literal argument.
   function openCheatSheet() {
     Util.execArgv(["env", "HYPRPAD_MODE=" + root.mode, "hyprpad-cheatsheet", "toggle"])
+  }
+
+  // Turn the controller off on a right-click. `hyprpad off` nudges the running
+  // daemon (SIGUSR1) rather than touching the device itself, so the widget
+  // needs no access to the puck and there is still exactly one writer. The
+  // widget then disappears on its own, because the daemon publishes
+  // `connected: false` the moment the stream stops.
+  function turnControllerOff() {
+    Util.execArgv(["hyprpad", "off"])
   }
 }

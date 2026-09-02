@@ -337,6 +337,17 @@ binding execs, and `hyprpad-cheatsheet` forwards it in the summon payload.
 Going through the script rather than spelling the IPC here is what keeps the
 widget correct if that spelling ever moves.
 
+**Right-click turns the controller off** (`hyprpad off`). `WidgetButton` emits
+`pressed(int button)` and its `MouseArea` already accepts all three buttons, so
+the second gesture costs one branch: `Qt.RightButton` runs `hyprpad off`,
+anything else opens the sheet. That is the *deliberate* power-off which replaces
+the firmware's guide-hold one (README, "Powering the controller off") — and
+choosing the other mouse button is the whole confirmation, on purpose: the owner
+asked for no menu. `hyprpad off` signals the running daemon rather than touching
+the puck, so the widget needs no access to the device; the widget then vanishes
+by itself, because the daemon publishes `connected: false` as soon as the stream
+stops. The tooltip says both.
+
 ## Theme
 
 `bar.barForeground` and `bar.fontFamily` rather than the `Color`/`Style`

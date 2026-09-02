@@ -125,6 +125,27 @@ h.default_mode "desktop"
 
 h.daemon { own_lizard = true }
 
+-- The firmware's own power timers, written alongside the lizard disable and
+-- re-sent with it every 30 s (docs/research/guide-hold-poweroff.md).
+--
+-- `steam_button_poweroff` is SETTING_STEAMBUTTON_POWEROFF_TIME (25): how long
+-- the FIRMWARE wants the Steam button held before it powers the controller off.
+-- That timer — not Steam, not hyprpad — is what turns the puck off while you
+-- are holding the guide and deliberating. `sleep_inactivity_timeout` is
+-- SETTING_SLEEP_INACTIVITY_TIMEOUT (50), the idle sleep.
+--
+-- Both are COMMENTED OUT because their units are UNVERIFIED and Valve publishes
+-- no defaults table: "off" writes 0xFFFF (the widest value the u16 field holds,
+-- which is a long time under every candidate unit and is safe whether or not
+-- the firmware reads 0 as "never"), and an integer is written raw. Read the
+-- firmware's own numbers first, then test with a stopwatch:
+--
+--   hyprpad puck-settings 25 50      # current / max / default, read-only
+--   …uncomment, `hyprpad reload`, read again, then time a hold
+--
+-- h.daemon { steam_button_poweroff = "off" }        -- or a number: 300, 0, …
+-- h.daemon { sleep_inactivity_timeout = 600 }       -- seconds on the 2015 fw
+
 -- ---------------------------------------------------------------------------
 -- Feel
 -- ---------------------------------------------------------------------------
@@ -279,6 +300,16 @@ h.bind("guide+view",        "Cheat sheet",         h.exec "hyprpad-cheatsheet to
 -- mid-match), and to hand it back:
 -- h.bind("guide+l4", "Force desktop mode", h.set_mode "desktop")
 -- h.bind("guide+l5", "Back to automatic",  h.clear_mode())
+
+-- Turn the CONTROLLER off, deliberately (`0x9F ID_TURN_OFF_CONTROLLER`). The
+-- replacement for the firmware's guide-hold power-off that fires while you are
+-- deliberating: lengthen or disable that with `steam_button_poweroff` above,
+-- and put the off switch somewhere you cannot hit by accident.
+--
+-- The quick-access "…" button is free on this pad and is nowhere near a thumb
+-- resting on the guide. `hyprpad off` does the same from a script, and the bar
+-- widget does it on a right-click.
+h.bind("guide+quickaccess", "Controller off", h.controller_off())
 
 -- R4 grip: screenshot (fullscreen = no picker to drag through).
 h.bind("guide+r4", "Screenshot", h.exec "omarchy screenshot fullscreen")   -- one press, whole screen; use "windows"/"region" for a picker

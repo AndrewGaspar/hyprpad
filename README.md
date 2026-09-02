@@ -79,7 +79,7 @@ with the compositor's Lua state.
 ```lua
 local h = hyprpad
 
-h.daemon  { own_lizard = true }
+h.daemon  { own_lizard = true, steam_button_poweroff = "off" }  -- see "Powering the controller off"
 h.cursor  { sens = 0.06, hysteresis = 0.0008, only_in = { "desktop" } }
 h.scroll  { mode = "circular", only_in = { "desktop" } }
 h.haptics { cursor_spacing_px = 96 }
@@ -93,6 +93,7 @@ h.bind("guide+stick_down", h.workspace "previous")
 h.bind("guide+dpad_down",  h.move_to_workspace "emptyn")
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
+h.bind("guide+quickaccess", "Controller off", h.controller_off())  -- turn the PAD off
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button, held with it
 h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
 h.button("l5",      h.exec "voxtype record toggle")      -- any other action fires once, on press
@@ -102,9 +103,9 @@ h.osk_button("l2",  h.osk "shift")                       -- the keyboard's own a
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
 `h.keyboard`, `h.key`, `h.mouse`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`,
-`h.none`, and — on `h.osk_button` only — `h.osk`. A plain string
-(`"workspace +1"`) works too — it is parsed by the same grammar the TOML file
-uses.
+`h.controller_off`, `h.none`, and — on `h.osk_button` only — `h.osk`. A plain
+string (`"workspace +1"`) works too — it is parsed by the same grammar the TOML
+file uses.
 
 `h.workspace` and `h.move_to_workspace` take a **Hyprland workspace selector**.
 `+1`/`-1` step to the next/previous *existing* workspace (Hyprland's `e±n`,
@@ -314,6 +315,84 @@ design the owner already proved in HypXRland's `src/config/lua/ConfigManager.cpp
   nobody declared — leaves the running config untouched and logs the reason.
   `hyprpad reload` can never leave the daemon input dead.
 
+## Powering the controller off
+
+Holding the Steam button turns the controller off — while you are still
+deciding what to do with it. **The firmware does that**, not Steam and not
+hyprpad: it happens with no Steam process running, the kernel's `hid-steam` is
+not even bound to this pad, and Steam's own chord layout for it has no
+long-press at all (its power-off is the instant `guide+Y`). The evidence is in
+[docs/research/guide-hold-poweroff.md](docs/research/guide-hold-poweroff.md).
+
+So hyprpad offers the two halves of a replacement: lengthen or disable the
+firmware's timer, and give you a deliberate off switch instead.
+
+**The timer.** `SETTING_STEAMBUTTON_POWEROFF_TIME` (25) is written in the same
+`0x87` settings frame that already disables lizard mode and is re-sent every
+30 s, so it survives a reconnect for free. Its companion is
+`SETTING_SLEEP_INACTIVITY_TIMEOUT` (50), the idle sleep.
+
+```lua
+h.daemon { steam_button_poweroff = "off", sleep_inactivity_timeout = 600 }
+```
+
+```toml
+[daemon]
+steam_button_poweroff = "off"     # or a raw number: 300, 0, …
+sleep_inactivity_timeout = 600
+```
+
+Both default to **unset**, which writes nothing at all and leaves the firmware
+exactly as it is. `"off"` writes `0xFFFF` — the widest value the `u16` field
+holds — rather than `0`: whether the firmware reads `0` as "never" or as "no
+delay at all" is unverified, and under the second reading `0` would power the
+pad off on *any* guide press. An integer is written raw, so `= 0` is available
+for testing that reading deliberately.
+
+> **The units of both settings are UNVERIFIED.** Valve publishes no defaults
+> table and nothing public writes setting 25. Treat these as knobs to test, not
+> to set and forget — the recipe is in
+> [docs/design/puck-power.md](docs/design/puck-power.md).
+
+**Reading the firmware back.** `hyprpad puck-settings [id…]` asks the controller
+what a setting currently is, what maximum it accepts and what its factory
+default is (`0x89`/`0x8B`/`0x8C`). Read-only — it sends queries and nothing
+else — and it defaults to the two settings above:
+
+```
+$ hyprpad puck-settings 25 50
+  id   current       max   default  name
+  25       300     65535       300  SETTING_STEAMBUTTON_POWEROFF_TIME
+  50       600     65535       600  SETTING_SLEEP_INACTIVITY_TIMEOUT
+```
+
+It needs the controller's descriptors, through the same acquire path the daemon
+uses (the root fd broker if one is installed, a direct open otherwise), and the
+controller has to be awake — an asleep one STALLs every node.
+
+**The off switch.** `h.controller_off()` (`"controller_off"` in TOML) sends
+`0x9F ID_TURN_OFF_CONTROLLER`. It is a one-shot, so it works on a guide chord
+and on a bare button alike. The sample config puts it on the quick-access "…"
+button, which is free and is nowhere near a thumb resting on the guide:
+
+```lua
+h.bind("guide+quickaccess", "Controller off", h.controller_off())
+```
+
+Two more ways in, both ending at the same write:
+
+* `hyprpad off` — sends **SIGUSR1** to the running daemon (found through its
+  pidfile, exactly as `hyprpad reload` sends SIGHUP). It goes through the daemon
+  rather than opening the device itself, because the daemon already holds the
+  descriptors and one writer to the puck is the invariant the design rests on;
+* **right-click the bar widget.** Left click still opens the cheat sheet.
+  Choosing the other button is the deliberation — there is no confirmation
+  dialog, on purpose.
+
+Turning the controller off does not stop the daemon: it sits in its reconnect
+wait and the widget vanishes, exactly as when the pad sleeps on its own. Press
+the Steam button to bring it back.
+
 ## The cheat sheet
 
 `hyprpad bindings` prints what the controller currently does, as a terminal
@@ -474,6 +553,7 @@ with no Steam relay. `status.json`'s `source` field says which half is live.
 | [08 — The living-room vision](docs/08-living-room-vision.md) | The full target experience, and the input contract |
 | [09 — The programme](docs/09-programme.md) | **The costed attack on the vision** — work items, sizes, order, risks |
 | [research/](docs/research/) | Six consolidated deep-research reports the programme rests on |
+| [design/](docs/design/) | How the shipped features are built: the [uhid relay](docs/design/uhid-relay.md), the [puck's power](docs/design/puck-power.md) |
 
 ## Status
 
