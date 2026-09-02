@@ -1,0 +1,37 @@
+# A short Xbox Elite Series 2 evdev session, wired (`xpad`, 045e:0b00).
+#
+# Format: `type code value`, decimal or 0x-hex — the three numbers `evtest`
+# prints per line, in the order the kernel emitted them. Blank lines and
+# everything after a `#` are ignored, so a real capture pasted in here works
+# unchanged. Recorded read-only; every line below is a synthetic stand-in with
+# the shape and ordering the driver actually produces (one `SYN_REPORT`
+# terminating each report, state changes only).
+#
+# 1 = EV_KEY, 3 = EV_ABS, 0 = EV_SYN (code 0 = SYN_REPORT).
+
+# --- D-pad up, as a hat axis (xpad does not set MAP_DPAD_TO_BUTTONS here) ---
+3 0x11 -1              # ABS_HAT0Y = -1
+0 0 0
+
+# --- the Xbox button down: the guide layer opens -----------------------------
+1 0x13c 1              # BTN_MODE
+0 0 0
+
+# --- P1, the upper-right paddle, chorded under the guide ---------------------
+1 0x225 1              # BTN_GRIPR
+0 0 0
+
+# --- both released in one report ---------------------------------------------
+1 0x225 0
+1 0x13c 0
+3 0x11 0
+0 0 0
+
+# --- right trigger pulled past the 85 % full-pull threshold -------------------
+3 0x05 900             # ABS_RZ, 900/1023 = 0.88
+0 0 0
+
+# --- right stick to the upper right (evdev +Y is down, so up is negative) -----
+3 0x03 24000           # ABS_RX
+3 0x04 -24000          # ABS_RY
+0 0 0
