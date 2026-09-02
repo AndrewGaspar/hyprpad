@@ -1,292 +1,384 @@
-# 13 — Modality: context-driven controller modes
+# 13 — Modality: modes as contexts, guards on bindings
 
-## Motivation
+Read this after [`README.md`](../README.md). The README says *how to write* modes
+and guards; this says **what the model is, why it has this shape, and how it
+behaves at runtime** — what a contributor needs before changing `src/mode.rs`,
+`src/config.rs` or the gates in `src/run.rs`.
 
-Today the daemon has a single binary gate: `Arbiter::suppressed()` — true when a
-game window (`steam_app_*` / `steam_proton*` / `gamescope*`) is focused, which
-drops the ambient desktop handlers (cursor/scroll/bare-buttons) while leaving
-guide chords alive. That's really a two-mode system with the modes and their
-trigger hard-coded.
+> A **mode** is a named context, chosen by an ordered list of Lua predicates
+> that run **only when the context changes**. A **binding** carries its own
+> guard saying where it is live. There are no category switches.
 
-The owner wants to generalize this into **modes** (modalities): named profiles of
-controller behavior, selected by **generic context conditions**, so the
-controller does different things depending on what's in front of you. Concrete
-near-term needs:
+Everything below follows from that. [§8](#8-owner-decisions-2026-09-01) is the
+owner-decision list the code cites by number.
 
-1. **Game / Steam Big Picture focused → passthrough**: disable *everything* that
-   isn't a guide chord, so the raw controller belongs to the game (and guide
-   chords stay as hyprpad's always-available overlay). This also fixes the
-   double-input we saw in Big Picture (its class isn't in the game list).
-2. **A terminal running Claude Code focused → a bespoke mode** (behavior TBD).
-   Crucially, a Claude Code terminal has the *same window class* as any terminal,
-   so selection must inspect the **process running inside the focused window**,
-   not just its class/title. This is the requirement that forces a generic,
-   pluggable condition system.
+---
 
-## Core concepts
+## 1. Why not a category switch
 
-- **Mode** — a named profile declaring which input *categories* are active, plus
-  optional per-mode binding overrides. Modes layer over a base so each only
-  states its deltas.
-- **Context** — the current world the daemon can observe: focused window class /
-  title / fullscreen, the process tree inside the focused window, the
-  layer-shell overlays on screen (`ctx.layers`), whether the session is locked
-  (`ctx.locked`), a manual override, (later) running processes, time, battery,
-  etc. The last two of those are the ones a focus-only engine cannot see — an
-  overlay and a lock surface both take the keyboard with no `activewindow`
-  behind them.
-- **Rule** — `context predicate → mode`. Rules are ordered; first match wins.
-- **ModeEngine** — subsumes `Arbiter`: tracks Context, re-resolves the active
-  Mode on every context change, and exposes the resolved Mode's flags to the loop.
+The daemon began with one binary gate: `Arbiter::suppressed()` in
+[`src/arbitrate.rs`](../src/arbitrate.rs) — true while a game window
+(`steam_app_*` / `steam_proton*` / `gamescope*`) holds focus, dropping the ambient
+desktop handlers and leaving guide chords alive. A two-mode system with the modes
+and their trigger hard-coded. The obvious generalisation is a mode owning category
+flags — `cursor = false, scroll = false, buttons = false`. The owner rejected it
+(decision #1): the interesting granularity is *below* the category. "Disable some
+chords in game mode but not others" has no spelling in a category model, and "a
+terminal running Claude Code" is not a window property at all — it is a question
+about the process tree inside the focused window, which no glob over
+`class`/`title` can answer.
 
-## Input categories a mode gates
+So the model inverts. A mode carries **no** behaviour flags (bar one, `forward`);
+it is a name with a rule, and every binding decides for itself where it is live.
+"Game passthrough" is not a switch — it is the emergent result of *nothing but
+the guide chords being live in `game`*.
 
-These map 1:1 to the existing per-frame handlers, so wiring is mechanical:
+`Arbiter` survives as the **built-in path**: a config that declares no modes
+(every `config.toml`) gets the original behaviour, and `ModeEngine` implements
+that by *embedding an `Arbiter`* rather than restating its rules
+(`src/mode.rs:132-135`) — so "no modes declared" is literally the old behaviour,
+not a re-implementation of it. Adopting Lua is opt-in twice over: once for the
+file, once for the modes.
 
-| category | controls | today's handler |
-|---|---|---|
-| `cursor`  | right pad → desktop cursor | `drive_cursor` |
-| `scroll`  | left pad → scroll          | `drive_scroll` |
-| `buttons` | bare buttons → keys (`[buttons]`) | `drive_buttons` |
-| `chords`  | guide chords → actions (`[bindings]`) | `handle_gesture` |
-| `osk`     | guide+Y can raise the keyboard | `toggle_keyboard` |
-| `forward` | raw controller → the virtual gamepad / game | `drive_gamepad` (uhid/gamepad) |
+---
 
-**Invariant (by convention, not hard-coded):** the default `game` mode keeps
-`chords = true` — guide chords are hyprpad's escape hatch and should survive
-every "hands-off" mode. A mode *can* set `chords = false` if someone really wants
-a total-passthrough mode, but the shipped game mode never does.
-
-## Config schema (proposed)
-
-```toml
-# ── Modes ──────────────────────────────────────────────────────────────────
-# Every mode inherits the top-level [bindings]/[buttons]/[osk_buttons] and the
-# built-in category defaults; a mode only states what differs. `default_mode`
-# picks the fallback when no rule matches (else "desktop").
-default_mode = "desktop"
-
-[modes.desktop]        # full hyprpad — all categories on (the base)
-cursor  = true
-scroll  = true
-buttons = true
-chords  = true
-osk     = true
-forward = false
-
-[modes.game]           # game / Big Picture: only guide chords survive
-cursor  = false
-scroll  = false
-buttons = false
-chords  = true         # escape hatch stays
-osk     = true         # guide+Y still raises the keyboard over a game
-forward = true         # raw input goes to the game (virtual pad / Steam)
-
-[modes.claude]         # terminal running Claude Code (behavior TBD by owner)
-# e.g. keep the cursor, repurpose bindings for reviewing diffs / approving:
-# inherits desktop; example override:
-# [modes.claude.bindings]
-# "guide+r1" = "key pagedown"
-# "guide+l1" = "key pageup"
-
-# ── Rules: first match wins, evaluated on every context change ───────────────
-# A rule matches when ALL of its stated conditions match (AND). A rule with no
-# conditions is a catch-all. Conditions are lists → any element matches (OR).
-[[mode_when]]
-mode = "game"
-focus_class = ["steam_app_*", "steam_proton*", "gamescope*", "steam", "steamwebhelper"]
-
-[[mode_when]]
-mode = "game"
-focus_fullscreen = true            # optional: treat any fullscreen app as hands-off
-
-[[mode_when]]
-mode = "claude"
-focus_process = ["claude"]         # focused window's process tree runs `claude`
-
-# (implicit catch-all → default_mode; or state it explicitly)
-[[mode_when]]
-mode = "desktop"
-```
-
-### Conditions (all optional, extensible)
-
-| condition | matches when… | source |
-|---|---|---|
-| `focus_class` | focused window class glob-matches any pattern | Hyprland `activewindow.class` |
-| `focus_title` | focused window title matches any glob/regex | Hyprland `activewindow.title` |
-| `focus_fullscreen` | focused window is fullscreen | Hyprland fullscreen event |
-| `focus_process` | a process in the focused window's **process tree** matches (name or cmdline substring) | `activewindow.pid` → walk `/proc` descendants |
-| *future* `process_running` | any process matches (regardless of focus) | `/proc` scan |
-| *future* `manual` | a mode was forced via a binding | override slot |
-| *future* `time_between`, `on_battery`, … | | |
-
-**`focus_process` is the generic mechanism that catches Claude Code** (and any
-"app-in-a-terminal" case). On a focus change we already learn the focused
-window's `pid` from Hyprland; walk its descendants (`/proc/<pid>/task/*/children`
-or a parent-map scan) and match `comm`/cmdline against the patterns. Cache the
-result per focused-window pid so we only walk on focus changes (cheap — not
-per-frame). A refinement re-walks on a slow timer so starting/quitting Claude in
-an already-focused terminal switches mode without a refocus.
-
-## Resolution precedence
-
-1. **Manual override** — if a binding forced a mode (`Action::SetMode(name)` /
-   `PushMode`/`ClearMode`), it wins. Lets the owner bind e.g. `guide+view` to
-   force `game` or pop back to `desktop`, overriding focus rules.
-2. **First matching `[[mode_when]]` rule** (top-to-bottom).
-3. **`default_mode`** (`desktop`).
-
-Re-resolve on: focus change, fullscreen change, manual override change, the
-slow-timer process re-walk. On a resolved-mode *transition*, run the same
-"clean handoff" we already do (release held clicks/keys, neutral the virtual
-pad, reset dampers) so nothing strands across a mode switch.
-
-## Runtime integration
-
-- `ModeEngine` replaces `Arbiter`. It keeps the Context (the focus fields the
-  arbiter already tracks, plus the focused pid + process-match cache) and the
-  parsed modes/rules. `HyprEvent::ActiveWindow{class,title,pid}` and
-  `Fullscreen` feed it (we'll need `pid` and `title` added to the event, both
-  available from Hyprland).
-- The loop gates each handler on `mode.cursor` / `.scroll` / `.buttons` /
-  `.chords` / `.osk` / `.forward` instead of `arbiter.suppressed()`. The current
-  `guide_active()` gating is orthogonal and stays (guide-held still steals the
-  pads for the guide layer; whether a resolved chord *acts* is `mode.chords`).
-- Per-mode binding overrides (`[modes.<name>.bindings]` etc.) layer over the base
-  `Config` maps when that mode is active — the loop looks up bindings in the
-  active mode's merged table. (Phase 2; the near-term game mode needs no overrides.)
-- Hot-reload: modes/rules re-read on `hyprpad reload` like everything else; the
-  active mode re-resolves against the new rules immediately.
-
-## Phasing
-
-- **Phase 1 (the near-term ask):** `[modes]` with category gates + `[[mode_when]]`
-  with `focus_class` / `focus_fullscreen`, resolution, loop gating. Ships the
-  game/Big-Picture passthrough and fixes the double-input. `Arbiter` → `ModeEngine`.
-- **Phase 2:** `focus_process` (Claude Code detection) + `focus_title`, the
-  process-tree walk + cache + slow re-walk.
-- **Phase 3:** manual override actions, per-mode binding overrides, further
-  conditions (process_running, time, battery).
-
-## Owner decisions (2026-09-01) — these reshape the design
-
-1. **Per-binding gating, NOT categories.** The owner wants granularity below the
-   six-category level: each binding/input decides for itself whether it's active
-   in a given context — not "game mode turns off the `cursor` category." This
-   largely dissolves the category model: a **mode becomes a named context/tag**,
-   and **every binding carries an optional guard** (which modes/conditions it's
-   active under). The "game passthrough" is then "no binding except guide chords
-   is tagged active in `game`," expressed per-binding rather than per-category.
-   → This is exactly the structure that is painful in declarative TOML and
-   natural as a **per-binding Lua predicate**, so the concrete schema is now
-   COUPLED to the config-format decision (see `docs/research/lua-config.md`,
-   in progress). Do not lock a per-binding TOML schema until that lands.
-2. **Fullscreen ≠ game.** Drop `focus_fullscreen` as a game trigger; it's a wrong
-   classification (fullscreen video, etc.). Keep it available only if some future
-   mode explicitly wants it, but it is not part of the game rule.
-3. **Claude detection: implementer's call** (owner has no preference; "finnicky
-   by design"). Default to the `focus_process` tree-walk on `claude`, title match
-   as a cheap optional add; keep expectations low on reliability.
-4. **Manual override: yes.** A binding can force a mode (over the context rules),
-   and pop back. Keep this a first-class part of the resolution precedence.
-
-**Consequence:** the category table above is superseded by a per-binding-guard
-model; it stays only as the conceptual bridge from today's binary arbiter. The
-final schema is deferred to the config-format (Lua vs TOML) recommendation.
-
-## Implemented shape (branch `feat-lua-config`)
-
-The config-format question landed on `docs/research/lua-config.md`'s option D2,
-so the schema above is superseded by the Lua one. What shipped:
-
-- `src/mode.rs` — `ModeEngine`, which subsumes `Arbiter` as the daemon's gate.
-  It *embeds* an `Arbiter` for the built-in path, so a config that declares no
-  modes (every `config.toml`) keeps today's behaviour exactly rather than a
-  re-implementation of it.
-- `src/lua_config.rs` — the `hyprpad.lua` (Lua) front-end and the `hyprpad` API.
-- `src/config.rs` — `ModeDef`, `Guard`, `ModeState`, `Action::SetMode` /
-  `Action::ClearMode`, and the dual-front-end `Config::load`.
-- `config/hyprpad.lua` — the owner's live `config.toml` translated 1:1, plus the
-  game mode, the guards, and a commented Claude-Code mode.
-
-Schema, in the shape the owner's decisions asked for:
+## 2. What a mode is
 
 ```lua
 h.mode("game", { forward = true }).when(function(ctx)
   return ctx.focus.class:lower():match("^steam_app_") ~= nil
 end)
-h.mode("claude").when(function(ctx) return ctx.focus:process_tree_has("claude") end)
-h.mode("desktop")
+h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatsheet") end)
+h.mode("locked").when(function(ctx) return ctx.locked end)
+h.mode("desktop")          -- no rule: the fallback
 h.default_mode "desktop"
-
-h.cursor { only_in = { "desktop" } }              -- ambient handlers are guardable
-h.button("a", h.key "enter"):only_in("desktop")   -- per binding, not per category
-h.bind("guide+r1", h.workspace "+1")              -- unguarded: the escape hatch
-h.bind("guide+view", h.set_mode "desktop")        -- manual override, first class
 ```
 
-Deltas from the proposal above, all following from the owner's decisions:
+A mode is a name, an optional rule, and the `forward` flag. Rules are tried in
+**definition order, first match wins**; modes are exclusive, so exactly one is
+live. Declaration order is therefore the priority order, which is why the
+sample config puts `locked` first, then the layer-keyed modes (an overlay is
+drawn *over* a game), then the class-keyed ones, then `desktop` last
+(`config/hyprpad.lua:56-120`).
 
-| proposed | shipped |
-|---|---|
-| category flags per mode (`cursor = false` …) | **gone** — a mode is a name + rule + `forward`; every binding carries its own guard |
-| `focus_fullscreen` as a game trigger | **dropped** — `ctx.focus.fullscreen` exists, nothing ships using it |
-| `[[mode_when]]` glob lists | Lua predicates over `ctx` |
-| per-mode binding *overrides* | not built — guards cover the near-term need; a mode that wants a different action for the same chord still needs this (see open items) |
-| `focus_process` glob condition | `ctx.focus:process_tree_has(name)`, cached per focused pid |
+### What a rule can see
 
-Still open: the slow-timer `/proc` re-walk (so starting `claude` in an
-already-focused terminal switches mode without a refocus), per-mode binding
-overrides, and the further conditions (process_running, time, battery).
+`ctx` is built fresh per re-resolve from three sources (`src/mode.rs:60-105`),
+each existing because the ones before it are blind to something:
 
-### The guide-held cursor (`feat-guide-mouse`)
+| source | reaches Lua as | why it exists |
+|---|---|---|
+| the focused window | `ctx.focus.class`, `.title`, `.pid`, `.fullscreen`, and `ctx.focus:process_tree_has(name)` | the ordinary case |
+| layer-shell overlays | `ctx.layers` — an array of namespaces with `:has(name)` / `:list()` | a layer surface takes the keyboard with **no `activewindow` event behind it**, so a focus-only engine cannot see hyprpad's own cheat sheet, or Omarchy's menu |
+| the session lock | `ctx.locked` (boolean) | Omarchy's lock is an `ext-session-lock-v1` surface: neither a window nor a layer. To an engine watching only the first two, a locked session and an idle desktop are the same picture — except every bare button is now typing into a password field |
 
-The one place the guide layer *keeps* an ambient handler rather than taking it
-away. `h.cursor` carries a second guard:
+`process_tree_has` is the requirement that forced a predicate language in the
+first place: a Claude Code terminal has the *same window class* as any other
+terminal, so selection has to look **inside** the window. It walks
+`/proc/<pid>/task/*/children` — the kernel's own child list — bounded at
+`PROC_WALK_LIMIT` (512) processes, matches a lowercased `"<comm> <cmdline>"` per
+descendant, and caches the walk per focused pid so it costs one walk however many
+predicates ask (`src/lua_config.rs:360-450`).
+
+Above all of it sits the manual override: `h.set_mode` / `h.clear_mode` beat the
+rules until cleared ([§8](#8-owner-decisions-2026-09-01) #4).
+
+---
+
+## 3. What counts as a context change
+
+Predicates run **only** here — never per input frame. The resolved mode, every
+guard result, and the filtered button maps are cached in `ModeEngine`, and the
+per-frame handlers only read them (`src/mode.rs:25-32`).
+
+| change | fed by | entry point |
+|---|---|---|
+| focus moved | `activewindow` (class, title) + a one-shot `j/activewindow` for the fields the event stream omits (pid, fullscreen) | `focus_changed` / `context_changed` |
+| the focused window renamed itself | `windowtitle` | `title_changed` |
+| fullscreen toggled | Hyprland fullscreen event | `set_fullscreen` |
+| an overlay opened or closed | `openlayer` / `closelayer`, plus a startup seed from `j/layers` | `layer_changed` / `seed_layers` |
+| the session locked or unlocked | a 1 s poll of `j/locked` on the socket the daemon already holds | `lock_changed` |
+| the process tree moved | the periodic `process_rescan_ms` sweep (default 500 ms) | `rescan_processes` |
+| a manual override | `h.set_mode` / `h.clear_mode` | `set_mode` / `clear_mode` |
+| a config reload | `hyprpad reload` | `reconfigure` |
+
+Four properties of that table are load-bearing:
+
+* **One call, one re-resolve.** `context_changed` replaces the whole focus at
+  once, so a predicate never sees the new window's pid against the old window's
+  class, and a transient mismatch is never reported as a mode transition
+  (`src/mode.rs:196-207`).
+* **A no-op change is not a change.** A rename to the title already held, a
+  repeat `openlayer` for a namespace already open, a lock report matching the
+  state already held — none re-resolve. That is what makes the compositor's two
+  events per rename cost one re-resolve, and what makes the lock poll free: it
+  fires every interval and costs one comparison until the answer moves.
+* **Never pay for what you did not ask for.** Each expensive source is opt-in,
+  decided once at load by scanning the config *source* for the bare word:
+  `process_rescan_useful` refuses the sweep without declared modes, a mention of
+  `process_tree_has`, and a focused pid; `watches_lock()` refuses the lock poll
+  without a mention of `locked`; `needs_focus_pid()` gates the extra
+  `j/activewindow` query. A TOML config never tracks layers or the lock at all.
+  The scan errs wide deliberately — over-matching (a mention in a comment) costs
+  a socket round trip, under-matching would cost a mode that silently never
+  resolves. One consequence: adding the *first* `ctx.locked` predicate is the one
+  change a reload cannot pick up, since the watcher is wired at startup.
+* **A rename is a process hint.** Starting `claude` in an already-focused
+  terminal changes only what the window is *called*, so `rescan_on_title_change`
+  (default `true`) reads the rename as "the tree probably moved" and drops the
+  `/proc` cache.
+
+---
+
+## 4. Guards: per binding, not per category
+
+Every `h.bind` / `h.button` / `h.osk_button`, and the `h.cursor` / `h.scroll`
+"virtual bindings", carry a `Guard` (`src/config.rs:1204-1254`):
+
+| variant | spelling | live when |
+|---|---|---|
+| `Always` | *(none)* | everywhere — the default, and everything the TOML front-end produces. This is why guide chords survive a fullscreen game: hyprpad's escape hatch |
+| `OnlyIn` | `:only_in("desktop", "browser")` | the active mode is one of these |
+| `NotIn` | `:not_in("game")` | the active mode is **not** one of these |
+| `When` | `:when(function(ctx) … end)` | the Lua predicate returned truthy at the last re-resolve |
+
+A guard is **exactly one** of those — never a conjunction: chaining a second
+replaces the first, so `:only_in("desktop"):when(f)` is just `:when(f)`. All three
+methods chain onto every binding kind, in either Lua punctuation (`:only_in(..)`
+and `.only_in(..)` both work, since the owner's Hyprland config uses dot calls
+throughout). The pads take theirs inline as table keys instead. A *mode* handle
+is the one thing that takes no guard — only `when` and `forward` — and says so.
+
+Guards never run on the input path. `Guard::allows(&ModeState)` is a single match
+arm over cached data — `OnlyIn`/`NotIn` compare mode names, `When(i)` is an
+**index into a cached bool vector**, not a Lua call — and that vector is computed
+in one pass per context change (`ModeEngine::refresh_declared`), so a predicate
+shared by a mode rule and a binding guard runs exactly once. Rules and guards
+share one flat index space (`Config::predicate_slots`).
+
+A `When` whose predicate is missing from the snapshot — it errored or timed out —
+reads as **false**: the same "a broken predicate is not a match" rule the mode
+rules use, so a bad guard silences one binding rather than taking the daemon with
+it. A guard naming a mode nobody declared is a different matter: a **load error**
+([§6](#6-guardrails)), because the binding would otherwise just never fire.
+
+### Bare buttons and `ButtonAlt`
+
+A bare button may be bound once per mode — the mechanism by which one physical
+control means two things:
 
 ```lua
-h.cursor { only_in = { "desktop" }, guide_in = { "game" } }
-h.bind("guide+rpad_click", h.mouse "left"):only_in("game")
+h.button("b", h.key "backspace"):only_in("desktop")
+h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
+```
+
+The first binding stays in the base map (so the TOML path is untouched) and later
+ones become `ButtonAlt`s; `Config::buttons_in(mode)` walks base-first, then alts
+in declaration order, and the **first passing guard wins**, flattening them into
+the single `button → action` map the frame handler reads. Since modes are
+exclusive there is normally no competition; two that *are* live at once means
+both were left unguarded, which the loader warns about by name. A `ButtonAction`
+is either `Hold` (a key/mouse pressed and released with the button) or `Fire`
+(run once on the press edge — `h.exec`, `h.keyboard`, `h.set_mode`,
+`h.clear_mode`).
+
+### The ambient handlers
+
+The two trackpads are guarded like anything else, with one extra:
+
+```lua
+h.cursor { only_in = { "desktop", "omarchy-ui", "browser" }, guide_in = { "game" } }
+h.scroll { mode = "circular", only_in = { "desktop", "omarchy-ui", "browser" } }
 ```
 
 `only_in` is where the right pad drives the cursor with the guide **up**;
 `guide_in` is where it goes on doing so with the guide **held** — Steam Input's
 own "guide + pad = mouse", so a game can be pointed at without leaving it. The
-frame arm's rule is `cursor_active(guide, ambient, under_guide)` in
-`src/run.rs`: guide up → `only_in` decides; guide held → only `guide_in` can
-keep the pad. Default is nowhere. Two consequences fall out of the precedence:
+whole rule is `cursor_active(guide, ambient, under_guide)` in `src/run.rs`:
+`if guide { under_guide } else { ambient }` — note the two guards are *not*
+ANDed, so `guide_in` alone suffices under a held guide and `only_in` is ignored
+there. Default is nowhere. Scroll has only the ambient guard. Either handler
+gated off does not merely skip: it drops its filter state, so re-entry never
+jumps. And a hold spent on pointing is **consumed**, so releasing the guide
+afterwards is not handed to Steam as a bare guide tap.
 
-* The game gets nothing meanwhile — the guide is rank 1, forwarding is off for
-  as long as it is held, so `desktop_yielded()` is untouched and the
-  "forward = true but the cursor is live" warning never fires for it.
-* A hold spent on pointing is **consumed** (`GestureEngine::consume_hold()` on
-  the first cursor motion), so releasing the guide afterwards is not handed to
-  Steam as a bare guide tap — the rule `docs/research/text-scrub.md` §5 asks
-  of every guide-scoped pad handler.
+---
 
-Clicking is a *held chord output*: a `h.key` / `h.mouse` on a guide chord is
-pressed on recognition and released on the chord button's lift
-(`GestureEvent::GuideChordRelease`) or the guide's, whichever first — tracked
-in `ChordKeys` beside `ButtonKeys` and released with it on the mode handoff and
-disconnect. This also makes `h.bind("guide+l5", h.key "leftshift")` a modifier
-on a grip, which the text-scrub design wants.
+## 5. Precedence and the gates
 
-Known interaction: while Steam runs unmasked it acts on guide+pad itself
-(Steam Input's chord layer), so two mice move together; the uhid/udev masking
-work is what removes that, not this feature.
+Four layers claim the same device. `run::gamepad_forwarding` (`src/run.rs:1619`)
+is the single place the order is written down:
 
-## Open questions for the owner (superseded — see decisions above)
+> **guide > OSK > game-forwarding > desktop**
 
-1. **Category granularity** — is the six-category set (cursor/scroll/buttons/
-   chords/osk/forward) the right resolution, or do you want per-binding gating
-   (e.g. disable *some* chords in game mode but not others)? Categories are
-   simpler; per-binding is Phase 2+ via mode binding-overrides.
-2. **Fullscreen = game?** Should any fullscreen window (e.g. a fullscreen video)
-   trigger passthrough, or only known game classes? (Proposed: off by default,
-   available as a rule.)
-3. **Claude Code detection** — process-tree match on `claude` (robust, proposed)
-   vs. matching the terminal title glyph Claude sets (we saw `◑ hyprpad`; lighter
-   but brittle). Recommend process-tree, with title as an optional extra condition.
-4. **Manual override ergonomics** — do you want a dedicated chord to force
-   desktop mode over a game (the reserved `force_desktop`), and/or a mode-cycle?
+| rank | layer | gate | what reaches it |
+|---|---|---|---|
+| 1 | **guide** | `guide_active()` | every per-frame handler drops out while the guide is held, in a game as much as on the desktop. Chords and flicks still resolve; a bare-button press is **swallowed, not deferred**. The one opt-in exception is `h.cursor { guide_in = … }` |
+| 2 | **OSK** | `osk.is_active()` | it owns both pads; cursor and scroll are forced into their drop-and-forget branches, and every desktop gesture is suppressed **except the keyboard toggle**, so the chord that raised it can dismiss it |
+| 3 | **game forwarding** | `gamepad_forwarding(enabled, forwards, desktop_yielded, !guide, !osk)` | the raw report goes to the virtual pad |
+| 4 | **desktop** | each handler's own guard in the active mode | cursor, scroll, bare-button fires and holds |
+
+Ranks 3 and 4 are **mutually exclusive by construction**, not by policy:
+forwarding also requires `ModeEngine::desktop_yielded()`, true exactly when
+neither cursor nor scroll is live. A manual override forcing the desktop live
+over a game, or a mode that sets `forward = true` while leaving the cursor
+guarded in, yields rather than driving both at once — and `refresh()` warns at
+load when a config asks for that, since the gate would otherwise silently never
+engage. `cursor_guide_enabled` is deliberately *excluded* from `desktop_yielded`:
+it is only live under the guide, where forwarding is already off. On every
+transition **out** of rank 3 the live sink gets one `neutral()` report and the
+rumble stops — a game is left with a connected, idle controller rather than a
+vanished one, and never holding input hyprpad has stopped feeding it.
+
+### The stale-press latch
+
+> Every layer acts on **press edges only**, and never on the frame it became
+> live. — `src/run.rs:86`
+
+Without this, a gate that opens and a press that lands in the same report are the
+same event: the `Y` of the `guide+Y` that raised the keyboard would also be its
+first keystroke. Two independent one-bit flags carry it — `ButtonKeys::open` ("the
+bare-button layer was live at the end of the last `reconcile`, with no transition
+since") and `OskRoute::live` — each gating presses on
+`settled = active && was_live_last_frame`. **Releases are unconditional**: a key
+comes up when its button lifts whatever else is going on, and Shift comes up when
+the last trigger holding it lifts.
+
+`ButtonKeys::release_all` resets the flag, which is what stops a button that is
+*still down* from re-pressing on the next frame. The motivating bug: a Tab that
+walks Omarchy's bar panels flips the mode away and back within milliseconds, each
+flip running the handoff — and without the mark, one tap became two or three. The
+price is that a key held straight through a guide tap does not resume on its own;
+it wants a fresh press.
+
+### The mode handoff
+
+One function, `run::mode_handoff` — "so a new way of *noticing* a transition can
+never come with a subtly different way of *making* one". It releases, in order:
+the cursor damper and scroll state, every held bare-button key or mouse button
+(plus the latch), every held guide-chord output, and the virtual pad.
+
+What it deliberately does **not** touch is the load-bearing half: the gesture
+engine and `prev_frame` are left alone, because a transition is usually *caused*
+by a chord that is still physically held — `guide+view` opens the cheat sheet,
+whose layer flips the mode. Resetting edge state would make that chord look
+freshly pressed next frame, fire again, toggle the overlay closed, flip back, and
+loop for as long as it was held. (Observed live.) Only the disconnect path
+rebuilds the gesture engine, and only because the device genuinely went away.
+
+A **reload** is the exception: it runs no handoff. Held keys are settled by the
+next frame's `reconcile` against the *new* map, so a binding that survived stays
+held (a reload mid-drag keeps the drag) and one that changed or vanished is
+released. Every other transition names its cause in the log — `(title change)`,
+`(overlay)`, `(session locked)`, `(process rescan)`, `(manual)` — because a
+transition with no focus change behind it is otherwise a mystery.
+
+### The `osk` context
+
+Rank 2 is a context, but it is **not a declared mode**: the daemon does not
+switch modes for the keyboard and no rule can select it. It behaves like one from
+the reader's side, so `hyprpad bindings` reports it as a built-in mode named
+`osk` (`bindings_sheet::OSK_MODE`, `builtin: true`) purely so the sheet can show
+a tab for it without knowing what a keyboard is.
+
+`h.osk_button("y", h.key "space")` types a key through the keyboard;
+`h.osk_button("l2", h.osk "shift")` binds one of its own actions
+(`commit` | `shift` | `dismiss`); `h.none()` drops a built-in entry. These layer
+*over* the built-in Deck map (`config::osk_builtins`) rather than replacing it,
+and an entry whose guard fails lets the built-in show through — so a helper
+guarded into one mode never leaves its button dead in the others.
+
+---
+
+## 6. Guardrails
+
+A config that is a *program* can hang or throw where a config that is *data*
+could only be malformed. The design mirrors the one the owner already proved in
+HypXRland's `src/config/lua/ConfigManager.cpp` (`src/lua_config.rs:98-115`):
+
+| guardrail | how |
+|---|---|
+| **syntax-check before swap** | the whole file is compiled with `into_function()` before a line executes, so a syntax error is reported with its line number and nothing was applied |
+| **fresh state per load** | every load builds a new `Lua` and a new `Config`; nothing is mutated in place, so a failure at any later step leaves the running config untouched *by construction* |
+| **watchdog** | an instruction-count hook (`lua_sethook`'s mlua equivalent, every `HOOK_INSTRUCTIONS = 1000` VM instructions) against an `Instant` deadline, with HypXRland's own per-context budgets: `LOAD_TIMEOUT` 1500 ms for the whole file, `PREDICATE_TIMEOUT` 100 ms for one rule or guard, `EVENT_TIMEOUT` 50 ms reserved for the callbacks the API will grow (`h.on`) |
+| **validation** | after execution, before anything is handed back: a guard naming a mode no `h.mode` declares is **refused** (a typo in `:only_in("desktopp")` would otherwise silently disable a binding), as is a mode declared twice. A `default_mode` nobody declared is *not* an error — it is declared implicitly, so `h.default_mode "desktop"` alone works. A button re-bound with no guard is a warning naming the button: only the first is live |
+| **last-good retention** | any failure leaves the running config in place and logs the reason. `hyprpad reload` can never leave the daemon input-dead |
+
+A predicate that is cut, or that throws, counts as **no match** and is logged
+once — never a panic, never a propagated error. The deadline is saved and
+restored around each guarded call, so a nested call cannot extend its budget and
+a finished predicate does not leave the watchdog armed for the next one.
+
+---
+
+## 7. The cheat sheet's view
+
+`hyprpad bindings [--json]` loads the config through the daemon's own
+`Config::load`, so the sheet cannot drift from it, and touches neither the
+controller nor the running daemon.
+
+One card is one *context*: **a tab per declared mode, in the order the rules are
+tried**, plus the built-in `osk` tab. A tab lists what is live there and nothing
+else — so `only_in("desktop")` renders as a *tab* rather than a tag on a row,
+which is what makes the guard model legible rather than a thicket of annotations.
+Where `h.cursor { guide_in = … }` lists a mode, that tab gets an extra `guide`
+row for the right pad carrying *that* guard. The sheet opens on the mode you were
+in when you summoned it — raising it is itself a mode change, since it is a layer
+surface `ctx.layers` can see — so the daemon exports `HYPRPAD_MODE` to the
+command a binding execs.
+
+---
+
+## 8. Owner decisions (2026-09-01)
+
+The decisions that reshaped this design away from the category model, cited **by
+number** from `src/mode.rs:9-18`, `src/config.rs:368`, `src/mode.rs:117` and
+`config/hyprpad.lua:276` — so the numbering is load-bearing and is preserved.
+Each is marked against what the code does today.
+
+**1. Per-binding gating, NOT categories.** ✅ *Holds.*
+`ModeDef` carries a name, an optional rule and `forward` — no category flags
+(`src/config.rs:1155-1170`) — and every binding carries a `Guard`. The decision
+noted the schema was coupled to the then-open config-format question; that landed
+on Lua (`docs/research/lua-config.md` D2), which made per-binding predicates
+spellable at all. *Residual:* the symmetry is incomplete — bare buttons can be
+bound once per mode (`ButtonAlt`), **chords cannot** ([§9](#9-still-open)).
+
+**2. Fullscreen ≠ game.** ✅ *Holds.*
+`ctx.focus.fullscreen` is available to a rule that asks for it and nothing ships
+using it; the test `fullscreen_is_available_to_a_rule_but_triggers_nothing_by_itself`
+asserts `set_fullscreen` alone never moves the mode, with an opt-in `cinema` mode
+as the counter-example. The built-in path classifies on class prefixes only.
+*Minor staleness elsewhere:* `Arbiter::suppressed`'s doc still reads "a fullscreen
+game always suppresses", as if fullscreen contributed; the code reads only
+`force_desktop` and `game_focused`.
+
+**3. Claude detection: implementer's call, "finnicky by design".** ⚠️ *Drifted —
+it got less finnicky than the decision assumed.*
+The mechanism is as decided: `process_tree_has`, a cached `/proc` walk, title
+matching left optional. But "keep expectations low" rested on starting `claude`
+in an already-focused terminal needing a refocus to be noticed, and that is no
+longer true — `rescan_on_title_change` and the 500 ms `process_rescan_ms` sweep
+both close it, on by default, gated behind `process_rescan_useful`.
+`config/hyprpad.lua:107-112` still carries the old caveat verbatim ("needs a
+refocus to be noticed") and should be corrected when that file is next touched.
+
+**4. Manual override is first class.** ✅ *Holds, and grew.*
+`h.set_mode` / `h.clear_mode` beat the rules (`src/mode.rs:22`), and `reconfigure`
+drops an override naming a mode the new config does not declare rather than
+stranding the daemon in one that no longer exists. Beyond the decision: it is no
+longer chord-only — a **bare button** can fire it (`ButtonAction::Fire`). The
+override is sticky until an explicit `clear_mode`.
+
+---
+
+## 9. Still open
+
+* **Per-mode chord overrides.** `bindings` is one action per chord, so a mode
+  that wants `guide+b` to mean something else cannot say so; guards can only
+  take a binding away. Bare buttons *do* have this (`ButtonAlt`), which is the
+  asymmetry to close. See `docs/research/text-scrub.md`.
+* **Further conditions** — `process_running` (regardless of focus), time of
+  day, battery. The `ctx` table is the extension point.
+* **A non-sticky override** — `h.toggle_mode`, or a `set_mode` that clears on
+  the next focus change, rather than only on an explicit `clear_mode`.
