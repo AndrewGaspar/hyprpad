@@ -528,6 +528,10 @@ pub fn run() -> std::io::Result<()> {
                         hx.dev,
                     );
                 }
+                // The keyboard is not a mode the engine knows, but to a bar
+                // widget it is the mode the pad is in. A no-op on every frame
+                // it has not flipped.
+                status.set_osk(osk.is_active());
                 if osk.is_active() {
                     // The keyboard owns both pads: route them to it, and keep the
                     // desktop cursor and scroll released (guide/suppressed = true

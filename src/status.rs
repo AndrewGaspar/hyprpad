@@ -55,7 +55,8 @@ pub struct Status {
     /// and during the reconnect wait, both of which the daemon sits through
     /// rather than exiting.
     pub connected: bool,
-    /// The active mode's name, as [`crate::mode::ModeEngine::active`] reports it.
+    /// The mode the pad is in: [`crate::mode::ModeEngine::active`]'s name, or
+    /// [`OSK_MODE`] while the on-screen keyboard owns the pads.
     pub mode: String,
     /// A human name for the controller, from the hidraw node's `HID_NAME`.
     pub controller: String,
@@ -97,6 +98,12 @@ pub struct StatusWriter {
     /// directory could not be created); every method is then a no-op.
     paths: Option<Paths>,
     status: Status,
+    /// The mode engine's mode, as last given to [`set_mode`](Self::set_mode).
+    /// Published as-is unless the keyboard is up.
+    base_mode: String,
+    /// Whether the on-screen keyboard owns the pads. While it does, the
+    /// published mode is [`OSK_MODE`], whatever the engine says.
+    osk: bool,
     /// Set once the first write fails, so the warning is not repeated per
     /// transition for the rest of the session.
     warned: bool,
@@ -157,6 +164,8 @@ impl StatusWriter {
                 modes: Vec::new(),
                 updated: now_secs(),
             },
+            base_mode: BUILTIN_DESKTOP.to_string(),
+            osk: false,
             warned: false,
         }
     }
@@ -188,10 +197,36 @@ impl StatusWriter {
     /// calls this after every transition, and a transition can land back on the
     /// mode that was already active.
     pub fn set_mode(&mut self, mode: &str) {
-        if self.status.mode == mode {
+        if self.base_mode == mode {
             return;
         }
-        self.status.mode = mode.to_string();
+        self.base_mode = mode.to_string();
+        self.refresh_mode();
+    }
+
+    /// Record whether the on-screen keyboard is up. The engine does not call
+    /// that a mode — it is a routing state that owns both pads — but to a
+    /// reader it is the mode the pad is in, and the cheat sheet already draws
+    /// it as one (its `osk` tab). So while the keyboard is up the published
+    /// mode is [`OSK_MODE`], and the engine's mode is kept aside to come back
+    /// the moment it goes down. Publishes only on a real flip, so the daemon
+    /// can call this every frame.
+    pub fn set_osk(&mut self, active: bool) {
+        if self.osk == active {
+            return;
+        }
+        self.osk = active;
+        self.refresh_mode();
+    }
+
+    /// Publish the effective mode — keyboard first, engine otherwise — if it
+    /// moved.
+    fn refresh_mode(&mut self) {
+        let effective = if self.osk { OSK_MODE } else { self.base_mode.as_str() };
+        if self.status.mode == effective {
+            return;
+        }
+        self.status.mode = effective.to_string();
         self.publish();
     }
 
@@ -451,6 +486,38 @@ mod tests {
             assert!(text.ends_with("}\n"), "publish {i}: {text}");
             assert!(text.contains(&format!("\"mode\": \"{mode}\"")), "publish {i}: {text}");
         }
+    }
+
+    #[test]
+    fn the_keyboard_overrides_the_published_mode_while_it_is_up() {
+        let dir = TempDir::new("osk");
+        let file = dir.path().join("status.json");
+        let read = || std::fs::read_to_string(&file).expect("read back");
+        let mut w = StatusWriter::in_dir(dir.path());
+        w.set_mode("game");
+        w.set_osk(true);
+        assert_eq!(w.status().mode, "osk");
+        assert!(read().contains("\"mode\": \"osk\""), "{}", read());
+        // The engine can move underneath the keyboard; the reader still sees
+        // the keyboard...
+        w.set_mode("desktop");
+        assert_eq!(w.status().mode, "osk");
+        // ...until it goes down, when the engine's *current* mode comes back,
+        // not the one it had when the keyboard came up.
+        w.set_osk(false);
+        assert_eq!(w.status().mode, "desktop");
+        assert!(read().contains("\"mode\": \"desktop\""), "{}", read());
+    }
+
+    #[test]
+    fn keyboard_state_that_does_not_flip_does_not_republish() {
+        let dir = TempDir::new("osk-noop");
+        let mut w = StatusWriter::in_dir(dir.path());
+        w.set_osk(true);
+        let published = w.status().clone();
+        // What the per-frame call sees on every frame the keyboard stays up.
+        w.set_osk(true);
+        assert_eq!(w.status(), &published);
     }
 
     #[test]

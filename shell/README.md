@@ -274,6 +274,11 @@ widget sits on someone's bar is not an installer's decision.
  "updated": 1725230000}
 ```
 
+`mode` is the mode the pad is *in*, which is not always the mode engine's: while
+the on-screen keyboard owns the pads it reads `osk`, the same built-in context the
+cheat sheet draws as a tab, and the engine's mode comes back when the keyboard goes
+down.
+
 The widget **watches a file and spawns nothing**. That is the whole design, and
 it is deliberately unlike the cheat sheet, which shells out to `hyprpad
 bindings --json` on every summon: a card is summoned occasionally and can

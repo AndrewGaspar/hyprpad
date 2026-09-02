@@ -236,6 +236,11 @@ exactly as long as the daemon does:
  "updated": 1725230000}
 ```
 
+`mode` is the mode the pad is *in*, which is not always the mode engine's: while
+the on-screen keyboard owns the pads it reads `osk`, the same built-in context the
+cheat sheet draws as a tab, and the engine's mode comes back when the keyboard goes
+down.
+
 `connected` is not "the daemon is up". The daemon deliberately outlives its
 controller — it sits through the startup wait and the reconnect wait rather
 than exiting — and says `connected: false` throughout both, which is what lets
