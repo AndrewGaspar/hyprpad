@@ -558,11 +558,16 @@ pub struct DaemonProc {
     /// Whether `/proc/<pid>/cgroup` places it inside [`USER_UNIT_NAME`] — i.e.
     /// this daemon *is* the systemd unit, not a hand-launched `hyprpad run`.
     pub under_unit: bool,
-    /// The supplementary gids from `/proc/<pid>/status`'s `Groups:` line. This
-    /// is the only honest answer to "does the daemon have the broker group",
-    /// because the group is inherited from the login session and neither the
-    /// unit file nor the group database can tell you what actually happened.
-    pub groups: Vec<u32>,
+    /// Every gid the daemon holds, from both credential lines of
+    /// `/proc/<pid>/status`: the four on `Gid:` (real, effective, saved, fs)
+    /// and the supplementary ones on `Groups:`. Reading the process is the only
+    /// honest answer to "does the daemon have the broker group", because the
+    /// group is inherited from the login session and neither the unit file nor
+    /// the group database can tell you what actually happened. Both lines
+    /// count: `usermod -aG` plus a fresh login puts the group on `Groups:`,
+    /// while `newgrp hyprpad` makes it the *primary* gid and leaves it off
+    /// `Groups:` entirely — and either daemon reaches the broker.
+    pub gids: Vec<u32>,
 }
 
 /// The gids on a `/proc/<pid>/status` `Groups:` line. A file with no such line
@@ -574,6 +579,29 @@ pub fn parse_proc_groups(status: &str) -> Vec<u32> {
         .find_map(|l| l.strip_prefix("Groups:"))
         .map(|rest| rest.split_whitespace().filter_map(|g| g.parse().ok()).collect())
         .unwrap_or_default()
+}
+
+/// The gids on a `/proc/<pid>/status` `Gid:` line — real, effective, saved
+/// and filesystem, in that order. A file with no such line yields an empty
+/// list.
+pub fn parse_proc_gid_line(status: &str) -> Vec<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Gid:"))
+        .map(|rest| rest.split_whitespace().filter_map(|g| g.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Every gid a `/proc/<pid>/status` body says the process holds: the primary
+/// four from `Gid:` followed by the supplementary ones from `Groups:`. The
+/// kernel grants access on any of them, so a check that reads only `Groups:`
+/// calls a daemon started from a `newgrp hyprpad` shell — where the group is
+/// the primary gid and appears nowhere else — groupless, even as it happily
+/// opens the broker's socket.
+pub fn parse_proc_gids(status: &str) -> Vec<u32> {
+    let mut gids = parse_proc_gid_line(status);
+    gids.extend(parse_proc_groups(status));
+    gids
 }
 
 /// The gid of `name` in an `/etc/group`-format body (`name:passwd:gid:members`).
@@ -833,7 +861,7 @@ pub fn user_unit_items(view: &dyn HostView) -> Vec<Check> {
             "daemon has the group",
             "unknown until started — it is read off the running daemon",
         ),
-        (Some(g), Some(d)) if d.groups.contains(&g) => Check::new(
+        (Some(g), Some(d)) if d.gids.contains(&g) => Check::new(
             Verdict::Ok,
             "daemon has the group",
             format!("gid {g} ({BROKER_GROUP}) — the broker will answer it"),
@@ -990,7 +1018,7 @@ impl HostView for LiveHost {
         Some(DaemonProc {
             pid,
             under_unit: cgroup_names_unit(&cgroup, USER_UNIT_NAME),
-            groups: parse_proc_groups(&status),
+            gids: parse_proc_gids(&status),
         })
     }
 
@@ -1198,6 +1226,21 @@ Exec=/usr/bin/steam steam://open/bigpicture
         gid: Option<u32>,
     }
 
+    /// A `/proc/<pid>/status` body, tab-separated the way the kernel writes
+    /// it, with `gid` on all four fields of the primary `Gid:` line and
+    /// `groups` on the supplementary `Groups:` line. The fixtures build their
+    /// daemons out of this rather than out of a gid list, so what the check is
+    /// given is what the kernel would actually have written.
+    fn status_body(gid: u32, groups: &[u32]) -> String {
+        let groups: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+        format!(
+            "Name:\thyprpad\nUid:\t1000\t1000\t1000\t1000\n\
+             Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
+             Groups:\t{} \nThreads:\t9\n",
+            groups.join(" ")
+        )
+    }
+
     /// The unit file and the enable symlink, as [`FakeHost`] spells them.
     const FAKE_UNIT: &str = "/home/u/.config/systemd/user/hyprpad.service";
     const FAKE_LINK: &str =
@@ -1223,7 +1266,13 @@ Exec=/usr/bin/steam steam://open/bigpicture
                     })
                     .collect(),
                 present: vec![PathBuf::from(FAKE_UNIT), PathBuf::from(FAKE_LINK)],
-                daemon: Some(DaemonProc { pid: 4242, under_unit: true, groups: vec![949, 1000] }),
+                daemon: Some(DaemonProc {
+                    pid: 4242,
+                    under_unit: true,
+                    // `usermod -aG` plus a fresh login: 1000 primary, 949
+                    // supplementary.
+                    gids: parse_proc_gids(&status_body(1000, &[949, 1000])),
+                }),
                 gid: Some(949),
             }
         }
@@ -1248,7 +1297,11 @@ Exec=/usr/bin/steam steam://open/bigpicture
                 // No unit, no group, and the daemon started by hand from a
                 // shell — the state of this machine today.
                 present: Vec::new(),
-                daemon: Some(DaemonProc { pid: 4242, under_unit: false, groups: vec![1000] }),
+                daemon: Some(DaemonProc {
+                    pid: 4242,
+                    under_unit: false,
+                    gids: parse_proc_gids(&status_body(1000, &[1000])),
+                }),
                 gid: None,
             }
         }
@@ -1602,7 +1655,11 @@ Exec=/usr/bin/steam steam://open/bigpicture
     #[test]
     fn a_daemon_whose_session_predates_the_group_is_caught() {
         let host = FakeHost {
-            daemon: Some(DaemonProc { pid: 4242, under_unit: true, groups: vec![1000] }),
+            daemon: Some(DaemonProc {
+                pid: 4242,
+                under_unit: true,
+                gids: parse_proc_gids(&status_body(1000, &[1000])),
+            }),
             ..FakeHost::ready()
         };
         let items = user_unit_items(&host);
@@ -1612,6 +1669,38 @@ Exec=/usr/bin/steam steam://open/bigpicture
         // And the first three still pass — this is not a unit problem.
         assert_eq!(items[0].verdict, Verdict::Ok);
         assert_eq!(items[2].verdict, Verdict::Ok);
+    }
+
+    /// Either credential line answers "does the daemon have the group". A
+    /// daemon started from a `newgrp hyprpad` shell carries 949 as its
+    /// *primary* gid and nowhere else; it reaches the broker exactly like one
+    /// holding the group supplementary, so it must not be told to re-login.
+    /// Reading `Groups:` alone once called such a daemon groupless.
+    #[test]
+    fn the_group_counts_from_either_credential_line() {
+        for (primary, supplementary, want) in [
+            // `usermod -aG hyprpad` and a fresh login: supplementary only.
+            (1000, &[949, 1000][..], Verdict::Ok),
+            // `newgrp hyprpad`, which is how this machine starts its daemon:
+            // primary only, and `Groups:` never mentions 949.
+            (949, &[958, 967, 1000][..], Verdict::Ok),
+            // Neither: the session that started the daemon predates the
+            // `usermod`, and only a re-login fixes it.
+            (1000, &[958, 967, 1000][..], Verdict::Bad),
+        ] {
+            let status = status_body(primary, supplementary);
+            let host = FakeHost {
+                daemon: Some(DaemonProc {
+                    pid: 4242,
+                    under_unit: true,
+                    gids: parse_proc_gids(&status),
+                }),
+                ..FakeHost::ready()
+            };
+            let item = &user_unit_items(&host)[3];
+            let seen = format!("Gid: {primary}, Groups: {supplementary:?}");
+            assert_eq!(item.verdict, want, "{seen} — {}", item.detail);
+        }
     }
 
     /// With no daemon running, the two questions that need a process must say
@@ -1651,6 +1740,27 @@ Exec=/usr/bin/steam steam://open/bigpicture
         // is an answer, not a failure to parse.
         assert!(parse_proc_groups("Name:\thyprpad\nGroups:\t\n").is_empty());
         assert!(parse_proc_groups("Name:\thyprpad\n").is_empty());
+    }
+
+    /// The primary line is four fields — real, effective, saved and fs — and
+    /// any of them holding the group means the process holds it. `newgrp` sets
+    /// all four; an sgid binary would set only some.
+    #[test]
+    fn the_gid_line_is_read_off_a_real_status_file() {
+        let newgrp = "Name:\thyprpad\nGid:\t949\t949\t949\t949\nGroups:\t1000 \n";
+        assert_eq!(parse_proc_gid_line(newgrp), vec![949, 949, 949, 949]);
+        // Both lines together, primary first — what the check actually asks.
+        assert_eq!(parse_proc_gids(newgrp), vec![949, 949, 949, 949, 1000]);
+        // A daemon that got the group the documented way has it on `Groups:`
+        // instead, and both must count.
+        let usermod = "Name:\thyprpad\nGid:\t1000\t1000\t1000\t1000\nGroups:\t949 1000 \n";
+        assert!(parse_proc_gids(usermod).contains(&949));
+        // Neither line: the state the re-login advice is for.
+        let stale = "Name:\thyprpad\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1000 \n";
+        assert!(!parse_proc_gids(stale).contains(&949));
+        // A body with no `Gid:` line at all is an empty answer, not a panic.
+        assert!(parse_proc_gid_line("Name:\thyprpad\n").is_empty());
+        assert_eq!(parse_proc_gids("Name:\thyprpad\nGroups:\t1000 \n"), vec![1000]);
     }
 
     #[test]
