@@ -86,7 +86,7 @@ h.haptics { cursor_spacing_px = 96 }
 h.gamepad { enabled = true }
 
 h.bind("guide+r1", "Workspace right", h.workspace "+1")  -- desc is optional
-h.bind("guide+x",  h.exec "omarchy-menu")
+h.bind("guide+menu", h.exec "omarchy-menu")
 h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 h.bind("guide+y",  h.keyboard { mode = "split" })
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button
