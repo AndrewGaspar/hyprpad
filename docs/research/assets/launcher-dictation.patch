@@ -1,0 +1,368 @@
+From faa0fdd6b322f4e6abf7918ba1130af0434f3926 Mon Sep 17 00:00:00 2001
+From: Andrew Gaspar <andrew.gaspar@outlook.com>
+Date: Wed, 2 Sep 2026 06:48:59 -0600
+Subject: [PATCH] Menu search: tolerate dictated punctuation and filler words
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The menu's search field is where dictation lands, and a speech model emits a
+sentence: "Open Spotify." rather than "spotify". Every term had to be a
+substring of the row's name text, so the trailing period and the word "open"
+each defeated a query that was otherwise a perfect hit — "Chrome.", "Music.",
+"Terminal." and "Open the browser." all found nothing.
+
+Fold both sides of the comparison instead. normalizeSearchText extends the
+`._-` fold searchableToken already applied to ids and aliases across labels,
+descriptions and the query; searchTerms drops the words a spoken sentence puts
+around a name, and falls back to the literal query when that would leave
+nothing, so "." and "the" still filter rather than listing every row. A term
+the substring pass rejects gets one more chance as a word-anchored subsequence
+of the label, which catches "gogle chrome" and "nodejs" and scores in a new
+tier below every literal hit.
+
+Two stock bugs surfaced on the way, both fixed here:
+
+- An app row's id is "apps." plus the whole desktop-file stem, so taking its
+  leaf handed search a vendor-stripped fragment (org.gnome.Nautilus searched
+  as "Nautilus") or the literal word "desktop" (org.telegram.desktop). App
+  rows carry the stem as appId; use it, and leave leafIdFor to the menu ids it
+  was written for.
+- The label went into the name text unfolded while everything around it was
+  folded, so "nodejs" missed Node.js and "xournal" missed Xournal++.
+
+The normalizer runs on the query, never on filterText: the search field still
+shows the sentence that was said, and dmenu still returns it verbatim.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017qqAVUizVkijbGHd3xnFMw
+---
+ docs/menu.md                     |   8 +-
+ shell/plugins/menu/MenuModel.js  |  97 ++++++++++++++++++---
+ test/shell.d/menu-search-test.sh | 139 +++++++++++++++++++++++++++++++
+ 3 files changed, 232 insertions(+), 12 deletions(-)
+ create mode 100755 test/shell.d/menu-search-test.sh
+
+diff --git a/docs/menu.md b/docs/menu.md
+index 480d128c..fb824f24 100644
+--- a/docs/menu.md
++++ b/docs/menu.md
+@@ -45,8 +45,12 @@ submenu. The fields:
+ 
+ Do not add `aliases` to new entries. They are reserved for established
+ alternate names users already type (`power-menu`, `settings`), kept for
+-compatibility — see `AGENTS.md`. Search does not need them: labels, the last
+-id segment, and descriptions are all searchable.
++compatibility — see `AGENTS.md`. Search does not need them: labels, the id (its
++last segment for a menu row, the whole desktop-file stem for an app row), and
++descriptions are all searchable. The query is folded before it is matched —
++punctuation, sentence casing, filler words like "open" and "the", and a dropped
++letter all still find the row, so a dictated "Open Spotify." lands on Spotify
++while the search field still shows what was said.
+ 
+ ## Load and merge
+ 
+diff --git a/shell/plugins/menu/MenuModel.js b/shell/plugins/menu/MenuModel.js
+index 28c995ea..2e147442 100644
+--- a/shell/plugins/menu/MenuModel.js
++++ b/shell/plugins/menu/MenuModel.js
+@@ -291,17 +291,86 @@ function searchableToken(value) {
+   return String(value || "").replace(/[._-]+/g, " ")
+ }
+ 
++// Both sides of a comparison get folded the same way, because a query and the
++// name it is looking for rarely agree about punctuation: "nodejs" and Node.js,
++// "cities skylines" and Cities: Skylines, a dictated "Spotify." and Spotify.
++// Ids and aliases were already folded by searchableToken; this extends the
++// same rule to labels, descriptions, and the query itself.
++function normalizeSearchText(value) {
++  return searchableToken(value)
++    .toLowerCase()
++    .replace(/[\/,;:!?]+/g, " ")
++    .replace(/\s+/g, " ")
++    .trim()
++}
++
+ function leafIdFor(id) {
+   var parts = String(id || "").split(".")
+   return parts.length > 0 ? parts[parts.length - 1] : id
+ }
+ 
++// Words a spoken sentence puts around a name, and that no name contains.
++// Dictation arrives as "Open Spotify, please." rather than "spotify", and an
++// on-screen keyboard's suggestions do the same thing; what is left once these
++// go is the part that actually names something.
++var FILLER_WORDS = ["the", "a", "an", "please", "open", "launch", "start", "run", "go", "to"]
++
++// The query, as the terms to match with. Nothing here touches filterText: the
++// search field still shows the sentence that was said and dmenu still returns
++// it verbatim, so only the matching is forgiving.
++function searchTerms(query) {
++  var raw = String(query || "").trim()
++  if (!raw) return []
++
++  var folded = normalizeSearchText(raw).split(" ")
++  var all = []
++  var named = []
++  for (var i = 0; i < folded.length; i++) {
++    if (!folded[i]) continue
++    all.push(folded[i])
++    if (FILLER_WORDS.indexOf(folded[i]) < 0) named.push(folded[i])
++  }
++
++  // A query that is *only* filler or only punctuation — "open", "." — is
++  // someone typing, not someone dictating a name. Keep filtering by what they
++  // typed rather than emptying the query, which would list every row.
++  if (named.length > 0) return named
++  if (all.length > 0) return all
++  return raw.toLowerCase().split(/\s+/)
++}
++
++// The last chance a term gets: its letters in order inside one of the name's
++// words, so a misheard "gogle chrome" still reaches Google Chrome. Anchored to
++// a word start, because an unanchored subsequence finds "theme" in "Virtual
++// Machine Manager" and buries the real answer in noise; and only from three
++// characters up, since a shorter term is a subsequence of nearly everything.
++function subsequenceMatch(term, text) {
++  if (!term || term.length < 3) return false
++
++  for (var start = 0; start < text.length; start++) {
++    if (start > 0 && text.charAt(start - 1) !== " ") continue
++    if (text.charAt(start) !== term.charAt(0)) continue
++
++    var matched = 1
++    for (var i = start + 1; i < text.length && matched < term.length; i++) {
++      if (text.charAt(i) === term.charAt(matched)) matched += 1
++    }
++    if (matched === term.length) return true
++  }
++
++  return false
++}
++
+ function nameSearchText(entry) {
+   if (!entry) return ""
+-  var aliases = []
+-  var values = Array.isArray(entry.aliases) ? entry.aliases : []
+-  for (var i = 0; i < values.length; i++) aliases.push(searchableToken(values[i]))
+-  return [entry.label, searchableToken(leafIdFor(entry.id)), aliases.join(" ")].join(" ").toLowerCase()
++  var aliases = Array.isArray(entry.aliases) ? entry.aliases : []
++  // An app row's id is "apps." plus the whole desktop-file stem, and a stem is
++  // dotted for reverse-DNS names, so its leaf is a vendor-stripped fragment
++  // (org.gnome.Nautilus -> "Nautilus") or the literal word "desktop"
++  // (org.telegram.desktop). The stem is on the row as appId; menu ids keep
++  // taking their leaf, which is what makes style.theme searchable as "theme".
++  var idText = entry.appId || leafIdFor(entry.id)
++  return normalizeSearchText([entry.label, idText, aliases.join(" ")].join(" "))
+ }
+ 
+ function termInSearchWords(term, text) {
+@@ -313,7 +382,7 @@ function termInSearchWords(term, text) {
+ }
+ 
+ function descriptionTextMatches(query, text) {
+-  var terms = String(query || "").toLowerCase().trim().split(/\s+/)
++  var terms = searchTerms(query)
+   for (var i = 0; i < terms.length; i++) {
+     if (terms[i] && !termInSearchWords(terms[i], text)) return false
+   }
+@@ -325,13 +394,15 @@ function matchesQuery(entry, query, visible) {
+   if (!visible) return false
+ 
+   var nameText = nameSearchText(entry)
+-  var descriptionText = String(entry.description || "").toLowerCase()
+-  var terms = String(query || "").toLowerCase().trim().split(/\s+/)
++  var labelText = normalizeSearchText(entry.label)
++  var descriptionText = normalizeSearchText(entry.description)
++  var terms = searchTerms(query)
+ 
+   for (var i = 0; i < terms.length; i++) {
+     if (!terms[i]) continue
+     if (nameText.indexOf(terms[i]) >= 0) continue
+     if (termInSearchWords(terms[i], descriptionText)) continue
++    if (subsequenceMatch(terms[i], labelText)) continue
+     return false
+   }
+ 
+@@ -339,10 +410,10 @@ function matchesQuery(entry, query, visible) {
+ }
+ 
+ function searchScore(items, entry, query) {
+-  var needle = String(query || "").toLowerCase().trim()
+-  var label = entry.label.toLowerCase()
++  var needle = searchTerms(query).join(" ")
++  var label = normalizeSearchText(entry.label)
+   var nameText = nameSearchText(entry)
+-  var descriptionText = String(entry.description || "").toLowerCase()
++  var descriptionText = normalizeSearchText(entry.description)
+   var score = 80
+ 
+   if (label === needle) score = entry.parent === "root" ? 2 : 0
+@@ -353,6 +424,9 @@ function searchScore(items, entry, query) {
+   else if (label.indexOf(needle) >= 0) score = 30
+   else if (nameText.indexOf(needle) >= 0) score = 40
+   else if (descriptionTextMatches(needle, descriptionText)) score = 60
++  // A subsequence is the weakest thing matchesQuery accepts, so it sorts below
++  // every literal hit rather than lifting a mishearing above an exact name.
++  else if (subsequenceMatch(needle, label)) score = 70
+ 
+   if (entry.kind === "menu" || entry.kind === "link") score -= 2
+   // App rows sort after all menu items, so they lose the tiebreak below to an
+@@ -513,6 +587,9 @@ if (typeof module !== "undefined") {
+     isDisabled: isDisabled,
+     labelFor: labelFor,
+     searchableToken: searchableToken,
++    normalizeSearchText: normalizeSearchText,
++    searchTerms: searchTerms,
++    subsequenceMatch: subsequenceMatch,
+     leafIdFor: leafIdFor,
+     nameSearchText: nameSearchText,
+     termInSearchWords: termInSearchWords,
+diff --git a/test/shell.d/menu-search-test.sh b/test/shell.d/menu-search-test.sh
+new file mode 100755
+index 00000000..03a84b60
+--- /dev/null
++++ b/test/shell.d/menu-search-test.sh
+@@ -0,0 +1,139 @@
++#!/bin/bash
++
++set -euo pipefail
++
++source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
++
++run_node_test <<'JS'
++const fs = require('fs')
++const menu = requireFromRoot('shell/plugins/menu/MenuModel.js')
++const menuQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/Menu.qml'), 'utf8')
++const defaultMenuJsonc = fs.readFileSync(path.join(root, 'default/omarchy/omarchy-menu.jsonc'), 'utf8')
++
++// App rows the way Menu.qml's mergeAppRows() builds them: the id is "apps."
++// plus the desktop-file stem, the description is GenericName, and the aliases
++// are GenericName followed by Keywords.
++function appRow(label, appId, genericName, keywords) {
++  return {
++    id: 'apps.' + appId,
++    parent: 'apps',
++    kind: 'app',
++    appId: appId,
++    label: label,
++    description: genericName,
++    aliases: (genericName ? [genericName] : []).concat(keywords || []),
++    order: 0
++  }
++}
++
++const apps = [
++  appRow('Google Chrome', 'google-chrome', 'Web Browser', []),
++  appRow('Chromium', 'chromium', 'Web Browser', ['browser']),
++  appRow('Spotify', 'spotify', 'Music Player', ['music', 'player']),
++  appRow('Alacritty', 'Alacritty', 'Terminal', ['terminal']),
++  appRow('Ghostty', 'com.mitchellh.ghostty', 'Terminal Emulator', []),
++  appRow('Node.js', 'nodejs', '', []),
++  appRow('btop++', 'btop', 'System Monitor', ['system', 'process', 'task']),
++  appRow('Telegram Desktop', 'org.telegram.desktop', 'Chat', ['messenger']),
++  appRow('Files', 'org.gnome.Nautilus', 'File Manager', []),
++  appRow('Xournal++', 'com.github.xournalpp.xournalpp', 'Notetaking', [])
++]
++
++function found(query) {
++  return apps
++    .filter(entry => menu.matchesQuery(entry, query, true))
++    .sort((a, b) => {
++      const byScore = menu.searchScore({}, a, query) - menu.searchScore({}, b, query)
++      return byScore !== 0 ? byScore : a.label.localeCompare(b.label)
++    })
++    .map(entry => entry.label)
++}
++
++// Dictation arrives as a sentence, because that is what a speech model emits:
++// sentence case, a trailing period, and the words a person says around a name.
++// Every one of these found nothing before the query was normalized.
++assertDeepEqual(found('Chrome.'), ['Google Chrome'], 'search ignores a dictated trailing period')
++assertDeepEqual(found('Spotify.'), ['Spotify'], 'search ignores a trailing period on an exact name')
++assertDeepEqual(found('Open Spotify.'), ['Spotify'], 'search ignores a leading "open"')
++assertDeepEqual(found('Open Chrome, please.'), ['Google Chrome'], 'search ignores "please" and an interior comma')
++assertDeepEqual(found('Open the browser.'), ['Chromium', 'Google Chrome'], 'search ignores "open" and "the" and still reaches GenericName')
++assertDeepEqual(found('Music.'), ['Spotify'], 'search reaches a keyword through a dictated period')
++assertDeepEqual(found('Terminal.'), ['Alacritty', 'Ghostty'], 'search reaches every terminal through a dictated period')
++assertDeepEqual(found('gogle chrome'), ['Google Chrome'], 'search tolerates a mishearing as a subsequence of the name')
++
++// The stock matcher took the leaf of a dotted id, which for an app row is the
++// desktop-file stem: org.telegram.desktop searched as the literal word
++// "desktop", and org.gnome.Nautilus lost its vendor prefix entirely.
++assertDeepEqual(found('desktop'), ['Telegram Desktop'], 'an app id ending in .desktop is not searchable as the bare word "desktop"')
++assertDeepEqual(found('org.telegram.desktop'), ['Telegram Desktop'], 'an app is searchable by its whole desktop-file stem')
++assertDeepEqual(found('nautilus'), ['Files'], 'an app is searchable by a stem its label never mentions')
++assertDeepEqual(found('google-chrome'), ['Google Chrome'], 'an app is searchable by its hyphenated stem')
++
++// The stock matcher folded `._-` for ids and aliases but never for the label,
++// so a name whose punctuation is load-bearing only matched spelled its way.
++assertDeepEqual(found('nodejs'), ['Node.js'], 'a label folds its punctuation for matching')
++assertDeepEqual(found('node.js'), ['Node.js'], 'a label still matches spelled with its punctuation')
++assertDeepEqual(found('node js'), ['Node.js'], 'a label still matches spelled with a space')
++assertDeepEqual(found('xournal'), ['Xournal++'], 'a label matches without its trailing punctuation')
++
++// Regressions: what a keyboard user types must land exactly where it did.
++assertDeepEqual(found('chrome'), ['Google Chrome'], 'a plain app name still matches only that app')
++assertDeepEqual(found('btop++'), ['btop++'], 'punctuation inside a label survives in the corpus')
++assertDeepEqual(found('btop'), ['btop++'], 'a label is still found without its punctuation')
++assertDeepEqual(found('browser'), ['Chromium', 'Google Chrome'], 'GenericName matching is unchanged')
++assertDeepEqual(found('Web Browser'), ['Chromium', 'Google Chrome'], 'a multi-word GenericName is unchanged')
++
++// A query that normalizes away to nothing is someone typing a stray character,
++// not someone dictating a name. It must keep filtering rather than list every
++// row, which is what an empty term list would do.
++assertDeepEqual(found('.'), [], 'a lone period matches nothing rather than everything')
++assertEqual(found('the').length, 0, 'a lone filler word does not become an empty query that matches everything')
++
++// Ranking: a subsequence is the weakest thing the matcher accepts, so it never
++// climbs over a name that matched literally.
++const ranked = [appRow('Ghostty', 'com.mitchellh.ghostty', 'Terminal Emulator', []), appRow('Go', 'go', 'Programming', [])]
++assert(
++  menu.searchScore({}, ranked[0], 'ghostty') < menu.searchScore({}, ranked[1], 'ghostty'),
++  'an exact name outranks a row that only matches as a subsequence'
++)
++
++// Drilldown search over the real menu is untouched: same rows, same order.
++const defaultItems = menu.parseMenuJsonc(defaultMenuJsonc)
++const defaultMenu = menu.mergeMenuSources(defaultItems, [])
++function menuHits(query) {
++  return defaultMenu.itemOrder
++    .map(id => defaultMenu.items[id])
++    .filter(entry => entry && menu.matchesQuery(entry, query, true))
++    .sort((a, b) => menu.searchScore(defaultMenu.items, a, query) - menu.searchScore(defaultMenu.items, b, query))
++    .map(entry => entry.id)
++}
++assertDeepEqual(
++  menuHits('theme'),
++  ['style.theme', 'install.style.theme', 'remove.theme', 'update.themes'],
++  'menu drilldown search reaches the same theme rows in the same order'
++)
++assertDeepEqual(menuHits('style'), ['install.style', 'style'], 'menu drilldown search reaches the same style rows in the same order')
++
++// The normalizer lives on the matching side only. filterText is what the
++// search field shows and what dmenu hands back as the answer, so a dictated
++// period has to survive in it even though the matcher ignores it.
++assert(
++  menuQml.includes('root.setFilter(root.filterText + event.text)'),
++  'typed and dictated characters still land in filterText verbatim'
++)
++assert(
++  menuQml.includes('root.applyDmenuSelection(root.filterText)'),
++  'dmenu still returns filterText verbatim rather than a normalized query'
++)
++
++// The terms themselves, so a failure points at the normalizer rather than at a
++// fixture.
++assertDeepEqual(menu.searchTerms('Open Chrome, please.'), ['chrome'], 'normalizer drops filler words and sentence punctuation')
++assertDeepEqual(menu.searchTerms('Node.js'), ['node', 'js'], 'normalizer folds interior punctuation to term boundaries')
++assertDeepEqual(menu.searchTerms('open'), ['open'], 'normalizer keeps a filler word that is the whole query')
++assertDeepEqual(menu.searchTerms('.'), ['.'], 'normalizer keeps a query that is nothing but punctuation')
++assertDeepEqual(menu.searchTerms(''), [], 'normalizer leaves an empty query empty')
++assert(menu.subsequenceMatch('gogle', 'google chrome'), 'subsequence matching finds a dropped letter')
++assert(!menu.subsequenceMatch('gc', 'google chrome'), 'subsequence matching ignores terms under three characters')
++assert(!menu.subsequenceMatch('theme', 'virtual machine manager'), 'subsequence matching is anchored to a word start')
++JS
+-- 
+2.55.0
+
