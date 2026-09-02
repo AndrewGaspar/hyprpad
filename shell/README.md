@@ -337,6 +337,88 @@ binding execs, and `hyprpad-cheatsheet` forwards it in the summon payload.
 Going through the script rather than spelling the IPC here is what keeps the
 widget correct if that spelling ever moves.
 
+## Bar mode: the focus ring
+
+The widget also hosts an accent **focus ring over the bar's own icons**, so the
+D-pad can walk the bar and A can press what it lands on
+(`docs/research/bar-navigation.md`, variant a′). It is a prototype for a patch
+to Omarchy's `Bar.qml`, and it exists here first because nothing about it needs
+upstream's permission: the bar injects itself into every widget as `bar`, and
+`bar` is the bar's *root*, so `clickTargets`, `moduleTargetClickable`,
+`activePopout` and `focusedScreenName()` are all callable from a widget.
+
+Three of the bar's own facts do the work:
+
+| what | why it matters |
+| --- | --- |
+| `bar.clickTargets` | every `WidgetButton` registers itself there, so the ring's stops *are* the things a mouse can click — workspace numbers and active indicators included — with the bar's visibility rules already applied |
+| `target.triggerPress(button)` | "activate" is the same call a click makes, so it cannot drift from what clicking does; a right-click activate reaches the actions with no IPC verb at all (mute-all, the clock's format cycle) |
+| `bar.activePopout` | the ring yields the keyboard while a panel is open and takes it back when the panel closes |
+
+### How the controller reaches it without a single new binding
+
+Entering bar mode maps a 1×1, click-through, keyboard-focused layer surface whose
+namespace is **`omarchy-bar-nav`**. Nothing is drawn on it. Both of its jobs are
+invisible: it holds the keyboard, and its namespace shows up in `hyprctl layers`
+— which is the only channel hyprpad needs, because modes are keyed on
+`openlayer`/`closelayer` (`src/mode.rs`), exactly as the cheat sheet is.
+
+`config/hyprpad.lua` lists that namespace in the `omarchy-ui` allowlist. From
+the moment the ring appears, then, the pad is *already* sending the right keys:
+
+    D-pad → arrows      A → Enter      B → XF86Back
+
+and the surface has the keyboard, so the widget's own key handler moves and
+activates the ring. **One chord to enter is the entire cost on the controller
+map**; there is no per-press IPC from the daemon, which there could not be
+anyway — a bare button can only carry a key, never an `exec`.
+
+    desktop --guide+dpad_up--> ring --A--> panel --A--> action
+       ^                        |  ^                |
+       +---------- B -----------+  +------- B ------+
+
+Escape and Back leave. So does the arrow that steps *off* the bar — Down on a
+top bar, Up on a bottom one, the inward arrow on a vertical one — which is why
+the axis the ring walks and the key that leaves can never collide. Tab and
+Shift-Tab step the ring too, so the bumpers (`h.key "tab"` in `omarchy-ui`) mean
+the same thing at the ring level as they already do inside a panel.
+
+### The verbs
+
+On the widget's existing `IpcHandler`, so a keyboard user or a script can drive
+the same ring:
+
+| call | what it does |
+| --- | --- |
+| `omarchy-shell -q hyprpad.status navEnter` | raise the ring (this is what `guide+dpad_up` runs) |
+| `omarchy-shell -q hyprpad.status navLeave` | drop it |
+| `omarchy-shell -q hyprpad.status navToggle` | either, whichever applies |
+| `omarchy-shell -q hyprpad.status navNext` / `navPrev` | step along the bar |
+| `omarchy-shell -q hyprpad.status navActivate` | left-click the focused widget |
+| `omarchy-shell -q hyprpad.status navSecondary` | right-click it |
+| `omarchy-shell -q hyprpad.status navIsActive` | whether the ring is up |
+
+Every verb is broadcast to all live copies of the widget, because one bar
+surface exists per monitor while an IPC target routes to a single handler. Each
+copy then decides whether *it* is the one on the focused output; only that one
+maps the nav surface.
+
+### Two details worth keeping
+
+**The ring is created as a child of the target**, not reparented onto it. It
+then tracks the widget's geometry with a plain anchor, paints inside that
+widget's own slot (so no z-order fight with the slots either side), and — the
+reason for creating rather than reparenting — dies with the target if that
+widget goes away underneath it. A workspace button vanishing when its workspace
+closes is a real case; the ring is simply rebuilt on the next step.
+
+**The focus prime is copied, not invented**: `Exclusive` at map time, then
+`OnDemand` 75 ms later, exactly as `Ui/KeyboardPanel.qml` does it. Hyprland
+grants an `OnDemand` surface focus when it first maps but not when an
+already-mapped one asks for it back, and `Exclusive` routes every pointer event
+compositor-wide to the surface for as long as it lasts (omacom/omarchy#9029) —
+so the prime has to be brief, and its timing is not a number to guess at.
+
 ## Theme
 
 `bar.barForeground` and `bar.fontFamily` rather than the `Color`/`Style`
@@ -356,5 +438,5 @@ a glyph and a word, which no stock button shape covers.
 | file | what it is |
 | --- | --- |
 | `manifest.json` | the Omarchy plugin manifest (schemaVersion 1, kind `bar-widget`) |
-| `Widget.qml` | the whole widget: two `FileView`s, two timers, one button |
+| `Widget.qml` | the whole widget: two `FileView`s, three timers, one button, and the bar-mode focus ring |
 | `art/` | Kenney's CC0 controller glyph, and `LICENSES.md` for its provenance |
