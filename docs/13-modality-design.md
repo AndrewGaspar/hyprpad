@@ -83,6 +83,20 @@ predicates ask (`src/lua_config.rs:360-450`).
 Above all of it sits the manual override: `h.set_mode` / `h.clear_mode` beat the
 rules until cleared ([§8](#8-owner-decisions-2026-09-01) #4).
 
+### A transient mode has no rule
+
+`h.mode("hints"):transient { … }` is a mode you can only *enter* — the one way in
+is `h.set_mode`, from a chord or a bare button — because it then gives itself
+back on its own (§3). It **may not carry a `:when`**: the loader refuses the two
+together by name (`src/lua_config.rs:614-627`) and the rule scan skips a
+transient mode even if one somehow reached it (`src/mode.rs:749-759`). Both
+guard the same thing — falling *into* such a mode would arm a press budget and a
+timer nobody asked for, and then clear the mode out from under the very window
+that selected it — and the load error exists so a `:when` cannot sit in the file
+looking live. Every field of the contract is optional, and "off" is the empty
+value rather than omission (`max_presses = 0`, `timeout_ms = 0`, `exit_on = {}`),
+so `:transient {}` alone is the browser-hints shape.
+
 ---
 
 ## 3. What counts as a context change
@@ -101,6 +115,7 @@ per-frame handlers only read them (`src/mode.rs:25-32`).
 | the process tree moved | the periodic `process_rescan_ms` sweep (default 500 ms) | `rescan_processes` |
 | a manual override | `h.set_mode` / `h.clear_mode` | `set_mode` / `clear_mode` |
 | a config reload | `hyprpad reload` | `reconfigure` |
+| a transient mode gave itself back | its own contract: the press cap, a named exit button, a focus change, a rename, a click, or the timer | `settle_presses` / `note_press` / `note_click` / `check_deadline` |
 
 Four properties of that table are load-bearing:
 
@@ -127,6 +142,29 @@ Four properties of that table are load-bearing:
   terminal changes only what the window is *called*, so `rescan_on_title_change`
   (default `true`) reads the rename as "the tree probably moved" and drops the
   `/proc` cache.
+
+### Transient modes: the fourth kind of transition
+
+The rows above are three kinds: the world changed (the first six), the user
+overrode it (`set_mode`), or the file did (`reconfigure`). A transient mode is
+the fourth — a manual override that carries its own **removal contract**, so
+what ends it is neither a compositor event nor a `clear_mode` but the mode's own
+bookkeeping. Six ways out, and every one of them lands in the same `refresh` and
+the same "did the mode move?" answer, so the daemon runs the same handoff it
+runs for a focus change. A new way of *leaving* a mode is never a new way of
+*making* a transition.
+
+Two of them need care about **when**, which is why the press cap and the exit
+button are separate calls:
+
+* **The consumed press** — the one place the engine eats an input rather than
+  routing it. A press of a named exit button *is* the exit, so `note_press`
+  answers `consumed: true` and the bare-button layer must not also deliver it:
+  `b` cancels the hints instead of typing a hint letter.
+* **The press cap** is the opposite. The press that spends the last of the
+  budget is the keystroke that picked the link, so it is delivered first and
+  `settle_presses` clears the mode afterwards — clearing on the spot would run
+  the handoff, close the bare-button layer, and swallow it.
 
 ---
 
@@ -181,6 +219,18 @@ both were left unguarded, which the loader warns about by name. A `ButtonAction`
 is either `Hold` (a key/mouse pressed and released with the button) or `Fire`
 (run once on the press edge — `h.exec`, `h.keyboard`, `h.set_mode`,
 `h.clear_mode`).
+
+`h.seq { h.key "f", h.set_mode "hints" }` is the one action that is a *list* of
+actions, run in order on a single press — the two-step binding the hints need:
+type into the page, *then* move the daemon into the mode whose buttons are that
+page's hint letters. Each step takes the same `perform_action` path it would
+alone, with one deliberate difference: an `h.key` **inside** a sequence is a
+**tap**, pressed and released on the spot. A held key needs a release edge to
+pair with and a sequence has none — by the time the button lifts the sequence is
+long over, and the daemon may not be in the mode that resolved it any more. A
+`set_mode` step applies where it stands, so later steps run in the new mode.
+Sequences never nest: the loader refuses one inside another rather than
+flattening it, so the cheat sheet's label for a `seq` is always one flat list.
 
 ### The ambient handlers
 

@@ -71,9 +71,15 @@ impl Arbiter {
     /// Suppressed when a game is focused and not overridden. Guide *chords* may
     /// still be honored by the caller even when this is true — this governs the
     /// ambient desktop gestures (bare stick flicks, non-guide bindings); the
-    /// guide-held layer is the caller's policy. Kept conservative: a fullscreen
-    /// game always suppresses; a windowed game also suppresses (the user is
-    /// still playing) unless overridden.
+    /// guide-held layer is the caller's policy.
+    ///
+    /// Fullscreen does not enter into it: the window class alone decides, so a
+    /// windowed game suppresses exactly as a fullscreen one does — the user is
+    /// still playing either way. [`fullscreen_game`](Self::fullscreen_game)
+    /// reports that state for a caller that wants a stronger signal, and
+    /// nothing in the daemon asks. Declared modes keep the same rule (docs/13):
+    /// `ctx.focus.fullscreen` is there for a rule that names it, and nothing
+    /// ships using it.
     pub fn suppressed(&self) -> bool {
         if self.force_desktop {
             return false;

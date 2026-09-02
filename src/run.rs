@@ -105,11 +105,18 @@
 //! edge and does nothing until it is released and pressed again. The frame a
 //! transition lands on is suppressed outright: [`ButtonKeys::reconcile`] and
 //! [`OskRoute::step`] both remember whether they were live last frame, and
-//! [`ButtonKeys::release_all`] (every mode handoff, reload and disconnect)
+//! [`ButtonKeys::release_all`] (every mode handoff and the disconnect path)
 //! resets that memory. That covers a gate that opens and a press that lands
 //! in the same report, and a handoff that runs between two reports. The price
 //! is that a key held straight through a guide tap does not resume on its
 //! own — it wants a fresh press.
+//!
+//! A config reload is deliberately **not** one of those. [`apply_reload`]
+//! re-resolves the mode against the unchanged context and rebuilds the pad
+//! dampers, but releases nothing wholesale and runs no handoff. The next
+//! frame's [`ButtonKeys::reconcile`] settles the held set against the new map
+//! instead, so a binding the reload left alone stays held — a reload mid-drag
+//! keeps the drag — and only one that changed or vanished is let go.
 
 use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, GamepadKind, HapticsConfig,
@@ -1123,13 +1130,21 @@ fn release_outputs(cursor: &mut CursorState, scroll: &mut ScrollState, osk_route
 }
 
 /// The clean handoff a mode transition runs, wherever the transition came from
-/// — a focus change, a rename of the focused window, the periodic process
-/// rescan, a manual override from a binding, or a reload.
+/// — a compositor event (a focus change, a rename of the focused window, a
+/// fullscreen change, an overlay, the session locking), the periodic process
+/// rescan, a manual override from a binding, or a transient mode giving itself
+/// back (its press budget running out, a click, or its timer).
 ///
 /// Whatever the outgoing mode was holding — a held key or mouse button, the
 /// virtual pad's last stick values, a mid-flight gesture — is let go before the
 /// incoming mode's gates apply. One function, so a new way of *noticing* a
 /// transition can never come with a subtly different way of *making* one.
+///
+/// A config reload is the one re-resolve that does **not** come through here:
+/// [`apply_reload`] swaps the config in and asks `ModeEngine::reconfigure` for
+/// a fresh answer, and the next frame's [`ButtonKeys::reconcile`] releases only
+/// the bindings that actually changed or vanished. Releasing everything would
+/// drop a held key that the new file still binds exactly as the old one did.
 #[allow(clippy::too_many_arguments)]
 fn mode_handoff(
     cursor: &mut CursorState,
