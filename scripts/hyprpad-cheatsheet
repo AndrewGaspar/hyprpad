@@ -33,6 +33,24 @@ ipc() {
   omarchy-shell shell "$@"
 }
 
+# Which controller drawing to open on, from the daemon's status file.
+#
+# The daemon is the only thing that knows which of a puck and a gamepad is
+# actually in your hands, and it publishes the answer as one string. Reading it
+# here rather than in QML is what keeps `Panel.qml` free of any controller name:
+# it already accepts `layout` in the summon payload, so the plugin needs no
+# change at all to grow a second controller.
+#
+# Absent, unreadable, or from a daemon too old to publish it: send nothing and
+# let the widget keep its own default. Scrubbed like the mode below.
+layout() {
+  local file="${XDG_RUNTIME_DIR:-}/hyprpad/status.json"
+  [[ -n ${XDG_RUNTIME_DIR:-} && -r $file ]] || return 0
+  local id
+  id=$(sed -n 's/.*"layout": "\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n1)
+  printf '%s' "${id//[^A-Za-z0-9_.:-]/}"
+}
+
 # The summon payload. The daemon exports HYPRPAD_MODE on the child it execs —
 # the mode the chord fired in — and the sheet opens on that context's tab.
 # It has to come down this way: summoning the sheet is itself a mode change
@@ -44,11 +62,13 @@ ipc() {
 payload() {
   local mode="${HYPRPAD_MODE:-}"
   mode="${mode//[^A-Za-z0-9_.:-]/}"
-  if [[ -n $mode ]]; then
-    printf '{"mode":"%s"}' "$mode"
-  else
-    printf '{}'
-  fi
+  local layout
+  layout=$(layout)
+  local -a fields=()
+  [[ -n $mode ]]   && fields+=("\"mode\":\"$mode\"")
+  [[ -n $layout ]] && fields+=("\"layout\":\"$layout\"")
+  local IFS=,
+  printf '{%s}' "${fields[*]-}"
 }
 
 cmd_install() {

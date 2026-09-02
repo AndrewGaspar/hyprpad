@@ -657,7 +657,7 @@ impl Node {
     /// is concerned — two asymmetric sticks, a face diamond, four paddles — so
     /// a generic gamepad borrows the Elite's drawing rather than getting none.
     pub fn layout(&self) -> &'static str {
-        LAYOUT_XBOX_ELITE_2
+        report::LAYOUT_XBOX_ELITE_2
     }
 
     /// Which paddle code set this node advertises, for the adoption log line.
@@ -697,12 +697,6 @@ impl Paddles {
         }
     }
 }
-
-/// The cheat-sheet layout id for any pad this backend adopts.
-pub const LAYOUT_XBOX_ELITE_2: &str = "xbox-elite-2";
-
-/// The cheat-sheet layout id for the puck.
-pub const LAYOUT_PUCK: &str = "steam-controller-2026";
 
 /// Whether a sysfs device path belongs to a **virtual** (uinput) device.
 ///

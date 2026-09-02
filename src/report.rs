@@ -101,7 +101,44 @@ pub enum Source {
     Evdev,
 }
 
+/// The cheat sheet's layout id for the puck —
+/// `shell/hyprpad.cheatsheet/layouts/steam-controller-2026.json`.
+pub const LAYOUT_PUCK: &str = "steam-controller-2026";
+
+/// The cheat sheet's layout id for a gamepad read over evdev. Every pad the
+/// second backend adopts draws as an Xbox-shaped one: two asymmetric sticks, a
+/// face diamond, four paddles.
+pub const LAYOUT_XBOX_ELITE_2: &str = "xbox-elite-2";
+
 impl Source {
+    /// Which cheat-sheet layout this source draws as.
+    ///
+    /// One string is the whole of "which controller is the reader holding":
+    /// the widget names no controller anywhere, it just loads
+    /// `layouts/<id>.json`.
+    pub const fn layout(self) -> &'static str {
+        match self {
+            Source::Puck => LAYOUT_PUCK,
+            Source::Evdev => LAYOUT_XBOX_ELITE_2,
+        }
+    }
+
+    /// The inverse of [`layout`](Self::layout): what a published layout id says
+    /// about the controller.
+    ///
+    /// Used by `hyprpad bindings`, which has no device and no daemon state —
+    /// only the layout id the daemon published — but still needs to know
+    /// whether the reader has trackpads, because the ambient cursor and scroll
+    /// rows say different things if they do not. An unknown id is read as the
+    /// puck, the safe default for a config written against it.
+    pub fn from_layout(id: &str) -> Source {
+        if id == LAYOUT_XBOX_ELITE_2 {
+            Source::Evdev
+        } else {
+            Source::Puck
+        }
+    }
+
     /// Whether this device has trackpads. `false` means every pad consumer —
     /// [`crate::run::drive_cursor`]'s touch gate, the OSK's pad router, the
     /// scroll and scrub handlers — sees a permanently untouched pad and idles

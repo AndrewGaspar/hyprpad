@@ -76,6 +76,30 @@ invisible to the rest of the widget.
 It also draws the shoulder ridges and trigger hints that Valve's pure front
 view omits, which gives the L1/R1/L2/R2 callouts something real to point at.
 
+## Bundled — `xbox-elite-2.svg` (the second controller)
+
+hyprpad's own schematic of the Xbox Elite Wireless Controller Series 2, drawn
+from scratch for this repo like the puck's and covered by the repo's licence.
+It is authored in the same `456 x 320` viewBox, so both layouts scale
+identically in the panel.
+
+There is **no** referenced-from-Steam counterpart for this one, and the reason
+is worth writing down: Steam does ship an Elite diagram, at
+
+    $STEAM_ROOT/steamui/images/controller/controller_config_controller_xboxelite.png
+
+but it is a **raster**. The widget themes a drawing by recolouring SVG strokes
+(`Callouts.recolor()`), so a PNG could not follow the theme. The `art` list for
+this layout therefore has one entry, not two.
+
+**No new glyphs were needed**, which was a pleasant surprise and is worth
+recording so the next controller's author checks before drawing anything:
+Kenney's vendored Steam set is already right for an Xbox pad. `steam_lb.svg`
+and `steam_lt.svg` literally draw the strings "LB" and "LT" — Xbox's own
+naming; the A/B/X/Y chips are lettered circles and the Elite's face diamond
+carries the same four letters in the same four positions; and the d-pad, stick
+and grip chips have no platform in them at all.
+
 ## Adding another controller
 
 Drop a `layouts/<id>.json` in beside the existing one:

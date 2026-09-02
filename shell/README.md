@@ -164,6 +164,18 @@ summon:
 
     omarchy-shell shell toggle hyprpad.cheatsheet '{"layout":"steam-deck"}'
 
+`layouts/xbox-elite-2.json` is the second one, and it cost **no QML at all**.
+The daemon publishes which controller is actually in your hands as
+`"layout"` in `status.json` — it is the only process that knows — and
+`scripts/hyprpad-cheatsheet` reads that one string into the summon payload
+above. `hyprpad bindings --json` carries the same id, and on a pad with no
+trackpads it also re-aims the two rows that name one: the ambient cursor and
+scroll rows point at the right and left **sticks**, with the stick's own top
+speed rather than the pad's `sens`, and the caret scrub — a thumb circling an
+absolute surface — is dropped, because nothing on that controller does it.
+Everything that is a *binding* is identical on both, which is the whole point
+of one vocabulary.
+
 Glyphs come from Kenney's CC0 "Input Prompts", which covers every mainstream
 pad with one naming convention. The *diagram* is the part that varies: see
 `art/LICENSES.md` for why Kenney's own `controller_*.svg` files cannot serve as

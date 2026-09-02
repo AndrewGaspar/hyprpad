@@ -459,7 +459,7 @@ pub fn run() -> std::io::Result<()> {
     // The rate integrators the sticks drive on a controller with no trackpads,
     // and the owner of this loop's fourth receive deadline ([`crate::sticks`]).
     let mut sticks = crate::sticks::StickDrive::new();
-    status.set_layout(crate::evdev::LAYOUT_PUCK);
+    status.set_layout(report::LAYOUT_PUCK);
     status.set_sources(source_names(true, evdev_pad));
 
     // Supervisor loop. Two states: *connected*, where it blocks on `rx`; and
@@ -827,7 +827,7 @@ pub fn run() -> std::io::Result<()> {
                 // `waiting`'s business.
                 if active_source == report::Source::Evdev {
                     active_source = report::Source::Puck;
-                    status.set_layout(crate::evdev::LAYOUT_PUCK);
+                    status.set_layout(report::LAYOUT_PUCK);
                     sticks.release();
                     reset_frame_state(
                         &mut engine,
@@ -857,7 +857,7 @@ pub fn run() -> std::io::Result<()> {
                     active_source = frame.source;
                     status.set_layout(match (frame.source, evdev_pad) {
                         (report::Source::Evdev, Some((_, layout))) => layout,
-                        _ => crate::evdev::LAYOUT_PUCK,
+                        _ => report::LAYOUT_PUCK,
                     });
                     sticks.release();
                     // The outgoing source's edge state is meaningless to the
