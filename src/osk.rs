@@ -164,6 +164,48 @@ fn key_cmd(chord: &KeyChord) -> String {
     line
 }
 
+/// Format a `candidate accept` / `candidate next` line — the prediction strip's
+/// two verbs (`docs/research/osk-prediction.md` §7.2: R1 accepts the highlighted
+/// suggestion, L1 moves the highlight along).
+fn candidate_cmd(accept: bool) -> String {
+    format!("candidate {}", if accept { "accept" } else { "next" })
+}
+
+/// Format a `learn on` / `learn off` line: the keyboard's personal word cache
+/// gate. The daemon turns it off for windows on [`LEARN_DENY`] (§5.3 rule 2).
+fn learn_cmd(on: bool) -> String {
+    format!("learn {}", if on { "on" } else { "off" })
+}
+
+/// Window classes the keyboard must never learn typed words from, before a
+/// config says otherwise: password managers, the polkit agents, and — following
+/// ibus-typing-booster's precedent — terminals, where a typed secret is a
+/// routine occurrence (`docs/research/osk-prediction.md` §5.3 rule 2).
+///
+/// Matched case-insensitively against the focused window's class, as a
+/// substring, so `1password` catches `1Password` and `com.1password.desktop`
+/// alike.
+pub const LEARN_DENY: &[&str] = &[
+    "1password",
+    "keepassxc",
+    "bitwarden",
+    "polkit",
+    "org.kde.polkit-kde-authentication-agent-1",
+    "gnome-keyring",
+    "hyprlock",
+    "foot",
+    "kitty",
+    "alacritty",
+    "ghostty",
+];
+
+/// Whether the personal word cache must be switched off for a focused window of
+/// this class, given a deny list.
+pub fn learn_denied(class: &str, deny: &[String]) -> bool {
+    let class = class.to_ascii_lowercase();
+    deny.iter().any(|d| !d.is_empty() && class.contains(&d.to_ascii_lowercase()))
+}
+
 /// A live handle to the on-screen keyboard child process.
 ///
 /// Construct once, up front — nothing is spawned until the first
@@ -186,6 +228,11 @@ pub struct OskHandle {
     /// want them, and the child's stdout is simply inherited as before. Cloned
     /// (not taken) on spawn, so a respawn after a broken pipe keeps reporting.
     events: Option<mpsc::Sender<OskEvent>>,
+    /// What the last `learn on|off` told the keyboard. Tracked so a focus
+    /// change that does not cross the deny list sends nothing, and — more
+    /// importantly — so a keyboard *raised inside* a denied window starts
+    /// gated, with no focus change to trigger it. `None` until a focus is seen.
+    learn: Option<bool>,
 }
 
 impl OskHandle {
@@ -205,6 +252,7 @@ impl OskHandle {
             active: false,
             spawn_failed: false,
             events: Some(events),
+            learn: None,
         }
     }
 
@@ -223,6 +271,13 @@ impl OskHandle {
         }
         if self.send(&show_cmd(mode, reflow)) {
             self.active = true;
+            // A `show` resets the keyboard's typed context by itself, but the
+            // learning gate is ours: re-state it, so a keyboard raised inside a
+            // password manager starts gated without waiting for a focus change
+            // that may never come.
+            if let Some(on) = self.learn {
+                self.send(&learn_cmd(on));
+            }
         }
     }
 
@@ -273,6 +328,48 @@ impl OskHandle {
             return;
         }
         self.send(&key_cmd(chord));
+    }
+
+    /// Accept the keyboard's highlighted suggestion — the `osk accept` binding,
+    /// R1 by default. Ignored unless the keyboard is shown.
+    pub fn candidate_accept(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.send(&candidate_cmd(true));
+    }
+
+    /// Move the suggestion strip's highlight along — the `osk next` binding, L1
+    /// by default. Ignored unless the keyboard is shown.
+    pub fn candidate_next(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.send(&candidate_cmd(false));
+    }
+
+    /// The focused window changed. Two things follow from that, and this is the
+    /// one call the frame loop makes for both
+    /// (`docs/research/osk-prediction.md` §5.3 rule 2 / §8.1):
+    ///
+    /// * whatever the keyboard had typed belongs to the *previous* field, so its
+    ///   prediction context is reset;
+    /// * `class` decides whether the personal word cache may learn here at all.
+    ///
+    /// The learning gate is remembered even while the keyboard is down, so the
+    /// next `show` starts correctly gated. Everything else is a no-op unless the
+    /// keyboard is up.
+    pub fn focus_changed(&mut self, class: &str, deny: &[String]) {
+        let allow = !learn_denied(class, deny);
+        let changed = self.learn != Some(allow);
+        self.learn = Some(allow);
+        if !self.active {
+            return;
+        }
+        self.send("context reset");
+        if changed {
+            self.send(&learn_cmd(allow));
+        }
     }
 
     /// Ensure a child is running; returns whether we have a usable control
@@ -495,6 +592,67 @@ mod tests {
         assert_eq!(key_cmd(&ctrl_bs), "key 14 29");
         let ctrl_shift_tab = KeyChord::parse("ctrl+shift+tab").expect("parse");
         assert_eq!(key_cmd(&ctrl_shift_tab), "key 15 29 42");
+    }
+
+    #[test]
+    fn prediction_cmds_match_the_osk_grammar() {
+        assert_eq!(candidate_cmd(true), "candidate accept");
+        assert_eq!(candidate_cmd(false), "candidate next");
+        assert_eq!(learn_cmd(true), "learn on");
+        assert_eq!(learn_cmd(false), "learn off");
+    }
+
+    #[test]
+    fn the_learn_deny_list_matches_a_window_class_case_insensitively() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        // The shipped list: password managers, polkit, the lock screen, terminals.
+        for class in [
+            "1Password",
+            "com.1password.desktop",
+            "KeePassXC",
+            "Bitwarden",
+            "org.kde.polkit-kde-authentication-agent-1",
+            "polkit-gnome-authentication-agent-1",
+            "hyprlock",
+            "foot",
+            "kitty",
+            "Alacritty",
+            "com.mitchellh.ghostty",
+        ] {
+            assert!(learn_denied(class, &deny), "{class} must gate learning off");
+        }
+        // Ordinary windows are not gated.
+        for class in ["firefox", "steam", "org.gnome.Nautilus", "", "code-oss"] {
+            assert!(!learn_denied(class, &deny), "{class} should be allowed to learn");
+        }
+        // An empty deny list turns the window gate off entirely, and an empty
+        // entry never matches everything by accident.
+        assert!(!learn_denied("1Password", &[]));
+        assert!(!learn_denied("1Password", &[String::new()]));
+        // A config's own list replaces the default.
+        assert!(learn_denied("Obsidian", &["obsidian".to_string()]));
+        assert!(!learn_denied("1Password", &["obsidian".to_string()]));
+    }
+
+    #[test]
+    fn a_focus_change_gates_learning_even_before_the_keyboard_is_up() {
+        // The gate is remembered while the keyboard is down, so a keyboard
+        // raised *inside* a password manager starts gated — there is no focus
+        // change after the raise to do it.
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = OskHandle::new();
+        assert_eq!(osk.learn, None);
+        osk.focus_changed("firefox", &deny);
+        assert_eq!(osk.learn, Some(true));
+        osk.focus_changed("1Password", &deny);
+        assert_eq!(osk.learn, Some(false));
+        osk.focus_changed("com.1password.desktop", &deny);
+        assert_eq!(osk.learn, Some(false), "still denied, and nothing was re-sent");
+        osk.focus_changed("firefox", &deny);
+        assert_eq!(osk.learn, Some(true));
+        // Nothing was spawned to do any of it.
+        assert!(osk.child.is_none() && osk.stdin.is_none());
+        assert!(!osk.is_active());
     }
 
     #[test]
