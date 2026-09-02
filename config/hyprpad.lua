@@ -118,6 +118,7 @@ h.cursor {
   one_euro_d_cutoff = 1.0,
   hysteresis = 0.0008,
   only_in = { "desktop", "omarchy-ui", "browser" },
+  guide_in = { "game" }, -- except while the guide is held: then it is a mouse in a game too
 }
 
 h.scroll {
@@ -187,6 +188,12 @@ h.button("r1", "Next browser tab",     h.dispatch 'hl.dsp.send_shortcut({ mods =
 h.osk_button("y", h.key "space")
 h.osk_button("x", h.key "backspace")
 
+-- The keyboard's own verbs, not just keys: `h.osk "commit|shift|dismiss"`. The
+-- entries here layer OVER the built-in Deck map, so this line only restates the
+-- default (L2 = Shift while held; R2 = Enter, the pad clicks commit, B and Menu
+-- close it) — it is here to show the form, and to give the sheet a real label.
+h.osk_button("l2", "Hold for capitals", h.osk "shift")
+
 -- ---------------------------------------------------------------------------
 -- Guide chords.
 --
@@ -209,6 +216,11 @@ h.bind("guide+menu",        "Omarchy menu",        h.exec "omarchy-menu")
 h.bind("guide+l2",          "Previous tab",        h.dispatch "hl.dsp.group.prev()")
 h.bind("guide+r2",          "Next tab",            h.dispatch "hl.dsp.group.next()")
 h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" })
+
+-- The one guarded chord here, and the other half of `guide_in` above: with the
+-- guide held the right pad is a mouse in `game`, so the pad click has to be a
+-- click there too. Elsewhere the bare `rpad_click` binding is already one.
+h.bind("guide+rpad_click",  "Click (guide mouse)", h.mouse "left"):only_in("game")
 
 -- `guide+x` and the stick's down flick above are HypXRland workspace
 -- selectors (docs/research/empty-workspace.md): `emptyn` is the first empty
