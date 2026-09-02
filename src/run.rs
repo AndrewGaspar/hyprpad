@@ -14,18 +14,29 @@
 //! why it is ordered this way. Highest first:
 //!
 //! 1. **Guide** — `guide_active()`. Every per-frame handler drops out while the
-//!    guide button is held, in a game as much as on the desktop — with one
-//!    opt-in exception: where `h.cursor { guide_in = … }` lists the active
-//!    mode, the **right pad keeps driving the desktop cursor under the guide**
-//!    ([`cursor_active`]), which is how a game is pointed at without leaving
-//!    it (Steam Input's own "guide + pad = mouse"). The guide layer is still
-//!    rank 1 there — the game gets nothing — the pad has simply been given to
-//!    the desktop's pointer instead of to nobody.
+//!    guide button is held, in a game as much as on the desktop — with two
+//!    opt-in exceptions, both of them a pad the guide layer would otherwise
+//!    leave idle being handed to the desktop rather than to nobody. The guide
+//!    layer is still rank 1 for both: the game gets nothing either way.
+//!     * where `h.cursor { guide_in = … }` lists the active mode, the **right
+//!       pad keeps driving the desktop cursor under the guide**
+//!       ([`cursor_active`]), which is how a game is pointed at without leaving
+//!       it (Steam Input's own "guide + pad = mouse");
+//!     * where `h.scrub`'s guard passes, circling the **left pad** taps the
+//!       arrow keys — the caret jog wheel ([`drive_scrub`],
+//!       `docs/research/text-scrub.md`). The two never meet: one reads the
+//!       right pad, the other the left, and neither touches the sticks that
+//!       `GuideStickFlick` needs.
+//!
+//!    Both spend the hold ([`GestureEngine::consume_hold`]) the moment they
+//!    actually do something, so the guide's release is never handed on as the
+//!    bare tap Steam acts on.
 //! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
 //! 3. **Game forwarding** — [`drive_gamepad`], when the active mode forwards
 //!    and neither layer above is claiming.
-//! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`fire_buttons`] /
-//!    [`drive_buttons`], each gated by its own guard in the active mode.
+//! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`drive_scrub`] /
+//!    [`fire_buttons`] / [`drive_buttons`], each gated by its own guard in the
+//!    active mode.
 //!
 //! Ranks 3 and 4 are mutually exclusive by construction: forwarding needs
 //! `ModeEngine::desktop_yielded()`, which is true exactly when neither the
@@ -45,6 +56,7 @@
 //! | [`handle_gesture`] | `modes.allows_gesture(..)` + `config.resolve_in(.., modes.state())` |
 //! | [`drive_cursor`] | `modes.cursor_enabled()` with the guide up, `modes.cursor_guide_enabled()` with it held ([`cursor_active`]) |
 //! | [`drive_scroll`] | `modes.scroll_enabled()` |
+//! | [`drive_scrub`] | `config.scrub_enabled_in(modes.state())` with the guide held |
 //! | [`fire_buttons`] / [`drive_buttons`] | `modes.buttons()` (already filtered by each binding's guard) |
 //! | [`drive_gamepad`] | `gamepad_forwarding(.., modes.forwards(), modes.desktop_yielded(), ..)` |
 //!
@@ -101,9 +113,9 @@
 
 use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, GamepadKind, HapticsConfig,
-    KeyChord, OskAction, RumbleMode, ScrollConfig, ScrollMode,
+    KeyChord, OskAction, RumbleMode, ScrollConfig, ScrollMode, ScrubConfig,
 };
-use crate::filter::{AngleAccumulator, PadDamper};
+use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper};
 use crate::gamepad::{self, VirtualGamepad};
 use crate::gesture::{GestureEngine, GestureEvent};
 // `Pad` is renamed: this module already talks about `report::Pad` (a pad
@@ -316,6 +328,10 @@ pub fn run() -> std::io::Result<()> {
     let mut cursor = CursorState::new(config.cursor());
     // Left-pad scroll shares the cursor's One Euro/hysteresis smoothing knobs.
     let mut scroll = ScrollState::new(config.scroll(), config.cursor());
+    // The same pad under a held guide: the caret jog wheel. Off in every
+    // config that has not written an `h.scrub` block, and it re-reads its own
+    // knobs per frame, so a reload can switch it on with no restart.
+    let mut scrub = ScrubState::new(config.scrub(), config.cursor());
 
     // Bare-button keyboard: buttons pressed without the guide modifier emit raw
     // keys (the D-pad acts as arrow keys by default). Degrades gracefully —
@@ -789,6 +805,28 @@ pub fn run() -> std::io::Result<()> {
                         );
                     }
                 }
+                // The guide layer's own use for the LEFT pad: circle it and the
+                // text caret walks, one step per detent
+                // (`docs/research/text-scrub.md` §3.1). A guide-scoped ambient
+                // handler, exactly like the guide-mouse on the right pad — it
+                // runs only while the guide is held AND `h.scrub`'s guard
+                // passes, so the pad's ambient scroll is untouched, and never
+                // while the keyboard owns both pads. Its first detent consumes
+                // the hold, so the release is not handed to Steam as a tap.
+                let scrub_active = engine.guide_active()
+                    && !osk.is_active()
+                    && config.scrub_enabled_in(modes.state());
+                drive_scrub(
+                    &mut keyboard,
+                    &mut engine,
+                    &frame,
+                    &mut scrub,
+                    config.scrub(),
+                    config.cursor(),
+                    scrub_active,
+                    &mut hx,
+                    now,
+                );
                 // Bare-button bindings that are *held* (D-pad -> arrows, pad
                 // click / triggers -> mouse clicks by default; each code goes
                 // to the device it belongs to). Gated OFF on the guide layer
@@ -893,8 +931,15 @@ enum Haptic {
     Commit,
     /// A guide chord or stick flick resolved to an action.
     Gesture,
-    /// One circular-scroll detent was emitted.
+    /// One circular-scroll detent was emitted — and one caret-scrub detent at
+    /// the character tiers, which is the same notched-wheel feel on the same
+    /// pad.
     Scroll,
+    /// A caret-scrub detent that moved a whole *word* (`ctrl`+arrow). The
+    /// heavier click is how the thumb feels the unit change under it
+    /// (`docs/research/text-scrub.md` §3.5); it rides the same `[haptics]
+    /// scroll` toggle, because it is the same wheel with a bigger notch.
+    ScrubWord,
     /// A bare-button (`[buttons]`) key went down.
     Button,
     /// The desktop cursor travelled one texture-spacing of pixels (right pad).
@@ -913,6 +958,7 @@ fn haptic_feel(cfg: &HapticsConfig, what: Haptic) -> Option<Feel> {
         Haptic::Commit => (cfg.commit, Feel::Click),
         Haptic::Gesture => (cfg.gesture, Feel::Buzz),
         Haptic::Scroll => (cfg.scroll, Feel::Tick),
+        Haptic::ScrubWord => (cfg.scroll, Feel::Click),
         Haptic::Button => (cfg.buttons, Feel::Tick),
         Haptic::CursorMove => (cfg.cursor, Feel::Texture),
     };
@@ -1318,6 +1364,258 @@ fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: boo
     let base = -f64::from(ticks) * per_tick;
     let dy = if natural { -base } else { base };
     (0.0, dy)
+}
+
+// ---------------------------------------------------------------------------
+// The caret scrub: the guide layer's jog wheel on the LEFT pad
+// ---------------------------------------------------------------------------
+
+/// `KEY_LEFTCTRL`, `KEY_LEFTSHIFT`, `KEY_LEFT`, `KEY_RIGHT` — the four codes
+/// the scrub can emit. Spelled as constants rather than parsed per detent; a
+/// test pins each against [`KeyChord::parse`]'s own name table, so the two can
+/// never drift.
+const KEY_LEFTCTRL: u16 = 29;
+/// See [`KEY_LEFTCTRL`].
+const KEY_LEFTSHIFT: u16 = 42;
+/// See [`KEY_LEFTCTRL`].
+const KEY_LEFT: u16 = 105;
+/// See [`KEY_LEFTCTRL`].
+const KEY_RIGHT: u16 = 106;
+
+/// Cross-frame state for the caret scrub — the left pad's jog wheel under a
+/// held guide ([`drive_scrub`]).
+///
+/// The shape is [`ScrollState`]'s, because the wheel is the same wheel: the
+/// same [`PadDamper`] smoothing off the same `[cursor]` knobs, the same
+/// [`AngleAccumulator`] detent engine. What differs is the emitter (arrow taps
+/// on the virtual keyboard, not scroll units on the pointer) and the
+/// [`JogPacer`] between them, which turns the spin's *speed* into the size of
+/// each step.
+///
+/// It holds the live [`ScrubConfig`] and [`CursorConfig`] it was built from and
+/// rebuilds itself when either changes ([`sync`](Self::sync)), so `hyprpad
+/// reload` retunes — or switches on — the wheel with nothing to wire in the
+/// reload path.
+struct ScrubState {
+    cfg: ScrubConfig,
+    /// The cursor knobs the damper was built from, so a reload that retunes
+    /// smoothing rebuilds this damper too.
+    cursor: CursorConfig,
+    /// Left-pad smoothing — the same One Euro + hysteresis pipeline the cursor
+    /// and the scroll use, so a held-still thumb is hard-zeroed and can never
+    /// tick.
+    damper: PadDamper,
+    /// Angle → detent accumulator: one tick per `detent_deg` of rotation, with
+    /// the sub-tick carry that makes a reversal cost a full detent.
+    angle: AngleAccumulator,
+    /// Speed → step-size ladder (×1 / ×2 / ×4-or-word).
+    pacer: JogPacer,
+    /// Previous frame's timestamp, for the pacer's `dt`. `None` until the first
+    /// scrubbing frame after a reset.
+    last_t: Option<Instant>,
+    /// Whether this guide hold has already been marked consumed. The first
+    /// detent spends the hold ([`GestureEngine::consume_hold`]); the rest of
+    /// the spin has nothing left to spend.
+    consumed: bool,
+}
+
+impl ScrubState {
+    fn new(cfg: &ScrubConfig, cursor: &CursorConfig) -> ScrubState {
+        ScrubState {
+            cfg: *cfg,
+            cursor: cursor.clone(),
+            damper: damper_from(cursor),
+            angle: AngleAccumulator::new(cfg.detent_deg.to_radians(), cfg.min_radius),
+            pacer: JogPacer::new(
+                cfg.fast_deg_per_s,
+                cfg.slow_deg_per_s,
+                cfg.fast_min_detents,
+                cfg.word_tier,
+            ),
+            last_t: None,
+            consumed: false,
+        }
+    }
+
+    /// Rebuild from `cfg`/`cursor` if either has changed since the last frame —
+    /// the whole of this handler's reload story. Rebuilding resets every
+    /// cross-frame value, which is what a retuned detent or damper wants: no
+    /// carry from a wheel with different notches on it.
+    fn sync(&mut self, cfg: &ScrubConfig, cursor: &CursorConfig) {
+        if self.cfg != *cfg || self.cursor != *cursor {
+            *self = ScrubState::new(cfg, cursor);
+        }
+    }
+
+    /// Forget all cross-frame state: on lift, on guide release, and whenever
+    /// the gate closes. No output can be stranded by this — the scrub only ever
+    /// *taps*, so unlike the cursor's click or a held key there is nothing it
+    /// could leave down — which is why it needs no place in `release_outputs`.
+    fn reset(&mut self) {
+        self.damper.reset();
+        self.angle.reset();
+        self.pacer.reset();
+        self.last_t = None;
+        self.consumed = false;
+    }
+}
+
+/// One frame's worth of scrub output: the `(chord, pressed)` edges to emit, in
+/// order, and whether any of them was a word-tier step (which feels heavier).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ScrubBurst {
+    events: Vec<(KeyChord, bool)>,
+    word: bool,
+}
+
+/// The key a detent taps: an arrow, `ctrl`-ed for a word jump and `shift`-ed
+/// while the select button is held.
+///
+/// `right` is the direction of travel; `word` picks `ctrl+arrow` over a plain
+/// one; `select` adds Shift so the scrub extends a selection instead of moving
+/// the caret. Modifier order is ctrl-then-shift, so a config could spell the
+/// same chord as `ctrl+shift+left` and get an identical [`KeyChord`] (pinned by
+/// a test). Pure.
+fn scrub_chord(right: bool, word: bool, select: bool) -> KeyChord {
+    let mut mods: [u16; 2] = [0; 2];
+    let mut n = 0;
+    if word {
+        mods[n] = KEY_LEFTCTRL;
+        n += 1;
+    }
+    if select {
+        mods[n] = KEY_LEFTSHIFT;
+        n += 1;
+    }
+    let code = if right { KEY_RIGHT } else { KEY_LEFT };
+    // `KeyChord::new` only errors past MAX_CHORD_MODS, and two is not past it.
+    KeyChord::new(&mods[..n], code).unwrap_or_else(|_| KeyChord::plain(code))
+}
+
+/// Turn one frame's signed detent count into the taps it emits, advancing the
+/// [`JogPacer`] once per detent.
+///
+/// Direction: the accumulator counts counter-clockwise positive, and a clock
+/// hand reads forward, so **clockwise (negative ticks) is `Right`** and
+/// counter-clockwise is `Left`. Each detent is a *complete* tap — press then
+/// release, both in this frame — so no client repeat timer is ever armed and a
+/// daemon that dies mid-spin leaves nothing held down
+/// (`docs/research/text-scrub.md` §1.3). A ×N character step is N taps of the
+/// same key; a word step is one `ctrl`+arrow.
+///
+/// Pure apart from the pacer it advances, which is the point: the whole
+/// direction/tier/modifier policy is testable without a device.
+fn scrub_burst(ticks: i32, pacer: &mut JogPacer, select: bool) -> ScrubBurst {
+    let mut out = ScrubBurst::default();
+    if ticks == 0 {
+        return out;
+    }
+    let right = ticks < 0;
+    for _ in 0..ticks.unsigned_abs() {
+        let step = pacer.detent();
+        let word = step.unit == JogUnit::Word;
+        out.word |= word;
+        let chord = scrub_chord(right, word, select);
+        for _ in 0..step.count.max(1) {
+            out.events.push((chord, true));
+            out.events.push((chord, false));
+        }
+    }
+    out
+}
+
+/// Drive the caret scrub from the LEFT trackpad for a single frame.
+///
+/// The guide-layer twin of [`drive_scroll`]: while the guide button is held and
+/// `h.scrub`'s guard passes in the active mode (`active`, which the caller
+/// computes from [`Config::scrub_enabled_in`] and `guide_active()`), circling
+/// the left pad walks the text caret one step per detent —
+/// `docs/research/text-scrub.md` §3.1, option (a).
+///
+/// Precedence, and why it fights nothing:
+///
+/// * the **guide layer** is where it lives, and the left pad is otherwise idle
+///   there ([`drive_scroll`] drops out under the guide), so the ambient scroll
+///   is untouched — release the guide and the pad scrolls again;
+/// * the **right pad** is the guide-mouse's (`h.cursor { guide_in = … }`) and
+///   the **sticks** are `GuideStickFlick`'s: this handler reads neither;
+/// * the **on-screen keyboard** owns both pads when it is up, so the caller
+///   passes `active = false` there and the wheel resets (scrubbing under the
+///   keyboard is phase 3 of the research doc, §3.3).
+///
+/// The first detent of a hold marks it **consumed**
+/// ([`GestureEngine::consume_hold`]), exactly as the guide-mouse does: a hold
+/// spent scrubbing must not reach Steam as the bare guide tap when it is
+/// released. The pad touch itself is not a chord (`chordable` excludes
+/// `PadLeftTouch`), so without this call every caret fix would end in a tap the
+/// daemon would hand on.
+#[allow(clippy::too_many_arguments)]
+fn drive_scrub(
+    kbd: &mut Option<VirtualKeyboard>,
+    engine: &mut GestureEngine,
+    frame: &report::Frame,
+    st: &mut ScrubState,
+    cfg: &ScrubConfig,
+    cursor: &CursorConfig,
+    active: bool,
+    hx: &mut HapticCtx,
+    now: Instant,
+) {
+    // A reload can retune the wheel or switch it on under us; rebuilding here
+    // keeps the reload path from having to know this handler exists.
+    st.sync(cfg, cursor);
+    // Off in this config, gated out of this mode, guide not held, or the
+    // keyboard owns the pads: drop everything so a re-entry starts clean and
+    // no rotation carries across.
+    if !cfg.enabled || !active {
+        st.reset();
+        return;
+    }
+    // Only while the LEFT pad is actually touched. A lift resets, so a
+    // lift-and-retouch never injects the angle it jumped across.
+    if !frame.pressed(report::Button::PadLeftTouch) {
+        st.reset();
+        return;
+    }
+
+    // Smooth the absolute pad position exactly as the scroll does, then read
+    // the angle off the *smoothed* signal: the damper's hard zero is the first
+    // of the three hysteresis layers that keep a resting thumb from ticking.
+    let s = st.damper.update(frame.left_pad.x, frame.left_pad.y, now);
+    let dt = match st.last_t {
+        Some(prev) => now.saturating_duration_since(prev).as_secs_f64(),
+        None => 0.0,
+    };
+    st.last_t = Some(now);
+    let ticks = st.angle.update(s.0, s.1);
+    // Feed the rate estimator every frame, ticking or not, so the ladder sees
+    // the spin slow down between detents as well as speed up into them.
+    st.pacer.observe(st.angle.last_delta(), dt);
+    if ticks == 0 {
+        return;
+    }
+
+    // A detent that fires is a hold spent: the guide's release is ours, not
+    // Steam's. Once per hold — `consume_hold` is idempotent, but saying so here
+    // keeps the "first detent" rule visible.
+    if !st.consumed {
+        engine.consume_hold();
+        st.consumed = true;
+    }
+
+    let select = frame.pressed(cfg.select);
+    let burst = scrub_burst(ticks, &mut st.pacer, select);
+    for (chord, pressed) in &burst.events {
+        // Arrows and modifiers are all keyboard codes, so there is no pointer
+        // for `emit_chord` to route anything to.
+        emit_chord(kbd, None, chord, *pressed);
+    }
+    // One pulse per frame that emitted at least one detent, as the circular
+    // scroll does — several detents inside one 4 ms frame would blur into a
+    // single buzz anyway. A word step gets the heavier click, so the thumb can
+    // feel that the unit changed under it.
+    let feel = if burst.word { Haptic::ScrubWord } else { Haptic::Scroll };
+    hx.fire(feel, HapticPad::Left);
 }
 
 /// Cross-frame state for the *held* bare-button bindings
@@ -3867,6 +4165,9 @@ mod tests {
         assert_eq!(haptic_feel(&cfg, Haptic::Commit), Some(Feel::Click));
         assert_eq!(haptic_feel(&cfg, Haptic::Gesture), Some(Feel::Buzz));
         assert_eq!(haptic_feel(&cfg, Haptic::Scroll), Some(Feel::Tick));
+        // A word-tier scrub detent is the same wheel with a bigger notch: the
+        // scroll toggle, a heavier feel.
+        assert_eq!(haptic_feel(&cfg, Haptic::ScrubWord), Some(Feel::Click));
         assert_eq!(haptic_feel(&cfg, Haptic::Button), None);
     }
 
@@ -3880,13 +4181,17 @@ mod tests {
             Haptic::Commit,
             Haptic::Gesture,
             Haptic::Scroll,
+            Haptic::ScrubWord,
             Haptic::Button,
         ] {
             assert_eq!(haptic_feel(&off, what), None, "{what:?} must be silent");
         }
-        // A per-trigger toggle silences only its own trigger.
+        // A per-trigger toggle silences only its own trigger — and the scrub's
+        // two detent feels share the scroll toggle, so one knob silences the
+        // whole wheel.
         let no_scroll = HapticsConfig { scroll: false, ..HapticsConfig::default() };
         assert_eq!(haptic_feel(&no_scroll, Haptic::Scroll), None);
+        assert_eq!(haptic_feel(&no_scroll, Haptic::ScrubWord), None);
         assert_eq!(haptic_feel(&no_scroll, Haptic::Crossing), Some(Feel::Tick));
         // And the opt-in bare-button tick can be switched on.
         let buttons = HapticsConfig { buttons: true, ..HapticsConfig::default() };
@@ -4307,6 +4612,336 @@ mod tests {
         // train has at least one cycle (a count of 0 would be a silent write).
         assert!(count_min > count_max);
         assert!(count_max >= 1);
+    }
+
+    // --- the caret scrub ---------------------------------------------------
+
+    /// A point on the pad at radius `r` (normalized) and `deg` around the
+    /// centre, in raw counts — what a thumb tracing a circle reports.
+    fn pad_at(r: f64, deg: f64) -> report::Pad {
+        let a = deg.to_radians();
+        report::Pad {
+            x: (r * a.cos() * 32767.0) as i16,
+            y: (r * a.sin() * 32767.0) as i16,
+            force: 0,
+        }
+    }
+
+    /// A frame with the left pad touched at `(r, deg)`, plus any extra buttons.
+    fn scrub_frame(r: f64, deg: f64, extra: &[report::Button]) -> report::Frame {
+        let mut btns = vec![report::Button::PadLeftTouch];
+        btns.extend_from_slice(extra);
+        report::Frame { left_pad: pad_at(r, deg), ..frame_of(&btns) }
+    }
+
+    /// A scrub whose ladder cannot climb, so a test about direction or count
+    /// is not also a test about speed.
+    fn one_x_pacer() -> JogPacer {
+        JogPacer::new(f64::MAX, 0.0, 2, true)
+    }
+
+    /// Run a pacer's rate estimator to steady state at `deg_per_s` (250 Hz,
+    /// 0.8 s — many time constants of its low-pass).
+    fn settle(p: &mut JogPacer, deg_per_s: f64) {
+        for _ in 0..200 {
+            p.observe((deg_per_s * 0.004).to_radians(), 0.004);
+        }
+    }
+
+    #[test]
+    fn a_scrub_chord_is_spelled_the_way_a_config_would_spell_it() {
+        // The four codes are constants here for speed; this pins each against
+        // the config's own name table, so a rename there cannot leave the
+        // scrub tapping something else.
+        let parse = |s: &str| KeyChord::parse(s).expect("a key name the config knows");
+        assert_eq!(scrub_chord(true, false, false), parse("right"));
+        assert_eq!(scrub_chord(false, false, false), parse("left"));
+        assert_eq!(scrub_chord(true, true, false), parse("ctrl+right"));
+        assert_eq!(scrub_chord(false, true, false), parse("ctrl+left"));
+        assert_eq!(scrub_chord(false, false, true), parse("shift+left"));
+        assert_eq!(scrub_chord(true, false, true), parse("shift+right"));
+        assert_eq!(scrub_chord(false, true, true), parse("ctrl+shift+left"));
+        assert_eq!(scrub_chord(true, true, true), parse("ctrl+shift+right"));
+    }
+
+    #[test]
+    fn a_scrub_detent_taps_and_never_holds() {
+        // The whole reason the scrub exists: a tap per detent, pressed and
+        // released in the same frame, so no client repeat timer is ever armed
+        // and a daemon that dies mid-spin leaves nothing down
+        // (docs/research/text-scrub.md §1.3). Combos bracket their key exactly
+        // as `chord_edges` does for a held binding.
+        let right = KeyChord::parse("right").unwrap();
+        let mut pacer = one_x_pacer();
+        let burst = scrub_burst(-1, &mut pacer, false);
+        assert_eq!(burst.events, vec![(right, true), (right, false)]);
+        assert!(!burst.word);
+
+        // A word step is one ctrl+arrow, and its edges expand modifier-first,
+        // key-last-out — the order the combo code uses everywhere.
+        let ctrl_left = KeyChord::parse("ctrl+left").unwrap();
+        let mut fast = JogPacer::new(360.0, 180.0, 1, true);
+        settle(&mut fast, 700.0);
+        fast.detent();
+        fast.detent();
+        let word = scrub_burst(1, &mut fast, false);
+        assert_eq!(word.events, vec![(ctrl_left, true), (ctrl_left, false)]);
+        assert!(word.word, "a word step asks for the heavier feel");
+        assert_eq!(chord_edges(&ctrl_left, true), vec![(29, true), (105, true)]);
+        assert_eq!(chord_edges(&ctrl_left, false), vec![(105, false), (29, false)]);
+    }
+
+    #[test]
+    fn a_scrub_step_is_n_whole_taps_of_one_key() {
+        // ×2 is two complete taps, not one longer press: the count is what the
+        // thumb feels and what the client counts.
+        let left = KeyChord::parse("left").unwrap();
+        // Fast enough for ×2 (360°/s), well under the ×4 rung's 720°/s.
+        let mut p = JogPacer::new(360.0, 180.0, 1, false);
+        settle(&mut p, 500.0);
+        p.detent(); // arms ×2
+        let burst = scrub_burst(1, &mut p, false);
+        assert_eq!(
+            burst.events,
+            vec![(left, true), (left, false), (left, true), (left, false)]
+        );
+        assert!(!burst.word, "characters keep the light tick");
+    }
+
+    #[test]
+    fn a_held_select_button_puts_shift_around_every_tap() {
+        let shift_right = KeyChord::parse("shift+right").unwrap();
+        let mut pacer = one_x_pacer();
+        let burst = scrub_burst(-2, &mut pacer, true);
+        assert_eq!(
+            burst.events,
+            vec![
+                (shift_right, true),
+                (shift_right, false),
+                (shift_right, true),
+                (shift_right, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slow_clockwise_revolution_is_exactly_twenty_four_right_taps() {
+        // The jog wheel's contract: 24 detents per revolution at 15°, one
+        // character each at the landing tier, and never a tap the other way.
+        let mut angle = AngleAccumulator::new(15f64.to_radians(), 0.35);
+        let mut pacer = one_x_pacer();
+        let mut events = Vec::new();
+        // A full turn clockwise in 1° steps, at a safe radius.
+        for i in 0..=360 {
+            let ticks = angle.update(
+                0.6 * f64::from(-i).to_radians().cos(),
+                0.6 * f64::from(-i).to_radians().sin(),
+            );
+            events.extend(scrub_burst(ticks, &mut pacer, false).events);
+        }
+        let right = KeyChord::parse("right").unwrap();
+        assert!(
+            events.iter().all(|&(c, _)| c == right),
+            "clockwise is Right, and only Right"
+        );
+        let taps = events.iter().filter(|&&(_, pressed)| pressed).count();
+        assert_eq!(taps, 24, "360° / 15° = 24 characters");
+        assert_eq!(events.len(), 48, "each tap is a press and a release");
+
+        // And the same turn the other way is 24 Lefts.
+        let mut angle = AngleAccumulator::new(15f64.to_radians(), 0.35);
+        let mut pacer = one_x_pacer();
+        let mut ccw = Vec::new();
+        for i in 0..=360 {
+            let ticks = angle.update(
+                0.6 * f64::from(i).to_radians().cos(),
+                0.6 * f64::from(i).to_radians().sin(),
+            );
+            ccw.extend(scrub_burst(ticks, &mut pacer, false).events);
+        }
+        let left = KeyChord::parse("left").unwrap();
+        assert!(ccw.iter().all(|&(c, _)| c == left));
+        assert_eq!(ccw.iter().filter(|&&(_, p)| p).count(), 24);
+    }
+
+    #[test]
+    fn reversing_direction_costs_a_full_detent() {
+        // The accumulator carries the sub-detent remainder, so turning back
+        // needs a whole step before the opposite key fires: a thumb parked on a
+        // boundary and breathing cannot chatter Left/Right.
+        let mut angle = AngleAccumulator::new(15f64.to_radians(), 0.35);
+        let mut pacer = one_x_pacer();
+        let mut events = Vec::new();
+        let push = |deg: f64, angle: &mut AngleAccumulator, pacer: &mut JogPacer, out: &mut Vec<(KeyChord, bool)>| {
+            let a = deg.to_radians();
+            let ticks = angle.update(0.6 * a.cos(), 0.6 * a.sin());
+            out.extend(scrub_burst(ticks, pacer, false).events);
+        };
+        // 16° counter-clockwise: one Left.
+        push(0.0, &mut angle, &mut pacer, &mut events);
+        push(16.0, &mut angle, &mut pacer, &mut events);
+        assert_eq!(events.iter().filter(|&&(_, p)| p).count(), 1);
+        // Now back 14°: still inside the detent that just fired — nothing.
+        push(2.0, &mut angle, &mut pacer, &mut events);
+        assert_eq!(events.iter().filter(|&&(_, p)| p).count(), 1, "no double fire");
+        // Two more degrees back completes a whole reverse detent: one Right.
+        push(0.0, &mut angle, &mut pacer, &mut events);
+        let taps: Vec<KeyChord> =
+            events.iter().filter(|&&(_, p)| p).map(|&(c, _)| c).collect();
+        assert_eq!(
+            taps,
+            vec![KeyChord::parse("left").unwrap(), KeyChord::parse("right").unwrap()]
+        );
+    }
+
+    #[test]
+    fn the_first_scrub_detent_consumes_the_guide_hold() {
+        // A pad touch is not chordable, so without this the release of every
+        // caret fix would reach Steam as a bare guide tap. Driven through the
+        // real handler, gate and all.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let mut st = ScrubState::new(&cfg, &cursor);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut engine = GestureEngine::new();
+        let t = Instant::now();
+
+        // Guide down: the layer opens with the hold unspent.
+        let guide = frame_of(&[report::Button::Steam]);
+        assert!(engine
+            .update(&guide, t)
+            .iter()
+            .any(|e| matches!(e, GestureEvent::GuideEnter)));
+
+        // Circle the pad for a quarter turn, a frame every 4 ms.
+        let mut now = t;
+        for i in 0..=120 {
+            now = t + Duration::from_millis(4 * i);
+            let f = scrub_frame(0.6, f64::from(i as i32) * -0.75, &[report::Button::Steam]);
+            let _ = engine.update(&f, now);
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut st, &cfg, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(st.consumed, "a detent must spend the hold");
+
+        // Releasing the guide is therefore NOT a bare tap.
+        let up = report::Frame::default();
+        assert_eq!(
+            engine.update(&up, now + Duration::from_millis(4)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+    }
+
+    #[test]
+    fn a_resting_thumb_under_the_guide_leaves_the_tap_alone() {
+        // The other half of the rule: touching the pad without turning it is
+        // not a scrub, so a `guide_tap` binding still fires. Same frames, no
+        // rotation.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let mut st = ScrubState::new(&cfg, &cursor);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut engine = GestureEngine::new();
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+        let mut now = t;
+        for i in 0..=50 {
+            now = t + Duration::from_millis(4 * i);
+            let f = scrub_frame(0.6, 30.0, &[report::Button::Steam]);
+            let _ = engine.update(&f, now);
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut st, &cfg, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(!st.consumed, "a still thumb emits nothing and spends nothing");
+        assert_eq!(
+            engine.update(&report::Frame::default(), now + Duration::from_millis(4)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn the_scrub_gate_drops_every_carry() {
+        // Guide released, guarded out of the mode, the keyboard taking the
+        // pads, or the thumb lifting: each closes the gate, and a closed gate
+        // forgets the spin so nothing carries into the next one.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let mut st = ScrubState::new(&cfg, &cursor);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut engine = GestureEngine::new();
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+        for i in 0..=200 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = scrub_frame(0.6, f64::from(i as i32) * -2.0, &[report::Button::Steam]);
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut st, &cfg, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(st.consumed && st.pacer.speed() > 0.0, "the spin was live");
+
+        // The guide comes up: `active` goes false and everything is dropped.
+        let now = t + Duration::from_millis(1000);
+        drive_scrub(
+            &mut kbd,
+            &mut engine,
+            &report::Frame::default(),
+            &mut st,
+            &cfg,
+            &cursor,
+            false,
+            &mut hx,
+            now,
+        );
+        assert!(!st.consumed, "a fresh hold gets to spend itself again");
+        assert_eq!(st.pacer.speed(), 0.0, "no speed carries into the next spin");
+        assert!(st.last_t.is_none());
+
+        // And a config that never asked for a scrub is inert even with the
+        // gate open — the section is off by default.
+        let off = ScrubConfig::default();
+        let mut idle = ScrubState::new(&off, &cursor);
+        for i in 0..=200 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = scrub_frame(0.6, f64::from(i as i32) * -2.0, &[report::Button::Steam]);
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut idle, &off, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(!idle.consumed, "an unconfigured scrub does nothing at all");
+    }
+
+    #[test]
+    fn a_reload_retunes_the_wheel_in_place() {
+        // The scrub reads its knobs per frame, which is the whole of its
+        // reload story: no wiring in `apply_reload`, and a retune drops the
+        // cross-frame state so a wheel with different notches never carries.
+        let cursor = CursorConfig::default();
+        let off = ScrubConfig::default();
+        let mut st = ScrubState::new(&off, &cursor);
+        assert!(!st.cfg.enabled);
+        let on = ScrubConfig { enabled: true, detent_deg: 20.0, ..ScrubConfig::default() };
+        st.sync(&on, &cursor);
+        assert_eq!(st.cfg.detent_deg, 20.0);
+        assert!(st.cfg.enabled);
+        // Same config again: not a rebuild (the marker survives).
+        st.consumed = true;
+        st.sync(&on, &cursor);
+        assert!(st.consumed, "an unchanged config must not reset the spin");
+        // A retuned damper is a rebuild too, since the smoothing feeds the angle.
+        st.sync(&on, &CursorConfig { hysteresis: 0.01, ..CursorConfig::default() });
+        assert!(!st.consumed);
     }
 
     #[test]

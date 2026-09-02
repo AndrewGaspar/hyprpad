@@ -326,6 +326,11 @@ pub struct AngleAccumulator {
     prev: Option<f64>,
     /// Signed accumulated rotation not yet emitted as whole ticks (radians).
     accum: f64,
+    /// The wrapped angle delta the most recent [`update`](Self::update)
+    /// contributed (radians), for a consumer that wants the *rate* as well as
+    /// the count ([`JogPacer`]). `0.0` whenever the sample contributed nothing
+    /// — near the centre, unseeded, or after a [`reset`](Self::reset).
+    last_delta: f64,
 }
 
 impl AngleAccumulator {
@@ -340,6 +345,7 @@ impl AngleAccumulator {
             min_radius: min_radius.max(0.0),
             prev: None,
             accum: 0.0,
+            last_delta: 0.0,
         }
     }
 
@@ -354,16 +360,20 @@ impl AngleAccumulator {
         // progress.
         if (x * x + y * y).sqrt() < self.min_radius {
             self.prev = None;
+            self.last_delta = 0.0;
             return 0;
         }
         let angle = y.atan2(x);
         let Some(prev) = self.prev else {
             // First valid sample only seeds the reference: no rotation yet.
             self.prev = Some(angle);
+            self.last_delta = 0.0;
             return 0;
         };
         self.prev = Some(angle);
-        self.accum += wrap_pi(angle - prev);
+        let delta = wrap_pi(angle - prev);
+        self.last_delta = delta;
+        self.accum += delta;
         // Emit as many whole ticks as have accumulated, truncating toward zero
         // and carrying the sub-tick remainder to the next call.
         let ticks = (self.accum / self.step).trunc();
@@ -371,10 +381,244 @@ impl AngleAccumulator {
         ticks as i32
     }
 
+    /// The rotation the most recent [`update`](Self::update) contributed, in
+    /// radians, signed the same way its return value is (`> 0` counter-
+    /// clockwise). `0.0` when that sample emitted nothing *and* moved nothing —
+    /// near the dead centre, on the seeding sample, and after a
+    /// [`reset`](Self::reset).
+    ///
+    /// The tick count alone cannot tell a slow quarter-turn from a fast one:
+    /// this is how [`JogPacer`] gets the angular *rate* out of the same pass,
+    /// without a second `atan2` or a second copy of the wrap handling.
+    pub fn last_delta(&self) -> f64 {
+        self.last_delta
+    }
+
     /// Drop all state (used on touch-lift), so a re-touch starts fresh.
     pub fn reset(&mut self) {
         self.prev = None;
         self.accum = 0.0;
+        self.last_delta = 0.0;
+    }
+}
+
+/// The unit one jog detent moves the caret by ([`JogPacer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JogUnit {
+    /// One or more plain arrow taps — `count` characters.
+    Char,
+    /// One `ctrl`+arrow tap: the caret jumps a whole word, and how far that is
+    /// is the text's business, not ours.
+    Word,
+}
+
+/// What one detent emits: a unit and how many of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JogStep {
+    pub unit: JogUnit,
+    /// Taps to send for this detent. Always `1` for [`JogUnit::Word`].
+    pub count: u32,
+}
+
+/// The rung the pacer is on. Not public: the caller reads [`JogStep`], which is
+/// the rung's *effect*, so the ladder can grow one without a breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    /// One character per detent — the landing tier, and where every spin starts.
+    One,
+    /// Two characters per detent.
+    Two,
+    /// The top rung: four characters, or one word when the word tier is on.
+    Top,
+}
+
+/// The cutoff (Hz) of the low-pass on the angular-rate estimate.
+///
+/// The rate is differenced from one 4 ms frame to the next, so the raw estimate
+/// is as noisy as the smoothed angle's last digit; ~5 Hz is slow enough to be
+/// steady under a thumb and fast enough that a deliberate acceleration reaches
+/// the threshold within a detent or two (`docs/research/pointer-damping.md`
+/// §2.2 — α ≈ 0.11 at 250 Hz).
+const RATE_CUTOFF_HZ: f64 = 5.0;
+
+/// Where the top rung sits relative to the configured `fast`/`slow` pair, as a
+/// multiplier on **both** — so one 2:1 hysteresis gap is configured and the
+/// whole ladder keeps its shape however it is tuned.
+///
+/// The character ladder doubles (Apple's staged ×1 → ×2 → ×4, US 7,312,785), so
+/// ×4 wants twice ×2's speed: 720 °/s in, 360 °/s out at the defaults. The word
+/// tier replaces it lower down (540 / 270), because a word is worth ≈ ×6 and
+/// should be reachable without spinning twice as fast as ×2 asks for —
+/// `docs/research/text-scrub.md` §3.5.
+const TOP_RATIO_CHAR: f64 = 2.0;
+/// The word tier's multiplier on `fast`/`slow`; see [`TOP_RATIO_CHAR`].
+const TOP_RATIO_WORD: f64 = 1.5;
+
+/// Angular velocity → how far one detent moves the caret: the speed ladder
+/// behind the guide-layer text scrub (`docs/research/text-scrub.md` §3.5).
+///
+/// A jog wheel is a *position* control — the count is exact and the rate follows
+/// the hand — so acceleration must multiply the **count**, never the rate
+/// (Apple's accelerated-scrolling patent, §2.4 of that doc). This is the state
+/// machine that picks the multiplier:
+///
+/// | tier | enters at | exits at | one detent emits |
+/// |---|---|---|---|
+/// | ×1 | — | — | 1 × `Left`/`Right` |
+/// | ×2 | `fast` (360 °/s) for `arm` detents | `slow` (180 °/s) | 2 taps |
+/// | top | `fast × ratio` for `arm` (+1 for words) detents | `slow × ratio` | 4 taps, or one `ctrl`+arrow |
+///
+/// Three properties, each of them a lesson from the prior art:
+///
+/// * **a 2:1 enter/exit gap** (Logitech's SmartShift ratchet/free-spin
+///   threshold): a thumb hovering at the threshold cannot chatter between units;
+/// * **arming over consecutive detents**: a single fast flick never jumps a
+///   tier, so the tier is a property of the *spin*, not of one frame;
+/// * **one rung at a time on the way down**: dropping below the top rung's exit
+///   speed lands on ×2, not on ×1, so slowing to a stop walks the ladder down
+///   and the last detents before the target are always ×1.
+///
+/// Pure and device-free: [`observe`](Self::observe) takes the angle delta of
+/// each frame as it arrives and [`detent`](Self::detent) is called once per
+/// detent the [`AngleAccumulator`] emitted, in order.
+#[derive(Clone, Debug)]
+pub struct JogPacer {
+    /// Enter-×2 speed, °/s.
+    fast: f64,
+    /// Exit-×2 speed, °/s. The gap to `fast` is the hysteresis.
+    slow: f64,
+    /// Consecutive detents at speed required to climb to ×2.
+    arm: u32,
+    /// Whether the top rung is the word tier (`ctrl`+arrow) rather than ×4.
+    word: bool,
+    /// Low-passed |ω| in °/s.
+    speed: f64,
+    /// Which rung we are on.
+    tier: Tier,
+    /// Consecutive detents seen at the *next* rung's enter speed.
+    run: u32,
+}
+
+impl JogPacer {
+    /// Build a pacer. `fast`/`slow` are the ×2 enter/exit speeds in °/s (the top
+    /// rung derives its own pair from them); `arm` is how many consecutive
+    /// detents at speed it takes to climb, floored at 1 so a zero in a config
+    /// cannot make the ladder jump on a single frame.
+    pub fn new(fast_deg_per_s: f64, slow_deg_per_s: f64, arm: u32, word_tier: bool) -> JogPacer {
+        let fast = fast_deg_per_s.max(0.0);
+        JogPacer {
+            fast,
+            // Never above `fast`: an exit at or over the enter speed is not a
+            // hysteresis band at all, it is a coin toss per detent.
+            slow: slow_deg_per_s.clamp(0.0, fast),
+            arm: arm.max(1),
+            word: word_tier,
+            speed: 0.0,
+            tier: Tier::One,
+            run: 0,
+        }
+    }
+
+    /// Feed one frame: `d_theta` radians of rotation (signed;
+    /// [`AngleAccumulator::last_delta`]) over `dt` seconds.
+    ///
+    /// Only the magnitude matters — a reversal is a change of direction, not a
+    /// slow-down, and the accumulator already makes a reversal cost a full
+    /// detent. A non-positive `dt` is ignored rather than divided by.
+    pub fn observe(&mut self, d_theta: f64, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+        let instant = d_theta.abs().to_degrees() / dt;
+        let alpha = smoothing_factor(dt, RATE_CUTOFF_HZ);
+        self.speed = exp_smooth(alpha, instant, self.speed);
+    }
+
+    /// The low-passed angular speed, °/s. Diagnostic: the ladder reads it itself.
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    /// Consume one detent: advance the ladder at the current speed and return
+    /// what this detent emits.
+    ///
+    /// Climbing takes effect on the detent that completes the arming, so a
+    /// transition never emits a burst of its own — the run simply gets longer
+    /// steps from here on.
+    pub fn detent(&mut self) -> JogStep {
+        let (top_enter, top_exit) = self.top_band();
+        match self.tier {
+            Tier::One => {
+                if self.speed > self.fast {
+                    self.run += 1;
+                    if self.run >= self.arm {
+                        self.tier = Tier::Two;
+                        self.run = 0;
+                    }
+                } else {
+                    self.run = 0;
+                }
+            }
+            Tier::Two => {
+                if self.speed < self.slow {
+                    self.tier = Tier::One;
+                    self.run = 0;
+                } else if self.speed > top_enter {
+                    self.run += 1;
+                    if self.run >= self.top_arm() {
+                        self.tier = Tier::Top;
+                        self.run = 0;
+                    }
+                } else {
+                    self.run = 0;
+                }
+            }
+            Tier::Top => {
+                if self.speed < top_exit {
+                    // One rung at a time: the tail of a spin is always ×1.
+                    self.tier = Tier::Two;
+                    self.run = 0;
+                }
+            }
+        }
+        self.step()
+    }
+
+    /// What the current rung emits per detent.
+    fn step(&self) -> JogStep {
+        match self.tier {
+            Tier::One => JogStep { unit: JogUnit::Char, count: 1 },
+            Tier::Two => JogStep { unit: JogUnit::Char, count: 2 },
+            Tier::Top if self.word => JogStep { unit: JogUnit::Word, count: 1 },
+            Tier::Top => JogStep { unit: JogUnit::Char, count: 4 },
+        }
+    }
+
+    /// The top rung's (enter, exit) speeds, °/s.
+    fn top_band(&self) -> (f64, f64) {
+        let ratio = if self.word { TOP_RATIO_WORD } else { TOP_RATIO_CHAR };
+        (self.fast * ratio, self.slow * ratio)
+    }
+
+    /// Detents of arming for the top rung. The word tier asks for one more than
+    /// the character ladder does: changing the *unit* mid-spin is a bigger
+    /// surprise than lengthening the step, so it wants more of a commitment
+    /// (`docs/research/text-scrub.md` §3.5 — three detents at the defaults).
+    fn top_arm(&self) -> u32 {
+        if self.word {
+            self.arm + 1
+        } else {
+            self.arm
+        }
+    }
+
+    /// Drop the speed estimate and fall back to ×1 — on lift, on guide release,
+    /// and wherever the accumulator is reset, so no spin inherits the last
+    /// one's tier.
+    pub fn reset(&mut self) {
+        self.speed = 0.0;
+        self.tier = Tier::One;
+        self.run = 0;
     }
 }
 
@@ -672,6 +916,188 @@ mod tests {
         // down-tick, proving the pre-reset 10° did not carry over.
         assert_eq!(acc.update_pt(on_circle(0.5, 0.0)), 0);
         assert_eq!(acc.update_pt(on_circle(0.5, -16.0)), -1);
+    }
+
+    #[test]
+    fn angle_accumulator_reports_the_delta_it_accumulated() {
+        // The rate estimator reads the same pass the count comes from, so the
+        // delta has to be there even on frames that emit no tick — and gone on
+        // the frames that contribute nothing.
+        let mut acc = AngleAccumulator::new(15f64.to_radians(), 0.35);
+        assert_eq!(acc.update_pt(on_circle(0.6, 0.0)), 0, "seeding frame");
+        assert_eq!(acc.last_delta(), 0.0, "a seed moved nothing");
+        assert_eq!(acc.update_pt(on_circle(0.6, 5.0)), 0, "below one detent");
+        assert!(
+            (acc.last_delta() - 5f64.to_radians()).abs() < 1e-9,
+            "5° CCW: {}",
+            acc.last_delta().to_degrees()
+        );
+        // Clockwise is negative, on the delta as on the count.
+        acc.update_pt(on_circle(0.6, -5.0));
+        assert!(acc.last_delta() < 0.0);
+        // A sample inside the dead centre contributes nothing at all.
+        acc.update(0.0, 0.0);
+        assert_eq!(acc.last_delta(), 0.0);
+        // And a reset clears it with everything else.
+        acc.update_pt(on_circle(0.6, 0.0));
+        acc.update_pt(on_circle(0.6, 4.0));
+        acc.reset();
+        assert_eq!(acc.last_delta(), 0.0);
+    }
+
+    /// Run the pacer's rate estimator to steady state at `deg_per_s`, at the
+    /// puck's 250 Hz. 0.8 s is many time constants of a 5 Hz low-pass, so the
+    /// tier tests can talk about speeds rather than about transients.
+    fn settle(p: &mut JogPacer, deg_per_s: f64) {
+        let dt = 0.004;
+        for _ in 0..200 {
+            p.observe((deg_per_s * dt).to_radians(), dt);
+        }
+    }
+
+    fn chars(n: u32) -> JogStep {
+        JogStep { unit: JogUnit::Char, count: n }
+    }
+
+    #[test]
+    fn jog_pacer_starts_at_one_character_per_detent() {
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        // Nothing observed yet, and a slow spin: the landing tier.
+        assert_eq!(p.detent(), chars(1));
+        settle(&mut p, 120.0);
+        for _ in 0..10 {
+            assert_eq!(p.detent(), chars(1), "120°/s is below the 360°/s threshold");
+        }
+    }
+
+    #[test]
+    fn jog_pacer_arms_over_consecutive_detents_and_never_bursts() {
+        // Above `fast`, but the climb waits for the arming count — a single
+        // fast detent must not change the unit, and the detent that completes
+        // the arming emits the NEW tier once, not a burst.
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        settle(&mut p, 500.0);
+        assert_eq!(p.detent(), chars(1), "first fast detent still ×1");
+        assert_eq!(p.detent(), chars(2), "second one completes the arming");
+        assert_eq!(p.detent(), chars(2), "and stays there, one step per detent");
+
+        // With a longer arming count the climb takes correspondingly longer.
+        let mut slow_to_arm = JogPacer::new(360.0, 180.0, 4, true);
+        settle(&mut slow_to_arm, 500.0);
+        for i in 0..3 {
+            assert_eq!(slow_to_arm.detent(), chars(1), "detent {i} of the arming run");
+        }
+        assert_eq!(slow_to_arm.detent(), chars(2));
+    }
+
+    #[test]
+    fn jog_pacer_needs_the_run_to_be_consecutive() {
+        // One fast detent, then a slow one, then a fast one: the run restarts,
+        // so a wobble at the threshold never climbs.
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        settle(&mut p, 500.0);
+        assert_eq!(p.detent(), chars(1));
+        settle(&mut p, 100.0);
+        assert_eq!(p.detent(), chars(1));
+        settle(&mut p, 500.0);
+        assert_eq!(p.detent(), chars(1), "the earlier fast detent does not count");
+        assert_eq!(p.detent(), chars(2));
+    }
+
+    #[test]
+    fn jog_pacer_holds_its_tier_across_the_hysteresis_band() {
+        // The 2:1 gap: ×2 is entered above 360°/s and left below 180°/s, so a
+        // thumb sitting anywhere between the two keeps the tier it has.
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        settle(&mut p, 500.0);
+        p.detent();
+        assert_eq!(p.detent(), chars(2));
+        for speed in [340.0, 260.0, 200.0] {
+            settle(&mut p, speed);
+            assert_eq!(p.detent(), chars(2), "{speed}°/s is inside the band");
+        }
+        // Below the exit speed it drops back, and stays down until the ENTER
+        // speed is met again for a whole arming run.
+        settle(&mut p, 150.0);
+        assert_eq!(p.detent(), chars(1));
+        settle(&mut p, 300.0);
+        assert_eq!(p.detent(), chars(1), "300°/s is under the 360°/s enter speed");
+    }
+
+    #[test]
+    fn jog_pacer_word_tier_replaces_the_top_rung() {
+        // With words on, the top rung is one ctrl+arrow at 1.5 × the ×2 pair
+        // (540 in, 270 out) and wants one more detent of arming.
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        settle(&mut p, 600.0);
+        assert_eq!(p.detent(), chars(1));
+        assert_eq!(p.detent(), chars(2), "climbs to ×2 first");
+        assert_eq!(p.detent(), chars(2), "arming the word tier, detent 1");
+        assert_eq!(p.detent(), chars(2), "arming the word tier, detent 2");
+        let word = JogStep { unit: JogUnit::Word, count: 1 };
+        assert_eq!(p.detent(), word, "three detents above 540°/s = words");
+        assert_eq!(p.detent(), word);
+        // Between the word tier's 540 °/s enter and its 270 °/s exit the unit
+        // holds: that gap is the whole point of the hysteresis.
+        settle(&mut p, 400.0);
+        assert_eq!(p.detent(), word, "still above the word tier's exit speed");
+        // Slowing past the exit drops ONE rung — back to ×2, not to ×1, so the
+        // wheel walks down instead of falling off.
+        settle(&mut p, 250.0);
+        assert_eq!(p.detent(), chars(2));
+        settle(&mut p, 100.0);
+        assert_eq!(p.detent(), chars(1), "and the landing is always ×1");
+    }
+
+    #[test]
+    fn jog_pacer_caps_at_four_without_the_word_tier() {
+        // Words off: the character ladder tops out at ×4, entered at twice the
+        // ×2 speeds (720 in, 360 out), and nothing goes past it however fast
+        // the thumb spins.
+        let mut p = JogPacer::new(360.0, 180.0, 2, false);
+        settle(&mut p, 3000.0);
+        assert_eq!(p.detent(), chars(1));
+        assert_eq!(p.detent(), chars(2));
+        assert_eq!(p.detent(), chars(2), "arming the top rung");
+        assert_eq!(p.detent(), chars(4));
+        for _ in 0..20 {
+            assert_eq!(p.detent(), chars(4), "×4 is the cap");
+        }
+        // 500°/s is below the ×4 enter speed but above its exit: it holds.
+        settle(&mut p, 500.0);
+        assert_eq!(p.detent(), chars(4));
+        settle(&mut p, 300.0);
+        assert_eq!(p.detent(), chars(2), "one rung at a time on the way down");
+    }
+
+    #[test]
+    fn jog_pacer_reset_forgets_the_spin() {
+        // Guide release / lift: the next spin starts at ×1 with no speed
+        // inherited, so a fresh touch can never begin mid-ladder.
+        let mut p = JogPacer::new(360.0, 180.0, 2, true);
+        settle(&mut p, 900.0);
+        p.detent();
+        assert_eq!(p.detent(), chars(2));
+        p.reset();
+        assert_eq!(p.speed(), 0.0);
+        assert_eq!(p.detent(), chars(1));
+    }
+
+    #[test]
+    fn jog_pacer_survives_a_degenerate_config() {
+        // A zero arming count must not make the ladder jump on one detent, and
+        // an exit speed above the enter speed is not a hysteresis band: it is
+        // clamped so the two can never cross.
+        let mut p = JogPacer::new(360.0, 900.0, 0, true);
+        settle(&mut p, 400.0);
+        assert_eq!(p.detent(), chars(2), "arm 0 is floored to 1, not to 'always'");
+        settle(&mut p, 370.0);
+        assert_eq!(p.detent(), chars(2), "an exit clamped to the enter speed still holds");
+        // A non-positive dt is ignored rather than divided by.
+        let before = p.speed();
+        p.observe(1.0, 0.0);
+        p.observe(1.0, -0.004);
+        assert_eq!(p.speed(), before);
     }
 
     // Small convenience so the arc tests read as a stream of points.

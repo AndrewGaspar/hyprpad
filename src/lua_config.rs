@@ -26,6 +26,7 @@
 //! h.daemon  { own_lizard = true, steam_button_poweroff = "off", process_rescan_ms = 500 }
 //! h.cursor  { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
+//! h.scrub   { detent_deg = 15, select = "l5" }   -- guide + circle the left pad = caret
 //! h.haptics { cursor_spacing_px = 96 }
 //! h.gamepad { enabled = true, kind = "xbox", identity = "triton" }
 //!
@@ -631,6 +632,7 @@ fn finish(
         process_rescan_ms: b.process_rescan_ms,
         cursor: b.cursor,
         scroll: b.scroll,
+        scrub: b.scrub,
         haptics: b.haptics,
         gamepad: b.gamepad,
         modes: b.modes,
@@ -645,6 +647,7 @@ fn finish(
         cursor_guard: b.cursor_guard,
         cursor_guide_guard: b.cursor_guide_guard,
         scroll_guard: b.scroll_guard,
+        scrub_guard: b.scrub_guard,
         lua: Some(Rc::new(runtime)),
     })
 }
@@ -716,6 +719,10 @@ struct Build {
     cursor_guide_guard: Option<Guard>,
     scroll: ScrollConfig,
     scroll_guard: Guard,
+    /// `h.scrub { … }`: the guide-layer caret jog wheel. Off until the file
+    /// writes the section, which is why the `Default` here is the right one.
+    scrub: crate::config::ScrubConfig,
+    scrub_guard: Guard,
     haptics: HapticsConfig,
     gamepad: GamepadConfig,
     modes: Vec<ModeDef>,
@@ -737,6 +744,7 @@ enum Slot {
     OskButton(crate::report::Button, String),
     Cursor,
     Scroll,
+    Scrub,
     Mode(usize),
 }
 
@@ -767,6 +775,7 @@ impl Build {
             }
             Some(Slot::Cursor) => self.cursor_guard = g,
             Some(Slot::Scroll) => self.scroll_guard = g,
+            Some(Slot::Scrub) => self.scrub_guard = g,
             Some(Slot::Mode(_)) | None => {
                 return Err("only a binding can be guarded; use h.mode(name).when(fn) \
                             to give a MODE its rule"
@@ -791,6 +800,7 @@ impl Build {
                 }
                 Slot::Cursor => ("the cursor".to_string(), Some(&self.cursor_guard)),
                 Slot::Scroll => ("scrolling".to_string(), Some(&self.scroll_guard)),
+                Slot::Scrub => ("the caret scrub".to_string(), Some(&self.scrub_guard)),
                 Slot::Mode(_) => continue,
             };
             if let Some(g) = g {
@@ -848,6 +858,7 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("daemon", section_daemon(lua, build)?)?;
     h.set("cursor", section_cursor(lua, build, &guard_mt)?)?;
     h.set("scroll", section_scroll(lua, build, &guard_mt)?)?;
+    h.set("scrub", section_scrub(lua, build, &guard_mt)?)?;
     h.set("haptics", section_haptics(lua, build)?)?;
     h.set("gamepad", section_gamepad(lua, build)?)?;
 
@@ -1352,6 +1363,92 @@ fn section_scroll(
             }
         }
         let slot = b.slot(Slot::Scroll);
+        if let Some(g) = inline {
+            b.set_guard(slot, g).map_err(err)?;
+        }
+        drop(b);
+        handle(lua, &mt, slot)
+    })
+}
+
+/// `h.scrub { … }` — the `[scrub]` knobs, guardable like the cursor and the
+/// scroll.
+///
+/// Writing the section IS the opt-in: the scrub is off by default
+/// ([`crate::config::ScrubConfig`]), so `h.scrub {}` with nothing in it turns
+/// the caret jog wheel on with every default, and `h.scrub { enabled = false }`
+/// switches it back off without deleting the tuning beside it.
+///
+/// ```lua
+/// h.scrub {
+///   detent_deg       = 15,        -- one caret step per 15° (24 per revolution)
+///   fast_deg_per_s   = 360,       -- above one revolution/s, two steps per detent
+///   fast_min_detents = 2,         -- ... once two detents in a row are that fast
+///   slow_deg_per_s   = 180,       -- drop back below this (the 2:1 hysteresis)
+///   word_tier        = true,      -- the top rung is ctrl+arrow, not ×4
+///   select           = "l5",      -- hold to select as you scrub (Shift)
+///   only_in          = { "desktop" },
+/// }
+/// ```
+fn section_scrub(
+    lua: &Lua,
+    build: &Rc<RefCell<Build>>,
+    guard_mt: &mlua::RegistryKey,
+) -> mlua::Result<Function> {
+    let build = Rc::clone(build);
+    let mt = lua.create_registry_value(lua.registry_value::<Table>(guard_mt)?)?;
+    lua.create_function(move |lua, t: Table| {
+        let mut b = build.borrow_mut();
+        // Present = on; an explicit `enabled = false` below overrides it.
+        b.scrub.enabled = true;
+        let mut inline: Option<Guard> = None;
+        for pair in t.pairs::<String, Value>() {
+            let (k, v) = pair?;
+            match k.as_str() {
+                "enabled" | "enable" | "on" => b.scrub.enabled = as_bool(&v, &k)?,
+                "detent_deg" | "detent_degrees" | "step_degrees" | "step" => {
+                    b.scrub.detent_deg = as_f64(&v, &k)?
+                }
+                "min_radius" => b.scrub.min_radius = as_f64(&v, &k)?,
+                "fast_deg_per_s" | "fast" => b.scrub.fast_deg_per_s = as_f64(&v, &k)?,
+                "slow_deg_per_s" | "slow" => b.scrub.slow_deg_per_s = as_f64(&v, &k)?,
+                "fast_min_detents" | "min_detents" => {
+                    let n = as_f64(&v, &k)?;
+                    if !n.is_finite() || n < 0.0 || n > f64::from(u32::MAX) {
+                        return Err(err(format!(
+                            "h.scrub {k} wants a whole number of detents, got {n}"
+                        )));
+                    }
+                    b.scrub.fast_min_detents = n as u32;
+                }
+                "word_tier" | "words" => b.scrub.word_tier = as_bool(&v, &k)?,
+                "select" | "select_with" => {
+                    let name = as_string(&v, &k)?.trim().to_ascii_lowercase();
+                    b.scrub.select = crate::config::parse_button(&name).map_err(err)?;
+                }
+                "only_in" => inline = Some(Guard::OnlyIn(mode_list(vec![v])?)),
+                "not_in" => inline = Some(Guard::NotIn(mode_list(vec![v])?)),
+                other => {
+                    return Err(unknown_key(
+                        "h.scrub",
+                        other,
+                        &[
+                            "enabled",
+                            "detent_deg",
+                            "min_radius",
+                            "fast_deg_per_s",
+                            "fast_min_detents",
+                            "slow_deg_per_s",
+                            "word_tier",
+                            "select",
+                            "only_in",
+                            "not_in",
+                        ],
+                    ))
+                }
+            }
+        }
+        let slot = b.slot(Slot::Scrub);
         if let Some(g) = inline {
             b.set_guard(slot, g).map_err(err)?;
         }
@@ -2409,6 +2506,74 @@ mod tests {
         // And an empty list is a typo too: leave the key out for off.
         let e = load_str(r#"hyprpad.cursor { guide_in = {} }"#, "t.lua").unwrap_err();
         assert!(e.contains("guide_in needs at least one mode name"), "{e}");
+    }
+
+    #[test]
+    fn h_scrub_is_the_opt_in_for_the_caret_wheel_and_is_guarded_like_the_cursor() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.scrub {
+              detent_deg = 20,
+              min_radius = 0.4,
+              fast_deg_per_s = 300,
+              fast_min_detents = 3,
+              slow_deg_per_s = 150,
+              word_tier = false,
+              select = "l4",
+              only_in = { "desktop" },
+            }
+            "#,
+        );
+        let game = ModeState::new("game", vec![]);
+        assert!(c.scrub().enabled);
+        assert_eq!(c.scrub().detent_deg, 20.0);
+        assert_eq!(c.scrub().min_radius, 0.4);
+        assert_eq!(c.scrub().fast_deg_per_s, 300.0);
+        assert_eq!(c.scrub().fast_min_detents, 3);
+        assert_eq!(c.scrub().slow_deg_per_s, 150.0);
+        assert!(!c.scrub().word_tier);
+        assert_eq!(c.scrub().select, crate::report::Button::GripL4);
+        assert!(c.scrub_enabled_in(&desktop()) && !c.scrub_enabled_in(&game));
+
+        // Writing the section IS the opt-in: an empty table is the whole thing
+        // switched on with every default.
+        let bare = load(r#"hyprpad.scrub {}"#);
+        assert!(bare.scrub().enabled);
+        assert_eq!(*bare.scrub(), crate::config::ScrubConfig { enabled: true, ..Default::default() });
+
+        // Left out entirely: off, which is what every config that predates the
+        // scrub gets.
+        let none = load(r#"hyprpad.cursor { sens = 0.06 }"#);
+        assert!(!none.scrub().enabled && !none.scrub_enabled_in(&desktop()));
+
+        // And `enabled = false` inside the block keeps the tuning but not the
+        // wheel.
+        let off = load(r#"hyprpad.scrub { enabled = false, detent_deg = 22 }"#);
+        assert!(!off.scrub().enabled);
+        assert_eq!(off.scrub().detent_deg, 22.0);
+
+        // The chained guard form works too, like every other section handle.
+        let chained = load(
+            r#"
+            local h = hyprpad
+            h.mode("desktop")
+            h.scrub { detent_deg = 15 }:only_in("desktop")
+            "#,
+        );
+        assert!(chained.scrub_enabled_in(&desktop()));
+
+        // Typos are load errors that name the key and the section.
+        let e = load_str(r#"hyprpad.scrub { detent = 15 }"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.scrub") && e.contains("detent"), "{e}");
+        let e = load_str(r#"hyprpad.scrub { select = "nope" }"#, "t.lua").unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        // A mode nobody declared is refused, as it is for the cursor's guard —
+        // a silent typo would leave the wheel dead everywhere.
+        let e = load_str(r#"hyprpad.scrub { only_in = { "dekstop" } }"#, "t.lua").unwrap_err();
+        assert!(e.contains("dekstop"), "{e}");
     }
 
     #[test]
