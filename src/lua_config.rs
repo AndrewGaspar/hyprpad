@@ -35,9 +35,10 @@
 //! h.bind("guide+x",  h.exec "omarchy-menu")
 //! h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 //! h.bind("guide+y",  h.keyboard { mode = "split" })
-//! h.button("dpad_up", h.key "up")       -- bare button, no guide modifier
+//! h.button("dpad_up", h.key "up")       -- bare button, no guide modifier; held with it
 //! h.button("r2",      h.mouse "left")   -- a mouse button, through the pointer
-//! h.osk_button("y",   h.key "space")    -- only while the OSK is up
+//! h.button("l5",      h.exec "voxtype record toggle") -- any other action fires once, on press
+//! h.osk_button("y",   h.key "space")    -- only while the OSK is up; keys only
 //!
 //! -- Modes: a mode is a NAMED CONTEXT selected by a predicate. Rules run in
 //! -- definition order, first match wins, and only on a context change.
@@ -90,13 +91,14 @@
 //! `string` are all there, as the owner's own configs use them).
 
 use crate::config::{
-    Action, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig, ModeDef,
-    ScrollConfig, ScrollMode,
+    Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
+    ModeDef, ScrollConfig, ScrollMode,
 };
 use crate::config::{is_mouse_code, key_code, mouse_code, parse_button, GestureKey};
 use crate::mode::Context;
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value, VmState};
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -630,7 +632,7 @@ fn traceback_position(full: &str, name: &str) -> Option<String> {
 struct Build {
     bindings: HashMap<GestureKey, Action>,
     binding_guards: HashMap<GestureKey, Guard>,
-    buttons: HashMap<crate::report::Button, u16>,
+    buttons: HashMap<crate::report::Button, ButtonAction>,
     button_guards: HashMap<crate::report::Button, Guard>,
     /// Bindings for a button `buttons` already binds, in declaration order.
     button_alts: Vec<ButtonAlt>,
@@ -1021,54 +1023,63 @@ fn bind_fn(
                 }
                 b.slot(Slot::Binding(k, key))
             }
-            BindKind::Button | BindKind::OskButton => {
+            // A bare button takes any action a chord takes: a key or mouse
+            // button is held with it, anything else fires once on the press
+            // edge (`ButtonAction::classify`, the same sort the TOML parser
+            // does).
+            BindKind::Button => {
                 let btn = parse_button(&key.trim().to_ascii_lowercase()).map_err(err)?;
-                let Action::Key(code) = action else {
-                    return Err(err(format!(
-                        "h.button/h.osk_button values must be a key, e.g. h.key \"up\" \
-                         (got {action:?} for '{key}')"
-                    )));
-                };
-                // The OSK types a key by name through its own virtual keyboard;
-                // a mouse button has no meaning there (and the OSK already owns
-                // the pad clicks as key commits). Same rule as the TOML parser.
-                if matches!(kind, BindKind::OskButton) && is_mouse_code(code) {
-                    return Err(err(format!(
-                        "h.osk_button sends keys through the on-screen keyboard; a mouse \
-                         button makes no sense there — bind '{key}' with h.button instead"
-                    )));
-                }
-                match kind {
+                let what = ButtonAction::classify(action)
+                    .map_err(|e| err(format!("{e} (button '{key}')")))?;
+                match b.buttons.entry(btn) {
                     // A button bound a *second* time is the same button meaning
                     // something else in another mode — `b` is backspace on the
                     // desktop and escape under the cheat sheet — so it becomes
                     // an alternate rather than overwriting the first binding.
                     // Modes are exclusive, so only one of them is ever live.
-                    BindKind::Button if b.buttons.contains_key(&btn) => {
+                    Entry::Occupied(_) => {
                         let at = b.button_alts.len();
                         b.button_alts.push(ButtonAlt {
                             button: btn,
-                            code,
+                            action: what,
                             guard: Guard::Always,
                             desc,
                         });
                         b.slot(Slot::ButtonAlt(at, key))
                     }
-                    BindKind::Button => {
-                        b.buttons.insert(btn, code);
+                    Entry::Vacant(first) => {
+                        first.insert(what);
                         if let Some(d) = desc {
                             b.button_descs.insert(btn, d);
                         }
                         b.slot(Slot::Button(btn, key))
                     }
-                    _ => {
-                        b.osk_buttons.insert(btn, code);
-                        if let Some(d) = desc {
-                            b.osk_button_descs.insert(btn, d);
-                        }
-                        b.slot(Slot::OskButton(btn, key))
-                    }
                 }
+            }
+            // An OSK helper types a key by name through the on-screen
+            // keyboard's own virtual keyboard, so a key is all it can be.
+            BindKind::OskButton => {
+                let btn = parse_button(&key.trim().to_ascii_lowercase()).map_err(err)?;
+                let Action::Key(code) = action else {
+                    return Err(err(format!(
+                        "h.osk_button values must be a key, e.g. h.key \"space\" \
+                         (got {action:?} for '{key}')"
+                    )));
+                };
+                // A mouse button has no meaning there either (and the OSK
+                // already owns the pad clicks as key commits). Same rule as
+                // the TOML parser.
+                if is_mouse_code(code) {
+                    return Err(err(format!(
+                        "h.osk_button sends keys through the on-screen keyboard; a mouse \
+                         button makes no sense there — bind '{key}' with h.button instead"
+                    )));
+                }
+                b.osk_buttons.insert(btn, code);
+                if let Some(d) = desc {
+                    b.osk_button_descs.insert(btn, d);
+                }
+                b.slot(Slot::OskButton(btn, key))
             }
         };
         drop(b);
@@ -1563,6 +1574,7 @@ fn unknown_key(section: &str, got: &str, want: &[&str]) -> mlua::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ButtonAction::{Fire, Hold};
     use crate::config::{ModeState, WorkspaceTarget};
     use crate::gesture::GestureEvent;
     use crate::mode::Focus;
@@ -1688,16 +1700,89 @@ mod tests {
             h.osk_button("y", h.key "space")
             "#,
         );
-        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&103));
-        assert_eq!(c.buttons().get(&Button::A), Some(&28));
+        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&Hold(103)));
+        assert_eq!(c.buttons().get(&Button::A), Some(&Hold(28)));
         assert_eq!(c.osk_buttons().get(&Button::Y), Some(&57));
         assert!(c.buttons().get(&Button::Y).is_none());
     }
 
     #[test]
-    fn a_button_bound_to_a_non_key_action_is_an_error() {
-        let e = load_str(r#"hyprpad.button("a", hyprpad.exec "walker")"#, "t.lua").unwrap_err();
+    fn a_button_takes_any_action_held_or_fired() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.button("y", h.exec "foo")
+            h.button("x", h.keyboard { mode = "split" })
+            h.button("a", "Close window", h.dispatch "hl.dsp.window.close()")
+            h.button("r1", "workspace +1")          -- the TOML grammar, as a plain string
+            h.button("l1", h.fullscreen())
+            h.button("r4", h.set_mode "desktop")
+            h.button("l4", h.clear_mode())
+            h.button("dpad_up", h.key "up")         -- still held with the button
+            h.button("r2", h.mouse "left")
+            "#,
+        );
+        let b = c.buttons();
+        assert_eq!(b.get(&Button::Y), Some(&Fire(Action::Exec("foo".into()))));
+        assert_eq!(
+            b.get(&Button::X),
+            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false }))
+        );
+        assert_eq!(
+            b.get(&Button::A),
+            Some(&Fire(Action::Dispatch("hl.dsp.window.close()".into())))
+        );
+        assert_eq!(c.button_descs.get(&Button::A).map(String::as_str), Some("Close window"));
+        assert_eq!(
+            b.get(&Button::BumperR1),
+            Some(&Fire(Action::Workspace(crate::config::WorkspaceTarget::Relative(1))))
+        );
+        assert_eq!(b.get(&Button::BumperL1), Some(&Fire(Action::ToggleFullscreen)));
+        assert_eq!(b.get(&Button::GripR4), Some(&Fire(Action::SetMode("desktop".into()))));
+        assert_eq!(b.get(&Button::GripL4), Some(&Fire(Action::ClearMode)));
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
+        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(272)));
+
+        // `h.none` binds nothing, and a button is not where to say so.
+        let e = load_str(r#"hyprpad.button("b", hyprpad.none())"#, "t.lua").unwrap_err();
+        assert!(e.contains("a bare button needs an action"), "{e}");
+        assert!(e.contains("'b'"), "should name the button: {e}");
+    }
+
+    #[test]
+    fn an_osk_button_bound_to_a_non_key_action_is_an_error() {
+        // The OSK helpers type through the keyboard's own uinput, so they stay
+        // keys-only even though a bare button now takes anything.
+        let e = load_str(r#"hyprpad.osk_button("y", hyprpad.exec "foo")"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.osk_button values must be a key"), "{e}");
+        assert!(e.contains("'y'"), "should name the button: {e}");
+        let e = load_str(r#"hyprpad.osk_button("y", hyprpad.keyboard "split")"#, "t.lua")
+            .unwrap_err();
         assert!(e.contains("must be a key"), "{e}");
+    }
+
+    #[test]
+    fn a_fired_action_can_be_a_buttons_alternate_in_another_mode() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.button("b", h.key "backspace"):only_in("desktop")
+            h.button("b", "Pause", h.exec "x"):only_in("game")
+            "#,
+        );
+        let game = ModeState::new("game", vec![]);
+        // The second binding is an alternate, guard and description intact...
+        assert_eq!(c.button_alts.len(), 1);
+        assert_eq!(c.button_alts[0].action, Fire(Action::Exec("x".into())));
+        assert_eq!(c.button_alts[0].guard, Guard::OnlyIn(vec!["game".into()]));
+        assert_eq!(c.button_alts[0].desc.as_deref(), Some("Pause"));
+        // ...and it is what `b` does in the game, while the desktop keeps the key.
+        assert_eq!(c.buttons_in(&game).get(&Button::B), Some(&Fire(Action::Exec("x".into()))));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)));
     }
 
     #[test]
@@ -1712,11 +1797,11 @@ mod tests {
             h.button("l3", h.key "btn_left") -- the evdev spelling through h.key
             "#,
         );
-        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&272));
-        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&273));
-        assert_eq!(c.buttons().get(&Button::PadRightClick), Some(&272));
-        assert_eq!(c.buttons().get(&Button::R3), Some(&274));
-        assert_eq!(c.buttons().get(&Button::L3), Some(&272));
+        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&Hold(272)));
+        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&Hold(273)));
+        assert_eq!(c.buttons().get(&Button::PadRightClick), Some(&Hold(272)));
+        assert_eq!(c.buttons().get(&Button::R3), Some(&Hold(274)));
+        assert_eq!(c.buttons().get(&Button::L3), Some(&Hold(272)));
 
         let e = load_str(r#"hyprpad.button("r2", hyprpad.mouse "side")"#, "t.lua").unwrap_err();
         assert!(e.contains("unknown mouse button 'side'"), "{e}");
@@ -1750,9 +1835,9 @@ mod tests {
             "#,
         );
         let game = ModeState::new("game", vec![]);
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerR2Full), Some(&272));
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerL2Full), Some(&273));
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::DpadUp), Some(&103));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerR2Full), Some(&Hold(272)));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerL2Full), Some(&Hold(273)));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::DpadUp), Some(&Hold(103)));
         // In the game the clicks are gone with the arrows: the map is what a
         // mode takes away, and a click is just another entry in it.
         assert!(c.buttons_in(&game).is_empty());
@@ -2116,8 +2201,8 @@ mod tests {
             "#,
         );
         let sheet = ModeState::new("cheatsheet", vec![]);
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&14), "Backspace");
-        assert_eq!(c.buttons_in(&sheet).get(&Button::B), Some(&1), "Escape");
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)), "Backspace");
+        assert_eq!(c.buttons_in(&sheet).get(&Button::B), Some(&Hold(1)), "Escape");
         assert_eq!(c.buttons_in(&sheet).len(), 1, "and nothing else is live there");
 
         // The alternate is a binding in its own right, description and all, so
@@ -2126,7 +2211,7 @@ mod tests {
         assert_eq!(c.button_alts[0].desc.as_deref(), Some("Close cheat sheet"));
         // The base map — the unguarded view the no-modes path uses — keeps the
         // binding that was declared first.
-        assert_eq!(c.buttons().get(&Button::B), Some(&14));
+        assert_eq!(c.buttons().get(&Button::B), Some(&Hold(14)));
     }
 
     #[test]
@@ -2141,7 +2226,7 @@ mod tests {
             h.button("b", h.key "escape")
             "#,
         );
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&14));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)));
     }
 
     #[test]

@@ -18,8 +18,8 @@
 //! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
 //! 3. **Game forwarding** — [`drive_gamepad`], when the active mode forwards
 //!    and neither layer above is claiming.
-//! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`drive_buttons`],
-//!    each gated by its own guard in the active mode.
+//! 4. **Desktop** — [`drive_cursor`] / [`drive_scroll`] / [`fire_buttons`] /
+//!    [`drive_buttons`], each gated by its own guard in the active mode.
 //!
 //! Ranks 3 and 4 are mutually exclusive by construction: forwarding needs
 //! `ModeEngine::desktop_yielded()`, which is true exactly when neither the
@@ -31,24 +31,37 @@
 //!
 //! [`ModeEngine`] re-resolves only on a **context change** — a compositor
 //! event ([`update_modes`]), a manual override from a binding
-//! ([`handle_gesture`]), or a reload ([`apply_reload`]). Every per-frame read
-//! is a cached lookup:
+//! ([`handle_gesture`], [`fire_buttons`]), or a reload ([`apply_reload`]).
+//! Every per-frame read is a cached lookup:
 //!
 //! | handler | consults |
 //! |---|---|
 //! | [`handle_gesture`] | `modes.allows_gesture(..)` + `config.resolve_in(.., modes.state())` |
 //! | [`drive_cursor`] | `modes.cursor_enabled()` |
 //! | [`drive_scroll`] | `modes.scroll_enabled()` |
-//! | [`drive_buttons`] | `modes.buttons()` (already filtered by each binding's guard) |
+//! | [`fire_buttons`] / [`drive_buttons`] | `modes.buttons()` (already filtered by each binding's guard) |
 //! | [`drive_gamepad`] | `gamepad_forwarding(.., modes.forwards(), modes.desktop_yielded(), ..)` |
 //!
 //! A mode transition runs the same clean handoff a controller disconnect does
 //! ([`reset_frame_state`] + `GamepadState::release`), so no key, click, or
 //! stick value is ever stranded across a switch.
+//!
+//! ## Bare buttons
+//!
+//! A button pressed without the guide modifier does what its `[buttons]` /
+//! `h.button` binding says ([`crate::config::ButtonAction`]), in one of two
+//! ways. A key or mouse button is **held** with it — pressed on the down edge,
+//! released on the up edge, so the kernel auto-repeats an arrow and a click
+//! drags ([`drive_buttons`]). Any other action — `exec`, `keyboard`,
+//! `set_mode`, a workspace switch — is **fired** once on the press edge and
+//! never repeated while the button stays down ([`fire_buttons`]), through
+//! exactly the path a guide chord takes once it has resolved
+//! ([`perform_action`]). Both obey one gate: off while the guide button is
+//! held and while the on-screen keyboard owns the pads.
 
 use crate::config::{
-    Action, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode, ScrollConfig,
-    ScrollMode, WorkspaceTarget,
+    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode,
+    ScrollConfig, ScrollMode, WorkspaceTarget,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gamepad::{self, VirtualGamepad};
@@ -513,9 +526,27 @@ pub fn run() -> std::io::Result<()> {
                     mode_changed |=
                         handle_gesture(&hypr, &config, &mut modes, &mut osk, &mut hx, ge);
                 }
+                // Bare-button actions that *fire* (`h.button("l5", h.exec …)`):
+                // the same actions a chord performs, on a button's press edge.
+                // The bare-button gate: off on the guide layer (so guide+l5
+                // stays a chord) and while the OSK owns the pads. Read again
+                // below for the held bindings, since an action fired here may
+                // have raised the keyboard.
+                let buttons_active = !engine.guide_active() && !osk.is_active();
+                mode_changed |= fire_buttons(
+                    &hypr,
+                    &config,
+                    &mut modes,
+                    &mut osk,
+                    &frame,
+                    &prev_frame,
+                    buttons_active,
+                    &mut hx,
+                );
                 if mode_changed {
-                    // A binding forced a mode (`h.set_mode` / `h.clear_mode`).
-                    // Same handoff as a context-driven transition.
+                    // A binding forced a mode (`h.set_mode` / `h.clear_mode`),
+                    // from a chord or a bare button. Same handoff as a
+                    // context-driven transition.
                     eprintln!("hyprpad: mode -> {} (manual)", modes.active());
                     status.set_mode(modes.active());
                     mode_handoff(
@@ -575,15 +606,15 @@ pub fn run() -> std::io::Result<()> {
                         now,
                     );
                 }
-                // Bare-button bindings (D-pad -> arrows, pad click / triggers ->
-                // mouse clicks by default; each code goes to the device it
-                // belongs to). Gated OFF on the guide layer (so guide+dpad and
-                // guide+l2/r2 stay chords) and while the OSK owns the pads (it
-                // takes the pad clicks as key commits itself, via `route_osk`).
-                // The per-mode gate is in the *map*: `modes.buttons()` already
-                // carries only the bindings whose guard passes, so a game mode
-                // that guards them out yields an empty map and `reconcile`
-                // releases anything held.
+                // Bare-button bindings that are *held* (D-pad -> arrows, pad
+                // click / triggers -> mouse clicks by default; each code goes
+                // to the device it belongs to). Gated OFF on the guide layer
+                // (so guide+dpad and guide+l2/r2 stay chords) and while the OSK
+                // owns the pads (it takes the pad clicks as key commits itself,
+                // via `route_osk`). The per-mode gate is in the *map*:
+                // `modes.buttons()` already carries only the bindings whose
+                // guard passes, so a game mode that guards them out yields an
+                // empty map and `reconcile` releases anything held.
                 let buttons_active = !engine.guide_active() && !osk.is_active();
                 drive_buttons(
                     &mut keyboard,
@@ -1070,10 +1101,13 @@ fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: boo
     (0.0, dy)
 }
 
-/// Cross-frame state for the bare-button keyboard bindings: the evdev keycodes
-/// currently held down, keyed by the controller button holding each. Kept so a
-/// gate change (the guide/OSK layer opening, or a game taking focus, while a
-/// button is held) releases the key cleanly instead of leaving it stuck down.
+/// Cross-frame state for the *held* bare-button bindings
+/// ([`ButtonAction::Hold`]): the evdev codes currently held down, keyed by the
+/// controller button holding each. Kept so a gate change (the guide/OSK layer
+/// opening, or a game taking focus, while a button is held) releases the key
+/// cleanly instead of leaving it stuck down. A fired binding
+/// ([`ButtonAction::Fire`]) has no state here: it is over the moment its press
+/// edge is.
 struct ButtonKeys {
     held: HashMap<report::Button, u16>,
 }
@@ -1090,13 +1124,15 @@ impl ButtonKeys {
     /// feedback on the side of the controller it sits on.
     ///
     /// When `active` is false (guide/OSK), every held key is released.
-    /// Otherwise each bound button that is physically down but not yet held
-    /// presses its key, and each held key whose button lifted — **or whose
-    /// binding has gone away**, which is what a mode transition or a reload
-    /// looks like from here — releases. Releases are emitted before presses.
+    /// Otherwise each `Hold`-bound button that is physically down but not yet
+    /// held presses its key, and each held key whose button lifted — **or
+    /// whose binding has gone away or changed**, which is what a mode
+    /// transition or a reload looks like from here — releases. Releases are
+    /// emitted before presses. `Fire` bindings are not this function's: they
+    /// have no held state ([`fire_edges`]).
     fn reconcile<F: Fn(report::Button) -> bool>(
         &mut self,
-        bindings: &HashMap<report::Button, u16>,
+        bindings: &HashMap<report::Button, ButtonAction>,
         pressed: F,
         active: bool,
     ) -> Vec<(report::Button, u16, bool)> {
@@ -1104,7 +1140,8 @@ impl ButtonKeys {
         // Release anything that should no longer be held: the gate closed, the
         // button lifted, or the binding is no longer live in this mode.
         self.held.retain(|&btn, &mut code| {
-            let keep = active && pressed(btn) && bindings.get(&btn) == Some(&code);
+            let keep =
+                active && pressed(btn) && bindings.get(&btn) == Some(&ButtonAction::Hold(code));
             if !keep {
                 events.push((btn, code, false));
             }
@@ -1112,7 +1149,8 @@ impl ButtonKeys {
         });
         // Press bound buttons that are down but not yet held — only when open.
         if active {
-            for (&btn, &code) in bindings {
+            for (&btn, what) in bindings {
+                let ButtonAction::Hold(code) = *what else { continue };
                 if pressed(btn) && !self.held.contains_key(&btn) {
                     events.push((btn, code, true));
                     self.held.insert(btn, code);
@@ -1183,12 +1221,13 @@ fn emit_button_code(
     }
 }
 
-/// Drive the bare-button bindings for a single frame: press each bound button's
-/// key or mouse button on its down edge and release it on its up edge, subject
-/// to `active` (the guide/OSK/suppressed gate, mirroring [`drive_cursor`]).
-/// Each code is routed to the device it belongs to ([`route`]); a missing
-/// keyboard or pointer silences the codes that would have gone to it and
-/// nothing else, so the pad click still clicks on a box with no uinput.
+/// Drive the *held* bare-button bindings ([`ButtonAction::Hold`]) for a single
+/// frame: press each bound button's key or mouse button on its down edge and
+/// release it on its up edge, subject to `active` (the guide/OSK/suppressed
+/// gate, mirroring [`drive_cursor`]). Each code is routed to the device it
+/// belongs to ([`route`]); a missing keyboard or pointer silences the codes
+/// that would have gone to it and nothing else, so the pad click still clicks
+/// on a box with no uinput. The bindings that *fire* are [`fire_buttons`]'s.
 ///
 /// Feedback fires on the **press edge only** ([`Haptic::Button`], off by
 /// default): a held D-pad auto-repeats in the kernel — which produces no further
@@ -1197,7 +1236,7 @@ fn drive_buttons(
     kbd: &mut Option<VirtualKeyboard>,
     mut pointer: Option<&mut VirtualPointer>,
     frame: &report::Frame,
-    bindings: &HashMap<report::Button, u16>,
+    bindings: &HashMap<report::Button, ButtonAction>,
     st: &mut ButtonKeys,
     active: bool,
     hx: &mut HapticCtx,
@@ -1208,6 +1247,59 @@ fn drive_buttons(
             hx.fire(Haptic::Button, button_pad(btn));
         }
     }
+}
+
+/// The bare-button actions due to *fire* this frame: every
+/// [`ButtonAction::Fire`] binding whose button went down on this frame and
+/// not the last. The press edge and nothing else — a button held across
+/// frames fires once, and its release fires nothing — and nothing at all
+/// while the gate is closed: a press under the guide layer or the keyboard is
+/// swallowed, not deferred. Pure, so the edge selection is unit-testable
+/// without a device.
+fn fire_edges(
+    bindings: &HashMap<report::Button, ButtonAction>,
+    frame: &report::Frame,
+    prev: &report::Frame,
+    active: bool,
+) -> Vec<(report::Button, Action)> {
+    if !active {
+        return Vec::new();
+    }
+    frame
+        .edges_down(prev)
+        .filter_map(|b| match bindings.get(&b) {
+            Some(ButtonAction::Fire(action)) => Some((b, action.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fire the bare-button actions due this frame ([`fire_edges`]), each through
+/// [`perform_action`] — the path a guide chord takes once it has resolved, so
+/// `h.exec` (with `HYPRPAD_MODE`), `h.dispatch`, `h.workspace`, `h.keyboard`,
+/// `h.set_mode` and the rest mean on a bare button exactly what they mean on a
+/// chord. Returns whether one of them moved the active mode, for the caller to
+/// run the same handoff a chord's override gets.
+///
+/// Feedback is [`Haptic::Button`] on the press edge, as for a held binding: to
+/// the hand this is a button press, whatever it does.
+#[allow(clippy::too_many_arguments)]
+fn fire_buttons(
+    hypr: &Hypr,
+    config: &Config,
+    modes: &mut ModeEngine,
+    osk: &mut OskHandle,
+    frame: &report::Frame,
+    prev: &report::Frame,
+    active: bool,
+    hx: &mut HapticCtx,
+) -> bool {
+    let mut mode_changed = false;
+    for (btn, action) in fire_edges(modes.buttons(), frame, prev, active) {
+        hx.fire(Haptic::Button, button_pad(btn));
+        mode_changed |= perform_action(hypr, config, modes, osk, &action);
+    }
+    mode_changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1980,24 +2072,40 @@ fn handle_gesture(
     // gives — nothing else about a chord is visible or audible.
     hx.fire(Haptic::Gesture, HapticPad::Both);
 
+    perform_action(hypr, config, modes, osk, &action)
+}
+
+/// Perform one resolved action: the tail every binding shares once its own
+/// gates have passed, whether it resolved from a guide chord
+/// ([`handle_gesture`]) or a bare button's press edge ([`fire_buttons`]) — one
+/// function, so the two can never mean subtly different things. Returns
+/// whether it moved the active mode (via [`Action::SetMode`] /
+/// [`Action::ClearMode`]), which the caller answers with the mode handoff.
+fn perform_action(
+    hypr: &Hypr,
+    config: &Config,
+    modes: &mut ModeEngine,
+    osk: &mut OskHandle,
+    action: &Action,
+) -> bool {
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
     if let Action::ToggleKeyboard { mode, reflow } = action {
-        toggle_keyboard(osk, mode, reflow);
+        toggle_keyboard(osk, *mode, *reflow);
         return false;
     }
 
     // The manual override drives the mode engine, not Hyprland. Top of the
     // resolution precedence (docs/13 decision #4), so this wins over whatever
     // the focus rules say until it is cleared.
-    match &action {
+    match action {
         Action::SetMode(name) => return modes.set_mode(config, name),
         Action::ClearMode => return modes.clear_mode(config),
         _ => {}
     }
 
-    // The mode as it is at the moment the chord fires: an `exec` that summons
-    // an overlay is about to change it.
-    if let Err(e) = execute(hypr, &action, modes.state().active()) {
+    // The mode as it is at the moment the binding fires: an `exec` that
+    // summons an overlay is about to change it.
+    if let Err(e) = execute(hypr, action, modes.state().active()) {
         eprintln!("dispatch failed: {e}");
     }
     false
@@ -2189,12 +2297,12 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
             Ok(())
         }
         Action::Dispatch(payload) => hypr.dispatch_raw(payload).map(|_| ()),
-        // Handled in `handle_gesture` against the OSK handle, never reaches here.
+        // Handled in `perform_action` against the OSK handle, never reaches here.
         Action::ToggleKeyboard { .. } => Ok(()),
         // Bare-button keys are emitted by `drive_buttons` against the virtual
         // keyboard, not dispatched here; a `key` bound to a guide chord no-ops.
         Action::Key(_) => Ok(()),
-        // Handled in `handle_gesture` against the mode engine, never here.
+        // Handled in `perform_action` against the mode engine, never here.
         Action::SetMode(_) | Action::ClearMode => Ok(()),
         Action::None => Ok(()),
     }
@@ -2417,10 +2525,23 @@ mod tests {
         drop(rtx);
     }
 
+    /// A frame with exactly these buttons down.
+    fn frame_of(buttons: &[report::Button]) -> report::Frame {
+        let mut bits = 0u32;
+        for &b in buttons {
+            let bit = (0..32)
+                .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
+                .expect("button has a bit");
+            bits |= 1 << bit;
+        }
+        report::Frame { buttons: bits, ..report::Frame::default() }
+    }
+
     #[test]
     fn bare_button_presses_on_down_and_releases_on_up() {
         use report::Button::*;
-        let bindings = HashMap::from([(DpadUp, 103u16), (DpadDown, 108u16)]);
+        use ButtonAction::Hold;
+        let bindings = HashMap::from([(DpadUp, Hold(103)), (DpadDown, Hold(108))]);
         let mut st = ButtonKeys::new();
         // DpadUp goes down while active: press KEY_UP, nothing for the unpressed
         // DpadDown. The originating button rides along for the haptic side.
@@ -2442,7 +2563,7 @@ mod tests {
     #[test]
     fn bare_button_gate_off_releases_and_suppresses() {
         use report::Button::*;
-        let bindings = HashMap::from([(DpadUp, 103u16)]);
+        let bindings = HashMap::from([(DpadUp, ButtonAction::Hold(103))]);
         let mut st = ButtonKeys::new();
         // Press while active.
         assert_eq!(
@@ -2468,15 +2589,103 @@ mod tests {
     #[test]
     fn bare_button_unbound_ignored_and_multiple_tracked() {
         use report::Button::*;
-        let bindings = HashMap::from([(DpadUp, 103u16), (DpadLeft, 105u16)]);
+        use ButtonAction::{Fire, Hold};
+        let bindings = HashMap::from([
+            (DpadUp, Hold(103)),
+            (DpadLeft, Hold(105)),
+            (GripL5, Fire(Action::Exec("true".into()))),
+        ]);
         let mut st = ButtonKeys::new();
         // An unbound button (A) produces nothing.
         assert!(st.reconcile(&bindings, |b| b == A, true).is_empty());
+        // Nor does a button whose binding fires rather than holds: nothing is
+        // pressed for it, and nothing is remembered as held.
+        assert!(st.reconcile(&bindings, |b| b == GripL5, true).is_empty());
+        assert!(st.held.is_empty());
         // Two bound buttons down at once: both press (HashMap order is arbitrary).
         let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, true);
         ev.sort_by_key(|&(_, code, _)| code);
         assert_eq!(ev, vec![(DpadUp, 103, true), (DpadLeft, 105, true)]);
         assert_eq!(st.held.len(), 2);
+    }
+
+    #[test]
+    fn a_fired_binding_fires_once_on_the_press_edge_and_never_while_gated() {
+        use report::Button::*;
+        use ButtonAction::{Fire, Hold};
+        let go = Action::Exec("true".into());
+        let bindings = HashMap::from([(GripL5, Fire(go.clone())), (DpadUp, Hold(103))]);
+        let idle = report::Frame::default();
+        let down = frame_of(&[GripL5, DpadUp]);
+
+        // The press edge: L5 fires. The D-pad is held, not fired — not this
+        // pass's business.
+        assert_eq!(fire_edges(&bindings, &down, &idle, true), vec![(GripL5, go.clone())]);
+        // Still down on the next frame: nothing. A fired action never repeats.
+        assert!(fire_edges(&bindings, &down, &down, true).is_empty());
+        // Release: nothing either.
+        assert!(fire_edges(&bindings, &idle, &down, true).is_empty());
+        // A fresh press fires again.
+        assert_eq!(fire_edges(&bindings, &down, &idle, true), vec![(GripL5, go)]);
+
+        // Gate closed (guide held, keyboard up): the edge is swallowed, not
+        // deferred to the frame the gate reopens on.
+        assert!(fire_edges(&bindings, &down, &idle, false).is_empty());
+        assert!(fire_edges(&bindings, &down, &down, true).is_empty());
+        // An unbound button's edge is nothing.
+        assert!(fire_edges(&bindings, &frame_of(&[A]), &idle, true).is_empty());
+    }
+
+    #[test]
+    fn perform_action_reports_a_manual_mode_change_for_the_handoff() {
+        use crate::mode::{BUILTIN_DESKTOP, BUILTIN_GAME};
+        let hypr = Hypr::detached();
+        let cfg = Config::load_default();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        assert_eq!(modes.active(), BUILTIN_DESKTOP);
+
+        // Forcing game mode from the desktop is a change; forcing it again is not.
+        let force_game = Action::SetMode(BUILTIN_GAME.into());
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &force_game));
+        assert_eq!(modes.active(), BUILTIN_GAME);
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &force_game));
+        // Clearing it hands the decision back to the rules (nothing focused:
+        // desktop); clearing an override that is not there changes nothing.
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &Action::ClearMode));
+        assert_eq!(modes.active(), BUILTIN_DESKTOP);
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &Action::ClearMode));
+    }
+
+    #[test]
+    fn a_bare_button_that_forces_a_mode_reports_it_like_a_chord_would() {
+        use crate::mode::{BUILTIN_DESKTOP, BUILTIN_GAME};
+        use report::Button::*;
+        // A `set_mode` on a bare button goes through the same `perform_action`
+        // a chord's does, so the frame arm gets the same "mode changed" answer
+        // and runs the same handoff.
+        let cfg = Config::from_toml_str("[buttons]\nl5 = \"set_mode game\"\ndpad_up = \"key up\"\n")
+            .expect("parse");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let idle = report::Frame::default();
+        let l5 = frame_of(&[GripL5]);
+
+        // Under the guide layer the press is a chord's, not ours.
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, false, &mut hx));
+        assert_eq!(modes.active(), BUILTIN_DESKTOP);
+        // On the desktop the press edge forces the game mode — and says so.
+        assert!(fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, true, &mut hx));
+        assert_eq!(modes.active(), BUILTIN_GAME);
+        // Held: nothing more. And in the game the bare buttons are not live at
+        // all (the built-in path empties the map), so a fresh press is inert.
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &l5, true, &mut hx));
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, true, &mut hx));
+        assert!(modes.buttons().is_empty());
     }
 
     #[test]
@@ -2714,12 +2923,13 @@ mod tests {
         // uinput keyboard and the virtual pointer may legitimately be absent;
         // it must still clear the held set — mouse codes included, with no
         // pointer to send their release to.
+        use ButtonAction::Hold;
         let mut keys = ButtonKeys::new();
         let map = HashMap::from([
-            (report::Button::DpadUp, 103u16),
-            (report::Button::A, 28),
-            (report::Button::TriggerR2Full, PointerButton::Left.evdev()),
-            (report::Button::TriggerL2Full, PointerButton::Right.evdev()),
+            (report::Button::DpadUp, Hold(103)),
+            (report::Button::A, Hold(28)),
+            (report::Button::TriggerR2Full, Hold(PointerButton::Left.evdev())),
+            (report::Button::TriggerL2Full, Hold(PointerButton::Right.evdev())),
         ]);
         keys.reconcile(&map, |_| true, true);
         assert_eq!(keys.held.len(), 4);
