@@ -222,10 +222,18 @@ const O_SRR_ERR: usize = 8;
 const SRR_LEN: usize = 10;
 
 /// `UHID_DEV_NUMBERED_FEATURE_REPORTS` (`linux/uhid.h`).
+///
+/// These three are **kernel → user space only**. They live in
+/// `struct uhid_start_req`, which is the payload of `UHID_START`;
+/// `struct uhid_create2_req` has no flags field, and `uhid_hid_start` computes
+/// them by walking the descriptor we published
+/// (`hid->report_enum[HID_FEATURE_REPORT].numbered` and friends). So a profile
+/// asks for numbered framing by *shipping a numbered descriptor*, and these
+/// constants exist to check the answer — see `profile::Framing`.
 pub const DEV_NUMBERED_FEATURE_REPORTS: u64 = 1;
-/// `UHID_DEV_NUMBERED_OUTPUT_REPORTS`.
+/// `UHID_DEV_NUMBERED_OUTPUT_REPORTS`. Kernel → user space; see above.
 pub const DEV_NUMBERED_OUTPUT_REPORTS: u64 = 2;
-/// `UHID_DEV_NUMBERED_INPUT_REPORTS`.
+/// `UHID_DEV_NUMBERED_INPUT_REPORTS`. Kernel → user space; see above.
 pub const DEV_NUMBERED_INPUT_REPORTS: u64 = 4;
 
 // ---------------------------------------------------------------------------
@@ -237,6 +245,11 @@ pub const DEV_NUMBERED_INPUT_REPORTS: u64 = 4;
 /// Byte-for-byte what `scripts/research/uhid_active_probe.py::ev_create2` writes
 /// for the `deck` profile — the exact event Steam adopted on this machine. Only
 /// the populated prefix is returned; the kernel zero-extends the rest.
+///
+/// Note what is *not* here: report-ID framing. `struct uhid_create2_req` ends at
+/// `country` and `rd_data`, with no `dev_flags` and no per-channel switch. The
+/// descriptor is the whole request — publish a numbered one and the kernel
+/// numbers the device, then says so in `UHID_START`.
 pub fn create2_event(profile: &Profile) -> Vec<u8> {
     let rd = profile.descriptor;
     let mut buf = vec![0u8; create2_len(rd.len())];
@@ -682,17 +695,36 @@ fn handle(
     match event {
         Decoded::Start(flags) => {
             shared.dev_flags.store(flags, Ordering::Relaxed);
+            // The kernel derives these from the descriptor we published
+            // (`uhid_hid_start` in `drivers/hid/uhid.c`), so a mismatch means
+            // the profile's `Framing` and its descriptor disagree — and every
+            // report on every channel is then framed wrong. Nothing can be
+            // done about it from here, but going quiet would leave the owner
+            // debugging Steam instead of debugging us.
+            let want = profile.framing.expected_dev_flags;
+            if flags != want {
+                eprintln!(
+                    "warning: the kernel reports dev_flags {flags:#x} for the {} profile, \
+                     not the {want:#x} its descriptor implies; report framing may be wrong",
+                    profile.identity.as_str()
+                );
+            }
         }
         Decoded::Open => shared.opened.store(true, Ordering::Relaxed),
         Decoded::Close => shared.opened.store(false, Ordering::Relaxed),
         // "You can usually ignore any UHID_STOP events safely."
         Decoded::Stop | Decoded::Other(_) => {}
-        Decoded::GetReport(id, _rnum, _rtype) => {
+        Decoded::GetReport(id, rnum, _rtype) => {
             // Never empty, and never late. A device that answers every
             // GET_REPORT with `size = 0` hands Steam an empty attributes /
             // serial / chip-id blob; the reference implementation never does
             // that, and the passive probe that did was ignored.
-            let data = profile.canned_reply(shared.selector.load(Ordering::Relaxed));
+            //
+            // `rnum` is Steam's own byte 0, carried through `hidraw_get_report`
+            // unchanged; `get_report_reply` echoes it back the way
+            // `usbhid_get_raw_report` would on real hardware, and sizes the
+            // answer as that profile's descriptor promises.
+            let data = profile.get_report_reply(rnum, shared.selector.load(Ordering::Relaxed));
             let _ = shared.write_event(&get_report_reply_event(id, &data));
         }
         Decoded::SetReport(id, write) => {
@@ -1066,16 +1098,29 @@ mod tests {
     }
 
     /// Drive the real event loop against a socketpair standing in for
-    /// `/dev/uhid`.
-    fn loop_on_a_socketpair() -> (UnixStream, Arc<Shared>, mpsc::Receiver<HostWrite>) {
+    /// `/dev/uhid`, for whichever profile is under test.
+    fn loop_for(
+        profile: &'static Profile,
+    ) -> (UnixStream, Arc<Shared>, mpsc::Receiver<HostWrite>) {
         let (kernel, device) = seqpacket_pair();
-        let shared = Arc::new(
-            Shared::new(device, profile::deck().default_selector).expect("nonblock"),
-        );
+        let shared = Arc::new(Shared::new(device, profile.default_selector).expect("nonblock"));
         let (tx, rx) = mpsc::sync_channel(WRITE_QUEUE_DEPTH);
         let s = Arc::clone(&shared);
-        std::thread::spawn(move || event_loop(&s, profile::deck(), &tx));
+        std::thread::spawn(move || event_loop(&s, profile, &tx));
         (kernel, shared, rx)
+    }
+
+    /// The proven profile, which most of these tests exercise.
+    fn loop_on_a_socketpair() -> (UnixStream, Arc<Shared>, mpsc::Receiver<HostWrite>) {
+        loop_for(profile::deck())
+    }
+
+    /// Read one event off the kernel end of the pair.
+    fn read_event(kernel: &mut UnixStream) -> Vec<u8> {
+        let mut buf = vec![0u8; EVENT_SIZE];
+        let n = kernel.read(&mut buf).expect("one event");
+        buf.truncate(n);
+        buf
     }
 
     #[test]
@@ -1094,6 +1139,123 @@ mod tests {
         assert_eq!(&reply[O_GRR_DATA..O_GRR_DATA + size], &profile::deck().canned_reply(profile::deck().default_selector)[..]);
 
         shared.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The triton round trip Steam actually performs, end to end through the
+    /// real event loop: a `SET_REPORT` naming `GetAttributesValues` selects the
+    /// answer, and the `GET_REPORT` that follows gets it — **65 bytes, report
+    /// number first, command id second**, the frame
+    /// `usbhid_get_raw_report` would have produced on a real `1302`.
+    #[test]
+    fn a_triton_get_report_round_trip_returns_65_framed_bytes() {
+        let t = profile::triton();
+        let (mut kernel, shared, rx) = loop_for(t);
+
+        // Steam: `buf[0] = 0; buf[1] = ID_GET_ATTRIBUTES_VALUES;`
+        // `SDL_hid_send_feature_report(dev, buf, 65)` — hidraw hands the whole
+        // 65-byte buffer through, report-number byte included.
+        let mut request = vec![0u8; 65];
+        request[1] = profile::cmd::GET_ATTRIBUTES_VALUES;
+        kernel.write_all(&kernel_set_report(1, 0, rtype::FEATURE, &request)).unwrap();
+        assert_eq!(read_event(&mut kernel), set_report_reply_event(1), "acked first");
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("the write is handed over");
+        assert_eq!(got.command()[0], profile::cmd::GET_ATTRIBUTES_VALUES, "the id is data[1]");
+
+        // Steam: `SDL_hid_get_feature_report(dev, uBuffer, 65)`.
+        kernel.write_all(&kernel_get_report(2, 0, rtype::FEATURE)).unwrap();
+        let reply = read_event(&mut kernel);
+        assert_eq!(le_u32(&reply, O_GRR_ID), Some(2));
+        assert_eq!(le_u16(&reply, O_GRR_ERR), Some(0));
+        let size = le_u16(&reply, O_GRR_SIZE).unwrap() as usize;
+        assert_eq!(size, 65, "a real 1302 answers a 65-byte request with 65 bytes");
+        let data = &reply[O_GRR_DATA..O_GRR_DATA + size];
+        assert_eq!(data[0], 0x00, "the report number Steam asked with");
+        assert_eq!(data[1], profile::cmd::GET_ATTRIBUTES_VALUES, "SDL checks uBuffer[1]");
+        assert_eq!(data[2], 0x2d, "…then the payload length, which SDL bounds-checks");
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 0x1302);
+        assert_eq!(data, t.get_report_reply(0, profile::cmd::GET_ATTRIBUTES_VALUES).as_slice());
+
+        shared.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The same exchange on the deck profile is byte-for-byte what it was: 64
+    /// bytes, unnumbered, the proven bytes.
+    #[test]
+    fn the_deck_round_trip_is_unchanged_at_64_unnumbered_bytes() {
+        let d = profile::deck();
+        let (mut kernel, shared, _rx) = loop_for(d);
+        let mut request = vec![0u8; 65];
+        request[1] = profile::cmd::GET_STRING_ATTRIBUTE;
+        kernel.write_all(&kernel_set_report(1, 0, rtype::FEATURE, &request)).unwrap();
+        let _ = read_event(&mut kernel);
+        kernel.write_all(&kernel_get_report(2, 0, rtype::FEATURE)).unwrap();
+        let reply = read_event(&mut kernel);
+        let size = le_u16(&reply, O_GRR_SIZE).unwrap() as usize;
+        assert_eq!(size, 64);
+        assert_eq!(
+            &reply[O_GRR_DATA..O_GRR_DATA + size],
+            &d.canned_reply(profile::cmd::GET_STRING_ATTRIBUTE)[..]
+        );
+        shared.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The triton input stream on the wire: exactly what the descriptor
+    /// promises, because `uhid_dev_input2` hands the buffer straight to
+    /// `hid_report_raw_event`, which reads `data[0]` as the report id.
+    #[test]
+    fn a_triton_input_event_carries_the_id_byte_and_the_declared_length() {
+        use crate::uhid::translate::{self, StripMask};
+        let f = profile::triton().framing;
+
+        // A captured-shape puck report: id 0x42, counter, A pressed.
+        let mut raw = vec![0u8; f.input_len];
+        raw[0] = 0x42;
+        raw[1] = 0x5a;
+        raw[2] = 0x01;
+        let report = translate::puck_to_triton(&raw, StripMask::guide_only()).expect("a 0x42");
+        let ev = input2_event(&report);
+        assert_eq!(le_u16(&ev, O_INPUT2_SIZE), Some(54));
+        assert_eq!(usize::from(le_u16(&ev, O_INPUT2_SIZE).unwrap()), f.input_len);
+        assert_eq!(ev[O_INPUT2_DATA], f.input_report_id.unwrap(), "byte 0 is the report id");
+        assert_eq!(ev[O_INPUT2_DATA + 1], 0x5a, "the puck's own counter, relayed");
+        assert_eq!(ev.len(), O_INPUT2_DATA + 54);
+
+        // Neutral is the same shape — a silent puck must not change the framing.
+        let ev = input2_event(&translate::triton_neutral(3));
+        assert_eq!(le_u16(&ev, O_INPUT2_SIZE), Some(54));
+        assert_eq!(ev[O_INPUT2_DATA], 0x42);
+
+        // And deck's stays bare 64 bytes with no id byte at all.
+        let d = profile::deck().framing;
+        let ev = input2_event(&translate::deck_neutral(3));
+        assert_eq!(le_u16(&ev, O_INPUT2_SIZE), Some(64));
+        assert_eq!(usize::from(le_u16(&ev, O_INPUT2_SIZE).unwrap()), d.input_len);
+        assert_eq!(d.input_report_id, None);
+    }
+
+    /// `UHID_CREATE2` has nowhere to ask for numbered framing, and that is the
+    /// point: `struct uhid_create2_req` ends at `country` + `rd_data`. The
+    /// descriptor is the request; `dev_flags` comes back the other way.
+    #[test]
+    fn create2_has_no_dev_flags_field_the_descriptor_is_the_request() {
+        for p in [profile::triton(), profile::deck()] {
+            let ev = create2_event(p);
+            assert_eq!(
+                ev.len(),
+                O_CREATE2_RD_DATA + p.descriptor.len(),
+                "nothing sits between country and rd_data"
+            );
+            assert_eq!(&ev[O_CREATE2_RD_DATA..], p.descriptor);
+            assert_eq!(le_u32(&ev, O_CREATE2_COUNTRY), Some(0));
+            // The flags are a *reply*: they only ever arrive in UHID_START.
+            let mut start = vec![0u8; 12];
+            start[0..4].copy_from_slice(&ev::START.to_le_bytes());
+            start[O_START_FLAGS..O_START_FLAGS + 8]
+                .copy_from_slice(&p.framing.expected_dev_flags.to_le_bytes());
+            assert_eq!(decode(&start), Some(Decoded::Start(p.framing.expected_dev_flags)));
+        }
+        assert_eq!(profile::triton().framing.expected_dev_flags, 1 | 2 | 4);
+        assert_eq!(profile::deck().framing.expected_dev_flags, 0);
     }
 
     #[test]
@@ -1134,6 +1296,10 @@ mod tests {
         shared.stop.store(true, Ordering::Relaxed);
     }
 
+    /// Whatever `UHID_START` says is recorded, even when it disagrees with the
+    /// profile — the flags it carries are the kernel's *answer*, and the only
+    /// honest thing to do with a surprising one is keep it and say so. (This
+    /// case does warn: the deck profile expects `0` and gets `1 | 4`.)
     #[test]
     fn start_and_open_are_recorded_for_the_streamer_to_see() {
         let (mut kernel, shared, _rx) = loop_on_a_socketpair();

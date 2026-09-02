@@ -30,6 +30,12 @@
 //!    writable fd on the puck", so rumble and haptics are *translated into that
 //!    path* rather than forwarded as raw bytes.
 //!
+//! 3. **The queries are already answered by the time the daemon sees them.** A
+//!    `SET_REPORT` naming `GetAttributesValues`, `GetStringAttribute` or
+//!    `GetChipId` selects what the next `GET_REPORT` reads back; `uhid.rs`
+//!    stores the selector and replies from the profile's canned data. Those
+//!    classify as [`Action::Answered`], not as drops.
+//!
 //! Everything else is dropped with a debug log. Note what that costs: Steam's
 //! IMU-enable would not reach the puck, so gyro does not start streaming by
 //! itself. That is a known limitation of this build, recorded in
@@ -80,6 +86,18 @@ pub mod cmd {
     pub const OUT_RUMBLE: u8 = 0x80;
     /// The puck's `0x81` haptic-pulse **output** report (`haptics.rs`).
     pub const OUT_PULSE: u8 = 0x81;
+
+    /// The queries `profile::Profile::canned_reply` has a real answer for.
+    ///
+    /// A `SET_REPORT` naming one of these selects what the next `GET_REPORT`
+    /// returns; the relay answers it and the daemon has nothing to do. Kept in
+    /// the same order as `Profile::canned_reply`'s match arms, and equal to
+    /// `profile::cmd`'s three ids by construction — a test pins that.
+    pub const ANSWERED_QUERIES: [u8; 3] = [
+        crate::uhid::profile::cmd::GET_ATTRIBUTES_VALUES,
+        crate::uhid::profile::cmd::GET_STRING_ATTRIBUTE,
+        crate::uhid::profile::cmd::GET_CHIP_ID,
+    ];
 }
 
 /// A human name for a command id, for logging only.
@@ -237,6 +255,19 @@ pub enum Action {
     /// A decoded `SetSettingsValues`. Informational: hyprpad maintains lizard
     /// mode itself and does not forward settings to the puck.
     Settings(Vec<Setting>),
+    /// A **query**, already answered by the relay's canned data.
+    ///
+    /// Valve's control protocol is stateful in one small way: a `SET_REPORT`
+    /// naming a query command does not set anything, it *selects* what the next
+    /// `GET_REPORT` reads back. `uhid.rs`'s event loop stores the id as the
+    /// selector and the following `GET_REPORT` returns
+    /// `Profile::get_report_reply` for it — so by the time the daemon sees this
+    /// action the exchange is complete.
+    ///
+    /// It exists to keep the debug log honest. `dropped GetAttributesValues
+    /// (0x83)` is what it used to say, which reads as "Steam asked and we
+    /// ignored it" when in fact Steam asked and was answered.
+    Answered { id: u8, name: &'static str },
     /// Understood, deliberately not acted on.
     Dropped { id: u8, name: &'static str },
     /// Not a well-formed command frame at all.
@@ -261,6 +292,7 @@ impl Action {
                     .collect();
                 format!("SetSettingsValues [{}]", pairs.join(", "))
             }
+            Action::Answered { id, name } => format!("answered {name} ({id:#04x})"),
             Action::Dropped { id, name } => format!("dropped {name} ({id:#04x})"),
             Action::Malformed => "malformed write".to_string(),
         }
@@ -281,6 +313,15 @@ pub fn classify(write: &HostWrite) -> Action {
         // `src/haptics.rs` builds, read back.
         cmd::OUT_RUMBLE if write.is_output() => parse_native_rumble(cmd),
         cmd::OUT_PULSE if write.is_output() => parse_native_pulse(cmd),
+        // A query on the *feature* channel: the event loop has already stored
+        // it as the GET selector and the reply is canned, so this is a
+        // completed exchange, not a dropped one. Only the feature channel
+        // selects — the interrupt-out channel's `0x83` is a declared output
+        // report on the triton descriptor, an actuator command with the same
+        // number, and must not be mistaken for a query.
+        other if !write.is_output() && cmd::ANSWERED_QUERIES.contains(&other) => {
+            Action::Answered { id: other, name: command_name(other) }
+        }
         other => Action::Dropped { id: other, name: command_name(other) },
     }
 }
@@ -585,6 +626,47 @@ mod tests {
         let w = feature(&[0x77, 0]);
         assert_eq!(classify(&w), Action::Dropped { id: 0x77, name: "unknown" });
         assert_eq!(classify(&w).describe(), "dropped unknown (0x77)");
+    }
+
+    /// A query is a **request**, not a setting: it selects what the next
+    /// `GET_REPORT` reads back, `uhid.rs` answers it from the profile's canned
+    /// data, and by the time the daemon sees it the exchange is done. Logging
+    /// it as "dropped" — which is what `[relay] dropped GetAttributesValues
+    /// (0x83)` said — sends anyone reading the log after the wrong bug.
+    #[test]
+    fn a_query_on_the_feature_channel_is_answered_not_dropped() {
+        for (id, name) in [
+            (0x83u8, "GetAttributesValues"),
+            (0xAE, "GetStringAttribute"),
+            (0xBA, "GetChipId"),
+        ] {
+            let w = feature(&[id, 0]);
+            assert_eq!(classify(&w), Action::Answered { id, name });
+            assert_eq!(classify(&w).describe(), format!("answered {name} ({id:#04x})"));
+        }
+        assert_eq!(
+            classify(&feature(&[0x83, 0])).describe(),
+            "answered GetAttributesValues (0x83)"
+        );
+
+        // The list is exactly the set `Profile::canned_reply` has an answer
+        // for — no more, no less.
+        assert_eq!(
+            cmd::ANSWERED_QUERIES,
+            [
+                crate::uhid::profile::cmd::GET_ATTRIBUTES_VALUES,
+                crate::uhid::profile::cmd::GET_STRING_ATTRIBUTE,
+                crate::uhid::profile::cmd::GET_CHIP_ID
+            ]
+        );
+
+        // On the interrupt-out channel `0x83` is a declared output report of
+        // the triton descriptor — an actuator command that happens to share the
+        // number. It selects nothing and must not read as answered.
+        assert_eq!(
+            classify(&output(&[0x83, 0])),
+            Action::Dropped { id: 0x83, name: "GetAttributesValues" }
+        );
     }
 
     #[test]
