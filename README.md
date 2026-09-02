@@ -350,7 +350,7 @@ exactly as long as the daemon does:
 
 ```json
 {"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
- "relay": "xbox", "pid": 12345,
+ "relay": "xbox", "source": "direct", "pid": 12345,
  "modes": ["cheatsheet", "omarchy-ui", "game", "browser", "desktop", "osk"],
  "updated": 1725230000}
 ```
@@ -360,6 +360,10 @@ exactly as long as the daemon does:
 (`[gamepad] kind = "steam"`, see `docs/design/uhid-relay.md`), or `none` when the
 forwarding path is switched off or the Steam relay could not be created. It
 reports the sink that *exists*, not the one the config asked for.
+
+`source` is `broker` or `direct`: how hyprpad got hold of the *real* controller.
+`broker` means the root fd helper passed the descriptors over, which is the only
+arrangement in which Steam cannot also open the puck — see the next section.
 
 `mode` is the mode the pad is *in*, which is not always the mode engine's: while
 the on-screen keyboard owns the pads it reads `osk`, the same built-in context the
@@ -384,6 +388,51 @@ cheat sheet's panel — it goes in a bar section of `shell.json` rather than in
 scripts/hyprpad-statusbar install
 omarchy plugin enable hyprpad.status --section right
 ```
+
+## Steam sees a Steam Controller (setup)
+
+Optional, and off by default. With `[gamepad] kind = "steam"` hyprpad presents
+Steam a **virtual Valve controller** on `/dev/uhid` and streams the real puck
+into it, so Steam Input gives you trackpads as trackpads, gyro, the four back
+grips and per-game configs — instead of the synthesized Xbox pad. The design is
+[docs/design/uhid-relay.md](docs/design/uhid-relay.md).
+
+Two things have to be true for that to be worth anything, and both need root:
+
+1. hyprpad must be able to open `/dev/uhid`, which is `root 0600`;
+2. Steam must **not** be able to open the real puck — otherwise it sees both
+   controllers and a game counts every press twice.
+
+Steam and hyprpad run as the same user, so no group or ACL can separate them.
+The split is made by taking the puck's hidraw nodes away from *everything*
+unprivileged (a udev rule) and handing hyprpad its descriptors from a tiny root
+helper over a unix socket (`hyprpad broker`, socket-activated by systemd).
+
+`hyprpad setup` **prints** the install steps and never runs them — read them,
+then run them yourself:
+
+```
+hyprpad setup --print          # just the block
+hyprpad setup --check          # read-only: is it installed, and does it work?
+```
+
+The files it installs all live under [`packaging/`](packaging), each with a
+comment header explaining what it does and how to remove it:
+
+| | |
+|---|---|
+| `packaging/udev/72-hyprpad-puck.rules` | makes the real puck root-only, and strips the `uaccess` tag Valve's own rule adds. The number is load-bearing — see the design doc §6.1 |
+| `packaging/sysusers.d/hyprpad.conf` | the `hyprpad` group, which is who may ask the broker |
+| `packaging/systemd/hyprpad-broker.socket` | `/run/hyprpad/broker.sock`, `0660 root:hyprpad` |
+| `packaging/systemd/hyprpad-broker.service` | the broker itself, root and tightly sandboxed |
+
+After installing, **re-login or `newgrp hyprpad`** — group membership only
+reaches processes started after it is granted — and confirm with
+`hyprpad setup --check`, which should print six `ok` lines and `READY`.
+
+If the broker is not installed, or is installed and refuses, **nothing breaks**:
+hyprpad opens the puck directly exactly as it always has, says so once, and runs
+with no Steam relay. `status.json`'s `source` field says which half is live.
 
 ## Documents
 
