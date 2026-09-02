@@ -350,9 +350,16 @@ exactly as long as the daemon does:
 
 ```json
 {"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
- "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "browser", "desktop", "osk"],
+ "relay": "xbox", "pid": 12345,
+ "modes": ["cheatsheet", "omarchy-ui", "game", "browser", "desktop", "osk"],
  "updated": 1725230000}
 ```
+
+`relay` is which virtual controller a focused game is actually being given —
+`xbox` for the uinput pad, `steam` for the virtual Valve controller
+(`[gamepad] kind = "steam"`, see `docs/design/uhid-relay.md`), or `none` when the
+forwarding path is switched off or the Steam relay could not be created. It
+reports the sink that *exists*, not the one the config asked for.
 
 `mode` is the mode the pad is *in*, which is not always the mode engine's: while
 the on-screen keyboard owns the pads it reads `osk`, the same built-in context the
