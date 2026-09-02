@@ -23,6 +23,17 @@
 //! which it got, via `described`, so the widget can style an authored label
 //! differently from a guessed one.
 //!
+//! # Modes, and the one the daemon hardwires
+//!
+//! `modes` reports every declared mode with what is live in it, and then one
+//! more the config never wrote: [`OSK_MODE`], the context the on-screen
+//! keyboard puts the pad in. It carries `builtin: true` and names the `section`
+//! whose rows ARE that context, so a reader — or the widget's tab strip — can
+//! show the keyboard's bindings as a mode without knowing what a keyboard is.
+//! The rows the daemon hardwires there (the pads' cursors, the commit clicks,
+//! the dismissal) are synthesized into that section, because a context whose
+//! only listed bindings are two helper keys is not one you could use.
+//!
 //! # Control ids
 //!
 //! Every entry carries a `control`: a stable id for the *physical* control it
@@ -119,12 +130,28 @@ pub struct ModeRow {
     pub has_rule: bool,
     /// Whether this is the fallback mode.
     pub default: bool,
+    /// Whether the daemon hardwires this context rather than the config
+    /// declaring it — see [`OSK_MODE`].
+    pub builtin: bool,
+    /// The section whose rows ARE this context, for a built-in one: the reader
+    /// is in it exactly when those bindings are the ones that work. `None` for
+    /// a declared mode, whose rows are decided by each binding's guard.
+    pub section: Option<&'static str>,
     /// The chords that are unconditionally live in this mode.
     pub active: Vec<String>,
     /// The chords whose guard is a `:when` predicate, so liveness cannot be
     /// decided without a live context.
     pub conditional: Vec<String>,
 }
+
+/// The name of the context the on-screen keyboard puts the pad in.
+///
+/// Not a declared mode — the daemon does not switch modes for the keyboard —
+/// but from the reader's side it is one: while the keyboard is up it owns both
+/// pads, the `[osk_buttons]` helpers type through it, and every other binding
+/// is suppressed (`route_osk` in `run.rs`). The sheet shows it as a mode
+/// because that is what it behaves like.
+pub const OSK_MODE: &str = "osk";
 
 /// Everything `hyprpad bindings` prints.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +246,40 @@ impl Sheet {
             RANK_PAD,
         ));
 
+        // What the on-screen keyboard hardwires. None of this is a binding
+        // anyone can write — `route_osk` owns the pads, the clicks and the
+        // dismissal itself — so a sheet that listed only `[osk_buttons]` would
+        // describe the keyboard's context as two helper keys and nothing else,
+        // which is not a context you could actually use.
+        for (control, control_label, rank) in [
+            ("lpad", "Left trackpad", RANK_PAD),
+            ("rpad", "Right trackpad", RANK_PAD + 1),
+        ] {
+            entries.push(osk_builtin(
+                control,
+                control_label.to_string(),
+                "Move the keyboard's cursor",
+                "osk cursor",
+                rank,
+            ));
+        }
+        for (b, label, action) in [
+            (Button::PadLeftClick, "Type the key under the cursor", "osk commit"),
+            (Button::PadRightClick, "Type the key under the cursor", "osk commit"),
+            (Button::TriggerL2Full, "Type the key under the cursor", "osk commit"),
+            (Button::TriggerR2Full, "Type the key under the cursor", "osk commit"),
+            (Button::B, "Close the keyboard", "osk close"),
+            (Button::Menu, "Close the keyboard", "osk close"),
+        ] {
+            entries.push(osk_builtin(
+                button_name(b),
+                button_label(b),
+                label,
+                action,
+                button_rank(b),
+            ));
+        }
+
         entries.sort_by(|a, b| {
             (section_rank(a.section), a.rank, &a.chord).cmp(&(
                 section_rank(b.section),
@@ -228,7 +289,7 @@ impl Sheet {
         });
 
         let default_mode = c.default_mode().to_string();
-        let modes = c
+        let mut modes: Vec<ModeRow> = c
             .modes()
             .iter()
             .map(|m| {
@@ -251,11 +312,39 @@ impl Sheet {
                     forward: m.forward,
                     has_rule: m.rule.is_some(),
                     default: m.name == default_mode,
+                    builtin: false,
+                    section: None,
                     active,
                     conditional,
                 }
             })
             .collect();
+
+        // The keyboard's context, as a mode the sheet can show. Its rows are a
+        // whole SECTION rather than a guard evaluation: the reader is in this
+        // context exactly when the OSK helpers are the bindings that work, and
+        // saying so in the data is what keeps the widget from having to know
+        // what an on-screen keyboard is.
+        let osk: Vec<&Entry> =
+            entries.iter().filter(|e| e.section == Section::OskButton).collect();
+        modes.push(ModeRow {
+            name: OSK_MODE.to_string(),
+            forward: false,
+            has_rule: false,
+            default: false,
+            builtin: true,
+            section: Some(Section::OskButton.wire()),
+            active: osk
+                .iter()
+                .filter(|e| !matches!(e.guard, Guard::When(_)))
+                .map(|e| e.chord.clone())
+                .collect(),
+            conditional: osk
+                .iter()
+                .filter(|e| matches!(e.guard, Guard::When(_)))
+                .map(|e| e.chord.clone())
+                .collect(),
+        });
 
         Sheet {
             source: source.map(|(p, f)| (p.display().to_string(), f)),
@@ -304,6 +393,33 @@ fn entry(
         action: action_string(action),
         action_kind: action_kind(action),
         guard: guard.cloned().unwrap_or(Guard::Always),
+        rank,
+    }
+}
+
+/// A row for something the daemon hardwires while the on-screen keyboard is up
+/// ([`crate::run`]'s `route_osk`). Not a binding: there is no config spelling
+/// for it, so `action` describes the behaviour instead of naming an action, and
+/// the label is authored here rather than derived. Guarded to [`OSK_MODE`], so
+/// it belongs to the keyboard's context and to no declared mode.
+fn osk_builtin(
+    control: &str,
+    control_label: String,
+    label: &str,
+    action: &str,
+    rank: u32,
+) -> Entry {
+    Entry {
+        section: Section::OskButton,
+        chord: control.to_string(),
+        control: control.to_string(),
+        direction: None,
+        control_label,
+        label: label.to_string(),
+        described: true,
+        action: action.to_string(),
+        action_kind: "builtin",
+        guard: Guard::OnlyIn(vec![OSK_MODE.to_string()]),
         rank,
     }
 }
@@ -740,9 +856,15 @@ impl Sheet {
             push_str(&mut o, &m.name);
             let _ = write!(
                 o,
-                ", \"forward\": {}, \"has_rule\": {}, \"default\": {}, \"active\": ",
-                m.forward, m.has_rule, m.default
+                ", \"forward\": {}, \"has_rule\": {}, \"default\": {}, \"builtin\": {}",
+                m.forward, m.has_rule, m.default, m.builtin
             );
+            o.push_str(", \"section\": ");
+            match m.section {
+                Some(s) => push_str(&mut o, s),
+                None => o.push_str("null"),
+            }
+            o.push_str(", \"active\": ");
             push_strs(&mut o, &m.active);
             o.push_str(", \"conditional\": ");
             push_strs(&mut o, &m.conditional);
@@ -798,13 +920,15 @@ impl Sheet {
             "\nModes (rules evaluated in order, first match wins; default: {})\n",
             self.default_mode
         );
-        if self.modes.is_empty() {
+        if self.modes.iter().all(|m| m.builtin) {
             o.push_str("  (none declared — built-in game/desktop behaviour)\n");
-            return o;
         }
         let total = self.entries.len();
         for m in &self.modes {
             let mut notes = Vec::new();
+            if m.builtin {
+                notes.push("built-in".to_string());
+            }
             if m.default {
                 notes.push("default".to_string());
             }
@@ -949,7 +1073,17 @@ mod tests {
     }
 
     fn find<'a>(s: &'a Sheet, chord: &str) -> &'a Entry {
-        s.entries.iter().find(|e| e.chord == chord).unwrap_or_else(|| panic!("no {chord}"))
+        s.entries
+            .iter()
+            .find(|e| e.chord == chord && !is_builtin(e))
+            .unwrap_or_else(|| panic!("no {chord}"))
+    }
+
+    /// The rows the daemon synthesizes for the keyboard's context share their
+    /// chord with the control they sit on (`b`, `rpad`), so a test looking for
+    /// what the CONFIG said has to step over them.
+    fn is_builtin(e: &Entry) -> bool {
+        e.action_kind == "builtin"
     }
 
     // --- derived labels ----------------------------------------------------
@@ -1055,8 +1189,9 @@ mod tests {
         assert_eq!(find(&s, "guide+x").label, "Omarchy menu");
         assert_eq!(find(&s, "dpad_up").section, Section::Button);
         assert_eq!(find(&s, "y").section, Section::OskButton);
-        // Every TOML binding is unguarded.
-        assert!(s.entries.iter().all(|e| e.guard == Guard::Always));
+        // Every TOML binding is unguarded. (The keyboard's built-in rows are
+        // not bindings and carry their own context's guard.)
+        assert!(s.entries.iter().filter(|e| !is_builtin(e)).all(|e| e.guard == Guard::Always));
     }
 
     // --- the Lua front-end -------------------------------------------------
@@ -1121,6 +1256,48 @@ mod tests {
         assert!(!desktop.has_rule);
         assert!(desktop.active.contains(&"a".to_string()));
         assert!(desktop.active.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn the_keyboards_context_is_a_builtin_mode_carrying_the_daemons_own_rows() {
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.osk_button("y", h.key "space")
+            "#,
+        );
+        let osk = s.modes.iter().find(|m| m.name == OSK_MODE).expect("an osk mode row");
+        assert!(osk.builtin);
+        assert_eq!(osk.section, Some("osk_button"), "the section that IS this context");
+        // Its rows are the whole section: what the config wrote, and what the
+        // daemon hardwires — a context listing only `y` would be unusable.
+        assert!(osk.active.contains(&"y".to_string()));
+        for chord in ["lpad", "rpad", "lpad_click", "rpad_click", "l2", "r2", "b", "menu"] {
+            assert!(osk.active.contains(&chord.to_string()), "no built-in row for {chord}");
+        }
+        // No declared mode claims them: while the keyboard is up, nothing else
+        // is live, so they are not "live in desktop" in any useful sense.
+        let desktop = s.modes.iter().find(|m| m.name == "desktop").unwrap();
+        assert!(!desktop.active.contains(&"lpad_click".to_string()));
+        assert!(!desktop.active.contains(&"menu".to_string()));
+
+        let close = s
+            .entries
+            .iter()
+            .find(|e| e.chord == "menu" && is_builtin(e))
+            .expect("Menu closes the keyboard");
+        assert_eq!(close.label, "Close the keyboard");
+        assert_eq!(close.section, Section::OskButton);
+        assert!(close.described, "a built-in row is authored, not derived");
+        assert_eq!(close.guard, Guard::OnlyIn(vec![OSK_MODE.to_string()]));
+
+        let j = s.to_json();
+        assert!(j.contains("\"builtin\": true"), "modes carry `builtin` in\n{j}");
+        assert!(j.contains("\"section\": \"osk_button\""), "and the section in\n{j}");
+        check_json(&j);
     }
 
     #[test]
@@ -1229,6 +1406,14 @@ mod tests {
         // Spot-check that the owner's own descriptions survive the trip.
         assert_eq!(find(&s, "guide+r1").label, "Workspace right");
         assert!(find(&s, "guide+r1").described);
+        // The sheet's own tab paging is live under the sheet and nowhere else:
+        // the bumpers keep their guide chords everywhere.
+        let sheet_mode = s.modes.iter().find(|m| m.name == "cheatsheet").unwrap();
+        assert!(sheet_mode.active.contains(&"l1".to_string()));
+        assert!(sheet_mode.active.contains(&"r1".to_string()));
+        let desktop = s.modes.iter().find(|m| m.name == "desktop").unwrap();
+        assert!(!desktop.active.contains(&"l1".to_string()));
+        assert!(desktop.active.contains(&"guide+l1".to_string()));
     }
 
     /// A minimal JSON well-formedness check: balanced braces/brackets outside

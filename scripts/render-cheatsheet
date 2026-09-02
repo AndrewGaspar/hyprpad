@@ -6,10 +6,17 @@
 #
 #   scripts/render-cheatsheet [out.png] [layout-id]     (default: ./cheatsheet.png, steam-controller-2026)
 #
+# CHEATSHEET_TAB=<mode> pins the tab the sheet opens on (the widget otherwise
+# opens on the mode it was summoned from, else the config's default), so every
+# context can be rendered without a controller in the loop:
+#
+#   for t in desktop game osk; do CHEATSHEET_TAB=$t scripts/render-cheatsheet $t.png; done
+#
 # Used to verify the sheet against a config change, or to grab a screenshot when the
 # session is locked (the compositor paints its lock over a real grim capture).
 set -euo pipefail
 OUT="${1:-$PWD/cheatsheet.png}"; LAYOUT_ID="${2:-steam-controller-2026}"
+TAB="${CHEATSHEET_TAB:-}"
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 PLUGIN="$HERE/shell/hyprpad.cheatsheet"
 STEAM="${STEAM_ROOT:-$HOME/.local/share/Steam}"
@@ -17,9 +24,9 @@ command -v qml6 >/dev/null || { echo "render-cheatsheet: needs qml6 (qt6-declara
 command -v hyprpad >/dev/null || { echo "render-cheatsheet: hyprpad not on PATH" >&2; exit 1; }
 WORK="$(mktemp -d "$HOME/tmp/render-cheatsheet.XXXXXX" 2>/dev/null || mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 hyprpad bindings --json > "$WORK/sheet.json"
-python3 - "$PLUGIN" "$LAYOUT_ID" "$STEAM" "$WORK" "$OUT" <<'PY'
+python3 - "$PLUGIN" "$LAYOUT_ID" "$STEAM" "$WORK" "$OUT" "$TAB" <<'PY'
 import json, sys, os
-P, LID, STEAM, WORK, OUT = sys.argv[1:6]
+P, LID, STEAM, WORK, OUT, TAB = sys.argv[1:7]
 layout = json.load(open(f"{P}/layouts/{LID}.json"))
 svg = ""
 for a in layout.get("art", []):
@@ -40,6 +47,7 @@ Window {{
     pluginDir: {js(P)}
     artSvg: Callouts.recolor({js(svg)}, "#D9CDB4")
     toggleChord: "guide+view"
+    initialMode: {js(TAB)}
   }}
   Timer {{ interval: 2500; running: true
     onTriggered: win.contentItem.grabToImage(function(r) {{ r.saveToFile({js(OUT)}); Qt.quit() }}) }}

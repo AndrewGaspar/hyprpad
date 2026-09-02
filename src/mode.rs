@@ -847,7 +847,12 @@ mod tests {
         assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
         assert_eq!(m.active(), "cheatsheet");
         assert_eq!(m.buttons().get(&Button::B), Some(&1), "B is Escape under the sheet");
-        assert_eq!(m.buttons().len(), 1, "nothing else is guarded into cheatsheet");
+        // The sheet's own controls, and nothing else: B closes it, and the
+        // bumpers page its tabs (Left/Right, which is what the widget listens
+        // for). The desktop's arrows and Enter are gone, as they must be.
+        assert_eq!(m.buttons().get(&Button::BumperL1), Some(&105), "L1 pages back");
+        assert_eq!(m.buttons().get(&Button::BumperR1), Some(&106), "R1 pages on");
+        assert_eq!(m.buttons().len(), 3, "nothing else is guarded into cheatsheet");
 
         // A repeat `openlayer` is not a context change: no re-resolve, and the
         // caller runs no second handoff.

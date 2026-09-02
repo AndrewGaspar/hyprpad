@@ -2,7 +2,7 @@
 
 An on-screen card showing what the controller currently does: a diagram of the
 pad with one callout per physical control, every binding that lands on that
-control stacked inside it, and the declared modes underneath.
+control stacked inside it, and a tab per context the pad can be in.
 
     scripts/hyprpad-cheatsheet install     # copy it into Omarchy
     omarchy plugin enable hyprpad.cheatsheet
@@ -11,22 +11,26 @@ control stacked inside it, and the declared modes underneath.
 ## What a callout says
 
 A callout is a **control**, not a binding family. Every row inside it is one
-binding, and the glyph in front of the row says what you have to be holding for
-it to do that:
+binding, and it opens with the **chord** that fires it — the button's own glyph,
+behind a modifier glyph and a `+` when something has to be held first:
 
 | row | means |
 | --- | --- |
-| `Enter` | press it on its own |
-| Steam glyph + `Dictation toggle` | hold Steam, then press |
-| keyboard glyph + `Backspace` | while the on-screen keyboard is up |
-| `· only in desktop` | a mode guard, dimmed |
+| `Ⓐ  Enter` | press it on its own |
+| `Ⓢ + Ⓐ  Dictation toggle` | hold Steam, then press |
+| `⌨ + Ⓧ  Backspace` | while the on-screen keyboard is up |
+| `Ⓢ + Ⓡ →  Workspace right` | hold Steam, then flick that way |
 | *italic* | the label was derived from the action, not written in the config |
 
-So the A button reads `Enter` / `ⓢ Dictation toggle`, and X reads
-`ⓢ Omarchy launcher` / `⌨ Backspace`. The first version put the bare buttons
-and the OSK helpers in tables under the drawing, which meant the reader had to
-join the string `x` in a table back to the X button in the picture themselves —
-the one thing the drawing was supposed to do for them.
+So the A button reads `Ⓐ Enter` / `Ⓢ + Ⓐ Dictation toggle`, and X reads
+`Ⓢ + Ⓧ Omarchy launcher`. The chord column is reserved at the widest chord in
+the box and right-aligned into it, so the buttons stack in one column and every
+label starts in the same place. The first version put the bare buttons and the
+OSK helpers in tables under the drawing, which meant the reader had to join the
+string `x` in a table back to the X button in the picture themselves — the one
+thing the drawing was supposed to do for them; the version after that dropped
+the table but left the button implicit, so a row said what it did without
+saying what you press.
 
 Rows stack bare-first, then the guide layer, then the keyboard helpers, so the
 top of every callout is what the control does if you just press it.
@@ -38,6 +42,33 @@ further to a single `→ arrow keys` row; bind one of them to something
 interesting and the four rows come back, each with its direction arrow. The
 engine checks that for itself — the layout only supplies the members and what
 the collapsed row should say.
+
+## One tab per context
+
+The card is one **context** at a time. There is a tab per mode the config
+declares, in the order their rules are tried, plus one per context the daemon
+hardwires — today the on-screen keyboard, which `hyprpad bindings --json`
+reports as a `builtin` mode naming the section that *is* it. A tab shows what
+is live there and nothing else, so `only in desktop` is a tab rather than a tag
+on a row, and the keyboard's tab lists the things nobody can bind: the pads
+driving its two cursors, a pad click or a full trigger typing the key under
+one, B or Menu closing it.
+
+Left/Right page the tabs; the bumpers are the obvious thing to bind to them,
+and they are free under the sheet because its mode is exclusive:
+
+```lua
+h.button("l1", "Previous tab", h.key "left"):only_in("cheatsheet")
+h.button("r1", "Next tab", h.key "right"):only_in("cheatsheet")
+```
+
+The sheet opens on the mode you were in when you summoned it. It cannot ask:
+raising the sheet is itself a mode change (the layer selects `cheatsheet`), so
+the daemon exports `HYPRPAD_MODE` to the command a binding execs and
+`hyprpad-cheatsheet` forwards it as `{"mode":"…"}` in the summon payload.
+Unset, the sheet falls back to the config's default mode.
+
+The card is measured for its widest tab, so paging moves nothing but the rows.
 
 The chord is `guide+view` — View is the "show me the map" button — bound in
 `config/hyprpad.lua`:

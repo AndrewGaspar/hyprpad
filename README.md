@@ -192,13 +192,22 @@ bindings still want a description.
 
 The widget itself is a Quickshell plugin for Omarchy's shell. It draws a
 diagram of the pad with one callout per *physical control*, and every binding
-that lands on that control stacked inside it — a Steam glyph in front of a row
-means "hold Steam, then press", a keyboard glyph means "while the on-screen
-keyboard is up", and nothing in front means the control does that on its own.
-So the X button's callout reads "Omarchy launcher" under the Steam glyph and
-"Backspace" under the keyboard glyph, instead of the reader having to join a
-table at the bottom of the card back to a button in the picture. The declared
-modes and a legend sit underneath. `guide+view` toggles it. Install and design
+that lands on that control stacked inside it. A row is the **chord you press**:
+the button's own glyph, behind a Steam glyph and a `+` when the guide button
+has to be held first, or a keyboard glyph when the on-screen keyboard has to be
+up. So the X button's callout reads `Ⓢ + Ⓧ  Omarchy launcher`, instead of the
+reader having to join a table at the bottom of the card back to a button in the
+picture.
+
+One card is one *context*: a tab per declared mode, in the order the rules are
+tried, plus one for the on-screen keyboard — a context the daemon hardwires,
+which `hyprpad bindings` reports as a built-in mode of its own so the sheet can
+show what the pads, the clicks and B/Menu do while the keyboard is up. A tab
+lists what is live there and nothing else, so "only in desktop" is a tab rather
+than a tag. Left/Right page the tabs, and the sheet opens on the mode you were
+in when you summoned it: raising it is itself a mode change, so the daemon
+exports `HYPRPAD_MODE` to the command a binding execs and the launcher forwards
+it in the summon payload. `guide+view` toggles it. Install and design
 notes are in [shell/README.md](shell/README.md); artwork provenance and licensing in
 [shell/hyprpad.cheatsheet/art/LICENSES.md](shell/hyprpad.cheatsheet/art/LICENSES.md).
 

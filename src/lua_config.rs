@@ -2196,7 +2196,13 @@ mod tests {
         assert_eq!(lua.cursor(), toml.cursor());
         assert_eq!(lua.scroll(), toml.scroll());
         assert_eq!(lua.haptics(), toml.haptics());
-        assert_eq!(lua.buttons(), toml.buttons());
+        // A TOML config has no modes, so a Lua binding guarded INTO one has no
+        // TOML counterpart to compare against: the cheat sheet's own Left/Right
+        // paging exists only under `cheatsheet`, a mode a TOML user never
+        // enters. What must still agree binding for binding is the pad a TOML
+        // user actually gets — the default mode.
+        let st = crate::config::ModeState::new(lua.default_mode(), Vec::new());
+        assert_eq!(&lua.buttons_in(&st), toml.buttons());
         assert_eq!(lua.osk_buttons(), toml.osk_buttons());
         for ev in every_bindable_gesture() {
             assert_eq!(

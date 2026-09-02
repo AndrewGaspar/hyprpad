@@ -33,6 +33,24 @@ ipc() {
   omarchy-shell shell "$@"
 }
 
+# The summon payload. The daemon exports HYPRPAD_MODE on the child it execs —
+# the mode the chord fired in — and the sheet opens on that context's tab.
+# It has to come down this way: summoning the sheet is itself a mode change
+# (the overlay puts the pad in `cheatsheet`), so by the time the widget is up,
+# the context the reader was in is gone. Unset — run by hand, or by a daemon
+# too old to export it — sends nothing, and the sheet falls back to the config's
+# default mode. Scrubbed to the characters a mode name can have, so nothing
+# here can hand the shell a malformed payload.
+payload() {
+  local mode="${HYPRPAD_MODE:-}"
+  mode="${mode//[^A-Za-z0-9_.:-]/}"
+  if [[ -n $mode ]]; then
+    printf '{"mode":"%s"}' "$mode"
+  else
+    printf '{}'
+  fi
+}
+
 cmd_install() {
   local src="$DEFAULT_SRC"
   if [[ ${1:-} == --from ]]; then
@@ -133,8 +151,8 @@ case "${1:-toggle}" in
   install)   shift; cmd_install "$@" ;;
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
-  toggle)    ipc toggle "$PLUGIN_ID" '{}' >/dev/null ;;
-  show)      ipc summon "$PLUGIN_ID" '{}' >/dev/null ;;
+  toggle)    ipc toggle "$PLUGIN_ID" "$(payload)" >/dev/null ;;
+  show)      ipc summon "$PLUGIN_ID" "$(payload)" >/dev/null ;;
   hide)      ipc hide   "$PLUGIN_ID" >/dev/null ;;
   -h|--help|help)
     sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'

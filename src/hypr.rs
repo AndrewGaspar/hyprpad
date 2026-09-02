@@ -205,11 +205,24 @@ impl Hypr {
     /// keeps running. The command inherits our environment (so
     /// `WAYLAND_DISPLAY` etc. reach GUI children).
     pub fn spawn(&self, cmd: &str) {
+        self.spawn_env(cmd, &[]);
+    }
+
+    /// [`spawn`](Self::spawn), with `env` set on the child on top of ours.
+    ///
+    /// This is how a child learns something about the moment it was launched
+    /// that it could not ask for afterwards — `HYPRPAD_MODE`, the mode the
+    /// chord fired in, which is already stale by the time an overlay the child
+    /// summons has changed it.
+    pub fn spawn_env(&self, cmd: &str, env: &[(&str, &str)]) {
         let cmd = cmd.to_string();
+        let env: Vec<(String, String)> =
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         thread::spawn(move || {
             let child = Command::new("/bin/sh")
                 .arg("-c")
                 .arg(&cmd)
+                .envs(env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

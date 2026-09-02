@@ -138,6 +138,13 @@ h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
 h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
 h.button("b", "Back / close", h.key "escape"):only_in("omarchy-ui")
 
+-- The sheet has one tab per mode — what the pad does in THAT context, and
+-- nothing else — and pages through them on Left/Right. The bumpers are the
+-- obvious thing to page with, and they are free here because the sheet's own
+-- mode is exclusive: `guide+l1`/`guide+r1` still change workspace.
+h.button("l1", "Previous tab", h.key "left"):only_in("cheatsheet")
+h.button("r1", "Next tab", h.key "right"):only_in("cheatsheet")
+
 -- While the on-screen keyboard is up, these tap keys THROUGH the OSK
 -- (Deck-style helpers) so you never hunt for them with a cursor. Unguarded on
 -- purpose: guide+Y is meant to raise the keyboard over a game too.

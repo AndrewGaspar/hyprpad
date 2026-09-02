@@ -15,7 +15,10 @@
 // through a virtual keyboard into whatever the compositor has focused — taking
 // an exclusive grab here would swallow those keystrokes. Escape still closes
 // the sheet when it is clicked, and the chord that summoned it always closes
-// it, which is the dismissal that actually matters on a controller.
+// it, which is the dismissal that actually matters on a controller. The same
+// caveat applies to Left/Right paging the tabs: they arrive when the layer has
+// the keyboard, and the chord bound to `b` (escape) closes the sheet either
+// way.
 
 import QtQuick
 import Quickshell
@@ -46,6 +49,12 @@ Item {
   property bool opened: false
   property string layoutId: "steam-controller-2026"
   property string toggleChord: "guide+view"
+  // The mode the pad was in when the chord fired. Summoning the sheet is itself
+  // a mode change — this layer is what puts the pad in `cheatsheet` — so the
+  // context the reader wants to see is one nobody can ask for after the fact.
+  // The daemon hands it to the launching command in `HYPRPAD_MODE`, and
+  // `hyprpad-cheatsheet` forwards it in the summon payload.
+  property string openedInMode: ""
 
   property var sheetData: null
   property var layoutData: null
@@ -61,6 +70,9 @@ Item {
     //   omarchy-shell shell toggle hyprpad.cheatsheet '{"layout":"steam-deck"}'
     if (payload.layout) root.layoutId = String(payload.layout)
     if (payload.chord) root.toggleChord = String(payload.chord)
+    // …and which context it was summoned from:
+    //   omarchy-shell shell toggle hyprpad.cheatsheet '{"mode":"desktop"}'
+    root.openedInMode = payload.mode ? String(payload.mode) : ""
     root.error = ""
     reload()
     root.opened = true
@@ -71,9 +83,12 @@ Item {
     if (bindingsProc.running) bindingsProc.running = false
   }
 
-  function toggle() {
+  // Omarchy's own `toggle` IPC summons through `open()` with the payload, so
+  // this is only for a caller that reaches the plugin directly — it forwards
+  // the payload all the same, rather than dropping the context on the floor.
+  function toggle(payloadJson) {
     if (root.opened) dismiss()
-    else open("{}")
+    else open(payloadJson || "{}")
   }
 
   // Route dismissal back through the shell so its own idea of what is open
@@ -213,6 +228,11 @@ Item {
       anchors.fill: parent
       focus: true
       Keys.onEscapePressed: root.dismiss()
+      // The bumpers page through the contexts, via whatever the config binds
+      // to Left/Right while the sheet is up:
+      //   h.button("r1", "Next tab", h.key "right"):only_in("cheatsheet")
+      Keys.onLeftPressed: card.stepTab(-1)
+      Keys.onRightPressed: card.stepTab(1)
 
       Item {
         anchors.centerIn: parent
@@ -235,6 +255,7 @@ Item {
           pluginDir: root.pluginDir
           artSvg: root.artSvg
           toggleChord: root.toggleChord
+          initialMode: root.openedInMode
 
           palBackground: Color.popups.background
           palText: Color.popups.text

@@ -1950,7 +1950,9 @@ fn handle_gesture(
         _ => {}
     }
 
-    if let Err(e) = execute(hypr, &action) {
+    // The mode as it is at the moment the chord fires: an `exec` that summons
+    // an overlay is about to change it.
+    if let Err(e) = execute(hypr, &action, modes.state().active()) {
         eprintln!("dispatch failed: {e}");
     }
     false
@@ -2115,7 +2117,12 @@ fn is_guide_scoped(ge: &GestureEvent) -> bool {
     )
 }
 
-fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
+/// Perform one resolved action. `mode` is the mode the gesture fired in, handed
+/// to an `exec` child as `HYPRPAD_MODE`: a command that summons an overlay
+/// changes the mode by being launched (the cheat sheet's own layer selects
+/// `cheatsheet`), so the mode it wants to know about is the one it can no
+/// longer read for itself.
+fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
     match action {
         Action::Workspace(t) => match t {
             WorkspaceTarget::Relative(n) => hypr.workspace_relative(*n),
@@ -2133,7 +2140,7 @@ fn execute(hypr: &Hypr, action: &Action) -> std::io::Result<()> {
         },
         Action::ToggleFullscreen => hypr.toggle_fullscreen(),
         Action::Exec(cmd) => {
-            hypr.spawn(cmd);
+            hypr.spawn_env(cmd, &[("HYPRPAD_MODE", mode)]);
             Ok(())
         }
         Action::Dispatch(payload) => hypr.dispatch_raw(payload).map(|_| ()),
