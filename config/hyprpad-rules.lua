@@ -53,3 +53,11 @@ o.window(pip, { rounding = 0 })
 -- Silent full-screen screenshot to disk + clipboard (no picker).
 o.bind("SUPER + SHIFT + PRINT", "Screenshot (silent, full screen)",
   "omarchy-capture-screenshot fullscreen slurp")
+
+-- hyprpad's virtual keyboards type by raw evdev keycode (US QWERTY). The compositor
+-- would otherwise run them through the user's XKB layout/options too -- with
+-- `caps:swapescape` a synthetic Escape became Caps Lock (LED lit, sheet stayed open),
+-- and any non-US layout would garble the on-screen keyboard. Pin them to a clean map.
+for _, name in ipairs({ "hyprpad-virtual-keyboard", "hyprpad-osk-virtual-keyboard" }) do
+  hl.device({ name = name, kb_layout = "us", kb_variant = "", kb_options = "" })
+end
