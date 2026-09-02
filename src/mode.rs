@@ -10,7 +10,9 @@
 //!   / `h.osk_button`, and the `h.cursor` / `h.scroll` "virtual bindings",
 //!   decide for themselves where they are live ([`crate::config::Guard`]).
 //!   "Game passthrough" is then *"nothing but the guide chords is guarded into
-//!   `game`"*, expressed one binding at a time.
+//!   `game`"*, expressed one binding at a time. The cursor carries a second
+//!   guard, `guide_in`, for where the right pad stays a mouse **while the
+//!   guide is held** — the one way to point inside a game without leaving it.
 //! * **Fullscreen is not a game trigger.** `ctx.focus.fullscreen` is available
 //!   to a rule that explicitly wants it; nothing ships using it.
 //! * **A manual override is first class** and beats the rules.
@@ -118,6 +120,10 @@ pub struct ModeEngine {
     /// The active mode hands raw input to the virtual gamepad.
     forwards: bool,
     cursor: bool,
+    /// The right pad keeps driving the desktop cursor **while the guide is
+    /// held** (`h.cursor { guide_in = … }`). Cached beside `cursor` because
+    /// the frame arm reads both every report.
+    cursor_guide: bool,
     scroll: bool,
     buttons: HashMap<report::Button, ButtonAction>,
     osk_buttons: HashMap<report::Button, u16>,
@@ -134,6 +140,7 @@ impl ModeEngine {
             state: ModeState::default(),
             forwards: false,
             cursor: true,
+            cursor_guide: false,
             scroll: true,
             buttons: HashMap::new(),
             osk_buttons: HashMap::new(),
@@ -378,9 +385,19 @@ impl ModeEngine {
         !self.cursor && !self.scroll
     }
 
-    /// Whether the right pad drives the desktop cursor in this mode.
+    /// Whether the right pad drives the desktop cursor in this mode (with the
+    /// guide up).
     pub fn cursor_enabled(&self) -> bool {
         self.cursor
+    }
+
+    /// Whether the right pad drives the desktop cursor in this mode **while
+    /// the guide is held** (`h.cursor { guide_in = … }`). Not part of
+    /// [`desktop_yielded`](Self::desktop_yielded): it is only ever live under
+    /// the guide, where forwarding is already off, so it can never put two
+    /// layers on the pad at once.
+    pub fn cursor_guide_enabled(&self) -> bool {
+        self.cursor_guide
     }
 
     /// Whether the left pad scrolls in this mode.
@@ -455,6 +472,8 @@ impl ModeEngine {
         };
         self.state = ModeState::new(active, Vec::new());
         self.cursor = !game;
+        // The one guard a TOML config can spell, against the built-in names.
+        self.cursor_guide = config.cursor_guide_enabled_in(&self.state);
         self.scroll = !game;
         self.forwards = game;
         self.buttons = if game { HashMap::new() } else { config.buttons().clone() };
@@ -493,6 +512,7 @@ impl ModeEngine {
 
         self.state = ModeState::new(active, results);
         self.cursor = config.cursor_enabled_in(&self.state);
+        self.cursor_guide = config.cursor_guide_enabled_in(&self.state);
         self.scroll = config.scroll_enabled_in(&self.state);
         self.buttons = config.buttons_in(&self.state);
         self.osk_buttons = config.osk_buttons_in(&self.state);
@@ -561,6 +581,43 @@ mod tests {
         assert!(m.focus_changed(&c, "foot", "shell", None));
         assert_eq!(m.active(), BUILTIN_DESKTOP);
         assert!(!m.forwards());
+    }
+
+    #[test]
+    fn the_guide_held_cursor_is_cached_per_mode_on_both_paths() {
+        // The built-in path, from the one guard a TOML config can spell.
+        let c = Config::from_toml_str("[cursor]\nguide_in = [\"game\"]\n").unwrap();
+        let mut m = ModeEngine::new(&c);
+        assert!(!m.cursor_guide_enabled(), "desktop: the guide layer takes the pad");
+        m.focus_changed(&c, "steam_app_413080", "Portal 2", None);
+        assert!(m.cursor_guide_enabled(), "game: guide + pad is a mouse");
+        // Orthogonal to the ambient cursor and to yielding: the game still
+        // gets the pad with the guide up, and forwarding is still allowed.
+        assert!(!m.cursor_enabled() && m.desktop_yielded() && m.forwards());
+        m.focus_changed(&c, "foot", "shell", None);
+        assert!(!m.cursor_guide_enabled());
+
+        // Left out: nowhere, on the built-in path too.
+        let off = Config::load_default();
+        let mut m = ModeEngine::new(&off);
+        m.focus_changed(&off, "steam_app_413080", "Portal 2", None);
+        assert!(!m.cursor_guide_enabled());
+
+        // The declared path, re-resolved with everything else on a context
+        // change and on a reload.
+        let c = lua(&format!(
+            "{GAME_CONFIG}\nh.cursor {{ only_in = {{ \"desktop\" }}, guide_in = {{ \"game\" }} }}"
+        ));
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.active(), "desktop");
+        assert!(m.cursor_enabled() && !m.cursor_guide_enabled());
+        m.focus_changed(&c, "steam_app_1", "", None);
+        assert_eq!(m.active(), "game");
+        assert!(!m.cursor_enabled() && m.cursor_guide_enabled());
+        let without = lua(GAME_CONFIG);
+        m.reconfigure(&without);
+        assert_eq!(m.active(), "game");
+        assert!(!m.cursor_guide_enabled(), "a reload that drops guide_in switches it off");
     }
 
     #[test]

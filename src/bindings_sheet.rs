@@ -34,6 +34,15 @@
 //! the dismissal) are synthesized into that section, because a context whose
 //! only listed bindings are two helper keys is not one you could use.
 //!
+//! # The pads
+//!
+//! The two trackpads get `ambient` rows for what they do with nothing held —
+//! the cursor and scroll, each carrying its guard — and, when `h.cursor {
+//! guide_in = … }` lists a mode, the right pad gets one more row in the
+//! `guide` section (`guide+rpad`, "Move the cursor (guide held)") carrying
+//! *that* guard, so a game's tab shows the pad as a mouse under the Steam
+//! glyph next to whatever `guide+rpad_click` is bound to.
+//!
 //! # Control ids
 //!
 //! Every entry carries a `control`: a stable id for the *physical* control it
@@ -231,20 +240,42 @@ impl Sheet {
         // The trackpads' ambient behaviour. Not a binding you press, but the
         // diagram has two pads on it and a sheet that leaves them blank is
         // lying about the biggest two controls on the puck.
+        let cursor_action = format!("cursor sens {:.2}", c.cursor().sens);
         entries.push(ambient(
+            Section::Ambient,
+            "rpad",
             "rpad",
             "Right trackpad",
             "Move the cursor",
-            format!("cursor sens {:.2}", c.cursor().sens),
+            cursor_action.clone(),
             &c.cursor_guard,
             RANK_PAD + 1,
         ));
+        // The same pad under a held guide (`h.cursor { guide_in = … }`): a
+        // guide-layer row on the pad's callout, so the tab for a game reads
+        // `Ⓢ + right pad: Move the cursor` beside a `Ⓢ + click` chord. Only
+        // when the config lists somewhere for it — off is nothing, not a row
+        // that is live nowhere.
+        if let Some(guard) = &c.cursor_guide_guard {
+            entries.push(ambient(
+                Section::Guide,
+                "guide+rpad",
+                "rpad",
+                "Right trackpad",
+                "Move the cursor (guide held)",
+                cursor_action,
+                guard,
+                RANK_PAD + 1,
+            ));
+        }
         let (scroll_label, scroll_mode) = match c.scroll().mode {
             crate::config::ScrollMode::Off => ("Scrolling off", "off"),
             crate::config::ScrollMode::Swipe => ("Scroll (swipe)", "swipe"),
             crate::config::ScrollMode::Circular => ("Scroll (circular)", "circular"),
         };
         entries.push(ambient(
+            Section::Ambient,
+            "lpad",
             "lpad",
             "Left trackpad",
             scroll_label,
@@ -431,7 +462,15 @@ fn osk_builtin(
     }
 }
 
+/// A row for a pad's continuous behaviour — no press involved, so `action`
+/// describes the handler rather than naming an action. `section` is
+/// [`Section::Ambient`] for what the pad does on its own and
+/// [`Section::Guide`] for what it does under a held guide (the guide-mouse),
+/// which is what puts the guide glyph in front of it on the widget.
+#[allow(clippy::too_many_arguments)]
 fn ambient(
+    section: Section,
+    chord: &str,
     control: &str,
     control_label: &str,
     label: &str,
@@ -440,8 +479,8 @@ fn ambient(
     rank: u32,
 ) -> Entry {
     Entry {
-        section: Section::Ambient,
-        chord: control.to_string(),
+        section,
+        chord: chord.to_string(),
         control: control.to_string(),
         direction: None,
         control_label: control_label.to_string(),
@@ -721,7 +760,16 @@ pub fn key_name(code: u16) -> String {
         107 => "end",
         104 => "pageup",
         109 => "pagedown",
+        111 => "delete",
         158 => "back",
+        42 => "leftshift",
+        54 => "rightshift",
+        29 => "leftctrl",
+        97 => "rightctrl",
+        56 => "leftalt",
+        100 => "rightalt",
+        125 => "leftmeta",
+        126 => "rightmeta",
         // The mouse buttons under their evdev names (`key btn_left` parses).
         // `action_string` prefers the `mouse left` spelling; this is the
         // fallback for anything that prints a code as a key name.
@@ -1162,6 +1210,10 @@ mod tests {
         assert_eq!(derive_label(&Action::Key(103)), "Up");
         assert_eq!(derive_label(&Action::Key(14)), "Backspace");
         assert_eq!(derive_label(&Action::Key(104)), "Page up");
+        // The modifiers print under the name they were bound by, and parse back.
+        assert_eq!(derive_label(&Action::Key(42)), "Leftshift");
+        assert_eq!(action_string(&Action::Key(125)), "key leftmeta");
+        assert_eq!(Action::parse("key leftmeta"), Ok(Action::Key(125)));
         assert_eq!(derive_label(&Action::SetMode("desktop".into())), "Force desktop mode");
         assert_eq!(derive_label(&Action::ClearMode), "Back to automatic mode");
     }
@@ -1457,6 +1509,79 @@ mod tests {
         let lpad = find(&s, "lpad");
         assert_eq!(lpad.label, "Scroll (circular)");
         assert_eq!(lpad.guard, Guard::OnlyIn(vec!["desktop".into()]));
+        // Nothing listed for the guide-held pad: no row for it at all.
+        assert!(!s.entries.iter().any(|e| e.chord == "guide+rpad"));
+    }
+
+    #[test]
+    fn the_guide_held_cursor_is_a_guide_row_on_the_pad_beside_its_click_chord() {
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true }).when(function(ctx) return false end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.cursor { sens = 0.06, only_in = { "desktop" }, guide_in = { "game" } }
+            h.button("rpad_click", h.mouse "left"):only_in("desktop")
+            h.bind("guide+rpad_click", "Click (guide mouse)", h.mouse "left"):only_in("game")
+            h.bind("guide+l5", h.key "leftshift")
+            "#,
+        );
+        // The pad's own row is untouched...
+        let rpad = find(&s, "rpad");
+        assert_eq!(rpad.section, Section::Ambient);
+        assert_eq!(rpad.guard, Guard::OnlyIn(vec!["desktop".into()]));
+        // ...and the guide-held one sits on the same control, in the guide
+        // section (so the widget draws the Steam glyph), carrying `guide_in`.
+        let under = find(&s, "guide+rpad");
+        assert_eq!(under.section, Section::Guide);
+        assert_eq!(under.control, "rpad");
+        assert_eq!(under.control_label, "Right trackpad");
+        assert_eq!(under.label, "Move the cursor (guide held)");
+        assert_eq!(under.action, "cursor sens 0.06");
+        assert_eq!(under.action_kind, "ambient");
+        assert_eq!(under.guard, Guard::OnlyIn(vec!["game".into()]));
+
+        // A key or mouse button on a chord reads like a bare one: the sheet
+        // does not know it is held, and does not need to.
+        let click = find(&s, "guide+rpad_click");
+        assert_eq!(click.section, Section::Guide);
+        assert_eq!(click.action_kind, "mouse");
+        assert_eq!(click.action, "mouse left");
+        assert_eq!(click.label, "Click (guide mouse)");
+        assert!(click.described);
+        let shift = find(&s, "guide+l5");
+        assert_eq!(shift.action_kind, "key");
+        assert_eq!(shift.label, "Leftshift");
+
+        // The game tab is where both live, and the desktop tab has neither.
+        let game = s.modes.iter().find(|m| m.name == "game").unwrap();
+        assert!(game.active.contains(&"guide+rpad".to_string()));
+        assert!(game.active.contains(&"guide+rpad_click".to_string()));
+        assert!(!game.active.contains(&"rpad".to_string()));
+        assert!(!game.active.contains(&"rpad_click".to_string()));
+        let desktop = s.modes.iter().find(|m| m.name == "desktop").unwrap();
+        assert!(!desktop.active.contains(&"guide+rpad".to_string()));
+        assert!(!desktop.active.contains(&"guide+rpad_click".to_string()));
+        assert!(desktop.active.contains(&"rpad".to_string()));
+
+        // Both renderings carry it: the guide-chord table in the text form,
+        // the `guide_chords` array in the JSON.
+        let text = s.to_text();
+        let table = text.split("Guide chords (hold Steam, then press)").nth(1).unwrap();
+        let table = table.split("Bare buttons").next().unwrap();
+        assert!(table.contains("guide+rpad ") && table.contains("Move the cursor (guide held)"), "{table}");
+        assert!(table.contains("only in game"), "{table}");
+        let j = s.to_json();
+        assert!(j.contains("\"chord\": \"guide+rpad\", \"control\": \"rpad\""), "{j}");
+        check_json(&j);
+
+        // The TOML front-end spells it too, against the built-in mode names.
+        let t = sheet_from_toml(
+            "[cursor]\nguide_in = [\"game\"]\n[bindings]\n\"guide+rpad_click\" = \"mouse left\"\n",
+        );
+        assert_eq!(find(&t, "guide+rpad").guard, Guard::OnlyIn(vec!["game".into()]));
+        assert_eq!(find(&t, "guide+rpad_click").action_kind, "mouse");
     }
 
     // --- JSON shape --------------------------------------------------------
