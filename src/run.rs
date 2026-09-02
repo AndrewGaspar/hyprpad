@@ -61,7 +61,8 @@ use crate::keyboard::VirtualKeyboard;
 use crate::mode::ModeEngine;
 use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
-use crate::{hidraw, report};
+use crate::status::StatusWriter;
+use crate::{hidraw, report, status};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -100,6 +101,11 @@ pub fn run() -> std::io::Result<()> {
     // guard removes the pidfile on the clean-return and panic paths.
     let _pidfile = PidFile::create();
 
+    // Live status for a bar widget, published from here on: the same RAII
+    // contract as the pidfile, and started before the controller wait so a
+    // widget can show "daemon up, controller not here yet" rather than nothing.
+    let mut status = StatusWriter::create();
+
     // Wait for the controller rather than exiting when it isn't there yet. The
     // loop below already survives the puck *leaving*; this makes startup
     // symmetric, so a daemon launched at login (or restarted while the puck is
@@ -117,6 +123,7 @@ pub fn run() -> std::io::Result<()> {
         }
         nodes
     };
+    status.set_connected(true);
     // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
     // live (see the `Input::Reload` arm and `apply_reload`).
     let mut config = match Config::load() {
@@ -261,6 +268,8 @@ pub fn run() -> std::io::Result<()> {
     // Lua predicates instead. Either way it is re-resolved only on a context
     // change and read as cached state per frame.
     let mut modes = ModeEngine::new(&config);
+    status.set_modes(status::mode_names(&config));
+    status.set_mode(modes.active());
     if !config.modes().is_empty() {
         eprintln!(
             "hyprpad: {} mode(s) declared, starting in '{}'",
@@ -364,6 +373,7 @@ pub fn run() -> std::io::Result<()> {
             watch.arm_rescan(&config);
             if modes.rescan_processes(&config) {
                 eprintln!("hyprpad: mode -> {} (process rescan)", modes.active());
+                status.set_mode(modes.active());
                 mode_handoff(
                     &mut cursor,
                     &mut scroll,
@@ -401,6 +411,7 @@ pub fn run() -> std::io::Result<()> {
                                 }
                             }
                             spawn_reader_pipeline(&nodes, &tx);
+                            status.set_connected(true);
                             waiting = false;
                         }
                         next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
@@ -418,6 +429,7 @@ pub fn run() -> std::io::Result<()> {
         match input {
             Input::ReadersEnded => {
                 eprintln!("hyprpad: controller disconnected, waiting for it to return…");
+                status.set_connected(false);
                 // Release everything held for the vanished controller — a
                 // synthetic click and all smoothing/gesture state — so nothing is
                 // stuck down and a stale `prev` cannot jump the cursor on return.
@@ -446,6 +458,11 @@ pub fn run() -> std::io::Result<()> {
                     &mut own_lizard,
                     &mut modes,
                 );
+                // The new file can rename modes as well as re-resolve the
+                // active one, so republish both. Each is a no-op when the
+                // reload changed nothing about it.
+                status.set_modes(status::mode_names(&config));
+                status.set_mode(modes.active());
             }
             Input::Compositor(ev) => {
                 if debug {
@@ -460,6 +477,7 @@ pub fn run() -> std::io::Result<()> {
                 };
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());
+                    status.set_mode(modes.active());
                     mode_handoff(
                             &mut cursor,
                         &mut scroll,
@@ -498,6 +516,7 @@ pub fn run() -> std::io::Result<()> {
                     // A binding forced a mode (`h.set_mode` / `h.clear_mode`).
                     // Same handoff as a context-driven transition.
                     eprintln!("hyprpad: mode -> {} (manual)", modes.active());
+                    status.set_mode(modes.active());
                     mode_handoff(
                             &mut cursor,
                         &mut scroll,

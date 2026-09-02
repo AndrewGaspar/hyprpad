@@ -8,6 +8,9 @@ control stacked inside it, and a tab per context the pad can be in.
     omarchy plugin enable hyprpad.cheatsheet
     hyprpad-cheatsheet toggle              # what the guide chord runs
 
+A second, much smaller plugin ships alongside it — the **bar widget**
+`hyprpad.status`, documented at the [bottom of this file](#the-bar-widget).
+
 ## What a callout says
 
 A callout is a **control**, not a binding family. Every row inside it is one
@@ -224,3 +227,129 @@ anywhere outside the card; Escape works too, once the card has focus.
 `exclusionMode: ExclusionMode.Ignore` means the surface reserves no space and
 displaces nothing, so summoning the sheet never reflows the desktop or fights
 the OSK's exclusive zone.
+
+# The bar widget
+
+`hyprpad.status` — the controller's mode, in Omarchy's bar. A glyph and a word:
+
+    scripts/hyprpad-statusbar install      # copy it into Omarchy
+    omarchy plugin enable hyprpad.status --section right
+
+It is the cheat sheet's opposite number. The sheet is a thing you summon and
+read; this is a thing that sits there and is *true*, and its whole job is to
+answer "is the pad listening, and to what" without being asked. Clicking it
+opens the sheet on the mode it is showing.
+
+## A different kind of plugin
+
+Same directory, same manifest envelope, same `omarchy plugin` CLI — and a
+different `kind`, which changes everything downstream:
+
+| | cheat sheet | bar widget |
+| --- | --- | --- |
+| `kinds` | `["panel"]` | `["bar-widget"]` |
+| entry point | `"panel": "Panel.qml"` | `"barWidget": "Widget.qml"` |
+| turned on by | an entry in `plugins[]` in `shell.json` | an entry in `bar.layout.<section>` |
+| loaded as | a `Loader`, live only while summoned | a component registered with `BarWidgetRegistry`, instantiated once per monitor |
+| injected with | `shell`, `manifest`, `omarchyPath`, … | `bar`, `moduleName`, `settings` |
+| owns | its own layer-shell surface | a slot inside the bar, sized by `implicitWidth`/`implicitHeight` |
+
+Presence in a bar section *is* "enabled" — there is no second list — so a bar
+widget must **not** also be added to `plugins[]`, where it would do nothing.
+Per-widget settings are inline sibling keys on that entry, read through
+`BarWidget`'s `setting()`: `{"id": "hyprpad.status", "showMode": false}` gives
+a glyph with no word beside it.
+
+As with the cheat sheet, `scripts/hyprpad-statusbar install` copies the plugin
+and then *prints* the placement line rather than editing `shell.json` — where a
+widget sits on someone's bar is not an installer's decision.
+
+## Where the state comes from
+
+`$XDG_RUNTIME_DIR/hyprpad/status.json`, written by the daemon (`src/status.rs`):
+
+```json
+{"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
+ "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
+ "updated": 1725230000}
+```
+
+The widget **watches a file and spawns nothing**. That is the whole design, and
+it is deliberately unlike the cheat sheet, which shells out to `hyprpad
+bindings --json` on every summon: a card is summoned occasionally and can
+afford a subprocess, whereas a bar item is always there and must cost nothing
+when nothing is happening. So there is no polling of the daemon, no IPC, and no
+process spawned per update — a mode change is one `rename(2)` on the daemon's
+side and one inotify wakeup on the widget's.
+
+Each publish writes `status.json.tmp` and renames it over `status.json`, so a
+reader woken mid-write still parses a whole object. The writer is an RAII guard
+like the daemon's pidfile: the file exists for exactly as long as the daemon
+does.
+
+## Why the slot disappears
+
+A bar item for hardware that is usually absent should not sit there saying
+"absent". Three conditions must all hold before the widget takes any space:
+
+1. the status file parses,
+2. it says `connected: true` — the puck is here *now*. This is not the same as
+   "the daemon is up": the daemon deliberately outlives its controller, sitting
+   through the startup wait and the reconnect wait rather than exiting, and
+   publishes `connected: false` throughout both, and
+3. `/proc/<pid>` still answers for the pid in the file.
+
+(3) covers the one case the RAII writer cannot. A daemon killed with SIGKILL
+never runs its guard, so it can leave behind a file that still claims a live
+controller — which is exactly why the object carries `pid`. The probe is a
+plain read of `/proc/<pid>/cmdline`; procfs's zero `st_size` does not trouble
+`FileView`, so even the liveness check spawns nothing.
+
+Setting the root item's `visible: false` is the supported way to collapse a bar
+slot: `Bar.qml`'s `ModuleSlot` zeroes a hidden child's `implicitWidth`, so the
+neighbouring widgets close the gap rather than leaving a hole.
+
+## The one timer that is not a poll
+
+`FileView`'s watcher only arms on a file that **existed when the view first
+loaded**. A missing file fails the load and nothing afterwards wakes it — so a
+bar that came up before the daemon would never notice it arrive. A 4 s timer
+covers exactly that gap and runs *only* while there is no parsed status; the
+moment one loads it stops, and the watcher carries every update from then on,
+including the file being removed and coming back. A second timer re-runs the
+liveness probe, and runs only while there is a status file to distrust.
+
+## The click
+
+`env HYPRPAD_MODE=<mode> hyprpad-cheatsheet toggle`, through `Util.execArgv`,
+which runs an argv without a shell re-tokenizing it.
+
+The mode has to travel in the environment because summoning the sheet is itself
+a mode change — the overlay puts the pad in `cheatsheet` — so by the time the
+sheet is up, the context the reader wanted is gone. This is the same contract
+the guide chord uses: the daemon exports `HYPRPAD_MODE` to the command a
+binding execs, and `hyprpad-cheatsheet` forwards it in the summon payload.
+Going through the script rather than spelling the IPC here is what keeps the
+widget correct if that spelling ever moves.
+
+## Theme
+
+`bar.barForeground` and `bar.fontFamily` rather than the `Color`/`Style`
+singletons directly — the bar's own copies are animated across a theme switch
+and account for transparency mode. Kenney's glyph fills `#FFFFFF`, so it is
+recoloured to the bar foreground and handed to `Image` as a `data:` URL, the
+same trick the cheat sheet uses on its diagram; the glyph follows a light theme
+with no second asset. A vertical bar drops the word and shows the glyph alone.
+
+The widget is built on `qs.Ui`'s `WidgetButton` with `labelVisible: false`,
+which is how `BarIconButton` is built too: it brings hover, the tooltip, click
+registration and the theme's colour animation, and leaves the drawing to us —
+a glyph and a word, which no stock button shape covers.
+
+## Files
+
+| file | what it is |
+| --- | --- |
+| `manifest.json` | the Omarchy plugin manifest (schemaVersion 1, kind `bar-widget`) |
+| `Widget.qml` | the whole widget: two `FileView`s, two timers, one button |
+| `art/` | Kenney's CC0 controller glyph, and `LICENSES.md` for its provenance |

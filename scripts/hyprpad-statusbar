@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# hyprpad-managed
+#
+# Install the hyprpad bar widget — the controller's mode, in the Omarchy bar.
+#
+#   hyprpad-statusbar install [--from DIR]   copy the widget into Omarchy
+#   hyprpad-statusbar status                 what is installed and reachable
+#   hyprpad-statusbar uninstall              remove the installed copy
+#
+# The widget is a *bar widget*, not a panel: Omarchy loads it from the same
+# `~/.config/omarchy/plugins/` directory as the cheat sheet, but turns it on by
+# listing it in a bar section of `shell.json` rather than in `plugins[]`.
+#
+# Nothing here edits shell.json. `install` copies the widget and then PRINTS
+# the one line only the owner should decide — where on their bar it goes.
+
+set -euo pipefail
+
+PLUGIN_ID="hyprpad.status"
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
+# The repo copy: this script lives in scripts/, the widget in shell/. `readlink
+# -f` first, so running this through a symlink still finds the repo.
+DEFAULT_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/shell/$PLUGIN_ID"
+
+die() { echo "hyprpad-statusbar: $*" >&2; exit 1; }
+
+have_shell() { command -v omarchy-shell >/dev/null 2>&1; }
+
+cmd_install() {
+  local src="$DEFAULT_SRC"
+  if [[ ${1:-} == --from ]]; then
+    src="${2:-}"
+    [[ -n $src ]] || die "--from needs a directory"
+  fi
+  [[ -f "$src/manifest.json" ]] || die "no manifest.json in $src"
+
+  mkdir -p "$(dirname "$PLUGIN_DIR")"
+  rm -rf "$PLUGIN_DIR"
+  cp -r "$src" "$PLUGIN_DIR"
+  echo "installed  $PLUGIN_DIR"
+
+  if command -v omarchy >/dev/null 2>&1; then
+    omarchy plugin validate "$PLUGIN_DIR" && echo "validated  ok"
+  fi
+  # Saving under plugins/ hot-reloads the shell; nudge it anyway so a fresh
+  # install is visible without waiting on the watcher.
+  have_shell && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+  echo
+  echo "ACTION REQUIRED — the one thing this script will not do for you:"
+  echo
+  echo "  Put it on your bar. A bar widget is turned on by its presence in a"
+  echo "  section of your shell.json, which is yours to edit; Omarchy's own CLI"
+  echo "  does it safely:"
+  echo
+  echo "      omarchy plugin enable $PLUGIN_ID --section right"
+  echo
+  echo "  or, to place it precisely:"
+  echo
+  echo "      omarchy bar put $PLUGIN_ID --after omarchy.tray"
+  echo
+  echo "  By hand, that is one entry in ~/.config/omarchy/shell.json:"
+  echo
+  echo "      { \"bar\": { \"layout\": { \"right\": ["
+  echo "          { \"id\": \"omarchy.tray\" },"
+  echo "          { \"id\": \"$PLUGIN_ID\" },"
+  echo "          { \"id\": \"omarchy.power\" }"
+  echo "      ] } } }"
+  echo
+  echo "  Settings are inline keys on that entry — { \"id\": \"$PLUGIN_ID\","
+  echo "  \"showMode\": false } for a glyph with no mode name beside it."
+  echo
+  echo "  Do NOT also add it to plugins[]: that array is for panels (which is"
+  echo "  what the cheat sheet is), and a bar widget listed there does nothing."
+  echo
+
+  cmd_status
+}
+
+cmd_uninstall() {
+  if [[ -d $PLUGIN_DIR ]]; then
+    rm -rf "$PLUGIN_DIR"
+    echo "removed    $PLUGIN_DIR"
+    have_shell && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  else
+    echo "absent     $PLUGIN_DIR (nothing to remove)"
+  fi
+  echo
+  echo "Also take it off the bar if you put it there:"
+  echo "    omarchy plugin disable $PLUGIN_ID"
+}
+
+# The widget reads one file and spawns nothing, so its whole world is: is it
+# installed, is the daemon publishing, and can a click reach the cheat sheet.
+# Report on all three — each is a failure the widget cannot show you itself,
+# because its answer to every one of them is to render nothing at all.
+cmd_status() {
+  echo "status:"
+  if [[ -d $PLUGIN_DIR ]]; then
+    echo "  widget    $PLUGIN_DIR"
+  else
+    echo "  widget    NOT INSTALLED (run: hyprpad-statusbar install)"
+  fi
+
+  local status_file="${XDG_RUNTIME_DIR:-}/hyprpad/status.json"
+  if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
+    echo "  daemon    XDG_RUNTIME_DIR unset — the daemon writes no status file,"
+    echo "            and the widget has nothing to show."
+  elif [[ -f $status_file ]]; then
+    echo "  daemon    publishing $status_file"
+    echo "            $(cat "$status_file")"
+  else
+    echo "  daemon    no $status_file — is 'hyprpad run' up?"
+    echo "            (the widget stays hidden until it is)"
+  fi
+
+  if command -v hyprpad-cheatsheet >/dev/null 2>&1; then
+    echo "  click     hyprpad-cheatsheet $(command -v hyprpad-cheatsheet)"
+  else
+    echo "  click     hyprpad-cheatsheet NOT ON PATH — the widget will draw"
+    echo "            fine, but clicking it will do nothing. Install the cheat"
+    echo "            sheet first: hyprpad-cheatsheet install"
+  fi
+
+  if have_shell; then
+    local layout
+    layout=$(omarchy-shell shell listShellConfig 2>/dev/null || true)
+    if [[ $layout == *"$PLUGIN_ID"* ]]; then
+      echo "  bar       widget is on the bar"
+    else
+      echo "  bar       widget NOT on the bar"
+      echo "            (run: omarchy plugin enable $PLUGIN_ID --section right)"
+    fi
+  else
+    echo "  bar       omarchy-shell not found"
+  fi
+}
+
+case "${1:-status}" in
+  install)   shift; cmd_install "$@" ;;
+  uninstall) cmd_uninstall ;;
+  status)    cmd_status ;;
+  -h|--help|help)
+    sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command '${1}' (want: install|uninstall|status)" ;;
+esac

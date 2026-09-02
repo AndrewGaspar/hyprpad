@@ -216,6 +216,45 @@ scripts/hyprpad-cheatsheet install
 omarchy plugin enable hyprpad.cheatsheet
 ```
 
+## The bar widget
+
+A second, much smaller Omarchy plugin: the controller's mode, in the bar. A
+glyph and a word — `desktop`, `game`, `OSK` — that **is not there** unless the
+puck is connected and the daemon is alive, and that opens the cheat sheet on
+the mode it is showing when you click it.
+
+It reads one file and spawns nothing. The daemon publishes
+`$XDG_RUNTIME_DIR/hyprpad/status.json` whenever its state changes — the puck
+arriving or going away, and every mode transition — writing a temp file and
+renaming it over the real one so a reader woken mid-write still parses a whole
+object. The file is owned by an RAII guard, like the pidfile, so it exists for
+exactly as long as the daemon does:
+
+```json
+{"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
+ "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
+ "updated": 1725230000}
+```
+
+`connected` is not "the daemon is up". The daemon deliberately outlives its
+controller — it sits through the startup wait and the reconnect wait rather
+than exiting — and says `connected: false` throughout both, which is what lets
+the widget vanish the moment the pad sleeps and come back when it wakes. `pid`
+is there for the one case the guard cannot cover: a daemon killed with SIGKILL
+leaves the file behind, so the widget also checks that `/proc/<pid>` still
+answers before it shows anything.
+
+The widget is a **bar widget**, a different kind of Omarchy plugin from the
+cheat sheet's panel — it goes in a bar section of `shell.json` rather than in
+`plugins[]`. Design notes and the full comparison are in
+[shell/README.md](shell/README.md); artwork provenance in
+[shell/hyprpad.status/art/LICENSES.md](shell/hyprpad.status/art/LICENSES.md).
+
+```
+scripts/hyprpad-statusbar install
+omarchy plugin enable hyprpad.status --section right
+```
+
 ## Documents
 
 | | |
