@@ -964,6 +964,88 @@ impl Default for ScrollConfig {
     }
 }
 
+/// Text-scrub knobs (the `[scrub]` section / `h.scrub { … }`): the caret jog
+/// wheel on the LEFT pad under a held guide.
+///
+/// Hold the guide button and circle the left pad, and every `detent_deg` of
+/// rotation **taps** an arrow key — clockwise `Right`, counter-clockwise `Left`
+/// — so the caret walks the text at whatever rate the thumb chooses, with a
+/// haptic tick per detent. Taps, never a held key: on Wayland key repeat is the
+/// *client's*, at a fixed rate after a fixed delay, which is exactly the
+/// one-speed shuttle a jog wheel exists to replace
+/// (`docs/research/text-scrub.md` §1.3). Spin faster and the ladder in
+/// [`crate::filter::JogPacer`] multiplies the step — ×2, then ×4, or one
+/// `ctrl`+arrow *word* jump when `word_tier` is on. Hold `select` while
+/// scrubbing and every tap goes out with Shift, selecting as it goes.
+///
+/// **Off unless a config asks for it.** `enabled` defaults to `false`, so a
+/// config with no `[scrub]` / `h.scrub` block behaves exactly as it did before
+/// the scrub existed: writing the block turns it on, and `enabled = false`
+/// inside the block turns it back off without deleting the tuning.
+///
+/// The guard (`only_in` / `not_in`) is [`Config::scrub_enabled_in`], evaluated
+/// like the cursor's and scroll's — the handler is *additionally* gated on the
+/// guide being held, which is what keeps the left pad's ambient scroll
+/// untouched.
+///
+/// Like [`CursorConfig`] and [`ScrollConfig`], the defaults are *tunable
+/// starting points* from the research doc (§3.5), not measured values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrubConfig {
+    /// Master switch. Default `false`: the scrub does nothing at all until a
+    /// config writes the section.
+    pub enabled: bool,
+    /// Degrees of rotation per caret step. Default `15.0` — 24 detents per
+    /// revolution, the granularity the circular scroll is already tuned to on
+    /// this device.
+    pub detent_deg: f64,
+    /// Minimum radius (normalized, pad edge ≈ `1.0` per axis) for the angle to
+    /// count — the dead centre, where the angle is ill-defined and small
+    /// circles would otherwise tick absurdly fast. Default `0.35`, as circular
+    /// scroll.
+    pub min_radius: f64,
+    /// Angular speed (°/s) above which the step doubles. Default `360.0` — one
+    /// revolution per second, i.e. 24 characters/s at the default detent.
+    pub fast_deg_per_s: f64,
+    /// How many consecutive detents at `fast_deg_per_s` it takes to climb a
+    /// rung, so a single fast flick never changes the unit. Default `2`.
+    pub fast_min_detents: u32,
+    /// Angular speed (°/s) below which the step drops back. Default `180.0` —
+    /// half of `fast_deg_per_s`, the 2:1 gap that stops a thumb hovering at the
+    /// threshold from chattering between units.
+    pub slow_deg_per_s: f64,
+    /// Whether the top rung is a *word* jump (`ctrl+left` / `ctrl+right`, one
+    /// tap, a heavier haptic click) instead of ×4 characters. Default `true`:
+    /// dictation errors are word-shaped, and `ctrl+arrow` lands on a boundary
+    /// instead of somewhere inside the word.
+    pub word_tier: bool,
+    /// The button that turns the scrub into a *selection* — held, every tap
+    /// goes out with Shift. Default `l5`, the left grip: it is under the
+    /// fingers of the same hand whose thumb is circling, and unlike the
+    /// triggers it is not already a guide chord.
+    ///
+    /// This is a *level*, read per frame, not a binding: if the same button
+    /// also carries a `guide+…` chord, pressing it under the guide still fires
+    /// that chord — pick a button the guide layer leaves alone (the cheat
+    /// sheet shows both rows on the same callout, so a collision is visible).
+    pub select: report::Button,
+}
+
+impl Default for ScrubConfig {
+    fn default() -> ScrubConfig {
+        ScrubConfig {
+            enabled: false,
+            detent_deg: 15.0,
+            min_radius: 0.35,
+            fast_deg_per_s: 360.0,
+            fast_min_detents: 2,
+            slow_deg_per_s: 180.0,
+            word_tier: true,
+            select: report::Button::GripL5,
+        }
+    }
+}
+
 /// Haptic-feedback knobs (the `[haptics]` config section).
 ///
 /// The puck has an actuator behind each trackpad ([`crate::haptics`]); firing a
@@ -1330,6 +1412,8 @@ pub struct Config {
     pub(crate) cursor: CursorConfig,
     /// Left-trackpad scroll knobs (`[scroll]` section).
     pub(crate) scroll: ScrollConfig,
+    /// Guide-layer caret-scrub knobs (`[scrub]` section). Off by default.
+    pub(crate) scrub: ScrubConfig,
     /// Haptic-feedback knobs (`[haptics]` section).
     pub(crate) haptics: HapticsConfig,
     /// Virtual-gamepad knobs (`[gamepad]` section).
@@ -1379,6 +1463,10 @@ pub struct Config {
     pub(crate) cursor_guide_guard: Option<Guard>,
     /// The guard on the scroll "virtual binding" (`h.scroll { only_in = … }`).
     pub(crate) scroll_guard: Guard,
+    /// The guard on the caret scrub (`h.scrub { only_in = … }`). Read together
+    /// with `scrub.enabled` by [`Config::scrub_enabled_in`]: a guard that
+    /// passes means nothing while the section is off.
+    pub(crate) scrub_guard: Guard,
     /// The live Lua state behind a `config.lua`, holding the mode rules and
     /// `:when` predicates. `None` for a TOML config. Shared (`Rc`) because
     /// `Config` is `Clone` and the interpreter must not be duplicated;
@@ -1481,6 +1569,8 @@ impl Config {
         let mut cursor = CursorConfig::default();
         let mut cursor_guide_guard = None;
         let mut scroll = ScrollConfig::default();
+        let mut scrub = ScrubConfig::default();
+        let mut scrub_guard = Guard::Always;
         let mut haptics = HapticsConfig::default();
         let mut gamepad = GamepadConfig::default();
         let mut section = String::new();
@@ -1492,6 +1582,12 @@ impl Config {
             }
             if let Some(inner) = line.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
                 section = inner.trim().to_ascii_lowercase();
+                // Writing the section IS the opt-in, exactly as `h.scrub {}`
+                // is on the Lua side; `enabled = false` inside it turns the
+                // scrub back off without deleting the tuning.
+                if section == "scrub" {
+                    scrub.enabled = true;
+                }
                 continue;
             }
             let (k, v) = line
@@ -1628,6 +1724,75 @@ impl Config {
                         }
                     }
                 }
+                // Guide-layer caret scrub: the left pad's jog wheel. Reaching
+                // the section at all has already switched it on (above), so a
+                // `[scrub]` block with nothing in it is the whole opt-in.
+                "scrub" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    // The two non-scalar knobs: the guard, spelled as a list
+                    // against the built-in mode names (a TOML config declares
+                    // none of its own), and the select button, spelled with the
+                    // same button names the chords use.
+                    match key.as_str() {
+                        "only_in" => {
+                            scrub_guard = Guard::OnlyIn(mode_list_or_err(v, lineno, &key)?);
+                            continue;
+                        }
+                        "not_in" => {
+                            scrub_guard = Guard::NotIn(mode_list_or_err(v, lineno, &key)?);
+                            continue;
+                        }
+                        "select" | "select_with" => {
+                            scrub.select = parse_button(&val.trim().to_ascii_lowercase())
+                                .map_err(|e| format!("line {lineno}: select: {e}"))?;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    match key.as_str() {
+                        "enabled" | "enable" | "on" => {
+                            scrub.enabled = parse_bool(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "word_tier" | "words" => {
+                            scrub.word_tier = parse_bool(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "detent_deg" | "detent_degrees" | "step_degrees" | "step" => {
+                            scrub.detent_deg = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "min_radius" => {
+                            scrub.min_radius = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "fast_deg_per_s" | "fast" => {
+                            scrub.fast_deg_per_s = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "slow_deg_per_s" | "slow" => {
+                            scrub.slow_deg_per_s = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "fast_min_detents" | "min_detents" => {
+                            let n = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                            if !n.is_finite() || n < 0.0 || n > f64::from(u32::MAX) {
+                                return Err(format!(
+                                    "line {lineno}: fast_min_detents must be a whole \
+                                     number of detents"
+                                ));
+                            }
+                            scrub.fast_min_detents = n as u32;
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [scrub] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 // Haptic-feedback knobs: a master switch, one toggle per trigger
                 // point, and the pulse-width scale.
                 "haptics" => {
@@ -1711,6 +1876,8 @@ impl Config {
             cursor,
             cursor_guide_guard,
             scroll,
+            scrub,
+            scrub_guard,
             haptics,
             gamepad,
             // The TOML dialect declares no modes and no guards: everything is
@@ -1873,6 +2040,13 @@ impl Config {
         &self.scroll
     }
 
+    /// The guide-layer caret-scrub knobs (`[scrub]` section); defaults from
+    /// [`ScrubConfig::default`], which is *off*. Read per frame by the daemon,
+    /// so a reload retunes the wheel — or switches it on — with no restart.
+    pub fn scrub(&self) -> &ScrubConfig {
+        &self.scrub
+    }
+
     /// The haptic-feedback knobs (`[haptics]` section); defaults from
     /// [`HapticsConfig::default`]. Read per event by the daemon so a reload
     /// retunes the feel live.
@@ -2006,6 +2180,17 @@ impl Config {
         self.scroll_guard.allows(st)
     }
 
+    /// Whether the left pad scrubs the caret in `st` (`h.scrub { only_in = …
+    /// }`) — the guard *and* the section's own master switch, because a scrub
+    /// that no config asked for is not "allowed everywhere", it is off.
+    ///
+    /// The daemon gates the handler on this **and** on the guide being held
+    /// (`docs/research/text-scrub.md` §3.1): the scrub is a guide-scoped
+    /// ambient handler, exactly like the guide-mouse on the right pad.
+    pub fn scrub_enabled_in(&self, st: &ModeState) -> bool {
+        self.scrub.enabled && self.scrub_guard.allows(st)
+    }
+
     /// Every `:when` predicate index the config uses, so the mode engine knows
     /// how large a result vector to build. One past the highest index in use.
     pub fn predicate_slots(&self) -> usize {
@@ -2015,7 +2200,7 @@ impl Config {
             .chain(self.button_guards.values())
             .chain(self.osk_button_guards.values())
             .chain(self.button_alts.iter().map(|a| &a.guard))
-            .chain([&self.cursor_guard, &self.scroll_guard])
+            .chain([&self.cursor_guard, &self.scroll_guard, &self.scrub_guard])
             .chain(self.cursor_guide_guard.iter());
         let from_guards = guards.filter_map(|g| match g {
             Guard::When(i) => Some(*i + 1),
@@ -2141,6 +2326,20 @@ fn parse_string_list(raw: &str) -> Vec<String> {
         .map(unquote)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// [`parse_string_list`] for a guard, which is meaningless empty: an
+/// `only_in = []` would switch the handler off in a way that reads like a
+/// typo, so say so instead of silently guarding it out of everywhere.
+fn mode_list_or_err(raw: &str, lineno: usize, key: &str) -> Result<Vec<String>, String> {
+    let modes = parse_string_list(raw);
+    if modes.is_empty() {
+        return Err(format!(
+            "line {lineno}: {key} needs at least one mode name \
+             (e.g. {key} = [\"desktop\"])"
+        ));
+    }
+    Ok(modes)
 }
 
 /// Strip a single pair of matching surrounding quotes, if present.
@@ -3415,6 +3614,71 @@ rumble_intensity = 0.25
         assert!(c.cursor_guide_guard.is_none());
         assert!(!c.cursor_guide_enabled_in(&anywhere));
         assert!(!c.cursor_guide_enabled_in(&ModeState::new("game", vec![])));
+        // The other one: the caret scrub is off until a config writes the
+        // section, so an existing config behaves exactly as it did before it
+        // existed — an unguarded scrub that nobody switched on is still off.
+        assert!(!c.scrub().enabled);
+        assert_eq!(c.scrub_guard, Guard::Always);
+        assert!(!c.scrub_enabled_in(&anywhere));
+    }
+
+    #[test]
+    fn the_scrub_section_is_the_opt_in_and_carries_its_own_guard() {
+        // Writing `[scrub]` switches the caret jog wheel on; every knob is
+        // optional and keeps its documented default.
+        let c = Config::from_toml_str("[scrub]\n").expect("parse");
+        assert!(c.scrub().enabled, "the section IS the opt-in");
+        let d = ScrubConfig::default();
+        assert_eq!(c.scrub().detent_deg, 15.0);
+        assert_eq!(c.scrub().min_radius, 0.35);
+        assert_eq!(c.scrub().fast_deg_per_s, 360.0);
+        assert_eq!(c.scrub().slow_deg_per_s, 180.0);
+        assert_eq!(c.scrub().fast_min_detents, 2);
+        assert!(c.scrub().word_tier);
+        assert_eq!(c.scrub().select, report::Button::GripL5);
+        assert_eq!(*c.scrub(), ScrubConfig { enabled: true, ..d });
+
+        // Every knob, including the two non-scalars.
+        let c = Config::from_toml_str(
+            "[scrub]\ndetent_deg = 20\nmin_radius = 0.4\nfast_deg_per_s = 300\n\
+             slow_deg_per_s = 150\nfast_min_detents = 3\nword_tier = false\n\
+             select = \"l4\"\nonly_in = [\"desktop\", \"browser\"]\n",
+        )
+        .expect("parse");
+        assert_eq!(c.scrub().detent_deg, 20.0);
+        assert_eq!(c.scrub().min_radius, 0.4);
+        assert_eq!(c.scrub().fast_deg_per_s, 300.0);
+        assert_eq!(c.scrub().slow_deg_per_s, 150.0);
+        assert_eq!(c.scrub().fast_min_detents, 3);
+        assert!(!c.scrub().word_tier);
+        assert_eq!(c.scrub().select, report::Button::GripL4);
+        assert_eq!(
+            c.scrub_guard,
+            Guard::OnlyIn(vec!["desktop".into(), "browser".into()])
+        );
+        let desktop = ModeState::new("desktop", vec![]);
+        let game = ModeState::new("game", vec![]);
+        assert!(c.scrub_enabled_in(&desktop) && !c.scrub_enabled_in(&game));
+
+        // `enabled = false` inside the section turns it back off without
+        // deleting the tuning beside it, and the guard cannot resurrect it.
+        let c = Config::from_toml_str("[scrub]\nenabled = false\ndetent_deg = 20\n")
+            .expect("parse");
+        assert!(!c.scrub().enabled);
+        assert_eq!(c.scrub().detent_deg, 20.0);
+        assert!(!c.scrub_enabled_in(&desktop));
+
+        // And the errors say which line and which key.
+        assert!(Config::from_toml_str("[scrub]\ndetent = 20\n")
+            .unwrap_err()
+            .contains("unknown [scrub] setting 'detent'"));
+        assert!(Config::from_toml_str("[scrub]\nselect = \"nope\"\n")
+            .unwrap_err()
+            .contains("select"));
+        assert!(Config::from_toml_str("[scrub]\nonly_in = []\n")
+            .unwrap_err()
+            .contains("at least one mode name"));
+        assert!(Config::from_toml_str("[scrub]\nfast_min_detents = -1\n").is_err());
     }
 
     #[test]

@@ -47,6 +47,12 @@
 //! *that* guard, so a game's tab shows the pad as a mouse under the Steam
 //! glyph next to whatever `guide+rpad_click` is bound to.
 //!
+//! `h.scrub` puts the same kind of row on the LEFT pad (`guide+lpad`, "Scrub
+//! the caret") plus one on whichever button it selects with (`guide+l5` by
+//! default, "Select while scrubbing"), both carrying the scrub's guard — so a
+//! tab where the caret jog wheel is live reads `Ⓢ + left pad: Scrub the caret`
+//! above the pad's own `Scroll (circular)`.
+//!
 //! # Control ids
 //!
 //! Every entry carries a `control`: a stable id for the *physical* control it
@@ -281,6 +287,36 @@ impl Sheet {
                 cursor_action,
                 guard,
                 RANK_PAD + 1,
+            ));
+        }
+        // The LEFT pad under a held guide: the caret jog wheel (`h.scrub`).
+        // Two rows, both carrying the scrub's own guard — the wheel itself, on
+        // the pad's callout beside its ambient scroll, and the button that
+        // turns it into a selection, on that button's callout. Only when the
+        // config switched the scrub on: off is nothing, not a row that is live
+        // nowhere.
+        if c.scrub().enabled {
+            let scrub = c.scrub();
+            entries.push(ambient(
+                Section::Guide,
+                "guide+lpad",
+                "lpad",
+                "Left trackpad",
+                "Scrub the caret",
+                format!("scrub {:.0}°", scrub.detent_deg),
+                &c.scrub_guard,
+                RANK_PAD,
+            ));
+            let sel = scrub.select;
+            entries.push(ambient(
+                Section::Guide,
+                &format!("guide+{}", button_name(sel)),
+                button_name(sel),
+                &button_label(sel),
+                "Select while scrubbing",
+                "scrub select (hold)".to_string(),
+                &c.scrub_guard,
+                button_rank(sel),
             ));
         }
         let (scroll_label, scroll_mode) = match c.scroll().mode {
@@ -2015,6 +2051,79 @@ mod tests {
         );
         assert_eq!(find(&t, "guide+rpad").guard, Guard::OnlyIn(vec!["game".into()]));
         assert_eq!(find(&t, "guide+rpad_click").action_kind, "mouse");
+    }
+
+    #[test]
+    fn the_caret_scrub_is_two_guide_rows_carrying_the_scrub_guard() {
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true }).when(function(ctx) return false end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.scroll { mode = "circular", only_in = { "desktop" } }
+            h.scrub { detent_deg = 15, only_in = { "desktop" } }
+            "#,
+        );
+        // The wheel sits on the left pad's callout in the guide section, so the
+        // widget draws it under the Steam glyph above the pad's own scroll row.
+        let wheel = find(&s, "guide+lpad");
+        assert_eq!(wheel.section, Section::Guide);
+        assert_eq!(wheel.control, "lpad");
+        assert_eq!(wheel.control_label, "Left trackpad");
+        assert_eq!(wheel.label, "Scrub the caret");
+        assert_eq!(wheel.action, "scrub 15°");
+        assert_eq!(wheel.action_kind, "ambient");
+        assert_eq!(wheel.guard, Guard::OnlyIn(vec!["desktop".into()]));
+        // The pad's ambient scroll is untouched beside it.
+        let lpad = find(&s, "lpad");
+        assert_eq!(lpad.section, Section::Ambient);
+        assert_eq!(lpad.label, "Scroll (circular)");
+
+        // The select button gets its own row, on its own control.
+        let sel = find(&s, "guide+l5");
+        assert_eq!(sel.section, Section::Guide);
+        assert_eq!(sel.control, "l5");
+        assert_eq!(sel.control_label, "L5 grip");
+        assert_eq!(sel.label, "Select while scrubbing");
+        assert_eq!(sel.action, "scrub select (hold)");
+        assert_eq!(sel.guard, Guard::OnlyIn(vec!["desktop".into()]));
+
+        // Both rows live on the tab the guard names, and nowhere else.
+        let desktop = s.modes.iter().find(|m| m.name == "desktop").unwrap();
+        assert!(desktop.active.contains(&"guide+lpad".to_string()));
+        assert!(desktop.active.contains(&"guide+l5".to_string()));
+        let game = s.modes.iter().find(|m| m.name == "game").unwrap();
+        assert!(!game.active.contains(&"guide+lpad".to_string()));
+        assert!(!game.active.contains(&"guide+l5".to_string()));
+
+        // Both renderings carry them.
+        let text = s.to_text();
+        let table = text.split("Guide chords (hold Steam, then press)").nth(1).unwrap();
+        let table = table.split("Bare buttons").next().unwrap();
+        assert!(table.contains("guide+lpad") && table.contains("Scrub the caret"), "{table}");
+        assert!(table.contains("Select while scrubbing"), "{table}");
+        let j = s.to_json();
+        assert!(j.contains("\"chord\": \"guide+lpad\", \"control\": \"lpad\""), "{j}");
+        check_json(&j);
+
+        // A configured `select` moves the second row to that button.
+        let l4 = sheet_from_lua(r#"hyprpad.scrub { select = "l4" }"#);
+        assert_eq!(find(&l4, "guide+l4").label, "Select while scrubbing");
+        assert!(!l4.entries.iter().any(|e| e.chord == "guide+l5"));
+
+        // Off — the default, and every config that predates the scrub — is no
+        // rows at all, not rows that are live nowhere.
+        let none = sheet_from_lua(r#"hyprpad.scroll { mode = "circular" }"#);
+        assert!(!none
+            .entries
+            .iter()
+            .any(|e| e.chord.starts_with("guide+lpad") || e.action.starts_with("scrub")));
+
+        // And the TOML front-end spells the same two rows.
+        let t = sheet_from_toml("[scrub]\ndetent_deg = 20\n");
+        assert_eq!(find(&t, "guide+lpad").action, "scrub 20°");
+        assert_eq!(find(&t, "guide+l5").label, "Select while scrubbing");
     }
 
     // --- JSON shape --------------------------------------------------------

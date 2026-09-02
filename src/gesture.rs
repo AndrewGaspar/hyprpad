@@ -206,11 +206,21 @@ impl GestureEngine {
     /// reported as `GuideLeave { was_chorded: true }` — never as the bare tap
     /// Steam would act on — exactly as recognising a chord does.
     ///
-    /// For the things the engine cannot see as chords: the daemon calls this
-    /// when the right pad moves the cursor under a held guide (`h.cursor {
-    /// guide_in = … }`). The decision is the daemon's, not the engine's, because
-    /// on a mode where the pad does nothing under the guide a thumb resting on
-    /// it must *not* eat the tap. A no-op while no guide is held.
+    /// For the things the engine cannot see as chords — a pad *touch* is not
+    /// chordable ([`Self::chordable`] excludes both pads, because a thumb rests
+    /// on one), so a hold spent on the pads would otherwise end in
+    /// `GuideLeave { was_chorded: false }`. The daemon calls this:
+    ///
+    /// * when the right pad moves the cursor under a held guide (`h.cursor {
+    ///   guide_in = … }`);
+    /// * on the first detent of a caret scrub, when circling the left pad has
+    ///   started tapping the arrow keys (`h.scrub`, `run::drive_scrub`) — a
+    ///   caret fix is a *long* hold by chord standards, and it must not end
+    ///   with Steam acting on the release.
+    ///
+    /// The decision is the daemon's, not the engine's, because on a mode where
+    /// the pads do nothing under the guide a thumb resting on one must *not*
+    /// eat the tap. A no-op while no guide is held.
     pub fn consume_hold(&mut self) {
         if self.guide_active {
             self.was_chorded = true;
@@ -748,6 +758,41 @@ mod tests {
         assert_eq!(
             g.update(&frame(&[]), t + ms(140)),
             vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn a_scrubbing_thumb_spends_the_hold_and_a_resting_one_does_not() {
+        // The caret scrub's half of the rule (`run::drive_scrub`): a thumb on
+        // the LEFT pad is a touch, not a chord, so holding the guide while it
+        // rests there must still read as a bare tap — and the daemon's call on
+        // the first detent is the only thing that changes that.
+        let t = Instant::now();
+        let touching = frame(&[Button::Steam, Button::PadLeftTouch]);
+
+        let mut resting = GestureEngine::new();
+        resting.update(&frame(&[]), t);
+        resting.update(&frame(&[Button::Steam]), t + ms(4));
+        assert!(resting.update(&touching, t + ms(8)).is_empty());
+        assert_eq!(
+            resting.update(&frame(&[]), t + ms(400)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }],
+            "a thumb that only rested there leaves the tap for Steam"
+        );
+
+        let mut scrubbing = GestureEngine::new();
+        scrubbing.update(&frame(&[]), t);
+        scrubbing.update(&frame(&[Button::Steam]), t + ms(4));
+        scrubbing.update(&touching, t + ms(8));
+        // The first detent fired: the daemon spends the hold.
+        scrubbing.consume_hold();
+        // The rest of the spin has nothing left to spend, and says so.
+        scrubbing.consume_hold();
+        assert!(scrubbing.update(&touching, t + ms(12)).is_empty());
+        assert_eq!(
+            scrubbing.update(&frame(&[]), t + ms(400)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }],
+            "a caret fix must not end as a guide tap"
         );
     }
 
