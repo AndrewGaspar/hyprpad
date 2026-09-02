@@ -412,8 +412,9 @@ the same ring:
 | `omarchy-shell -q hyprpad.status navActivate` | left-click the focused widget |
 | `omarchy-shell -q hyprpad.status navSecondary` | right-click it |
 | `omarchy-shell hyprpad.status navIsActive` | whether the ring is up — prints `true`/`false` |
+| `omarchy-shell hyprpad.status navStatus` | what the ring knows about itself — one JSON object per live copy |
 
-Note the missing `-q` on the last row. `omarchy-shell`'s quiet mode is
+Note the missing `-q` on the last two rows. `omarchy-shell`'s quiet mode is
 best-effort *and silent*: it suppresses stdout and exits 0 whatever happened
 (`bin/omarchy-shell`, `if (( !QUIET )) && [[ -n $output ]]`). That is exactly
 right for the fire-and-forget verbs `config/hyprpad.lua` binds, and exactly
@@ -425,6 +426,56 @@ Every verb is broadcast to all live copies of the widget, because one bar
 surface exists per monitor while an IPC target routes to a single handler. Each
 copy then decides whether *it* is the one on the focused output; only that one
 maps the nav surface.
+
+`navStatus` is the one to reach for when the ring misbehaves, because
+`navIsActive` only says the surface is up — it cannot say whether anything is
+going to take it down:
+
+```console
+$ omarchy-shell hyprpad.status navStatus
+[{"screen":"eDP-2","owner":true,"active":true,"idleSec":12,"idleMs":12000,
+  "idleRunning":true,"yielded":false,"focused":true,"focusSeen":true,
+  "locked":false,"lockService":true,"targets":17}]
+```
+
+A ring that is `active` with `idleRunning: false` is a ring that is never
+leaving. `focusSeen: false` means the compositor has never fed the surface, so
+the focus watch is not armed yet and the idle clock is the only backstop.
+`lockService: false` means the lock hop found nothing and the lock exit is off.
+One object per copy, so the array length is also the instance count.
+
+### Making a change actually run
+
+**Editing the installed plugin is not enough, and the shell will tell you it
+was.** Omarchy file-watches `~/.config/omarchy/plugins/` and logs
+
+    DEBUG qml: Local plugin changed, reloading: hyprpad.status
+
+on every write, and the reload really does run: the widget is unregistered, its
+item is destroyed and a fresh one is built. But the QML *type loader* inside a
+long-running Quickshell keeps its own cache of that directory, so
+`Widget.qml` recompiles to the unit it compiled at process start — the new file
+on disk is never read. The same frozen cache rejects a file added next to it:
+
+    WARN qml: Plugin widget hyprpad.status failed:
+      file://…/hyprpad.status/Widget2.qml: File name case mismatch
+
+for a file that plainly exists with exactly that name. So a widget edit lands
+only on the *next* shell start, and a session that has been up since before the
+edit is running the old code while reporting a successful reload.
+
+This is worth knowing because the ring's exits are the kind of thing you verify
+by watching it, and watching stale code proves nothing: the pre-timeout widget
+stays up forever and looks exactly like a timeout that does not fire. Before
+concluding anything about the ring's behaviour, confirm the running widget is
+the installed one — `omarchy-shell hyprpad.status navStatus` answering `No such
+method` means it is not.
+
+To pick up an edit: restart the shell. To pick one up *without* restarting —
+useful while iterating, because a plugin reload while the session is locked
+takes the lock screen down with it — point the manifest's entry point at a
+subdirectory the process has never listed (`"barWidget": "v2/Widget.qml"`) and
+put the new file there; a directory with no cache entry is read from disk.
 
 ### The ring lets go of itself
 

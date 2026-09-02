@@ -250,6 +250,31 @@ BarWidget {
     function navIsActive(): string {
       return root.navAnyActive() ? "true" : "false"
     }
+
+    // Everything the ring knows about itself, one JSON object per live copy.
+    //
+    // `navIsActive` says whether the surface is up; this says whether anything
+    // is going to take it down, which is the question that matters — a ring
+    // that is up with `idleRunning: false` is a ring that is never leaving.
+    // It also reports how many copies there are, because the verbs broadcast
+    // and only the copy on the focused output raises the surface.
+    //
+    // And it is a version probe. Omarchy logs "Local plugin changed,
+    // reloading" on every write into `~/.config/omarchy/plugins/`, but a
+    // long-running Quickshell keeps serving the widget QML it compiled at
+    // startup (shell/README.md, "Making a change actually run"). A shell on
+    // stale code answers `No such method`, which is the whole difference
+    // between "the timeout is broken" and "the timeout is not installed".
+    // Ask WITHOUT `-q`, for the reason above.
+    function navStatus(): string {
+      var peers = root.navPeers()
+      var out = []
+      for (var i = 0; i < peers.length; i++) {
+        if (peers[i] && typeof peers[i].navStatusLocal === "function")
+          out.push(peers[i].navStatusLocal())
+      }
+      return JSON.stringify(out)
+    }
   }
 
   // --- bar navigation: the ring --------------------------------------------
@@ -427,6 +452,29 @@ BarWidget {
     for (var i = 0; i < peers.length; i++)
       if (peers[i] && peers[i].navActive === true) return true
     return false
+  }
+
+  // This copy's share of `navStatus`. Every exit above is represented, so the
+  // answer says not just that the ring is up but which of the five is still
+  // armed behind it: `idleRunning` for the idle clock, `focusSeen`/`focused`
+  // for the focus watch (it only arms once the compositor has fed the surface
+  // at least once), `lockService` for whether the lock hop resolved at all,
+  // and `targets` for the stops the ring has left to walk.
+  function navStatusLocal() {
+    return {
+      screen: root.navScreenName(root),
+      owner: root.navOwner() === root,
+      active: root.navActive,
+      idleSec: root.navIdleSec,
+      idleMs: navIdleTimer.interval,
+      idleRunning: navIdleTimer.running,
+      yielded: root.navYielded,
+      focused: root.navSurfaceFocused,
+      focusSeen: root.navFocusSeen,
+      locked: root.navSessionLocked,
+      lockService: !!root.navLockService,
+      targets: root.navTargets().length
+    }
   }
 
   // The ring's stops, in bar order. The bar's own clickability filter decides
