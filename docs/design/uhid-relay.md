@@ -78,15 +78,31 @@ position to take it — everyone else (InputPlumber, hhd) *synthesises* a Valve
 controller from other hardware, whereas hyprpad has a real Triton behind the
 clone.
 
-Decoding the captured 372-byte `1302` descriptor shows its vendor collection
-declares:
+Walking the captured 372-byte `1302` descriptor gives its **whole** report
+table. Every framing decision below is read off it, and
+`profile::tests::the_triton_descriptor_report_table_is_pinned` pins it so a
+re-capture that changes any row fails the build rather than silently reframing
+the wire. Wire length is always payload + 1, because the report id goes in
+front.
 
-```
-Input   id=0x42  count=53 size=8  ->  53-byte payload, 54 on the wire
-Feature id=0x01  count=63 size=8  ->  64 on the wire
-Output  id=0x80  count=9          ->  10 on the wire   (rumble)
-Output  id=0x81  count=7          ->   8 on the wire   (haptic pulse)
-```
+| Collection | Type | Id | Payload | Wire |
+|---|---|---|---|---|
+| lizard Mouse (Generic Desktop) | Input | `0x40` | 5 | 6 |
+| lizard Keyboard | Input | `0x41` | 8 | 9 |
+| vendor `0xFF00` | Input | **`0x42`** | **53** | **54** |
+| | Input | `0x44` / `0x79` / `0x43` / `0x7b` / `0x45` | 5 / 1 / 14 / 12 / 45 | +1 each |
+| | Output | `0x80` rumble | 9 | 10 |
+| | Output | `0x81` haptic pulse | 7 | 8 |
+| | Output | `0x82` / `0x83` / `0x84` / `0x85` / `0x86` | 3 / 9 / 8 / 3 / 3 | +1 each |
+| | Output | `0x87` / `0x89` / `0x88` | 63 | 64 |
+| | Feature | **`0x01`** — the Valve control channel | **63** | **64** |
+| | Feature | `0x02` | 63 | 64 |
+
+(The `0x40` row is why the walker accumulates **bits** and rounds once, exactly
+as the kernel's `hid_compute_report_size` does: that report's first byte is a
+`2 + 6`-bit split, and summing byte-rounded main items loses it. The earlier
+capture note's "report id `0x40` (64-byte reports)" was a misreading — `0x40` is
+the lizard mouse, and the Steam protocol is on `0x42` / `0x01`.)
 
 Those are, byte for byte, the reports `src/report.rs` already decodes and
 `src/lizard.rs` / `src/haptics.rs` already write. **The wired `1302` speaks the
@@ -95,9 +111,78 @@ field hyprpad does not model rides along untouched, including the IMU at bytes
 30+ and the undecoded tail. That is the standing advantage over `deck`, which
 forfeits it.
 
-The one thing not settled is risk **R1**: whether Steam accepts a `1302` whose
-`Interface:` reads `-1` because a uhid device has no USB parent (research §3.2,
-§6 R1, Q-u1).
+### 1.1 Framing: what numbered reports actually oblige us to do
+
+`profile::Framing` carries this per profile, and it is the half of an identity
+Steam's *parser* sees.
+
+**There is nothing to switch on.** Numbering is a property of the descriptor and
+the kernel derives it: `uhid_hid_start` (`drivers/hid/uhid.c`) walks the
+descriptor it was handed and raises `UHID_DEV_NUMBERED_{FEATURE,OUTPUT,INPUT}_REPORTS`
+from `hid->report_enum[…].numbered`. Those flags live in `struct uhid_start_req`
+and travel **kernel → user space** in `UHID_START`; `struct uhid_create2_req`
+(`include/uapi/linux/uhid.h`) has no flags field at all. Publishing the numbered
+372-byte descriptor *is* the request, so `Framing::expected_dev_flags` is checked
+against what `UHID_START` reports (`0b111` for triton, `0` for deck) and a
+mismatch is warned about at startup.
+
+What user space must then do is match it, because **uhid neither inserts nor
+strips the leading report-number byte on any channel**:
+
+| Channel | Kernel | Consequence |
+|---|---|---|
+| Input | `uhid_dev_input2` → `hid_report_raw_event`, which takes `data[0]` as the report id when the input enum is numbered | triton emits `[0x42][53 bytes]`; deck emits a bare 64 |
+| Feature `GET` | `uhid_hid_get_report`: `ret = min3(count, req->size, UHID_DATA_MAX); memcpy(buf, req->data, ret)` — then `hidraw_get_report` copies that to the caller verbatim | the **entire** buffer, byte 0 included, is ours to build |
+| Feature `SET` | `uhid_hid_set_report` copies hidraw's whole buffer, report-number byte and all | the Valve command id is `data[1]` — what `HostWrite::command` strips for |
+
+The one that was wrong: **a real `1302` answers a 65-byte request with 65
+bytes.** Real hardware is framed by `usbhid_get_raw_report`
+(`drivers/hid/usbhid/hid-core.c`), which uhid does not emulate:
+
+```c
+/* Byte 0 is the report number. Report data starts at byte 1.*/
+buf[0] = report_number;
+if (report_number == 0x0) {
+        /* Offset the return buffer by 1, so that the report ID
+           will remain in byte 0. */
+        buf++; count--; skipped_report_id = 1;
+}
+ret = usb_control_msg(…, buf, count, …);
+/* count also the report id */
+if (ret > 0 && skipped_report_id)
+        ret++;
+```
+
+Valve's own client asks for exactly that much and says why:
+`src/joystick/hidapi/SDL_hidapi_steam.c` declares `unsigned char buf[65]` under
+the comment *"Firmware quirk: Set Feature and Get Feature requests always
+require a 65-byte buffer"*, sends with `SDL_hid_send_feature_report(dev,
+uBuffer, 65)`, reads with `SDL_hid_get_feature_report(dev, uBuffer, 65)`, and
+validates the answer at `uBuffer[1] != nExpectedResponse` — never `[0]` — then
+bounds-checks `nAttributesLength = buf[2]` against the returned byte count.
+
+So triton's `GET_REPORT` answer is **65 bytes**: the report number echoed into
+byte 0 the way `usbhid_get_raw_report` does it, then the 64-byte Valve message.
+The message content is unchanged; only the frame around it grew, from
+`[id byte][63-byte message]` to `[id byte][64-byte message]`.
+
+`deck` keeps its 64 bytes untouched — one byte shorter than a real USB device
+would return, and pinned anyway, because those are the bytes Steam adopted on
+2026-09-01. Changing a proven wire to satisfy a theory is how you lose the
+fallback.
+
+### 1.2 What is still unsettled
+
+Risk **R1**: whether Steam accepts a `1302` whose `Interface:` reads `-1`
+because a uhid device has no USB parent (research §3.2, §6 R1, Q-u1).
+
+And the framing fix above is **inferred, not observed**: it makes the wire
+byte-for-byte what a real `1302` puts there, but nobody has watched Steam accept
+it. The failure it targets is the 2026-09-02 run where Steam opened the fake,
+looped `CGetControllerInfoWorkItem::RunFunc: Read failure.` and
+`Warning, couldn't get controller details for SC, PID=4866` several times a
+second, and re-opened the device every 15 s — with the daemon answering every
+`GetAttributesValues` correctly except that its answer was 64 bytes long.
 
 > **If `triton` is not adopted, the fallback is one line.** Set
 > `identity = "deck"` and **restart the daemon** — `identity` chooses a device

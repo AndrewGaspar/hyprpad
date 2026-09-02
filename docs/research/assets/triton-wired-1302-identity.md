@@ -35,9 +35,21 @@ set map onto the `1302` protocol Steam will speak — TBD after the decisive tes
   (unlike wireless 1304, gated on interface 2..6).
 
 ## Report descriptor
-- 372 bytes; top-level Generic Desktop / report id 0x40 (64-byte reports) — the
-  V1 wired HID protocol Steam's log calls "V1 HID protocol via USB".
+- 372 bytes; three top-level collections — the V1 wired HID protocol Steam's log
+  calls "V1 HID protocol via USB".
 - full hexdump: triton-wired-1302-report-descriptor.hex
+
+> **Correction (2026-09-02).** This section originally read "top-level Generic
+> Desktop / report id 0x40 (64-byte reports)". Walking the bytes says otherwise:
+> `0x40` is the **lizard mouse** (5-byte payload) in the Generic Desktop
+> collection, `0x41` the lizard keyboard (8), and the Steam protocol lives in the
+> vendor `0xFF00` collection — input `0x42` with 53 payload bytes, feature `0x01`
+> and `0x02` with 63 each, and ten numbered output reports including `0x80`
+> rumble (9) and `0x81` haptic pulse (7). The full table is pinned in
+> `src/uhid/profile.rs`
+> (`the_triton_descriptor_report_table_is_pinned`) and reproduced in
+> `docs/design/uhid-relay.md` §1. Nothing in this descriptor is 64 bytes on the
+> input side, and nothing in it is unnumbered.
 
 ## Relay plan (Path A)
 - Real puck streams input on its own report id; the wired 1302 presents id 0x40.

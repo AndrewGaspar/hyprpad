@@ -7,9 +7,13 @@
 //! |---|---|---|
 //! | VID:PID | `28de:1302` — the *wired* single-interface Steam Controller | `28de:12f0` — InputPlumber's `ProductId::Generic` |
 //! | Descriptor | the real 372-byte capture, `docs/research/assets/` | InputPlumber's 38-byte vendor-only blob |
-//! | Input report | **the puck's own `0x42`, passed through** | a translated 64-byte Deck report |
-//! | Report IDs | yes, on all three types | none at all |
+//! | Input report | **the puck's own `0x42`, passed through** — 54 bytes | a translated 64-byte Deck report |
+//! | Report IDs | yes, on all three types (`dev_flags` `0b111`) | none at all (`dev_flags` `0`) |
+//! | `GET_REPORT` answer | **65 bytes**: report number + a 64-byte Valve message | 64 bytes, the proven probe's |
 //! | Steam adoption | **unproven** — awaits the owner's live test | **PROVEN on-device 2026-09-01** |
+//!
+//! [`Framing`] carries all of that as data and says where each number comes
+//! from; it is what the relay frames every report with.
 //!
 //! # Why `triton` is the default despite being unproven
 //!
@@ -116,6 +120,88 @@ impl ReportKind {
     }
 }
 
+/// How a profile's reports are framed on the wire.
+///
+/// This is the half of an identity that Steam's *parser* sees, as opposed to the
+/// half `lsusb` sees, and the two profiles disagree about all of it.
+///
+/// # There is nothing to "turn on" — the descriptor is the request
+///
+/// Numbering is a property of the report descriptor, and the kernel derives it
+/// itself. `uhid_hid_start` (`drivers/hid/uhid.c`) walks the descriptor it was
+/// handed and reports the result *back* to user space:
+///
+/// ```text
+/// if (hid->report_enum[HID_FEATURE_REPORT].numbered)
+///         ev->u.start.dev_flags |= UHID_DEV_NUMBERED_FEATURE_REPORTS;
+/// if (hid->report_enum[HID_OUTPUT_REPORT].numbered)
+///         ev->u.start.dev_flags |= UHID_DEV_NUMBERED_OUTPUT_REPORTS;
+/// if (hid->report_enum[HID_INPUT_REPORT].numbered)
+///         ev->u.start.dev_flags |= UHID_DEV_NUMBERED_INPUT_REPORTS;
+/// ```
+///
+/// `dev_flags` lives in `struct uhid_start_req`, which travels kernel → user
+/// space; `struct uhid_create2_req` (`include/uapi/linux/uhid.h`) has **no flags
+/// field at all**. So publishing the numbered 372-byte descriptor *is* how the
+/// triton profile asks for numbered framing, and [`expected_dev_flags`] is the
+/// answer the kernel is expected to give back — checked at runtime, not set.
+///
+/// [`expected_dev_flags`]: Framing::expected_dev_flags
+///
+/// # What user space must then do
+///
+/// uhid **neither inserts nor strips** the leading report-number byte on any
+/// channel, so every byte on the wire is ours to get right:
+///
+/// * **Input** — `uhid_dev_input2` hands the buffer straight to
+///   `hid_report_raw_event`, which takes `data[0]` as the report id whenever the
+///   input enum is numbered. So a triton input report is `[0x42][53 bytes]` and
+///   a deck one is a bare 64 bytes.
+/// * **Feature `GET`** — `uhid_hid_get_report` answers with
+///   `ret = min3(count, req->size, UHID_DATA_MAX); memcpy(buf, req->data, ret)`,
+///   and `hidraw_get_report` copies that to the caller verbatim. A **real** USB
+///   device is framed for us by `usbhid_get_raw_report` instead, which does
+///   `buf[0] = report_number`, offsets the payload by one when the caller asked
+///   for report 0, and then `if (ret > 0 && skipped_report_id) ret++`. That is
+///   why a real `1302` answers Steam's 65-byte request with **65** bytes —
+///   one echoed report-number byte plus a 64-byte Valve message — and why
+///   [`Framing::feature_reply_len`] is 65 here. SDL's own client says the same
+///   thing out loud: *"Firmware quirk: Set Feature and Get Feature requests
+///   always require a 65-byte buffer"* (`src/joystick/hidapi/SDL_hidapi_steam.c`,
+///   `unsigned char buf[65]`, `SDL_hid_get_feature_report(dev, uBuffer, 65)`),
+///   and it reads the command id at `uBuffer[1]` — never `[0]`.
+/// * **Feature `SET`** — `uhid_hid_set_report` copies hidraw's whole buffer,
+///   report-number byte and all, so the Valve command id is `data[1]`. That is
+///   what `crate::uhid::HostWrite::command` already strips for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Framing {
+    /// Whether this profile's descriptor carries `REPORT_ID` items at all. When
+    /// it does, every report on every channel is prefixed with its id.
+    pub numbered: bool,
+    /// The input report id byte 0 carries, or `None` for an unnumbered profile.
+    pub input_report_id: Option<u8>,
+    /// Exact wire length of one input report, id byte included.
+    pub input_len: usize,
+    /// The feature report id Steam's control traffic rides on, or `None`.
+    /// Valve multiplexes the whole command set through this one report, so it
+    /// says nothing about *which* command — that is the byte after it.
+    pub feature_report_id: Option<u8>,
+    /// Exact wire length of one `GET_REPORT` answer: the report-number byte
+    /// plus the Valve message. 65 for a numbered profile emulating what
+    /// `usbhid_get_raw_report` would have produced; 64 for the deck profile,
+    /// which is pinned to the proven probe's bytes.
+    pub feature_reply_len: usize,
+    /// The `dev_flags` `UHID_START` is expected to report for this descriptor.
+    /// Diagnostic, never sent: see the type docs.
+    pub expected_dev_flags: u64,
+}
+
+/// The triton descriptor numbers input, output *and* feature reports, so the
+/// kernel raises all three bits.
+const NUMBERED_ALL: u64 = crate::uhid::DEV_NUMBERED_FEATURE_REPORTS
+    | crate::uhid::DEV_NUMBERED_OUTPUT_REPORTS
+    | crate::uhid::DEV_NUMBERED_INPUT_REPORTS;
+
 /// Everything that makes the virtual device one identity rather than the other.
 ///
 /// All `'static`: a profile is a compile-time constant, so the running relay
@@ -146,6 +232,8 @@ pub struct Profile {
     pub descriptor: &'static [u8],
     /// The shape of this profile's input reports.
     pub kind: ReportKind,
+    /// How this profile's reports are framed on the wire.
+    pub framing: Framing,
     /// Canned `GetAttributesValues` (`0x83`) answer, 64 bytes.
     pub attributes: [u8; 64],
     /// Serial reported by `GetStringAttribute` (`0xAE`).
@@ -179,6 +267,35 @@ impl Profile {
             cmd::GET_CHIP_ID => framed(&[0x00, cmd::GET_CHIP_ID, 0x11, 0x00], &self.chip_id),
             other => framed(&[0x00, other, 0x00], &[]),
         }
+    }
+
+    /// The exact bytes one `UHID_GET_REPORT` is answered with — the canned
+    /// [`Profile::canned_reply`] frame, framed for this profile's wire.
+    ///
+    /// `rnum` is the report number the kernel passed through from
+    /// `hidraw_get_report`, which read it out of byte 0 of Steam's own buffer.
+    ///
+    /// * **deck** — 64 bytes, the canned frame verbatim. The device is
+    ///   unnumbered and this is the byte sequence Steam adopted on 2026-09-01;
+    ///   it does not move.
+    /// * **triton** — 65 bytes: `rnum` echoed into byte 0 exactly as
+    ///   `usbhid_get_raw_report` does (`buf[0] = report_number`), then the
+    ///   64-byte Valve message. The canned frame is 64 bytes of
+    ///   `[report-number byte][63-byte message]`, so the message gets its full
+    ///   64 bytes here and the reply is the length a real `1302` returns.
+    ///   Nothing in the message content changes — only the frame around it.
+    pub fn get_report_reply(&self, rnum: u8, selector: u8) -> Vec<u8> {
+        let canned = self.canned_reply(selector);
+        let mut out = vec![0u8; self.framing.feature_reply_len];
+        let n = canned.len().min(out.len());
+        out[..n].copy_from_slice(&canned[..n]);
+        if self.framing.numbered {
+            // A real device echoes the requested report number here; Steam asks
+            // with 0, which is what the canned frame already carries, so this
+            // only ever differs if Steam names the feature report explicitly.
+            out[0] = rnum;
+        }
+        out
     }
 
     /// The `28de:12f0`-style `<vid>-<pid>` string Steam falls back to when a
@@ -274,6 +391,18 @@ pub fn deck() -> &'static Profile {
         country: 0,
         descriptor: &DECK_DESCRIPTOR,
         kind: ReportKind::Deck,
+        // Nothing in the 38-byte descriptor is numbered, so the kernel raises
+        // no `dev_flags` bit and every report is bare. The 64-byte answer is
+        // one byte shorter than the 65 a real USB device would return, and is
+        // kept anyway: these are the bytes Steam adopted.
+        framing: Framing {
+            numbered: false,
+            input_report_id: None,
+            input_len: crate::uhid::translate::DECK_REPORT_LEN,
+            feature_report_id: None,
+            feature_reply_len: 64,
+            expected_dev_flags: 0,
+        },
         attributes: DECK_ATTRIBUTES,
         serial: "1NPU7PLUMB3R",
         chip_id: DECK_CHIP_ID,
@@ -304,6 +433,12 @@ pub const TRITON_DESCRIPTOR: [u8; 372] =
 /// because Steam keys `configset_<uniq>.vdf` on it (§3.3, §6 R11) — a Steam
 /// Input config bound to this string survives every restart of the daemon.
 pub const TRITON_SERIAL: &str = "FXA9961402A6C";
+
+/// The feature report the wired `1302` multiplexes Valve's whole command set
+/// through: id `0x01`, 63 payload bytes, vendor page `0xFF00`. Read straight off
+/// the captured descriptor (`the_triton_descriptor_report_table_is_pinned`); its
+/// twin `0x02` is the same shape and Steam does not use it.
+pub const TRITON_FEATURE_REPORT_ID: u8 = 0x01;
 
 /// Replace `ATTRIB_PRODUCT_ID` (attribute `0x01`, the first TLV, its `u32` at
 /// bytes 4..8) in an attributes blob.
@@ -356,6 +491,19 @@ pub fn triton() -> &'static Profile {
         country: 0,
         descriptor: &TRITON_DESCRIPTOR,
         kind: ReportKind::Triton,
+        // Straight off the captured descriptor: input `0x42` is 53 payload
+        // bytes (54 on the wire), the Valve control channel is feature report
+        // `0x01` (63 payload bytes), and every report type is numbered, so the
+        // kernel raises all three `UHID_DEV_NUMBERED_*` bits. The 65-byte
+        // answer is what `usbhid_get_raw_report` builds for a real unit.
+        framing: Framing {
+            numbered: true,
+            input_report_id: Some(crate::uhid::translate::REPORT_ID_INPUT),
+            input_len: crate::uhid::translate::TRITON_REPORT_LEN,
+            feature_report_id: Some(TRITON_FEATURE_REPORT_ID),
+            feature_reply_len: 65,
+            expected_dev_flags: NUMBERED_ALL,
+        },
         attributes: TRITON_ATTRIBUTES,
         serial: TRITON_SERIAL,
         // UNVERIFIED: no chip id was captured from a 1302. Modelled on the Deck
@@ -494,6 +642,7 @@ mod tests {
         assert_eq!(items[0].payload_bytes, crate::uhid::translate::DECK_REPORT_LEN);
     }
 
+    #[derive(Debug, PartialEq, Eq)]
     struct Item {
         /// The main-item tag: 0x81 Input, 0x91 Output, 0xb1 Feature.
         main: u8,
@@ -502,30 +651,184 @@ mod tests {
     }
 
     /// A minimal HID report-descriptor walker: enough to recover
-    /// `(main item, report id, payload size)` for each Input/Output/Feature.
+    /// `(main item, report id, payload size)` for every report the descriptor
+    /// declares, in the order it declares them.
+    ///
+    /// One report is usually built from several main items, so the fields are
+    /// accumulated **in bits** and rounded once at the end — exactly the
+    /// kernel's `hid_compute_report_size`, `((report->size - 1) >> 3) + 1`.
+    /// Summing byte-rounded main items instead loses the lizard mouse's
+    /// `2 + 6`-bit button byte, and the whole point of this walker is that the
+    /// numbers it prints are the numbers on the wire.
     fn report_items(rd: &[u8]) -> Vec<Item> {
         let (mut id, mut count, mut size) = (0u8, 0usize, 0usize);
-        let mut out = Vec::new();
+        // (main, id) in first-seen order, with the running bit total.
+        let mut order: Vec<(u8, u8)> = Vec::new();
+        let mut bits: Vec<usize> = Vec::new();
         let mut i = 0;
         while i < rd.len() {
             let b = rd[i];
-            let len = usize::from(b & 3);
+            // Short items: the low two bits are the data length, and `3` means
+            // four bytes (HID 1.11 §6.2.2.2).
+            let len = match b & 3 {
+                3 => 4,
+                n => usize::from(n),
+            };
             let val = rd[i + 1..(i + 1 + len).min(rd.len())]
                 .iter()
                 .rev()
                 .fold(0usize, |a, &x| (a << 8) | usize::from(x));
             match b & 0xfc {
-                0x84 => id = val as u8,           // Report ID
-                0x94 => count = val,              // Report Count
-                0x74 => size = val,               // Report Size
+                0x84 => id = val as u8, // Report ID
+                0x94 => count = val,    // Report Count
+                0x74 => size = val,     // Report Size
                 _ => {}
             }
             if matches!(b, 0x81 | 0x91 | 0xb1) {
-                out.push(Item { main: b, report_id: id, payload_bytes: count * size / 8 });
+                let key = (b, id);
+                let at = order.iter().position(|k| *k == key).unwrap_or_else(|| {
+                    order.push(key);
+                    bits.push(0);
+                    order.len() - 1
+                });
+                bits[at] += count * size;
             }
             i += 1 + len;
         }
-        out
+        order
+            .into_iter()
+            .zip(bits)
+            .map(|((main, report_id), n)| Item {
+                main,
+                report_id,
+                payload_bytes: if n == 0 { 0 } else { ((n - 1) >> 3) + 1 },
+            })
+            .collect()
+    }
+
+    /// A row of the pinned tables below: `(type, report id, payload bytes)`.
+    fn table(rd: &[u8]) -> Vec<(&'static str, u8, usize)> {
+        report_items(rd)
+            .into_iter()
+            .map(|i| {
+                let ty = match i.main {
+                    0x81 => "input",
+                    0x91 => "output",
+                    _ => "feature",
+                };
+                (ty, i.report_id, i.payload_bytes)
+            })
+            .collect()
+    }
+
+    /// **The whole captured `1302` report table, pinned.**
+    ///
+    /// Every framing decision the triton profile makes is read off this list:
+    /// which id the input stream carries and how long it is, which feature
+    /// report Valve's command set is multiplexed through, and — because *every*
+    /// row is numbered — that the kernel will number all three channels. A
+    /// re-capture that changes any of it must fail here rather than silently
+    /// reframing the wire.
+    ///
+    /// Wire length is always one more than the payload: the report id goes in
+    /// front of it.
+    #[test]
+    fn the_triton_descriptor_report_table_is_pinned() {
+        assert_eq!(
+            table(&TRITON_DESCRIPTOR),
+            vec![
+                // Collection 1: the lizard Mouse (Generic Desktop / Pointer).
+                ("input", 0x40, 5),
+                // Collection 2: the lizard Keyboard.
+                ("input", 0x41, 8),
+                // Collection 3: vendor page 0xFF00 — the Steam protocol.
+                ("input", 0x42, 53), // controller state: THE pass-through
+                ("input", 0x44, 5),
+                ("input", 0x79, 1),
+                ("input", 0x43, 14),
+                ("input", 0x7b, 12),
+                ("input", 0x45, 45),
+                ("output", 0x80, 9), // rumble      — src/haptics.rs writes it
+                ("output", 0x81, 7), // haptic pulse — likewise
+                ("output", 0x82, 3),
+                ("output", 0x83, 9),
+                ("output", 0x84, 8),
+                ("output", 0x85, 3),
+                ("output", 0x86, 3),
+                ("output", 0x87, 63),
+                ("output", 0x89, 63),
+                ("output", 0x88, 63),
+                ("feature", 0x01, 63), // the Valve control channel
+                ("feature", 0x02, 63),
+            ]
+        );
+    }
+
+    /// The deck table is the mirror image, and just as load-bearing: two
+    /// unnumbered 64-byte reports, so no `dev_flags` bit and no prefix byte
+    /// anywhere.
+    #[test]
+    fn the_deck_descriptor_report_table_is_pinned() {
+        assert_eq!(table(&DECK_DESCRIPTOR), vec![("input", 0x00, 64), ("feature", 0x00, 64)]);
+    }
+
+    /// Each profile's declared [`Framing`] is exactly what its own descriptor
+    /// says — including the `dev_flags` the kernel will hand back in
+    /// `UHID_START`, which is derived and checked, never sent.
+    #[test]
+    fn each_profiles_framing_is_derived_from_its_own_descriptor() {
+        for p in [triton(), deck()] {
+            let items = report_items(p.descriptor);
+            let f = p.framing;
+
+            let numbered = |main: u8| items.iter().any(|i| i.main == main && i.report_id != 0);
+            assert_eq!(
+                f.numbered,
+                items.iter().any(|i| i.report_id != 0),
+                "{}: numbered",
+                p.identity.as_str()
+            );
+            // `uhid_hid_start` raises one bit per *report type* that is
+            // numbered, so build the expectation the same way it does.
+            let mut want = 0u64;
+            if numbered(0xb1) {
+                want |= crate::uhid::DEV_NUMBERED_FEATURE_REPORTS;
+            }
+            if numbered(0x91) {
+                want |= crate::uhid::DEV_NUMBERED_OUTPUT_REPORTS;
+            }
+            if numbered(0x81) {
+                want |= crate::uhid::DEV_NUMBERED_INPUT_REPORTS;
+            }
+            assert_eq!(f.expected_dev_flags, want, "{}: dev_flags", p.identity.as_str());
+
+            // The input report the streamer actually emits.
+            let input = items
+                .iter()
+                .find(|i| i.main == 0x81 && i.report_id == f.input_report_id.unwrap_or(0))
+                .expect("the streamed input report is declared");
+            assert_eq!(
+                f.input_len,
+                input.payload_bytes + usize::from(f.numbered),
+                "{}: input wire length",
+                p.identity.as_str()
+            );
+            assert_eq!(f.input_len, p.kind.report_len(), "{}: kind agrees", p.identity.as_str());
+
+            // The feature report Valve's control traffic rides on.
+            let feature = items
+                .iter()
+                .find(|i| i.main == 0xb1 && i.report_id == f.feature_report_id.unwrap_or(0))
+                .expect("the control feature report is declared");
+            assert_eq!(feature.payload_bytes, if f.numbered { 63 } else { 64 });
+        }
+
+        assert_eq!(triton().framing.expected_dev_flags, 1 | 2 | 4, "all three, numerically");
+        assert_eq!(deck().framing.expected_dev_flags, 0);
+        assert_eq!(triton().framing.input_report_id, Some(0x42));
+        assert_eq!(deck().framing.input_report_id, None);
+        assert_eq!(triton().framing.feature_report_id, Some(TRITON_FEATURE_REPORT_ID));
+        assert_eq!(deck().framing.feature_report_id, None);
     }
 
     #[test]
@@ -598,6 +901,61 @@ mod tests {
         assert_eq!(attrs[3], 0x01, "still ATTRIB_PRODUCT_ID");
         // Everything after the patched u32 is untouched Deck data.
         assert_eq!(&attrs[8..], &DECK_ATTRIBUTES[8..]);
+    }
+
+    /// The framed `GET_REPORT` answer, which is what Steam's parser actually
+    /// reads.
+    ///
+    /// A real wired `1302` is framed by `usbhid_get_raw_report`: `buf[0] =
+    /// report_number`, the device's payload from `buf[1]`, and `ret++` for the
+    /// echoed id — so Steam's 65-byte request comes back **65 bytes**, and SDL
+    /// reads the Valve command id at `uBuffer[1]`. uhid inserts nothing
+    /// (`uhid_hid_get_report` is a bare `memcpy` of what user space sent), so
+    /// the profile has to produce that frame itself.
+    #[test]
+    fn a_triton_get_report_answer_is_65_bytes_with_the_id_byte_in_front() {
+        let t = triton();
+        let r = t.get_report_reply(0x00, cmd::GET_ATTRIBUTES_VALUES);
+        assert_eq!(r.len(), 65, "one report-number byte plus a 64-byte Valve message");
+        assert_eq!(r.len(), t.framing.feature_reply_len);
+        assert_eq!(r[0], 0x00, "the report number Steam asked with, echoed");
+        assert_eq!(r[1], cmd::GET_ATTRIBUTES_VALUES, "SDL reads the command id here");
+        assert_eq!(r[2], 0x2d, "…and the payload length here");
+        // The message itself is untouched: the canned 64-byte frame, then the
+        // one pad byte that gives it its full 64 bytes.
+        assert_eq!(&r[..64], &TRITON_ATTRIBUTES[..]);
+        assert_eq!(r[64], 0x00);
+        assert_eq!(u32::from_le_bytes(r[4..8].try_into().unwrap()), 0x1302);
+
+        // A request naming the feature report explicitly is echoed as such,
+        // exactly as `buf[0] = report_number` would leave it.
+        let named = t.get_report_reply(TRITON_FEATURE_REPORT_ID, cmd::GET_ATTRIBUTES_VALUES);
+        assert_eq!(named[0], 0x01);
+        assert_eq!(&named[1..], &r[1..], "only the report-number byte differs");
+
+        // Every other canned answer is framed the same way.
+        for selector in [cmd::GET_STRING_ATTRIBUTE, cmd::GET_CHIP_ID, cmd::INPUT_DATA, 0x77] {
+            let r = t.get_report_reply(0, selector);
+            assert_eq!(r.len(), 65, "never short, never empty");
+            assert_eq!(r[1], selector, "the command id Steam asked for");
+        }
+        assert_eq!(&t.get_report_reply(0, cmd::GET_STRING_ATTRIBUTE)[4..17], b"FXA9961402A6C");
+    }
+
+    /// The deck answer does **not** move: 64 bytes, the canned frame verbatim,
+    /// the bytes Steam adopted on 2026-09-01.
+    #[test]
+    fn the_deck_get_report_answer_is_the_proven_64_bytes_unchanged() {
+        let d = deck();
+        for selector in [cmd::GET_ATTRIBUTES_VALUES, cmd::GET_STRING_ATTRIBUTE, cmd::INPUT_DATA] {
+            for rnum in [0x00, 0x01, 0xff] {
+                let r = d.get_report_reply(rnum, selector);
+                assert_eq!(r.len(), 64);
+                assert_eq!(r.as_slice(), &d.canned_reply(selector)[..]);
+                assert_eq!(r[0], 0x00, "unnumbered: the leading byte is never an id");
+            }
+        }
+        assert_eq!(d.get_report_reply(0, cmd::GET_ATTRIBUTES_VALUES), DECK_ATTRIBUTES.to_vec());
     }
 
     #[test]
