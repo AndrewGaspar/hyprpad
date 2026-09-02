@@ -2631,41 +2631,155 @@ mod tests {
         }
     }
 
+    /// A spawned test process tree, killed and reaped however the test leaves
+    /// the stack — a failing assert must not leak a `sleep` into the session.
+    ///
+    /// The child leads its own process group (`process_group(0)`, so its pgid
+    /// is its pid), because `Child::kill` signals only the process itself and
+    /// would orphan the descendants the shell started. One negative-pid signal
+    /// takes the whole tree.
+    struct ProcessTree(std::process::Child);
+
+    impl Drop for ProcessTree {
+        fn drop(&mut self) {
+            // SAFETY: a plain `kill(2)`; the pgid is this child's own, created
+            // by `process_group(0)` at spawn, so nothing else can be in it.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Poll `pred` on a 10 ms step until it holds or `budget` runs out.
+    ///
+    /// `/proc` is not a snapshot, so a single look is a coin flip in two ways
+    /// that have nothing to do with what is being tested:
+    ///
+    /// * `Command::spawn` returns once the child's `execve` has reached the
+    ///   point that closes the CLOEXEC pipe std waits on. The kernel sets
+    ///   `comm` before that but publishes `mm->arg_start` after it, so a walk
+    ///   landing in the window reads `/proc/<pid>/comm` as the new name and
+    ///   `/proc/<pid>/cmdline` as *empty* — anything that only appears in the
+    ///   command line is invisible. Measured at ~90% of spawns on an idle box.
+    /// * a grandchild is started by the shell, with no handshake with us at
+    ///   all, and `/proc/<pid>/task` listings are not atomic against libtest
+    ///   starting and joining threads around us.
+    ///
+    /// Both windows are transient, so wait for them rather than race them.
+    fn poll_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + budget;
+        loop {
+            if pred() {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn process_tree_has_finds_a_descendant_process() {
-        // Spawn a child under this test process and look for it by name through
-        // the same /proc walk a `ctx.focus:process_tree_has(...)` predicate runs.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let me = std::process::id() as i32;
+        // Spawn a process tree under this test process and look for it by name
+        // through the same /proc walk a `ctx.focus:process_tree_has(...)`
+        // predicate runs.
+        //
+        // The tree is three deep — test -> sh -> sh -> sleep — so this covers
+        // the recursive descent, not just "is it a direct child". Two details
+        // keep the needle honest:
+        //
+        // * the script arrives on the outer shell's *stdin*, not in its argv,
+        //   so that shell's own `/proc/<pid>/cmdline` is bare `/bin/sh` and
+        //   cannot satisfy the predicate by accident. Only the tagged inner
+        //   shell can.
+        // * the tag carries our pid, so the sibling tests that spawn `sleep`
+        //   in parallel (and any stray one on the machine) cannot satisfy it
+        //   either.
+        //
+        // Readiness is signalled by `/bin/echo` *inside* the tagged shell: an
+        // external command that runs only after that shell has exec'd, and
+        // that flushes by exiting, so reading the token proves the tag is
+        // already published in /proc rather than merely forked.
+        //
+        // The tagged shell backgrounds its `sleep` and blocks in `wait` rather
+        // than running it last, so that it stays a shell. A shell whose final
+        // command is a simple one exec's it in place — `sh -c '... ; sleep
+        // 300'` *becomes* `sleep 300` and drops the tag from its command line,
+        // which made an earlier draft of this test pass only when the lookup
+        // won the race against that exec.
+        let tag = format!("hyprpad-descendant-probe-{}", std::process::id());
+        let script = format!("/bin/sh -c '/bin/echo ready; sleep 300 & wait' {tag} &\nwait\n");
 
-        let c = load(
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::process::CommandExt;
+        let mut spawned = std::process::Command::new("/bin/sh")
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+        spawned
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("feed the script");
+        let out = spawned.stdout.take().expect("piped stdout");
+        let _child = ProcessTree(spawned);
+        let mut ready = String::new();
+        BufReader::new(out).read_line(&mut ready).expect("read the ready token");
+        assert_eq!(ready.trim(), "ready", "the probe shell never came up");
+
+        let me = std::process::id() as i32;
+        let c = load(&format!(
             r#"
             hyprpad.mode("has").when(function(ctx)
-              return ctx.focus:process_tree_has("sleep")
+              return ctx.focus:process_tree_has("{tag}")
             end)
             hyprpad.mode("dot").when(function(ctx)
-              return ctx.focus.process_tree_has("sleep")
+              return ctx.focus.process_tree_has("{tag}")
             end)
             hyprpad.mode("missing").when(function(ctx)
               return ctx.focus:process_tree_has("definitely-not-a-real-process-name")
             end)
             hyprpad.mode("desktop")
-            "#,
-        );
+            "#
+        ));
         let rt = c.lua().unwrap();
         let focus = focused(Focus { pid: Some(me), ..Focus::default() });
-        assert!(rt.eval_predicate(c.modes()[0].rule.unwrap(), &focus), "method call form");
+
+        // One bounded poll to let the tree settle, re-walking each time (the
+        // cache would otherwise pin the first, negative, answer forever)...
+        assert!(
+            poll_until(Duration::from_secs(2), || {
+                rt.forget_process_tree();
+                rt.eval_predicate(c.modes()[0].rule.unwrap(), &focus)
+            }),
+            "method call form: {tag} never appeared in the walk within 2s; \
+             the tree under {me} was {:#?}",
+            walk_process_tree(me)
+        );
+        // The match must have been reached by *descending*: no direct child of
+        // ours carries the tag, so a walk that only looked one level down —
+        // which is all the old version of this test would have caught — fails
+        // here rather than passing quietly.
+        let direct: Vec<String> =
+            process_children(me).into_iter().filter_map(process_description).collect();
+        assert!(
+            direct.iter().all(|d| !d.contains(&tag)),
+            "the tag should live in a grandchild, not a direct child; ours are {direct:#?}"
+        );
+
+        // ...after which the walk is warm and settled, so the rest are strict
+        // single checks against that same walk.
         assert!(rt.eval_predicate(c.modes()[1].rule.unwrap(), &focus), "dot call form");
         assert!(!rt.eval_predicate(c.modes()[2].rule.unwrap(), &focus));
 
         // No pid (focus lost to the desktop) is simply "no match", not an error.
         assert!(!rt.eval_predicate(c.modes()[0].rule.unwrap(), &Context::default()));
 
-        let _ = child.kill();
-        let _ = child.wait();
+        // `_child` drops here, killing the whole probe group on every path.
     }
 
     #[test]
