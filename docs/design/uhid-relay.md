@@ -528,6 +528,102 @@ The 200 ms staleness timer exists because the frame path *stops running* when th
 puck sleeps; without it the last live frame would repeat forever, and whatever
 was pressed at the moment the controller napped would stay pressed.
 
+### 4.1 The Steam log churn (#35) — measured, and it is not ours
+
+With the fake adopted, `~/.local/share/Steam/logs/controller.txt` fills up fast,
+and the obvious suspicion was the 250 Hz stream: something in a "neutral" report
+toggling under Steam and being read as an event. It was worth checking properly,
+because a stream that lies about being idle is the kind of bug that never shows
+up in a unit test.
+
+**It is not us.** Three measurements, all on 2026-09-02 on this machine.
+
+#### What we actually put on the wire
+
+10 seconds of the live fake read straight off its hidraw node — `28DE:1302`,
+found by walking `/sys/class/hidraw/*/device/uevent` — while the daemon was on
+the desktop (i.e. streaming neutral) and Steam held the device open:
+
+```
+reports: 2501 over 9.997 s = 250.1 Hz
+lengths: [54]          report ids: [0x42]
+byte indices that ever change over the WHOLE capture: [1]
+counter steps != +1 (mod 256): 0
+bytes differing between ANY consecutive pair: [1]
+reports with any non-zero byte at 30+: 0 / 2501
+inter-report ms: min 1.33  p50 4.00  p99 4.50  max 4.77
+```
+
+Byte 1 is the sequence counter. **It is the only byte that changes anywhere in
+the capture**, it advances by exactly one every tick with no exceptions across
+2500 reports, and it wraps cleanly. There is no battery field, no timestamp, no
+"connected" flag, no pad-touch bit and no capacitive bit — not "constant", but
+*absent*, because a neutral report is zeros. Nothing here can be what Steam is
+reacting to. `relay::tests` now pins all of that
+(`six_hundred_neutral_triton_ticks_differ_only_in_the_sequence_counter` and
+friends), so it stays true.
+
+#### The churn predates the relay, and was worse with the real puck
+
+The lines the churn is made of — `Controller N uses xinput`, `Queueing
+activation for controller`, `Add to Config Cache Request`, `HID: Add to Config
+Cache - full cache hit`, `Opted-in Controller Mask for AppId`, `Controller
+PollState Changed` — are ordinary Steam Input bookkeeping:
+
+| Evidence | Number |
+|---|---|
+| `uses xinput` lines in this log | **3381**, spread over 20 dates back to 2026-06-11 — months before the relay existed |
+| `uses xinput` lines on 2026-09-02, the day the fake was adopted | **0** |
+| Busiest single second with the **real** puck (2026-08-31, `V1 HID protocol via Dongle`) | **1168 lines**, and 243 lines/s was routine that day |
+| That day's composition | `Add to Config Cache Request` ×412, `HID: … full cache hit` ×350, `Queueing activation` ×307, `Opted-in Controller Mask` ×48 — the exact categories |
+
+So the baseline the change should be judged against is not "a quiet log"; it is
+a log that hit four figures in a second when Steam had the hardware directly.
+`PollState Changed` is not high-frequency either: today it went `1 → 2` at
+08:04:42 and `2 → 1` at **08:14:26**, ten minutes apart.
+
+#### The part that *was* ours, and is already fixed
+
+One category was genuinely ours, and it is the 64-versus-65-byte `GET_REPORT`
+answer of §1.1 — not the input stream at all:
+
+| Window (2026-09-02) | Lines | `CGetControllerInfoWorkItem::RunFunc: Read failure.` + `couldn't get controller details for SC, PID=4866` |
+|---|---|---|
+| before the framing fix (to 08:05) | 4165 | **1527** — 37% of the log |
+| after it (08:22 onward) | 340 | **0** |
+
+Pre-fix, Steam also re-enumerated every device on a **15-second cycle**
+(08:02:59, 08:03:13, 08:03:28, 08:03:43, 08:03:58, 08:04:13, 08:04:28 …), each
+sweep costing ~50 lines. Post-fix that stops dead: two bursts, one per adoption,
+and then `Controller Info: HWID: 46, FWTimestamp: 0x65E4F1AD` — Steam reading
+the attributes successfully for the first time — after which **the log went
+silent at 08:23:47 and stayed silent for minutes while the fake kept streaming
+at 250 Hz**.
+
+That is the dispositive observation: a 250 Hz stream producing *zero* log lines.
+Whatever churn remains is Steam talking to itself about config sets.
+
+#### The one bit of noise that is a consequence of our design
+
+`packaging/udev/72-hyprpad-puck.rules` makes the real puck's five hidraw nodes
+unopenable, so every Steam device sweep logs `Local Device Found … Unable to
+open local device: /dev/hidraw7` five times over. That is ~45 lines per sweep,
+and it is the *intended* behaviour — Steam must not see the real puck (§6) —
+with the log line as its only cost. It fires per sweep, not continuously.
+
+#### What is deliberately *not* changed
+
+The obvious "fix" would be to renumber relayed reports so the counter is always
+ours and always monotonic. **No.** §4.4 forbids it, and now more strongly than
+when it was written: the counter shares the report with the IMU data §3.1 turned
+on, and renumbering risks desync with the IMU timestamp path. The consequence is
+that a live frame held between puck updates repeats its counter for up to
+`STALE_AFTER`, and that crossing live → neutral moves the counter's *source*
+once per transition. Both are bounded, both are on the record
+(`a_held_live_frame_repeats_its_own_counter_rather_than_being_renumbered`,
+`the_live_to_neutral_transition_is_one_counter_discontinuity_and_nothing_else`),
+and neither is tens of lines per second.
+
 ### Reconnect
 
 **The uhid device is created once, at daemon start, and destroyed only at exit.**
@@ -829,6 +925,7 @@ end over a real unix socket. Not verified, because it needs an install:
 | G3 | `triton`'s chip id | **UNVERIFIED.** Modelled on the Deck answer. |
 | G4 | `TriggerHapticCommand` (`0xEA`) shape | **Partly UNVERIFIED.** The `PackedHapticReport` layout is verbatim, but `PadSide`/`Intensity` are enums whose discriminants were not captured, and the command carries **no duration** — only an intensity class. hyprpad fires its own calibrated single tick (`0x190` = 400 µs, from the kernel's `steam_haptic_pulse`) on the named side, reading side as `0 = left, 1 = right`. The first live session's `HYPRSC_DEBUG` log settles it. |
 | G5 | **Gyro does not reach Steam.** | **CLOSED on `triton`, pending a live check** — §3.1. Steam's `SETTING_IMU_MODE` (48) is now written to the real puck through `lizard.rs`'s frame builder, and the pass-through carries whatever the puck then puts in bytes 30+. That the puck answers setting 48 by filling those bytes of the *same* `0x42` is **inferred from the report table, not observed** — §8 step 6 is the check. Still open **by construction on `deck`**: `puck_to_deck` transcodes from `report::Frame`, which has no IMU fields. |
+| — | **Steam log churn (#35)** | **Not ours — measured, §4.1.** Our stream is 2500 consecutive reports in which byte 1 is the only byte that changes; the churn categories predate the relay by months and hit 1168 lines/s with the *real* puck. The one part that was ours was the `GET_REPORT` framing (§1.1), now fixed: 1527 read-failure lines before, zero after, and the log falls silent while the fake streams at 250 Hz. |
 | G6 | Quick Access is never stripped | `StripMask` supports it; nothing sets it. §4.4 suggests deriving the whole mask from the live binding table so any bound button is withheld. Follow-on. |
 | G7 | `identity` / `kind` do not take effect on `hyprpad reload` | They choose a device created once at startup. Restart the daemon. |
 | G8 | Latency of the extra userspace hop | Unmeasured (risk R7). Both hops are non-blocking; budget ≪1 ms. Measure on the first live run. |
@@ -1055,7 +1152,13 @@ All pure, no devices. `cargo test` gates on the exit code.
   Steam asked; that a re-stated mode reports no change (so it becomes no write);
   and that a nudge is never dropped and wakes a blocked wait.
 * **`relay.rs`** — the neutral stream, the advancing Deck counter, the untouched
-  Triton counter, and the staleness decay.
+  Triton counter, and the staleness decay; and the **neutral-frame stability**
+  rule of §4.1: 600 consecutive neutral ticks on each profile in which the
+  sequence counter is the only byte that may differ and may only advance by one,
+  that a neutral report has no flag or reading anywhere that *could* toggle
+  (including a zero IMU window), that the `u8` counter wraps without a stutter,
+  and the two deliberate counter discontinuities — a held live frame repeating
+  its own counter, and the one jump when live gives way to neutral.
 * **`config.rs` / `lua_config.rs`** — `kind` and `identity` on both front-ends,
   their aliases, their defaults, and that a typo fails the whole parse.
 * **`status.rs` / `run.rs`** — the `"relay"` field, and that it reports the sink

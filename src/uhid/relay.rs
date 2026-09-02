@@ -380,4 +380,171 @@ mod tests {
         assert_eq!(&out[..4], &[0x01, 0x00, 0x09, 0x40]);
         assert_eq!(out[8] & 0x80, 0x80, "A survived the transcode");
     }
+
+    // -----------------------------------------------------------------------
+    // Neutral-frame stability — issue #35, and what it turned out to be
+    // -----------------------------------------------------------------------
+    //
+    // With the fake adopted, `~/.local/share/Steam/logs/controller.txt` churns,
+    // and the first suspicion was that something in *our* stream was toggling
+    // under Steam. It is not, and these tests are what pins that down; the
+    // measurement that settled it is recorded in `docs/design/uhid-relay.md`
+    // §4.1. The rule they enforce is one sentence:
+    //
+    //   **Between two neutral ticks, the sequence counter is the only byte that
+    //   may differ, and it may only advance by one.**
+    //
+    // Everything a host could read as an event — a battery level, a touch bit,
+    // a "connected" flag, a timestamp — must be *absent*, not merely constant,
+    // because a byte that is constant today is a byte someone can make toggle
+    // tomorrow without noticing what it costs.
+
+    /// How many ticks the stability tests walk. Long enough to wrap the
+    /// triton profile's `u8` counter more than once, which is the only place
+    /// the two profiles' counters can behave differently.
+    const STABILITY_TICKS: u32 = 600;
+
+    /// The whole of issue #35's "is it us?", for the profile Steam actually
+    /// adopted: 600 consecutive neutral ticks, and byte 1 is the only thing
+    /// that moves.
+    #[test]
+    fn six_hundred_neutral_triton_ticks_differ_only_in_the_sequence_counter() {
+        let now = Instant::now();
+        let mut prev: Option<Vec<u8>> = None;
+        for n in 0..STABILITY_TICKS {
+            let r = tick_report(profile::triton(), Streamed::Neutral, n, now);
+            assert_eq!(r.len(), TRITON_REPORT_LEN);
+            assert_eq!(r[0], 0x42, "the report id never changes");
+            assert_eq!(r[1], (n & 0xff) as u8, "byte 1 is the counter, and only that");
+            assert!(
+                r[2..].iter().all(|&b| b == 0),
+                "tick {n}: everything but the id and the counter is zero"
+            );
+            if let Some(p) = &prev {
+                let differing: Vec<usize> =
+                    (0..r.len()).filter(|&i| p[i] != r[i]).collect();
+                assert_eq!(differing, vec![1], "tick {n}: exactly one byte may differ");
+                assert_eq!(
+                    r[1].wrapping_sub(p[1]),
+                    1,
+                    "tick {n}: the counter advances by exactly one, wrapping"
+                );
+            }
+            prev = Some(r);
+        }
+    }
+
+    /// The same rule for the deck profile, whose counter is a `u32` at 4..8 and
+    /// whose header must likewise never move.
+    #[test]
+    fn six_hundred_neutral_deck_ticks_differ_only_in_the_frame_counter() {
+        let now = Instant::now();
+        let mut prev: Option<Vec<u8>> = None;
+        for n in 0..STABILITY_TICKS {
+            let r = tick_report(profile::deck(), Streamed::Neutral, n, now);
+            assert_eq!(r.len(), DECK_REPORT_LEN);
+            assert_eq!(&r[..4], &[0x01, 0x00, 0x09, 0x40], "the header never changes");
+            assert_eq!(&r[4..8], &n.to_le_bytes());
+            assert!(r[8..].iter().all(|&b| b == 0), "tick {n}: nothing else is set");
+            if let Some(p) = &prev {
+                let differing: Vec<usize> =
+                    (0..r.len()).filter(|&i| p[i] != r[i]).collect();
+                assert!(
+                    differing.iter().all(|&i| (4..8).contains(&i)),
+                    "tick {n}: only the frame counter may differ, saw {differing:?}"
+                );
+            }
+            prev = Some(r);
+        }
+    }
+
+    /// A neutral report carries **no state at all** beyond its counter — which
+    /// is the structural reason the stability above holds rather than a
+    /// coincidence of today's field assignments.
+    ///
+    /// Named individually so a future field lands on a failing assertion rather
+    /// than quietly becoming a thing that toggles under Steam.
+    #[test]
+    fn a_neutral_report_has_no_flag_or_reading_that_could_toggle() {
+        let r = translate::triton_neutral(0x5a);
+
+        // Every button/touch byte of the puck's 0x42 (report.rs BUTTON_BITS
+        // spans bytes 2..6) is clear: no pad-touch bit, no capacitive bit, no
+        // trigger-full bit.
+        assert!(r[2..6].iter().all(|&b| b == 0), "no button or touch bit is set");
+        // Analog channels: triggers, sticks, both pads and both pad forces.
+        assert!(r[6..30].iter().all(|&b| b == 0), "every analog channel is centred at zero");
+        // The IMU window and the undecoded tail. This is also what makes
+        // "not forwarding parks the gyro" true from Steam's side (§3.1): while
+        // hyprpad owns the controller, the gyro Steam sees is stationary
+        // whatever the firmware is doing.
+        assert!(r[30..].iter().all(|&b| b == 0), "the IMU window and tail are zero");
+        // And there is no battery, timestamp or "connected" field anywhere,
+        // because there is nothing non-zero left to be one.
+        assert_eq!(r.iter().filter(|&&b| b != 0).count(), 2, "only the id and the counter");
+    }
+
+    /// The counter wraps cleanly rather than sticking or jumping at the `u8`
+    /// boundary — the one arithmetic edge in the neutral path.
+    #[test]
+    fn the_triton_neutral_counter_wraps_without_a_stutter() {
+        let now = Instant::now();
+        let at = |n: u32| tick_report(profile::triton(), Streamed::Neutral, n, now)[1];
+        assert_eq!(at(254), 254);
+        assert_eq!(at(255), 255);
+        assert_eq!(at(256), 0, "wraps to zero");
+        assert_eq!(at(257), 1);
+        // Never repeats within one lap: 256 ticks, 256 distinct values.
+        let lap: std::collections::HashSet<u8> = (0..256).map(at).collect();
+        assert_eq!(lap.len(), 256);
+    }
+
+    /// **Deliberate, and the one place a repeated counter can occur.**
+    ///
+    /// A live triton frame is relayed byte for byte, counter included (§4.4:
+    /// renumbering risks desync with the IMU timestamp path — which now matters
+    /// *more*, not less, since the gyro rides in the same report). So while the
+    /// puck's frame path is between updates, the identical report is re-sent,
+    /// counter and all, for up to [`STALE_AFTER`].
+    ///
+    /// That is not the churn: it is bounded at 200 ms, and Steam tolerates a
+    /// repeated counter exactly as it tolerates a gap. This test exists so the
+    /// behaviour is a decision on the record rather than an accident.
+    #[test]
+    fn a_held_live_frame_repeats_its_own_counter_rather_than_being_renumbered() {
+        let now = Instant::now();
+        let raw = translate::puck_to_triton(&raw_0x42(0x77), StripMask::guide_only()).unwrap();
+        let held = live(&raw, now);
+        let a = tick_report(profile::triton(), held, 10, now);
+        let b = tick_report(profile::triton(), held, 11, now);
+        let c = tick_report(profile::triton(), held, 12, now);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(a[1], 0x77, "the puck's counter, not the streamer's tick");
+    }
+
+    /// Crossing from a live frame to neutral changes the counter's *source*,
+    /// which shows up as one discontinuity — and nothing else moves with it.
+    ///
+    /// Recorded because a jump there is the one thing in the stream that could
+    /// look like an event to a host, and it is bounded to one per transition
+    /// (a handful per session), not the tens per second the log churns at.
+    #[test]
+    fn the_live_to_neutral_transition_is_one_counter_discontinuity_and_nothing_else() {
+        let set_at = Instant::now();
+        let raw = translate::puck_to_triton(&raw_0x42(0x77), StripMask::none()).unwrap();
+        let held = live(&raw, set_at);
+        let last_live = tick_report(profile::triton(), held, 40, set_at);
+        let after = set_at + STALE_AFTER + Duration::from_millis(1);
+        let first_neutral = tick_report(profile::triton(), held, 41, after);
+
+        assert_eq!(last_live[1], 0x77);
+        assert_eq!(first_neutral[1], 41, "the streamer's own counter takes over");
+        assert_eq!(first_neutral, translate::triton_neutral(41).to_vec());
+        // From there it is stable again: the next tick differs in byte 1 alone.
+        let second = tick_report(profile::triton(), held, 42, after);
+        let differing: Vec<usize> =
+            (0..second.len()).filter(|&i| first_neutral[i] != second[i]).collect();
+        assert_eq!(differing, vec![1]);
+    }
 }
