@@ -466,6 +466,9 @@ pub fn run() -> std::io::Result<()> {
             Err(e) => eprintln!("warning: not watching the session lock ({e})"),
         }
     }
+    // The seeds above may have moved the mode (a daemon started under the lock,
+    // or over a game); the status file was written before them, so say so.
+    status.set_mode(modes.active());
 
     loop {
         // The periodic process-tree rescan (`process_rescan_ms`), the title-less
