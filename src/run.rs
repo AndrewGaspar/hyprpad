@@ -2798,4 +2798,63 @@ mod tests {
         st.reconfigure(&cfg, &CursorConfig::default());
         assert_eq!(st.cfg.mode, ScrollMode::Swipe);
     }
+
+    /// Regression: a chord that CAUSES a mode transition (guide+view opens the
+    /// sheet, whose layer flips the mode) is still physically held when the
+    /// handoff runs. The handoff must not reset gesture edge state, or the held
+    /// chord looks freshly pressed on the next frame and fires again -- which
+    /// toggled the sheet / Omarchy menu open-closed in a loop, observed live.
+    #[test]
+    fn a_held_chord_does_not_refire_across_a_mode_handoff() {
+        use report::Button;
+        fn bit(b: Button) -> u32 {
+            (0..32)
+                .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
+                .expect("button has a bit")
+        }
+        fn frame(buttons: &[Button]) -> report::Frame {
+            let mut bits = 0u32;
+            for &b in buttons {
+                bits |= 1 << bit(b);
+            }
+            report::Frame { buttons: bits, ..report::Frame::default() }
+        }
+        let t = Instant::now();
+        let mut engine = GestureEngine::new();
+        // Guide down (emits GuideEnter -- expected, not a chord).
+        let _ = engine.update(&frame(&[Button::Steam]), t);
+        let fired = engine.update(&frame(&[Button::Steam, Button::Menu]), t + Duration::from_millis(8));
+        assert!(
+            fired.iter().any(|e| matches!(e, GestureEvent::GuideChord(Button::Menu))),
+            "the chord fires once on the press edge: {fired:?}"
+        );
+
+        // The transition the chord caused: the same handoff the loop runs.
+        let cc = CursorConfig::default();
+        let mut cursor = CursorState::new(&cc);
+        let mut scroll = ScrollState::new(&ScrollConfig::default(), &cc);
+        let mut osk_route = OskRoute::new(&cc);
+        let mut button_keys = ButtonKeys::new();
+        let mut keyboard: Option<VirtualKeyboard> = None;
+        let mut gamepad = GamepadState { tried: true, ..GamepadState::new() };
+        let mut haptics = Haptics::new();
+        mode_handoff(
+            &mut cursor,
+            &mut scroll,
+            &mut osk_route,
+            None,
+            &mut button_keys,
+            &mut keyboard,
+            &mut gamepad,
+            &mut haptics,
+        );
+
+        // Still holding the chord on the very next frame: NOTHING may fire.
+        let again = engine.update(&frame(&[Button::Steam, Button::Menu]), t + Duration::from_millis(12));
+        assert!(
+            !again.iter().any(|e| matches!(e, GestureEvent::GuideChord(_))),
+            "held chord re-fired across the handoff: {again:?}"
+        );
+        assert!(engine.guide_active(), "edge state must survive the handoff");
+    }
 }
