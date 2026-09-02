@@ -901,8 +901,15 @@ mod tests {
     /// The `deck` profile's `UHID_CREATE2` event, rebuilt exactly the way
     /// `scripts/research/uhid_active_probe.py::ev_create2` builds it, must equal
     /// what [`create2_event`] produces. That probe is the run Steam adopted.
+    ///
+    /// **One field is a deliberate departure**, and it is spelled out here
+    /// rather than hidden in the expected bytes: `uniq` was empty in the probe,
+    /// and Steam answered `Controller has an Invalid or missing unit serial
+    /// number`. It now carries `profile::DECK_SERIAL`. Everything else — name,
+    /// phys, descriptor, bus, VID/PID, version, country — is still the probe's,
+    /// byte for byte, which is what this test is for.
     #[test]
-    fn create2_matches_the_proven_probe_byte_for_byte() {
+    fn create2_matches_the_proven_probe_but_for_the_deck_serial() {
         let p = profile::deck();
         // The probe, transcribed:
         //   buf  = struct.pack("<I", UHID_CREATE2)
@@ -916,7 +923,8 @@ mod tests {
         want.extend_from_slice(&11u32.to_le_bytes());
         want.extend_from_slice(&ljust(b"Steam Controller", 128));
         want.extend_from_slice(&ljust(b"", 64));
-        want.extend_from_slice(&ljust(b"", 64));
+        // The one departure: the probe left `uniq` empty (`ljust(b"", 64)`).
+        want.extend_from_slice(&ljust(profile::DECK_SERIAL.as_bytes(), 64));
         want.extend_from_slice(&38u16.to_le_bytes());
         want.extend_from_slice(&0x03u16.to_le_bytes());
         want.extend_from_slice(&0x28deu32.to_le_bytes());
@@ -927,7 +935,22 @@ mod tests {
 
         let got = create2_event(p);
         assert_eq!(got.len(), 280 + 38);
-        assert_eq!(got, want, "CREATE2 must be byte-identical to the proven probe");
+        assert_eq!(got, want, "CREATE2 must match the proven probe but for `uniq`");
+
+        // And the departure really is only that field: everything before the
+        // `uniq` slot and everything after it is the probe's, unchanged.
+        let uniq = 4 + 128 + 64..4 + 128 + 64 + 64;
+        let mut probe = want.clone();
+        probe[uniq.clone()].fill(0);
+        let mut ours = got.clone();
+        ours[uniq].fill(0);
+        assert_eq!(ours, probe, "nothing outside `uniq` moved");
+
+        // A NUL-terminated field, not a 64-byte string: the serial is followed
+        // by zeros the whole way, which is what hidapi reads back as HID_UNIQ.
+        let at = 4 + 128 + 64;
+        assert_eq!(&got[at..at + profile::DECK_SERIAL.len()], profile::DECK_SERIAL.as_bytes());
+        assert_eq!(got[at + profile::DECK_SERIAL.len()], 0);
     }
 
     fn ljust(s: &[u8], n: usize) -> Vec<u8> {

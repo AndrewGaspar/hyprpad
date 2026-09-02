@@ -366,6 +366,56 @@ pub const DECK_ATTRIBUTES: [u8; 64] = [
 /// InputPlumber's default chip id filler, `[0,1,2,…,9,0,1,2,3,4]`.
 const DECK_CHIP_ID: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
 
+/// The `deck` profile's unit serial — its `uniq`, and the string its
+/// `GetStringAttribute` answers with.
+///
+/// # Why it exists at all
+///
+/// InputPlumber leaves `uniq` empty and so did this profile, and on 2026-09-02
+/// Steam said what it thinks of that, one line after adopting the fake:
+///
+/// ```text
+/// Local Device Found
+///   type: 28de 12f0
+///   path: /dev/hidraw12
+///   serial_number:  - 0
+/// !! Steam controller device opened for index 0.
+/// Controller has an Invalid or missing unit serial number, setting to '28de-12f0-3147b8f'
+/// ```
+///
+/// **The field it read is `uniq`, not the `0xAE` answer.** Three things settle
+/// that: the `serial_number:` line of the enumeration block comes from hidapi's
+/// hidraw backend, which parses `HID_UNIQ` out of the node's `uevent`; the
+/// complaint lands *before* any feature round trip, immediately on open; and the
+/// `triton` profile, whose `uniq` is set, is enumerated as
+/// `serial_number: FXA9961402A6C` and draws no complaint at all. The canned
+/// `0xAE` answer already said `1NPU7PLUMB3R` throughout and changed nothing.
+///
+/// # Why this string
+///
+/// Not the real unit's serial. `FXA9961402A6C` is the wireless controller's own
+/// and `FXB99614031B4` is the puck's, and baking either into the source would
+/// ship one machine's hardware identity to everyone who builds hyprpad — and
+/// would make the `deck` and `triton` identities collide on one Steam config
+/// key, so a Deck-shaped binding set would be applied to a Triton-shaped device.
+///
+/// A fixed synthetic is what the field actually needs to be: **stable**, because
+/// Steam keys `configset_<serial>.vdf` on it and a binding set must survive a
+/// daemon restart; **distinct** from `triton`'s, so the two identities keep
+/// separate configs; and **obviously ours**, so anyone reading a Steam log knows
+/// what they are looking at. `1NPU7PLUMB3R` — InputPlumber's own joke serial,
+/// which this profile answers `0xAE` with — is none of the first two.
+///
+/// # The cost, which the owner should know about
+///
+/// Steam's config key for this identity changes from the `28de-12f0-3147b8f` it
+/// invented to one derived from this string. **Any Steam Input binding already
+/// saved against the old key is orphaned** and has to be redone once. That is a
+/// one-time cost on a fallback identity, paid to stop Steam inventing a fresh
+/// key it might not invent identically on another machine — and it is why this
+/// value must never change again.
+pub const DECK_SERIAL: &str = "HYPRPAD-DECK-0001";
+
 /// The **proven** identity: an emulated Steam Deck controller under
 /// InputPlumber's non-Deck `Generic` PID.
 ///
@@ -375,15 +425,21 @@ const DECK_CHIP_ID: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
 /// `!! Steam controller device opened for index 5.`, loaded
 /// `configset_neptune.vdf` for it, and sent it 39 `SetSettingsValues` writes.
 ///
-/// `uniq` is deliberately empty, as InputPlumber leaves it: Steam then names the
-/// device `28de-12f0-<hash>` and keys its config on that, which was stable
-/// across the proven run. Pinning a serial here would change the config key.
+/// **One field departs from the probe: `uniq`.** It was empty, as InputPlumber
+/// leaves it, and Steam answered `Controller has an Invalid or missing unit
+/// serial number, setting to '28de-12f0-3147b8f'` — inventing a key of its own
+/// rather than using one this profile controls. It now carries
+/// [`DECK_SERIAL`], which is also what `GetStringAttribute` answers, so the
+/// device does not state two different serials on two channels the way it used
+/// to. See [`DECK_SERIAL`] for which field Steam actually read, and for what
+/// the change costs. Everything else — descriptor, attributes blob, chip id,
+/// framing, PID, version — is still the proven run's, byte for byte.
 pub fn deck() -> &'static Profile {
     static DECK: Profile = Profile {
         identity: Identity::Deck,
         name: "Steam Controller",
         phys: "",
-        uniq: "",
+        uniq: DECK_SERIAL,
         bus: BUS_USB,
         vendor: VID_VALVE,
         product: 0x12f0,
@@ -404,7 +460,7 @@ pub fn deck() -> &'static Profile {
             expected_dev_flags: 0,
         },
         attributes: DECK_ATTRIBUTES,
-        serial: "1NPU7PLUMB3R",
+        serial: DECK_SERIAL,
         chip_id: DECK_CHIP_ID,
         default_selector: cmd::INPUT_DATA,
     };
@@ -841,7 +897,9 @@ mod tests {
         assert_eq!(t.kind, ReportKind::Triton);
         assert_eq!(d.kind, ReportKind::Deck);
         assert_eq!(t.uniq, "FXA9961402A6C", "pinned so Steam's config key is stable");
-        assert_eq!(d.uniq, "", "verbatim InputPlumber — Steam names it 28de-12f0-<hash>");
+        assert_eq!(d.uniq, DECK_SERIAL, "pinned for the same reason — see DECK_SERIAL");
+        assert_ne!(t.uniq, d.uniq, "the two identities must not share a Steam config key");
+        assert!(!d.uniq.is_empty(), "an empty uniq is what Steam called an invalid unit serial");
         assert_eq!(t.vid_pid(), "28de:1302");
         assert_eq!(d.vid_pid(), "28de:12f0");
         // Never the puck's own PID: the bInterfaceNumber slot gate (§3.2).
@@ -867,11 +925,20 @@ mod tests {
         let d = deck();
         assert_eq!(d.canned_reply(cmd::GET_ATTRIBUTES_VALUES), DECK_ATTRIBUTES);
 
-        // The probe: `[0x00, 0xAE, 0x14, 0x01] + b"1NPU7PLUMB3R"`, resized to 64.
+        // The probe's framing, verbatim — `[0x00, 0xAE, 0x14, 0x01]` — with
+        // this profile's own serial as the payload. `0x01` is
+        // `ATTRIB_STR_UNIT_SERIAL` (SDL `controller_constants.h`), which is
+        // exactly the attribute Steam's "Invalid or missing unit serial
+        // number" names, and `0x14` = 20 is the declared payload length: the
+        // attribute selector plus up to 19 serial bytes.
         let serial = d.canned_reply(cmd::GET_STRING_ATTRIBUTE);
-        assert_eq!(&serial[..4], &[0x00, 0xAE, 0x14, 0x01]);
-        assert_eq!(&serial[4..16], b"1NPU7PLUMB3R");
-        assert!(serial[16..].iter().all(|&b| b == 0));
+        assert_eq!(&serial[..4], &[0x00, 0xAE, 0x14, 0x01], "framing is the proven probe's");
+        assert_eq!(&serial[4..4 + DECK_SERIAL.len()], DECK_SERIAL.as_bytes());
+        assert!(serial[4 + DECK_SERIAL.len()..].iter().all(|&b| b == 0));
+        assert!(
+            DECK_SERIAL.len() <= 19,
+            "the serial must fit inside the declared 0x14-byte payload"
+        );
 
         // The probe: `[0x00, 0xBA, 0x11, 0x00] + chip_id`, resized to 64.
         let chip = d.canned_reply(cmd::GET_CHIP_ID);
@@ -963,5 +1030,79 @@ mod tests {
         let long = framed(&[0x00, 0xAE, 0x14, 0x01], &[0xab; 200]);
         assert_eq!(long.len(), 64);
         assert!(long[4..].iter().all(|&b| b == 0xab));
+    }
+
+    /// The `deck` serial: what it is, where Steam reads it, and the framing of
+    /// the answer that carries it.
+    ///
+    /// On 2026-09-02 Steam enumerated the empty-`uniq` deck fake as
+    /// `serial_number:  - 0` and logged `Controller has an Invalid or missing
+    /// unit serial number, setting to '28de-12f0-3147b8f'` — inventing a config
+    /// key rather than using one this profile controls.
+    #[test]
+    fn the_deck_serial_is_fixed_stable_and_stated_the_same_on_both_channels() {
+        let d = deck();
+
+        // `uniq` is the field Steam's enumeration reads (hidapi parses HID_UNIQ
+        // out of the node's uevent), and the one that was empty.
+        assert_eq!(d.uniq, DECK_SERIAL);
+        assert!(!d.uniq.is_empty());
+
+        // The device must not state two different serials on two channels: the
+        // `0xAE` answer says the same thing the HID descriptor does. This is the
+        // same self-consistency rule `TRITON_ATTRIBUTES` follows for the product
+        // id (risk R3), applied to the serial.
+        assert_eq!(d.serial, d.uniq, "the 0xAE answer agrees with the HID descriptor");
+        assert_eq!(triton().serial, triton().uniq, "and triton already did");
+
+        // Distinct from triton's, so the two identities keep separate
+        // `configset_<serial>.vdf` files — a Deck-shaped binding set applied to
+        // a Triton-shaped device would bind the wrong buttons.
+        assert_ne!(d.uniq, triton().uniq);
+
+        // Not the real hardware's serial, on either channel: those belong to one
+        // machine and this string ships to everyone.
+        for real in ["FXA9961402A6C", "FXB99614031B4"] {
+            assert_ne!(d.serial, real, "no real unit's serial is baked into the source");
+        }
+
+        // Plain ASCII, and short enough for every field that carries it: the
+        // 63-usable-byte `uniq` of `struct uhid_create2_req`, the 19 bytes left
+        // inside the `0x14`-byte declared payload of the `0xAE` answer, and a
+        // filename, since Steam makes one out of it.
+        assert!(DECK_SERIAL.is_ascii());
+        assert!(DECK_SERIAL.len() <= 19, "fits the declared 0xAE payload");
+        assert!(
+            DECK_SERIAL.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "safe in a configset_<serial>.vdf filename"
+        );
+    }
+
+    /// The `0xAE` answer's framing, checked against SDL rather than against
+    /// itself — the half of the fix that had to stay right while the payload
+    /// changed.
+    #[test]
+    fn the_string_attribute_answer_is_framed_the_way_sdl_reads_it() {
+        for p in [deck(), triton()] {
+            let r = p.canned_reply(cmd::GET_STRING_ATTRIBUTE);
+            assert_eq!(r.len(), 64);
+            // byte 0: the report-number byte. byte 1: the command SDL validates
+            // (`uBuffer[1] != nExpectedResponse`, never `[0]`). byte 2: the
+            // declared payload length, which SDL bounds-checks against the
+            // bytes it actually read. byte 3: ATTRIB_STR_UNIT_SERIAL = 1, the
+            // attribute Steam's "invalid or missing unit serial" names —
+            // ATTRIB_STR_BOARD_SERIAL is 0 and would be the wrong one.
+            assert_eq!(r[0], 0x00, "{:?}: report-number byte", p.identity);
+            assert_eq!(r[1], cmd::GET_STRING_ATTRIBUTE, "{:?}: echoed command", p.identity);
+            assert_eq!(r[2], 0x14, "{:?}: declared payload length", p.identity);
+            assert_eq!(r[3], 0x01, "{:?}: ATTRIB_STR_UNIT_SERIAL", p.identity);
+
+            // The serial, then zeros to the end — no stale bytes behind it.
+            let n = p.serial.len();
+            assert_eq!(&r[4..4 + n], p.serial.as_bytes(), "{:?}", p.identity);
+            assert!(r[4 + n..].iter().all(|&b| b == 0), "{:?}: NUL padded", p.identity);
+            // The payload fits inside what byte 2 declares: 1 selector + serial.
+            assert!(n < r[2] as usize, "{:?}: serial fits the declared length", p.identity);
+        }
     }
 }

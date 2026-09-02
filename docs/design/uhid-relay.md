@@ -52,7 +52,7 @@ The identity is **data**, not a constant (`src/uhid/profile.rs`), and two ship.
 |---|---|---|
 | VID:PID | `28de:1302`, the *wired* single-interface Steam Controller | `28de:12f0`, InputPlumber's `ProductId::Generic` |
 | `name` | `Valve Software Steam Controller` | `Steam Controller` |
-| `uniq` (Steam's config key) | `FXA9961402A6C`, the captured unit's serial — pinned | `""`; Steam names it `28de-12f0-<hash>` |
+| `uniq` (Steam's config key) | `FXA9961402A6C`, the captured unit's serial — pinned | `HYPRPAD-DECK-0001`, a fixed synthetic — pinned (§1.3) |
 | `phys` | `hyprpad-uhid/1302` | `""` |
 | `version` | `0x0307` (bcdDevice 307, as Steam logged for the real unit) | `0x1000` |
 | `bus` | `BUS_USB` | `BUS_USB` |
@@ -190,6 +190,78 @@ second, and re-opened the device every 15 s — with the daemon answering every
 > created once at startup, so unlike the rest of `[gamepad]` it is not picked up
 > by `hyprpad reload`. That path is the exact recipe SteamOS ships, and the one
 > this machine has already run.
+
+### 1.3 The unit serial, and which field Steam actually reads
+
+On 2026-09-02 the `deck` profile was adopted and Steam immediately said:
+
+```text
+Local Device Found
+  type: 28de 12f0
+  path: /dev/hidraw12
+  serial_number:  - 0
+  Interface:    -1
+
+Unrecognized controller using V1 HID protocol
+!! Steam controller device opened for index 0.
+Steam Controller reserving XInput slot 0
+Controller has an Invalid or missing unit serial number, setting to '28de-12f0-3147b8f'
+ConfigSet - found config set file on-disk: …/configset_28de-12f0-3147b8f.vdf
+```
+
+**The field it read is `uniq`, not the `0xAE` answer** — which matters, because
+the two are different code paths and only one of them was empty. Three things
+settle it:
+
+* the `serial_number:` line comes from **hidapi's enumeration**, whose hidraw
+  backend parses `HID_UNIQ` out of the node's `uevent` — and `uniq` is what
+  `struct uhid_create2_req` puts there. On this machine the live triton fake
+  reads `HID_UNIQ=FXA9961402A6C`;
+* the complaint lands **immediately on open**, one line after `!! Steam
+  controller device opened`, before any feature-report round trip could have
+  happened;
+* the `triton` profile, whose `uniq` *is* set, is enumerated as
+  `serial_number: FXA9961402A6C`, loads `configset_FXA9961402A6C.vdf`, and draws
+  no complaint at all.
+
+The canned `0xAE` answer said `1NPU7PLUMB3R` (InputPlumber's joke serial)
+throughout, on both the complaining run and the quiet one, and changed nothing.
+
+#### What it is now, and why not something else
+
+`deck`'s `uniq` is `HYPRPAD-DECK-0001`, and the `0xAE` answer says the same
+thing so the device does not state two different serials on two channels — the
+self-consistency rule `TRITON_ATTRIBUTES` already follows for the product id
+(risk R3), applied to the serial.
+
+| Candidate | Rejected because |
+|---|---|
+| `""` (InputPlumber's) | this is the bug |
+| `FXA9961402A6C` / `FXB99614031B4`, the real controller's and puck's | ships one machine's hardware identity to everyone who builds hyprpad — and colliding with `triton`'s key would apply a Deck-shaped binding set to a Triton-shaped device |
+| `1NPU7PLUMB3R`, the `0xAE` answer's old value | not distinct from InputPlumber's own devices, and not obviously ours in a log |
+| **`HYPRPAD-DECK-0001`** | **stable** (Steam keys `configset_<serial>.vdf` on it, so bindings must survive a restart), **distinct** from `triton`'s, and **obviously ours** in a Steam log |
+
+The framing is unchanged and was checked against SDL rather than against itself:
+SDL validates `uBuffer[1] != nExpectedResponse` — never byte 0 — and
+bounds-checks the declared length against the bytes it read, so the answer stays
+`[0x00][0xAE][0x14][0x01]` + serial + NULs. `0x01` is `ATTRIB_STR_UNIT_SERIAL`
+in SDL's `ControllerStringAttributes` (`ATTRIB_STR_BOARD_SERIAL` is `0`), which
+is precisely the attribute Steam's message names.
+
+#### The cost
+
+**Steam's config key for this identity changes**, from the `28de-12f0-3147b8f`
+Steam invented to one derived from this string. Any Steam Input binding already
+saved against the old key is orphaned and has to be redone once. That is a
+one-time cost on a fallback identity, paid to stop Steam inventing a key it
+might not invent identically elsewhere — and it is why this value must never
+change again.
+
+Everything else about `deck` is still the proven run's, byte for byte:
+descriptor, attributes blob, chip id, framing, name, phys, PID, version,
+country. `uhid::tests::create2_matches_the_proven_probe_but_for_the_deck_serial`
+zeroes the `uniq` slot in both and asserts the rest is identical, so a second
+departure cannot slip in behind this one.
 
 ---
 
@@ -476,7 +548,7 @@ InputPlumber's verbatim bytes — the ones the adopted run sent:
 | Selector | Answer |
 |---|---|
 | `GetAttributesValues` `0x83` | the 64-byte TLV blob, `[0x00, 0x83, 0x2d, …]`. For `triton`, `ATTRIB_PRODUCT_ID` (the first TLV's u32) is patched from `0x1205` to `0x1302` so the answer does not contradict the claimed identity — risk R3's prescribed mitigation. |
-| `GetStringAttribute` `0xAE` | `[0x00, 0xAE, 0x14, 0x01]` + serial, padded to 64. `deck`: `1NPU7PLUMB3R`. `triton`: `FXA9961402A6C`, the captured unit's. |
+| `GetStringAttribute` `0xAE` | `[0x00, 0xAE, 0x14, 0x01]` + serial, padded to 64. `0x01` is `ATTRIB_STR_UNIT_SERIAL`; `0x14` = 20 is the declared payload, so the serial has 19 bytes to fit in. `deck`: `HYPRPAD-DECK-0001`. `triton`: `FXA9961402A6C`, the captured unit's. Both equal that profile's `uniq` — §1.3. |
 | `GetChipId` `0xBA` | `[0x00, 0xBA, 0x11, 0x00]` + 15 chip-id bytes, padded to 64. |
 | anything else | a **correctly framed** 64 bytes: `[0x00, <selector>, 0x00, …]`. |
 
@@ -922,6 +994,7 @@ end over a real unix socket. Not verified, because it needs an install:
 |---|---|---|
 | G1 | **Does Steam adopt `triton` (`1302`) at `Interface: -1`?** | **UNPROVEN.** The one open question. Risk R1 / Q-u1. Falls back to `identity = "deck"`, which is proven. |
 | G2 | `triton`'s `GetAttributesValues` blob | **UNVERIFIED.** No `1302` blob was ever captured. It is the Deck blob with `ATTRIB_PRODUCT_ID` patched to `0x1302`. Steam's log shows a real Triton survives a *failed* attribute probe (`Deck Controller PCB Serial# invalid: NA`), so a well-formed wrong answer is low severity. Replace when a real blob is captured. |
+| — | **`deck` had no unit serial** | **FIXED, §1.3.** `uniq` was empty and Steam invented `28de-12f0-3147b8f`; it is now `HYPRPAD-DECK-0001`, matched by the `0xAE` answer. Costs one re-do of any binding saved against the invented key. |
 | G3 | `triton`'s chip id | **UNVERIFIED.** Modelled on the Deck answer. |
 | G4 | `TriggerHapticCommand` (`0xEA`) shape | **Partly UNVERIFIED.** The `PackedHapticReport` layout is verbatim, but `PadSide`/`Intensity` are enums whose discriminants were not captured, and the command carries **no duration** — only an intensity class. hyprpad fires its own calibrated single tick (`0x190` = 400 µs, from the kernel's `steam_haptic_pulse`) on the named side, reading side as `0 = left, 1 = right`. The first live session's `HYPRSC_DEBUG` log settles it. |
 | G5 | **Gyro does not reach Steam.** | **CLOSED on `triton`, pending a live check** — §3.1. Steam's `SETTING_IMU_MODE` (48) is now written to the real puck through `lizard.rs`'s frame builder, and the pass-through carries whatever the puck then puts in bytes 30+. That the puck answers setting 48 by filling those bytes of the *same* `0x42` is **inferred from the report table, not observed** — §8 step 6 is the check. Still open **by construction on `deck`**: `puck_to_deck` transcodes from `report::Frame`, which has no IMU fields. |
@@ -1013,6 +1086,7 @@ grep -iE '1302|12f0|opened|V1 HID|deck' ~/.local/share/Steam/logs/controller.txt
 | Look for | Meaning |
 |---|---|
 | `Local Device Found / type: 28de 1302` (or `12f0`) | Steam enumerated it |
+| `serial_number: FXA9961402A6C` (triton) or `HYPRPAD-DECK-0001` (deck), **not** blank | the `uniq` field arrived — no `Invalid or missing unit serial number` should follow (§1.3) |
 | `Interface: -1` then `Controller uses V1 HID protocol via USB` | the `-1` question answered — **G1 PASS** |
 | **`!! Steam controller device opened for index N`** | **adopted** |
 | the fake's `/dev/hidrawN` in `/proc/$(pgrep -x steam)/fd` | Steam is holding it |
@@ -1131,7 +1205,13 @@ All pure, no devices. `cargo test` gates on the exit code.
   the probe script itself** at test time and compared; the `triton` descriptor
   compared against the committed capture; a descriptor walk asserting the `1302`
   declares input `0x42` at 54 bytes (the fact the whole pass-through rests on)
-  and that the Deck descriptor is unnumbered and 64/64.
+  and that the Deck descriptor is unnumbered and 64/64; and the **unit serial**
+  of §1.3 — that `deck`'s is fixed and non-empty, that it equals its own `uniq`
+  so the two channels agree, that it differs from `triton`'s so the two
+  identities keep separate config keys, that it is neither real unit's serial,
+  that it fits the `0xAE` answer's declared payload and a `.vdf` filename, and
+  that the answer's framing is `[0x00][0xAE][0x14][ATTRIB_STR_UNIT_SERIAL]` on
+  both profiles.
 * **`translate.rs`** — pass-through fidelity including bytes the decoder does not
   model; the strip mask; the untouched counter; every Deck button bit; every
   analog offset; neutral for both profiles; and a guard that every mapped button
