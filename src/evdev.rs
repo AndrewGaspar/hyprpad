@@ -1412,6 +1412,20 @@ mod tests {
     #[test]
     fn scanning_the_real_machine_is_safe_and_excludes_virtual_nodes() {
         let Ok(nodes) = gamepad_nodes() else { return };
+        // Printed under `--nocapture`, which is how you check the filter
+        // against whatever is actually plugged into the machine in front of
+        // you without a daemon and without opening anything.
+        for n in &nodes {
+            eprintln!(
+                "evdev: {} {:04x}:{:04x} {:?} paddles={:?} layout={}",
+                n.path.display(),
+                n.vendor,
+                n.product,
+                n.name,
+                n.paddles(),
+                n.layout()
+            );
+        }
         for n in &nodes {
             assert!(n.path.starts_with("/dev/input/event"));
             let real = fs::canonicalize(

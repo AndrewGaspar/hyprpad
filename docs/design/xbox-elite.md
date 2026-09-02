@@ -280,10 +280,15 @@ There is one pointer, one keyboard, one OSK and one mode engine, so two
 controllers cannot both drive.
 
 * a frame from the source that is not active is **dropped** unless
-  `Frame::is_neutral()` says the user actually did something — a button down, a
-  stick past the gesture engine's centre deadzone, a trigger off zero. A change
-  driven pad's re-sends and a hand resting on either controller therefore never
-  steal the cursor;
+  `Frame::is_neutral()` says the user actually did something — a press, a
+  click, a pad touch, a trigger off zero, or a stick past the gesture engine's
+  centre deadzone. A change-driven pad's re-sends therefore never steal the
+  cursor;
+* **the capacitive flags are excluded from that test, and this is the subtle
+  bit.** `Cap0..3` fire on hand *contact* with the puck's grips, not on an
+  action. Counting them would make every frame from a puck a resting hand
+  happens to be on "deliberate", and the two sources would swap the cursor back
+  and forth at the report rate. Proximity is not intent;
 * a frame that *does* switches the active source, and switching runs the same
   release the disconnect path runs: the gesture engine and `prev_frame` are
   reset, every held key, click and chord is let go, the virtual pad is
@@ -317,9 +322,31 @@ puck. Each stick integrates into a per-hand position in the OSK's own
 `[-1, 1]` box, and the daemon sends it over the **existing** `cursor L|R` wire.
 
 **The OSK child is completely unchanged.** Commits come from the same
-`[osk_buttons]` map every config already has; the pad clicks simply do not
-exist, so the sample binds `a` and the triggers instead. Phase 2's snap
-navigation (a focus model in `osk/`) is a change to the child, not to this.
+`[osk_buttons]` map every config already has, and the built-in Deck map already
+suits this pad almost exactly: L2 Shift, R2 Enter, Y Space, X Backspace,
+B/Menu dismiss are all buttons an Elite has. The **only** thing missing is the
+commit, which the built-ins put on the two pad *clicks*. Give it a home:
+
+```lua
+h.osk_button("a",  h.osk "commit")   -- commits under the RIGHT cursor
+h.osk_button("l3", h.osk "commit")   -- left stick click -> the left cursor
+h.osk_button("r3", h.osk "commit")   -- right stick click -> the right cursor
+```
+
+```toml
+[osk_buttons]
+a  = "osk commit"
+l3 = "osk commit"
+r3 = "osk commit"
+```
+
+The stick clicks are the natural home because `commit_pad` reads the cursor
+under the **same hand** as the button, so each thumb commits its own cursor —
+which is what the split layout was designed for. `a` reads the right cursor,
+like the rest of the face cluster.
+
+Phase 2's snap navigation (a focus model in `osk/`) is a change to the child,
+not to this.
 
 ## 11. The cheat sheet
 

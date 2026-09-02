@@ -4484,6 +4484,41 @@ h.bind("guide+a", h.fullscreen())
         }
     }
 
+    /// The one binding a padless controller genuinely needs added.
+    ///
+    /// The built-in OSK map commits on the two pad *clicks*, which an Xbox pad
+    /// does not have; everything else in it — L2 Shift, R2 Enter, Y Space, X
+    /// Backspace, B/Menu dismiss — is already a button that pad has. So the
+    /// sample gives the commit a home, and the natural ones are the stick
+    /// clicks, because `commit_pad` reads the pad (here, the stick cursor)
+    /// under the same hand as the button.
+    #[test]
+    fn the_osk_commit_can_be_moved_off_the_pad_clicks() {
+        let c = Config::from_toml_str(
+            "[osk_buttons]\na = \"osk commit\"\nl3 = \"osk commit\"\nr3 = \"osk commit\"\n",
+        )
+        .expect("parse");
+        for b in [Button::A, Button::L3, Button::R3] {
+            assert_eq!(c.osk_buttons.get(&b), Some(&OskAction::Commit), "{b:?}");
+        }
+        let lua = crate::lua_config::load_str(
+            r#"
+local h = hyprpad
+h.osk_button("a",  h.osk "commit")
+h.osk_button("l3", h.osk "commit")
+h.osk_button("r3", h.osk "commit")
+"#,
+            "test.lua",
+        )
+        .expect("lua parses");
+        assert_eq!(lua.osk_buttons, c.osk_buttons, "both dialects, one map");
+        // The built-ins the Elite already has are untouched by adding these.
+        let live = c.osk_buttons_in(&ModeState::default());
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&OskAction::Key(KeyChord::plain(28))));
+        assert_eq!(live.get(&Button::TriggerL2Full), Some(&OskAction::Shift));
+        assert_eq!(live.get(&Button::B), Some(&OskAction::Dismiss));
+    }
+
     #[test]
     fn a_transient_exit_names_a_button_or_a_context_change() {
         assert_eq!(TransientExit::parse("b"), Ok(TransientExit::Button(Button::B)));
