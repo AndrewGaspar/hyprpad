@@ -236,16 +236,22 @@ impl Frame {
         }
     }
 
-    /// Whether this frame carries no deliberate input at all: nothing pressed,
-    /// both sticks inside the gesture engine's centre deadzone, both triggers
-    /// released, and neither pad touched.
+    /// Whether this frame carries no deliberate input at all: nothing pressed
+    /// or touched, both triggers released, and both sticks inside the gesture
+    /// engine's centre deadzone.
     ///
-    /// This is the question "last-active source wins" asks
-    /// ([`crate::run`]): with two controllers connected, a frame from the
-    /// *inactive* one is dropped unless it says the user actually did
-    /// something. A resting stick's idle offset and a change-driven device's
-    /// periodic re-send therefore never steal the cursor from the pad the hand
-    /// is really on.
+    /// This is the question "last-active source wins" asks ([`crate::run`]):
+    /// with two controllers connected, a frame from the *inactive* one is
+    /// dropped unless it says the user actually did something. A resting
+    /// stick's idle offset and a change-driven device's periodic re-send
+    /// therefore never steal the cursor from the pad the hand is really on.
+    ///
+    /// **The capacitive flags are excluded**, and that is the whole subtlety
+    /// here. `Cap0..3` fire on *hand contact* with the puck's grips, not on an
+    /// action — so a hand simply resting on the puck while the other one drives
+    /// an Xbox pad would otherwise make every puck frame "deliberate" and the
+    /// two sources would fight over the cursor several hundred times a second.
+    /// Proximity is not intent. A press, a click, a trigger or a stick is.
     pub fn is_neutral(&self) -> bool {
         let centred = |(x, y): (i16, i16)| {
             // The same centre the flick recogniser uses, so "did the user move
@@ -253,7 +259,7 @@ impl Frame {
             let dz = crate::gesture::DEADZONE;
             i32::from(x).abs() < dz && i32::from(y).abs() < dz
         };
-        self.buttons == 0
+        self.without(&[Button::Cap0, Button::Cap1, Button::Cap2, Button::Cap3]).buttons == 0
             && self.l2 == 0
             && self.r2 == 0
             && centred(self.left_stick)

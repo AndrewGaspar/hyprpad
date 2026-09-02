@@ -490,7 +490,7 @@ pub fn run() -> std::io::Result<()> {
     // and the owner of this loop's fourth receive deadline ([`crate::sticks`]).
     let mut sticks = crate::sticks::StickDrive::new();
     status.set_layout(report::LAYOUT_PUCK);
-    status.set_sources(source_names(true, evdev_pad));
+    status.set_sources(source_names(!waiting, evdev_pad));
 
     // Supervisor loop. Two states: *connected*, where it blocks on `rx`; and
     // *waiting*, entered when the readers all end (controller gone), where it
@@ -679,7 +679,13 @@ pub fn run() -> std::io::Result<()> {
                     modes.cursor_enabled(),
                     modes.cursor_guide_enabled(),
                 ),
-                scroll: !engine.guide_active() && modes.scroll_enabled(),
+                // `mode = off` is "the left input does not scroll", and it
+                // means that on a stick as much as on a pad — the pad path
+                // checks it inside `drive_scroll`, so the stick path checks it
+                // here rather than letting the two disagree.
+                scroll: !engine.guide_active()
+                    && modes.scroll_enabled()
+                    && config.scroll().mode != ScrollMode::Off,
                 osk: osk.is_active(),
             };
             let mut hx =
@@ -1019,6 +1025,11 @@ pub fn run() -> std::io::Result<()> {
                     // and a still-held Shift button is not remembered as
                     // holding it. A no-op when it was already down.
                     osk_route.disarm();
+                    // The stick-driven halves of the same routing state. A
+                    // fresh keyboard starts with both cursors centred rather
+                    // than wherever the last one was left.
+                    sticks.osk_left.reset();
+                    sticks.osk_right.reset();
                     if let Some(ptr) = pointer.as_mut() {
                         // Ambient (non-guide) layer: the RIGHT pad drives the
                         // cursor and the LEFT pad drives scroll. The guide layer
@@ -4451,6 +4462,38 @@ mod tests {
         let on = Config::from_toml_str("[device]\nevdev = true\n").unwrap();
         let scanned = crate::evdev::gamepad_nodes().is_ok_and(|n| !n.is_empty());
         assert_eq!(gamepad_present(&on), scanned);
+    }
+
+    /// Last-active-source wins, and the one case that would otherwise thrash:
+    /// a hand resting on the puck's grips while the other drives an Xbox pad.
+    #[test]
+    fn only_deliberate_input_takes_the_device_from_the_other_controller() {
+        use report::Button::*;
+        assert!(report::Frame::default().is_neutral());
+
+        // Proximity is not intent. The capacitive cluster fires on hand
+        // contact, so a hand simply on the puck must not claim the cursor —
+        // it would fight the other pad at the report rate.
+        for cap in [Cap0, Cap1, Cap2, Cap3] {
+            assert!(frame_of(&[cap]).is_neutral(), "{cap:?} is a hand, not a press");
+        }
+        assert!(frame_of(&[Cap0, Cap1, Cap2, Cap3]).is_neutral());
+
+        // A press, a click, a touch, a trigger or a stick is.
+        for b in [A, Steam, GripR4, PadLeftClick, PadRightTouch, DpadUp] {
+            assert!(!frame_of(&[b]).is_neutral(), "{b:?} is deliberate");
+        }
+        let pulled = report::Frame { r2: 9_000, ..report::Frame::default() };
+        assert!(!pulled.is_neutral(), "a trigger off zero is deliberate");
+
+        // A stick's idle offset is not, but a real push is. The threshold is
+        // the gesture engine's own centre, so there is one answer in the
+        // daemon to "did the user move a stick".
+        let dz = crate::gesture::DEADZONE as i16;
+        let idle = report::Frame { left_stick: (dz - 1, 0), ..report::Frame::default() };
+        assert!(idle.is_neutral(), "a resting stick is not a command");
+        let pushed = report::Frame { right_stick: (0, dz + 1), ..report::Frame::default() };
+        assert!(!pushed.is_neutral());
     }
 
     /// The `"sources"` list, puck first, and only what is actually there.
