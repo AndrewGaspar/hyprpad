@@ -210,10 +210,21 @@ fn stream_loop(
         let n = seq.fetch_add(1, Ordering::Relaxed);
         let current = *state.lock().unwrap_or_else(|e| e.into_inner());
         let report = tick_report(profile, current, n, now);
-        if device.send_input(&report).is_err() {
-            // The device is gone (the fd closed, or the kernel tore it down).
-            // Nothing to recover here: the caller re-creates the relay with a
-            // fresh descriptor.
+        if let Err(e) = device.send_input(&report) {
+            // The device is gone — the fd closed, or the kernel tore it down.
+            // Nothing is recoverable from in here; re-creating it needs a fresh
+            // descriptor, which only the caller can obtain. Say so rather than
+            // going quiet, because from Steam's side a stream that stops is
+            // indistinguishable from a controller that died.
+            //
+            // The ordinary shutdown path sets `stop` first, so this only ever
+            // logs when the device really did fail under us.
+            if !stop.load(Ordering::Relaxed) {
+                eprintln!(
+                    "warning: virtual Steam Controller stream ended ({e}); \
+                     Steam will see it stop responding"
+                );
+            }
             return;
         }
         next += STREAM_PERIOD;

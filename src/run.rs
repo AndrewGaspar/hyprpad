@@ -1742,17 +1742,31 @@ impl GamepadState {
     }
 }
 
-/// Forward one frame to the virtual gamepad, or release it.
+/// Forward one frame to whichever game sink is live, or release it.
 ///
-/// While `forwarding`, every frame becomes one SYN-terminated report on the
-/// virtual pad (only the axes and buttons that changed are written). On the
-/// frame `forwarding` goes false — for *any* reason: the game lost focus, the
-/// guide button went down, the on-screen keyboard came up, the config was
-/// reloaded with `enabled = false` — the pad is neutralled exactly once.
+/// Two sinks can stand here, chosen by `[gamepad] kind`, and **only ever one at
+/// a time** — two would put two pads in front of Steam and make every press
+/// count twice:
 ///
-/// The device is created here rather than at startup, on the first frame that
-/// wants it, so a session that never focuses a game never creates one. Games
-/// discover it through the usual udev hotplug path.
+/// * the **Xbox pad** ([`crate::gamepad`]), where each frame becomes one
+///   SYN-terminated uinput report (only the axes and buttons that changed are
+///   written). Created here rather than at startup, on the first frame that
+///   wants it, so a session that never focuses a game never creates one; games
+///   discover it through the usual udev hotplug path.
+/// * the **Steam relay** ([`crate::uhid`]), where each frame updates what a
+///   250 Hz streamer thread is already sending. That device is created at
+///   startup instead ([`start_relay`]) and outlives every focus change, because
+///   Steam re-detects a controller whenever its node appears.
+///
+/// On the frame `forwarding` goes false — for *any* reason: the game lost
+/// focus, the guide button went down, the on-screen keyboard came up, the
+/// config was reloaded with `enabled = false` — the live sink is neutralled
+/// exactly once. Neither sink is destroyed there; a game is left with a
+/// connected, idle controller rather than a vanished one.
+///
+/// With `kind = "steam"` and no relay (no writable `/dev/uhid`) there is no
+/// sink at all: the Xbox pad is deliberately **not** substituted, because it is
+/// a different controller than the config asked for.
 #[allow(clippy::too_many_arguments)]
 fn drive_gamepad(
     st: &mut GamepadState,
@@ -1856,6 +1870,12 @@ fn absorb_relay_writes(
             // clock, the same one the Xbox pad's force feedback runs on.
             RelayAction::Rumble { strong, weak } if ours => st.relay_rumble = (strong, weak),
             RelayAction::Haptic { pad, on_us, off_us, count } if ours => {
+                // Steam's trackpad haptics are game feedback, so they answer to
+                // the same `rumble_intensity` knob as its rumble — "turn what
+                // the game does to my hands down" should mean one setting, not
+                // two. Strength on this device *is* pulse width (the IBEX pulse
+                // struct has no gain field), so the knob scales `on_us`;
+                // `Haptics::pulse` clamps the result to its own ceiling.
                 let on_us = gamepad::scale_magnitude(on_us, cfg.rumble_intensity);
                 haptics.pulse(pad, on_us, off_us, count);
             }
@@ -1895,7 +1915,7 @@ fn drive_rumble(
     // sinks: the Xbox pad's force-feedback reader thread publishes what a game
     // uploaded, while the relay carries what Steam wrote to the virtual
     // controller. Both are then scaled, clocked and emitted identically.
-    let raw = if !(forwarding && cfg.rumble) {
+    let (strong, weak) = if !(forwarding && cfg.rumble) {
         (0, 0)
     } else if st.relay.is_some() {
         st.relay_rumble
@@ -1906,8 +1926,8 @@ fn drive_rumble(
         }
     };
     let want = (
-        gamepad::scale_magnitude(raw.0, cfg.rumble_intensity),
-        gamepad::scale_magnitude(raw.1, cfg.rumble_intensity),
+        gamepad::scale_magnitude(strong, cfg.rumble_intensity),
+        gamepad::scale_magnitude(weak, cfg.rumble_intensity),
     );
     if !rumble_due(want, st.rumble, st.rumble_sent, now) {
         return;
