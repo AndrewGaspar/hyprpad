@@ -67,13 +67,17 @@ use crate::config::{
     OskAction, TransientExit, TransientSpec, WorkspaceTarget,
 };
 use crate::gesture::{Stick, StickDir};
-use crate::report::Button;
+use crate::report::{Button, Source};
 
 /// Entry point for the `bindings` subcommand.
 pub fn run(json: bool) -> Result<(), String> {
     let config = Config::load()?;
     let source = Config::active_config_path();
-    let sheet = Sheet::build(&config, source.as_ref().map(|(p, f)| (p.as_path(), *f)));
+    let mut sheet = Sheet::build(&config, source.as_ref().map(|(p, f)| (p.as_path(), *f)));
+    // The one thing the config cannot answer: which controller is in the
+    // user's hands. The daemon publishes it and this reads that file — the
+    // command still never opens a device.
+    sheet.set_layout(&crate::status::active_layout(), &config);
     print!("{}", if json { sheet.to_json() } else { sheet.to_text() });
     Ok(())
 }
@@ -194,6 +198,17 @@ pub struct Sheet {
     pub entries: Vec<Entry>,
     pub modes: Vec<ModeRow>,
     pub default_mode: String,
+    /// Which controller drawing the sheet should use — the id of a file in
+    /// `shell/hyprpad.cheatsheet/layouts/`.
+    ///
+    /// [`Sheet::build`] always fills in the puck's, because this module reads
+    /// only the config and must not depend on a running daemon. The `bindings`
+    /// subcommand then overwrites it from `status.json`
+    /// ([`crate::status::active_layout`]) when a daemon is publishing one, so
+    /// `hyprpad bindings --json` names the controller actually in the user's
+    /// hands. Still no device is touched: a file the daemon wrote is not the
+    /// controller.
+    pub layout: String,
 }
 
 impl Sheet {
@@ -433,6 +448,58 @@ impl Sheet {
             entries,
             modes,
             default_mode,
+            layout: crate::report::LAYOUT_PUCK.to_string(),
+        }
+    }
+
+    /// Say which controller the reader is holding, and re-aim the rows that
+    /// name a control the reader does not have.
+    ///
+    /// Everything on the sheet is a *binding*, and bindings are the same on
+    /// every controller — that is the whole point of one vocabulary. Two rows
+    /// are not: the ambient cursor and the ambient scroll say which physical
+    /// thing does them, and on a pad with no trackpads the answer is the
+    /// sticks. Those two are retargeted here; the caret scrub is dropped
+    /// outright, because circling a spring-loaded stick is not the jog wheel
+    /// it describes and there is nothing on this controller that does it.
+    ///
+    /// The alternative — teaching [`build`](Self::build) which controller is
+    /// live — would make the sheet depend on a running daemon. This way it
+    /// depends only on the layout id, which is a string.
+    pub fn set_layout(&mut self, layout: &str, c: &Config) {
+        self.layout = layout.to_string();
+        if Source::from_layout(layout).has_pads() {
+            return;
+        }
+        // The caret scrub is a jog wheel: a thumb circling an absolute
+        // surface. There is nothing on this controller that does it.
+        self.entries.retain(|e| !e.action.starts_with("scrub"));
+        let sticks = c.sticks();
+        if !sticks.enabled {
+            // Nothing drives the pointer at all here. Saying nothing is more
+            // honest than pointing at a stick that does not move it.
+            self.entries.retain(|e| e.control != "rpad" && e.control != "lpad");
+            return;
+        }
+        let scroll_off = c.scroll().mode == crate::config::ScrollMode::Off;
+        for e in &mut self.entries {
+            let (id, control_label) = match e.control.as_str() {
+                "rpad" => ("rstick", "Right stick"),
+                "lpad" => ("lstick", "Left stick"),
+                _ => continue,
+            };
+            e.chord = e.chord.replace(&e.control, id);
+            e.control = id.to_string();
+            e.control_label = control_label.to_string();
+            // The numbers change with the control. The pad's `sens` is
+            // pixels-per-pad-count and its scroll `mode` is how a finger is
+            // read; a stick has neither. Both are rates.
+            if id == "rstick" {
+                e.action = format!("cursor {:.0} px/s", sticks.cursor.max);
+            } else if !scroll_off {
+                e.label = "Scroll".to_string();
+                e.action = format!("scroll {:.0} units/s", sticks.scroll.max);
+            }
         }
     }
 
@@ -1262,6 +1329,8 @@ impl Sheet {
         }
         o.push_str(",\n  \"default_mode\": ");
         push_str(&mut o, &self.default_mode);
+        o.push_str(",\n  \"layout\": ");
+        push_str(&mut o, &self.layout);
         o.push_str(",\n");
 
         for (name, section) in [
@@ -2297,6 +2366,7 @@ mod tests {
         for key in [
             "\"source\":",
             "\"default_mode\":",
+            "\"layout\":",
             "\"guide_chords\": [",
             "\"buttons\": [",
             "\"osk_buttons\": [",
@@ -2306,6 +2376,185 @@ mod tests {
             assert!(j.contains(key), "missing {key} in\n{j}");
         }
         assert!(j.ends_with("}\n"));
+    }
+
+    /// The layout id is which controller drawing to show. `build` cannot know
+    /// — it reads only the config — so it names the puck, and the `bindings`
+    /// subcommand overwrites it from what the daemon published.
+    #[test]
+    fn the_json_names_the_controller_drawing_to_use() {
+        let src = "[bindings]\n\"guide+r1\" = \"workspace +1\"\n";
+        let c = Config::from_toml_str(src).unwrap();
+        let mut s = sheet_from_toml(src);
+        assert_eq!(s.layout, "steam-controller-2026");
+        assert!(s.to_json().contains(r#""layout": "steam-controller-2026""#));
+        s.set_layout("xbox-elite-2", &c);
+        assert!(s.to_json().contains(r#""layout": "xbox-elite-2""#));
+    }
+
+    /// A controller with no trackpads: the *bindings* are identical — that is
+    /// the point of one vocabulary — but the two rows that name a physical
+    /// pad have to name the stick that stands in for it, and the caret scrub
+    /// goes away because nothing on this pad does it.
+    #[test]
+    fn a_padless_layout_retargets_the_ambient_rows_onto_the_sticks() {
+        let src = "[bindings]\n\"guide+r1\" = \"workspace +1\"\n[scrub]\ndetent_deg = 15\n";
+        let c = Config::from_toml_str(src).unwrap();
+        let puck = sheet_from_toml(src);
+        let cursor = |s: &Sheet| {
+            s.entries
+                .iter()
+                .find(|e| e.label == "Move the cursor")
+                .expect("an ambient cursor row")
+                .clone()
+        };
+        assert_eq!(cursor(&puck).control, "rpad");
+        assert_eq!(cursor(&puck).control_label, "Right trackpad");
+        assert!(puck.entries.iter().any(|e| e.action.starts_with("scrub")));
+
+        let mut xbox = sheet_from_toml(src);
+        xbox.set_layout("xbox-elite-2", &c);
+        assert_eq!(cursor(&xbox).control, "rstick");
+        assert_eq!(cursor(&xbox).control_label, "Right stick");
+        // The numbers change with the control: the pad's `sens` is pixels per
+        // pad count, the stick's is a top speed.
+        assert_eq!(cursor(&xbox).action, "cursor 1500 px/s");
+        let scroll = xbox
+            .entries
+            .iter()
+            .find(|e| e.action.starts_with("scroll"))
+            .expect("an ambient scroll row");
+        assert_eq!(scroll.control, "lstick");
+        assert_eq!(scroll.control_label, "Left stick");
+        assert_eq!(scroll.label, "Scroll", "a stick has no circular mode");
+        assert_eq!(scroll.action, "scroll 180 units/s");
+        assert!(
+            !xbox.entries.iter().any(|e| e.action.starts_with("scrub")),
+            "there is no pad to circle"
+        );
+
+        // Turn the stick layer off and the two rows go away: nothing drives
+        // the pointer, and pointing at a stick that does not move it would be
+        // a lie.
+        let off = Config::from_toml_str(&format!("{src}[sticks]\nenabled = false\n")).unwrap();
+        let mut dead = sheet_from_toml(src);
+        dead.set_layout("xbox-elite-2", &off);
+        assert!(!dead.entries.iter().any(|e| e.label == "Move the cursor"));
+        assert!(!dead.entries.iter().any(|e| e.action.starts_with("scroll")));
+        // Everything that is a binding is untouched: same chord, same action.
+        let bound = |s: &Sheet| {
+            s.entries
+                .iter()
+                .filter(|e| e.section == Section::Guide && e.chord == "guide+r1")
+                .map(|e| (e.chord.clone(), e.action.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bound(&puck), bound(&xbox));
+        // And an unknown layout id is read as the puck, so a config written
+        // against it is never silently rewritten.
+        let mut unknown = sheet_from_toml(src);
+        unknown.set_layout("some-future-pad", &c);
+        assert_eq!(cursor(&unknown).control, "rpad");
+    }
+
+    /// The two shipped layouts must anchor every control the sheet can emit
+    /// for them, and must not invent ids the daemon never produces. Checked
+    /// against the real files, so a layout and the vocabulary cannot drift.
+    #[test]
+    fn every_shipped_layout_anchors_only_real_control_ids() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("shell/hyprpad.cheatsheet/layouts");
+        // Every id the daemon can put in an entry's `control` field: each
+        // bindable button's config name, the two stick flicks, the guide, and
+        // the group ids a layout may collapse into.
+        use crate::report::Button::*;
+        let mut known: Vec<String> = [
+            A, B, X, Y, BumperL1, BumperR1, TriggerL2Full, TriggerR2Full, L3, R3, GripL4,
+            GripL5, GripR4, GripR5, DpadUp, DpadDown, DpadLeft, DpadRight, Menu, View,
+            QuickAccess, PadLeftClick, PadRightClick, Steam,
+        ]
+        .iter()
+        .map(|&b| button_name(b).to_string())
+        .collect();
+        known.extend(["lstick", "rstick", "dpad", "lpad", "rpad"].map(str::to_string));
+
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("layouts/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&path).expect("read layout");
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            // The file's own id must be its filename: that is how Panel.qml
+            // finds it (`layouts/<layoutId>.json`).
+            assert!(
+                text.contains(&format!("\"id\": \"{stem}\"")),
+                "{stem}: `id` must match the filename"
+            );
+            for key in ["viewBox", "art", "controls", "glyphs", "modifiers"] {
+                assert!(text.contains(&format!("\"{key}\"")), "{stem}: missing `{key}`");
+            }
+            let controls = layout_keys(&text, "controls");
+            assert!(controls.len() > 10, "{stem}: only found {} controls", controls.len());
+            for id in &controls {
+                assert!(known.contains(id), "{stem}: `{id}` is not a control the daemon emits");
+            }
+            // The four d-pad directions and the guide are what every config
+            // reaches for first; a layout that cannot anchor them is broken.
+            for must in ["a", "b", "steam", "dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
+                assert!(controls.iter().any(|c| c == must), "{stem}: no anchor for `{must}`");
+            }
+            // Every anchored control needs a chip, or its callout draws blank.
+            let glyphs = layout_keys(&text, "glyphs");
+            assert!(!glyphs.is_empty(), "{stem}: no glyphs parsed");
+            for id in &controls {
+                assert!(glyphs.contains(id), "{stem}: `{id}` is anchored but has no glyph");
+            }
+            // Bundled art has to exist; `steam`-sourced art is read from the
+            // local Steam install and is allowed to be absent.
+            for line in text.lines() {
+                if let Some(rest) = line.trim().strip_prefix("\"path\": \"") {
+                    let rel = rest.split('"').next().unwrap();
+                    if rel.starts_with("art/") {
+                        let art = dir.parent().unwrap().join(rel);
+                        assert!(art.exists(), "{stem}: missing bundled art {rel}");
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 2, "the puck's layout and the Xbox one");
+    }
+
+    /// Pull the object keys out of one top-level block of a layout file.
+    ///
+    /// A five-line scanner rather than a JSON dependency: these files are
+    /// ours, hand-formatted one `"key": { … }` per line, and the alternative
+    /// is a crate for one test.
+    fn layout_keys(text: &str, block: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with(&format!("\"{block}\": {{")) {
+                inside = true;
+                continue;
+            }
+            if inside {
+                if t == "}," || t == "}" {
+                    break;
+                }
+                if let Some(rest) = t.strip_prefix('"') {
+                    if let Some(key) = rest.split('"').next() {
+                        if t.contains("{") {
+                            out.push(key.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]

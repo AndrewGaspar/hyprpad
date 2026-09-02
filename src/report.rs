@@ -76,9 +76,101 @@ const BUTTON_BITS: [(usize, u8, Button); 30] = [
     (5, 5, Button::Cap3),
 ];
 
+/// Which backend produced a [`Frame`] — and therefore what the frame's empty
+/// fields *mean*.
+///
+/// The daemon's vocabulary is the puck's: face buttons, grips, two sticks, two
+/// trackpads. A second backend ([`crate::evdev`]) fills the same struct from an
+/// ordinary Linux gamepad, which has no trackpads and no per-pad actuators. The
+/// difference is not "the pads happen to be untouched this frame" — it is "this
+/// device has no pads at all", and every consumer that would otherwise idle
+/// forever on a touch bit needs to be able to tell the two apart.
+///
+/// [`Frame`] derives `Default`, and [`Source::Puck`] is the default, so every
+/// existing test and the whole puck path are byte-identical to before this
+/// existed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Source {
+    /// The 2026 Steam Controller puck, decoded from hidraw ([`Frame::decode`]).
+    #[default]
+    Puck,
+    /// A generic Linux gamepad read over evdev ([`crate::evdev`]) — the Xbox
+    /// Elite Series 2 is the one this was built for. Phase 2's Bluetooth hidraw
+    /// sidecar (`docs/design/xbox-elite.md`) will be a third variant beside it,
+    /// which is why this is an enum and not a bool.
+    Evdev,
+}
+
+/// The cheat sheet's layout id for the puck —
+/// `shell/hyprpad.cheatsheet/layouts/steam-controller-2026.json`.
+pub const LAYOUT_PUCK: &str = "steam-controller-2026";
+
+/// The cheat sheet's layout id for a gamepad read over evdev. Every pad the
+/// second backend adopts draws as an Xbox-shaped one: two asymmetric sticks, a
+/// face diamond, four paddles.
+pub const LAYOUT_XBOX_ELITE_2: &str = "xbox-elite-2";
+
+impl Source {
+    /// Which cheat-sheet layout this source draws as.
+    ///
+    /// One string is the whole of "which controller is the reader holding":
+    /// the widget names no controller anywhere, it just loads
+    /// `layouts/<id>.json`.
+    pub const fn layout(self) -> &'static str {
+        match self {
+            Source::Puck => LAYOUT_PUCK,
+            Source::Evdev => LAYOUT_XBOX_ELITE_2,
+        }
+    }
+
+    /// The inverse of [`layout`](Self::layout): what a published layout id says
+    /// about the controller.
+    ///
+    /// Used by `hyprpad bindings`, which has no device and no daemon state —
+    /// only the layout id the daemon published — but still needs to know
+    /// whether the reader has trackpads, because the ambient cursor and scroll
+    /// rows say different things if they do not. An unknown id is read as the
+    /// puck, the safe default for a config written against it.
+    pub fn from_layout(id: &str) -> Source {
+        if id == LAYOUT_XBOX_ELITE_2 {
+            Source::Evdev
+        } else {
+            Source::Puck
+        }
+    }
+
+    /// Whether this device has trackpads. `false` means every pad consumer —
+    /// [`crate::run::drive_cursor`]'s touch gate, the OSK's pad router, the
+    /// scroll and scrub handlers — sees a permanently untouched pad and idles
+    /// cleanly, which is exactly the behaviour they already have for a lifted
+    /// finger. Nothing has to be special-cased; this is the *reason* nothing
+    /// has to be.
+    pub fn has_pads(self) -> bool {
+        matches!(self, Source::Puck)
+    }
+
+    /// Whether this device can play the puck's `0x81` pulse reports. A rumble
+    /// motor cannot: `ff-memless` runs at jiffy granularity and an ERM motor
+    /// needs tens of milliseconds to spin up, so a 250 Hz texture would be
+    /// noise. Phase 2 maps only `Gesture`/`Commit` to a short rumble tap.
+    pub fn has_haptics(self) -> bool {
+        matches!(self, Source::Puck)
+    }
+
+    /// Whether the cursor on this device is *rate* controlled (a stick is a
+    /// velocity command) rather than *position* controlled (a pad is an
+    /// absolute coordinate). The inverse of [`has_pads`](Self::has_pads),
+    /// named for the thing it decides.
+    pub fn cursor_is_rate(self) -> bool {
+        !self.has_pads()
+    }
+}
+
 /// One decoded frame of controller state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Frame {
+    /// Which backend produced this frame. Not on the wire — set by the decoder.
+    pub source: Source,
     pub counter: u8,
     /// Button bits in `Button` enum order (bit i == BUTTON_BITS[i]).
     pub buttons: u32,
@@ -112,6 +204,7 @@ impl Frame {
             }
         }
         Some(Frame {
+            source: Source::Puck,
             counter: raw[1],
             buttons,
             l2: u16le(6),
@@ -126,6 +219,51 @@ impl Frame {
     pub fn pressed(&self, b: Button) -> bool {
         let idx = BUTTON_BITS.iter().position(|&(_, _, bb)| bb == b).unwrap();
         self.buttons & (1 << idx) != 0
+    }
+
+    /// Set or clear one button bit.
+    ///
+    /// The puck's decoder builds `buttons` in one pass from the wire, but a
+    /// change-driven backend ([`crate::evdev`]) is handed one button at a time
+    /// and keeps a persistent frame between events, so it needs the inverse of
+    /// [`pressed`](Self::pressed).
+    pub fn set(&mut self, b: Button, down: bool) {
+        let idx = BUTTON_BITS.iter().position(|&(_, _, bb)| bb == b).unwrap();
+        if down {
+            self.buttons |= 1 << idx;
+        } else {
+            self.buttons &= !(1 << idx);
+        }
+    }
+
+    /// Whether this frame carries no deliberate input at all: nothing pressed
+    /// or touched, both triggers released, and both sticks inside the gesture
+    /// engine's centre deadzone.
+    ///
+    /// This is the question "last-active source wins" asks ([`crate::run`]):
+    /// with two controllers connected, a frame from the *inactive* one is
+    /// dropped unless it says the user actually did something. A resting
+    /// stick's idle offset and a change-driven device's periodic re-send
+    /// therefore never steal the cursor from the pad the hand is really on.
+    ///
+    /// **The capacitive flags are excluded**, and that is the whole subtlety
+    /// here. `Cap0..3` fire on *hand contact* with the puck's grips, not on an
+    /// action — so a hand simply resting on the puck while the other one drives
+    /// an Xbox pad would otherwise make every puck frame "deliberate" and the
+    /// two sources would fight over the cursor several hundred times a second.
+    /// Proximity is not intent. A press, a click, a trigger or a stick is.
+    pub fn is_neutral(&self) -> bool {
+        let centred = |(x, y): (i16, i16)| {
+            // The same centre the flick recogniser uses, so "did the user move
+            // a stick" has exactly one answer in the daemon.
+            let dz = crate::gesture::DEADZONE;
+            i32::from(x).abs() < dz && i32::from(y).abs() < dz
+        };
+        self.without(&[Button::Cap0, Button::Cap1, Button::Cap2, Button::Cap3]).buttons == 0
+            && self.l2 == 0
+            && self.r2 == 0
+            && centred(self.left_stick)
+            && centred(self.right_stick)
     }
 
     /// The same frame with `buttons` reported as *not* pressed.

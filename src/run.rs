@@ -154,7 +154,22 @@ const RECONNECT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 /// or the signal that the controller's readers have all ended. The source
 /// threads funnel into this so the loop can own all mutable state without locks.
 enum Input {
-    Report(Vec<u8>),
+    /// One decoded frame from **either** backend.
+    ///
+    /// The puck's bytes are decoded in its forwarder thread rather than in the
+    /// loop, so both sources arrive in the same shape and every layer above
+    /// this one keeps its single meaning of "a frame". `raw` is the puck's
+    /// original report, kept only because the Steam relay forwards the puck's
+    /// own bytes unprocessed ([`drive_gamepad`]); an evdev frame has none, and
+    /// the uinput pad — which re-encodes from the frame — does not want one.
+    Frame { frame: report::Frame, raw: Option<Vec<u8>> },
+    /// The evdev backend adopted a gamepad ([`crate::evdev`]). Carries what
+    /// `status.json` needs to name it and which cheat-sheet layout it draws as.
+    EvdevAdopted { label: &'static str, layout: &'static str, name: String },
+    /// The adopted gamepad went away. Distinct from [`Input::ReadersEnded`],
+    /// which is the *puck* leaving: either controller may go without the other,
+    /// and only the one that left is released.
+    EvdevGone,
     Compositor(HyprEvent),
     /// An event the on-screen keyboard child reported back over its stdout
     /// channel (see [`crate::osk`]) — currently a key crossing, which the daemon
@@ -187,47 +202,10 @@ pub fn run() -> std::io::Result<()> {
     // widget can show "daemon up, controller not here yet" rather than nothing.
     let mut status = StatusWriter::create();
 
-    // Wait for the controller rather than exiting when it isn't there yet. The
-    // loop below already survives the puck *leaving*; this makes startup
-    // symmetric, so a daemon launched at login (or restarted while the puck is
-    // unplugged / asleep on a dead dongle) simply sits until it appears —
-    // "leave it running" has to include "start it before the controller".
+    // Load the config BEFORE the controller wait, because the wait now has to
+    // ask it a question: whether the gamepad backend is armed, and therefore
+    // whether a pad on `/dev/input` counts as "a controller is here".
     //
-    // The wait polls exactly what the reconnect wait polls — `PuckSource::acquire`
-    // — so both paths ask the broker first and fall back to opening the nodes
-    // directly, and neither can be satisfied by a puck that is listed in `/sys`
-    // but not actually openable.
-    let source = {
-        let mut source = hidraw::PuckSource::acquire();
-        if source.is_none() {
-            // Distinguish the two ways this can fail, because they need
-            // different things from the user. A puck that is *listed* in `/sys`
-            // but not obtainable is a half-finished host install — the udev rule
-            // took the nodes away and no broker is handing them back — and
-            // "waiting for a controller" would be a misleading thing to say
-            // about a controller that is plugged in.
-            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
-            if listed > 0 {
-                eprintln!(
-                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
-                     obtained — the udev rule is installed and the fd broker is not \
-                     reachable. Run `hyprpad setup --check`. Waiting…"
-                );
-            } else {
-                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
-            }
-            while source.is_none() {
-                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
-                source = hidraw::PuckSource::acquire();
-            }
-        }
-        let source = source.expect("the loop only exits with a source in hand");
-        eprintln!("hyprpad: controller found ({} node(s), {})", source.len(), source.label());
-        source
-    };
-    let node_count = source.len();
-    status.set_source(status::Source::of(&source));
-    status.set_connected(true);
     // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
     // live (see the `Input::Reload` arm and `apply_reload`).
     let mut config = match Config::load() {
@@ -245,6 +223,64 @@ pub fn run() -> std::io::Result<()> {
             Config::load_default()
         }
     };
+
+    // Wait for *a* controller rather than exiting when there isn't one yet. The
+    // loop below already survives a controller *leaving*; this makes startup
+    // symmetric, so a daemon launched at login (or restarted while the puck is
+    // unplugged / asleep on a dead dongle) simply sits until one appears —
+    // "leave it running" has to include "start it before the controller".
+    //
+    // The puck half polls exactly what the reconnect wait polls —
+    // `PuckSource::acquire` — so both paths ask the broker first and fall back
+    // to opening the nodes directly, and neither can be satisfied by a puck
+    // that is listed in `/sys` but not actually openable.
+    //
+    // The gamepad half is why this returns an `Option`: a machine with only an
+    // Xbox pad plugged in is a perfectly good hyprpad session, and waiting
+    // forever for a Steam Controller that is not coming would be the wrong
+    // answer. `None` means "start with no puck", which is exactly the state the
+    // reconnect wait already handles — so the loop below begins in it and picks
+    // the puck up on its next scan if it ever arrives.
+    let source = {
+        let mut source = hidraw::PuckSource::acquire();
+        if source.is_none() {
+            // Distinguish the ways this can fail, because they need different
+            // things from the user. A puck that is *listed* in `/sys` but not
+            // obtainable is a half-finished host install — the udev rule took
+            // the nodes away and no broker is handing them back — and "waiting
+            // for a controller" would be a misleading thing to say about a
+            // controller that is plugged in.
+            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
+            if listed > 0 {
+                eprintln!(
+                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
+                     obtained — the udev rule is installed and the fd broker is not \
+                     reachable. Run `hyprpad setup --check`. Waiting…"
+                );
+            } else {
+                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
+            }
+            while source.is_none() && !gamepad_present(&config) {
+                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
+                source = hidraw::PuckSource::acquire();
+            }
+        }
+        match &source {
+            Some(s) => {
+                eprintln!("hyprpad: controller found ({} node(s), {})", s.len(), s.label())
+            }
+            None => eprintln!(
+                "hyprpad: starting on a gamepad instead; the puck will be picked up if it \
+                 turns up"
+            ),
+        }
+        source
+    };
+    let node_count = source.as_ref().map_or(0, hidraw::PuckSource::len);
+    if let Some(s) = &source {
+        status.set_source(status::Source::of(s));
+        status.set_connected(true);
+    }
 
     // Lizard-mode ownership (opt-in). Off by default so we never fight an
     // unmasked Steam that is managing lizard mode itself
@@ -302,7 +338,34 @@ pub fn run() -> std::io::Result<()> {
     // `hyprpad reload` works either way.
     install_reload_signal(&tx);
 
-    spawn_reader_pipeline(source, &tx);
+    // `None` means we started on a gamepad with no puck present. That is the
+    // reconnect wait's own state, so begin in it: the loop scans for the puck
+    // on its timer and arms a reader pipeline the moment it appears.
+    let mut waiting = match source {
+        Some(source) => {
+            spawn_reader_pipeline(source, &tx);
+            false
+        }
+        None => true,
+    };
+
+    // The second backend: any ordinary Linux gamepad on `/dev/input/event*`
+    // ([`crate::evdev`]). One thread owns discovery, adoption, the grab, the
+    // blocking read and the hotplug rescan, and reports into this same channel
+    // — which is why the loop below grows three match arms and not a second
+    // supervisor. Armed unconditionally when the config allows it: with no pad
+    // plugged in it costs one sleeping thread and nothing else.
+    //
+    // `grab` is read here, once. A reload that changes it takes effect on the
+    // next adoption, not immediately — the alternative is tearing the read out
+    // from under a live device, which is a lot of machinery for a knob nobody
+    // flips twice.
+    if config.device().evdev {
+        let events = crate::evdev::watch(config.device().grab);
+        let tx_e = tx.clone();
+        std::thread::spawn(move || forward_evdev(events, tx_e));
+        eprintln!("hyprpad: gamepad backend armed (evdev; scanning for a pad)");
+    }
 
     match crate::hypr::subscribe() {
         Ok(events) => {
@@ -416,14 +479,34 @@ pub fn run() -> std::io::Result<()> {
     // click-down and the B/Menu dismiss).
     let mut prev_frame = report::Frame::default();
 
+    // --- two controllers, one pointer ------------------------------------
+    //
+    // Both backends may be live at once, and there is exactly one cursor, one
+    // keyboard, one OSK and one mode engine, so they cannot both drive. The
+    // rule is **last-active source wins**: a frame from the source that is not
+    // active is dropped unless it carries deliberate input
+    // ([`report::Frame::is_neutral`]), and one that does runs the same clean
+    // handoff a mode change does before taking over. A hand resting on the
+    // puck therefore keeps the puck, and picking up the Xbox pad and moving a
+    // stick switches on the spot.
+    let mut active_source = report::Source::default();
+    // The gamepad the evdev backend currently holds, if any: its `status.json`
+    // name and its cheat-sheet layout id.
+    let mut evdev_pad: Option<(&'static str, &'static str)> = None;
+    // The rate integrators the sticks drive on a controller with no trackpads,
+    // and the owner of this loop's fourth receive deadline ([`crate::sticks`]).
+    let mut sticks = crate::sticks::StickDrive::new();
+    status.set_layout(report::LAYOUT_PUCK);
+    status.set_sources(source_names(!waiting, evdev_pad));
+
     // Supervisor loop. Two states: *connected*, where it blocks on `rx`; and
     // *waiting*, entered when the readers all end (controller gone), where it
     // re-scans for the puck on a timer while still draining compositor events —
     // and, crucially, never returns. Hyprland IPC and the virtual pointer stay
     // alive across the gap; only the hidraw reader pipeline is torn down and
     // re-armed. `recv_timeout` with a shrinking deadline guarantees the scan
-    // still fires even if compositor events keep arriving.
-    let mut waiting = false;
+    // still fires even if compositor events keep arriving. `waiting` was
+    // decided above, when the reader pipeline was (or was not) armed.
     let mut next_scan = Instant::now();
     // What the loop knows about the focused window: which address it is (so a
     // `windowtitle` event can be attributed), which title form this compositor
@@ -581,11 +664,59 @@ pub fn run() -> std::io::Result<()> {
             continue;
         }
 
+        // The stick integrators' step, for a controller whose sticks stand in
+        // for the puck's trackpads. Checked HERE, before the receive, for the
+        // same reason the two above are: a change-driven pad moving a stick
+        // produces a busy report stream, and a deadline that were only honoured
+        // on a receive *timeout* would then never fire at all.
+        //
+        // This is a deadline and not a tick. `StickDrive::deadline` is `Some`
+        // only while a stick is outside its deadzone or a velocity is still
+        // decaying through the smoothing; centred, it is `None`, this branch is
+        // dead, nothing is added to `wake`, and the loop blocks indefinitely
+        // exactly as it does today with the puck asleep.
+        let stick_at = sticks.deadline();
+        if stick_at.is_some_and(|at| at <= Instant::now()) {
+            let now = Instant::now();
+            // The same guards the pad paths consult, read before the call so
+            // the keyboard's own handle is not borrowed twice.
+            let gates = StickGates {
+                cursor: cursor_active(
+                    engine.guide_active(),
+                    modes.cursor_enabled(),
+                    modes.cursor_guide_enabled(),
+                ),
+                // `mode = off` is "the left input does not scroll", and it
+                // means that on a stick as much as on a pad — the pad path
+                // checks it inside `drive_scroll`, so the stick path checks it
+                // here rather than letting the two disagree.
+                scroll: !engine.guide_active()
+                    && modes.scroll_enabled()
+                    && config.scroll().mode != ScrollMode::Off,
+                osk: osk.is_active(),
+            };
+            let mut hx =
+                HapticCtx { dev: &mut haptics, cfg: config.haptics(), source: active_source };
+            drive_sticks(
+                &mut sticks,
+                pointer.as_mut(),
+                &mut osk,
+                config.sticks(),
+                config.scroll(),
+                gates,
+                &mut hx,
+                now,
+            );
+            sticks.stepped(config.sticks(), now);
+            continue;
+        }
+
         // The earliest deadline this iteration must wake for: the reconnect
         // re-scan while the controller is away, the process rescan whenever it
-        // is armed, and a transient mode's timer while one is running. With
-        // none of them, this is the plain blocking receive it has always been.
-        let wake = [waiting.then_some(next_scan), rescan_at, transient_at]
+        // is armed, a transient mode's timer while one is running, and the
+        // stick integrators' step while a stick is deflected. With none of
+        // them, this is the plain blocking receive it has always been.
+        let wake = [waiting.then_some(next_scan), rescan_at, transient_at, stick_at]
             .into_iter()
             .flatten()
             .min();
@@ -614,6 +745,7 @@ pub fn run() -> std::io::Result<()> {
                             spawn_reader_pipeline(source, &tx);
                             status.set_connected(true);
                             waiting = false;
+                            status.set_sources(source_names(true, evdev_pad));
                         }
                         next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
                     }
@@ -651,7 +783,15 @@ pub fn run() -> std::io::Result<()> {
                 // leave the virtual pad holding its last frame, or a rumble
                 // running with nothing left to stop it.
                 gamepad.release(&mut haptics);
+                // The puck's rate integrators are always idle (its pads drive
+                // the cursor), but if the Xbox pad was driving and the puck is
+                // what left, this is still the right place to drop any claim
+                // held for a source that is now gone.
+                if active_source == report::Source::Puck {
+                    sticks.release();
+                }
                 waiting = true;
+                status.set_sources(source_names(false, evdev_pad));
                 next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
             }
             Input::ControllerOff => {
@@ -718,16 +858,87 @@ pub fn run() -> std::io::Result<()> {
                 // The child hit-tested a crossing onto a NEW key; we hold the
                 // writable puck node, so the tick is fired here. Gating and
                 // intensity come off the live config, so a reload retunes it.
-                let mut hx = HapticCtx { dev: &mut haptics, cfg: config.haptics() };
+                let mut hx =
+                    HapticCtx { dev: &mut haptics, cfg: config.haptics(), source: active_source };
                 hx.fire(Haptic::Crossing, haptic_pad(pad));
             }
-            Input::Report(data) => {
-                let Some(frame) = report::Frame::decode(&data) else { continue };
+            Input::EvdevAdopted { label, layout, name } => {
+                evdev_pad = Some((label, layout));
+                status.set_sources(source_names(!waiting, evdev_pad));
+                eprintln!("hyprpad: second source available — {name} ({label})");
+            }
+            Input::EvdevGone => {
+                evdev_pad = None;
+                status.set_sources(source_names(!waiting, evdev_pad));
+                // Only the pad that left is released. If it was the one
+                // driving, everything it was holding goes with it — exactly
+                // what `Input::ReadersEnded` does for the puck — and the
+                // active source falls back to the puck, whose own presence is
+                // `waiting`'s business.
+                if active_source == report::Source::Evdev {
+                    active_source = report::Source::Puck;
+                    status.set_layout(report::LAYOUT_PUCK);
+                    sticks.release();
+                    reset_frame_state(
+                        &mut engine,
+                        &mut cursor,
+                        &mut scroll,
+                        &mut osk_route,
+                        &mut prev_frame,
+                    );
+                    button_keys.release_all(&mut keyboard, pointer.as_mut());
+                    chord_keys.release_all(&mut keyboard, pointer.as_mut());
+                    gamepad.release(&mut haptics);
+                }
+            }
+            Input::Frame { frame, raw } => {
+                // Last-active-source wins. An idle frame from the source that
+                // is not driving is dropped outright — a change-driven pad
+                // re-sends, and a resting hand on either controller must not
+                // take the cursor from the other. A frame that says the user
+                // actually did something switches, and switching runs the same
+                // clean handoff a mode change does, so nothing is left held by
+                // the source that just lost the device.
+                if frame.source != active_source {
+                    if frame.is_neutral() {
+                        continue;
+                    }
+                    eprintln!("hyprpad: input source -> {:?}", frame.source);
+                    active_source = frame.source;
+                    status.set_layout(match (frame.source, evdev_pad) {
+                        (report::Source::Evdev, Some((_, layout))) => layout,
+                        _ => report::LAYOUT_PUCK,
+                    });
+                    sticks.release();
+                    // The outgoing source's edge state is meaningless to the
+                    // incoming one, so `prev_frame` and the gesture engine are
+                    // reset the way a disconnect resets them. Everything the
+                    // old source was holding is released here: no report from
+                    // it will arrive to `reconcile` it away.
+                    reset_frame_state(
+                        &mut engine,
+                        &mut cursor,
+                        &mut scroll,
+                        &mut osk_route,
+                        &mut prev_frame,
+                    );
+                    button_keys.release_all(&mut keyboard, pointer.as_mut());
+                    chord_keys.release_all(&mut keyboard, pointer.as_mut());
+                    gamepad.release(&mut haptics);
+                }
                 let now = Instant::now();
+                // Record the sticks for the rate integrators and arm (or drop)
+                // their deadline. A puck frame parks them: its pads drive the
+                // cursor and its sticks are for guide flicks, so nothing here
+                // must ever hold the deadline open for it.
+                sticks.observe(&frame, config.sticks(), now);
                 // The live haptics context for this frame: the device handle plus
                 // the current `[haptics]` knobs, read fresh so `hyprpad reload`
-                // takes effect on the very next pulse.
-                let mut hx = HapticCtx { dev: &mut haptics, cfg: config.haptics() };
+                // takes effect on the very next pulse. The source rides along so
+                // a device with no actuators drops every pulse in one place
+                // rather than at each of the call sites.
+                let mut hx =
+                    HapticCtx { dev: &mut haptics, cfg: config.haptics(), source: frame.source };
                 let mut mode_changed = false;
                 for ge in engine.update(&frame, now) {
                     if debug {
@@ -828,6 +1039,11 @@ pub fn run() -> std::io::Result<()> {
                     // and a still-held Shift button is not remembered as
                     // holding it. A no-op when it was already down.
                     osk_route.disarm();
+                    // The stick-driven halves of the same routing state. A
+                    // fresh keyboard starts with both cursors centred rather
+                    // than wherever the last one was left.
+                    sticks.osk_left.reset();
+                    sticks.osk_right.reset();
                     if let Some(ptr) = pointer.as_mut() {
                         // Ambient (non-guide) layer: the RIGHT pad drives the
                         // cursor and the LEFT pad drives scroll. The guide layer
@@ -920,7 +1136,12 @@ pub fn run() -> std::io::Result<()> {
                 drive_gamepad(
                     &mut gamepad,
                     &frame,
-                    &data,
+                    // The Steam relay forwards the puck's own bytes
+                    // unprocessed; an evdev frame has none, and the uinput pad
+                    // re-encodes from the frame either way. `&[]` is what the
+                    // relay reads as "nothing to pass through", which is the
+                    // truth for a source that is not the puck.
+                    raw.as_deref().unwrap_or(&[]),
                     config.gamepad(),
                     forwarding,
                     hx.dev,
@@ -991,13 +1212,37 @@ fn spawn_reader_pipeline(source: hidraw::PuckSource, tx: &mpsc::Sender<Input>) {
 /// single [`Input::ReadersEnded`] so the loop enters its reconnect wait instead
 /// of going silently idle. Split out from [`spawn_reader_pipeline`] so the
 /// sentinel behaviour is unit-testable without hardware.
+/// The decode runs **here**, in the reader thread, rather than in the loop: the
+/// evdev backend builds its frames in its own thread too, so doing the same for
+/// the puck is what makes [`Input::Frame`] mean one thing whichever controller
+/// produced it. A report that does not decode (the puck's other report ids) is
+/// dropped exactly as the loop used to drop it.
 fn forward_reports(reports: mpsc::Receiver<hidraw::Report>, tx: mpsc::Sender<Input>) {
     for r in reports {
-        if tx.send(Input::Report(r.data)).is_err() {
+        let Some(frame) = report::Frame::decode(&r.data) else { continue };
+        if tx.send(Input::Frame { frame, raw: Some(r.data) }).is_err() {
             return; // main loop gone; nothing to announce to.
         }
     }
     let _ = tx.send(Input::ReadersEnded);
+}
+
+/// Forward the evdev backend's events into the loop's single input stream, the
+/// way [`forward_reports`] and [`forward_osk_events`] do for the other two
+/// sources. Split out for the same reason: it is testable without a device.
+fn forward_evdev(events: mpsc::Receiver<crate::evdev::Event>, tx: mpsc::Sender<Input>) {
+    for ev in events {
+        let input = match ev {
+            crate::evdev::Event::Adopted { label, layout, name } => {
+                Input::EvdevAdopted { label, layout, name }
+            }
+            crate::evdev::Event::Frame(frame) => Input::Frame { frame, raw: None },
+            crate::evdev::Event::Released => Input::EvdevGone,
+        };
+        if tx.send(input).is_err() {
+            return; // main loop gone
+        }
+    }
 }
 
 /// Forward every event the OSK child reported on its stdout back-channel into
@@ -1066,16 +1311,40 @@ fn haptic_feel(cfg: &HapticsConfig, what: Haptic) -> Option<Feel> {
 struct HapticCtx<'a> {
     dev: &'a mut Haptics,
     cfg: &'a HapticsConfig,
+    /// Which controller this frame came from. A device with no actuators drops
+    /// every pulse — see [`HapticCtx::fire`].
+    source: report::Source,
 }
 
 impl HapticCtx<'_> {
     /// Fire `what` on `pad`, if the config enables it. Non-blocking: the pulse is
     /// queued for the haptics writer thread and dropped if that queue is full.
+    ///
+    /// **The one place a source without haptics is handled.** The puck has an
+    /// actuator behind each trackpad and the pulses are 200–600 µs; an Xbox pad
+    /// has two rumble motors, which `ff-memless` runs at jiffy granularity and
+    /// which need tens of milliseconds to spin up. There is no honest way to
+    /// play a 250 Hz texture on one, so every `Feel` is dropped here rather
+    /// than at each of the dozen call sites — which is what lets
+    /// `drive_scroll`, `route_osk` and the rest stay source-agnostic.
+    ///
+    /// Phase 2 maps only `Gesture` and `Commit` to a short weak-motor tap
+    /// (`FF_RUMBLE` over the grabbed evdev fd, or report 3 over the Bluetooth
+    /// hidraw node) and keeps dropping the rest; the hook is this one `if`.
     fn fire(&mut self, what: Haptic, pad: HapticPad) {
-        if let Some(feel) = haptic_feel(self.cfg, what) {
+        if let Some(feel) = haptic_for(self.source, self.cfg, what) {
             self.dev.play(feel, pad, self.cfg.intensity);
         }
     }
+}
+
+/// The whole "should this pulse happen" decision, as a pure function: the
+/// device must be able to play it *and* the config must want it.
+///
+/// Split out from [`HapticCtx::fire`] so the source gate is testable without a
+/// device, and so it reads as one rule rather than two guards in sequence.
+fn haptic_for(source: report::Source, cfg: &HapticsConfig, what: Haptic) -> Option<Feel> {
+    source.has_haptics().then(|| haptic_feel(cfg, what)).flatten()
 }
 
 /// Which actuator sits under an OSK pad: each thumb feels its own cursor.
@@ -1426,6 +1695,158 @@ fn drive_scroll(
     if dx != 0.0 || dy != 0.0 {
         ptr.scroll(dx, dy);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sticks in place of pads
+// ---------------------------------------------------------------------------
+
+/// Which of the stick-driven layers may act on this step.
+///
+/// The guards are the **existing** ones, deliberately: a stick cursor is a
+/// cursor, so it obeys `h.cursor { only_in = … }` and `guide_in` through
+/// [`cursor_active`] exactly as the right pad does, and stick scrolling obeys
+/// `h.scroll`'s guard and the guide layer exactly as the left pad does. There
+/// is no second permission model to keep in step with the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StickGates {
+    cursor: bool,
+    scroll: bool,
+    /// The keyboard owns both sticks while it is up, as it owns both pads.
+    osk: bool,
+}
+
+/// One integration step of the stick-driven layers, run off this loop's fourth
+/// receive deadline ([`crate::sticks::StickDrive::deadline`]).
+///
+/// Why a step at all: a gamepad reports **only on change**. Hold a stick at
+/// 60 % and the device goes silent, so a cursor driven off frames would move
+/// once and stop. Why a *deadline* and not a tick: the deadline is armed only
+/// while something is moving, so an idle pad costs nothing (`docs/09`'s "never
+/// busy-poll" holds unchanged).
+///
+/// The OSK comes first and takes both sticks: while the keyboard is up it owns
+/// them, as it owns both pads on the puck.
+#[allow(clippy::too_many_arguments)]
+fn drive_sticks(
+    st: &mut crate::sticks::StickDrive,
+    mut ptr: Option<&mut VirtualPointer>,
+    osk: &mut OskHandle,
+    cfg: &crate::config::SticksConfig,
+    scroll_cfg: &ScrollConfig,
+    gates: StickGates,
+    hx: &mut HapticCtx,
+    now: Instant,
+) {
+    if gates.osk {
+        // Phase 1 of the keyboard on a padless controller: each stick
+        // integrates into a per-hand position and goes out over the SAME
+        // `cursor L|R` wire the pads use, so the OSK child is untouched. The
+        // commits are ordinary `[osk_buttons]` bindings — `a` and the triggers
+        // rather than the pad clicks, which do not exist here.
+        // The wire's `+ny` is up and the frame's `+y` is up too, so both axes
+        // pass straight through — the same no-flip the pad path relies on —
+        // and each is deduped at the wire's own precision, so a stick held
+        // hard against an edge stops re-sending.
+        let l = st.osk_left.step(st.sticks.left, &cfg.osk, now);
+        let l = (round_wire(l.0), round_wire(l.1));
+        if st.osk_left.should_send(l) {
+            osk.cursor(OskPad::Left, l.0, l.1);
+        }
+        let r = st.osk_right.step(st.sticks.right, &cfg.osk, now);
+        let r = (round_wire(r.0), round_wire(r.1));
+        if st.osk_right.should_send(r) {
+            osk.cursor(OskPad::Right, r.0, r.1);
+        }
+        // Nothing else runs while the keyboard is up.
+        st.cursor.reset();
+        st.scroll.reset();
+        st.scroll_detent = 0.0;
+        return;
+    }
+    st.osk_left.reset();
+    st.osk_right.reset();
+
+    // The RIGHT stick is the pointer, as the right pad is.
+    if gates.cursor {
+        let (dx, dy) = st.cursor.step_whole(st.sticks.right, &cfg.cursor, now);
+        if dx != 0 || dy != 0 {
+            if let Some(ptr) = ptr.as_mut() {
+                // Frame `+y` is up, screen `+y` is down.
+                ptr.move_relative(f64::from(dx), f64::from(-dy));
+            }
+        }
+    } else {
+        st.cursor.reset();
+    }
+
+    // The LEFT stick scrolls, in the same `wl_pointer.axis` units the pad's
+    // circular mode emits — 15 units to a notch — and honouring the same
+    // `natural` / `horizontal` knobs, so the stick and the pad read as one
+    // setting rather than two.
+    if gates.scroll {
+        let (dx, dy) = st.scroll.step(st.sticks.left, &cfg.scroll, now);
+        // Frame `+y` is up; a non-natural wheel scrolls up when the thumb goes
+        // up, which is `dy < 0` in axis convention. `natural` flips it, exactly
+        // as `swipe_scroll` does for the pad.
+        let out_y = if scroll_cfg.natural { dy } else { -dy };
+        let out_x = if scroll_cfg.horizontal {
+            if scroll_cfg.natural {
+                -dx
+            } else {
+                dx
+            }
+        } else {
+            0.0
+        };
+        if out_x != 0.0 || out_y != 0.0 {
+            // The detent haptic, on the same policy the circular pad scroll
+            // uses: one pulse per notch of travel, at most one per step, with
+            // the remainder carried so a slow scroll still ticks. A no-op on a
+            // device with no actuators — `HapticCtx::fire` drops it there, in
+            // one place, rather than here.
+            st.scroll_detent += out_x.hypot(out_y);
+            if st.scroll_detent >= SCROLL_NOTCH {
+                st.scroll_detent %= SCROLL_NOTCH;
+                hx.fire(Haptic::Scroll, HapticPad::Left);
+            }
+            if let Some(ptr) = ptr.as_mut() {
+                ptr.scroll(out_x, out_y);
+            }
+        }
+    } else {
+        st.scroll.reset();
+        st.scroll_detent = 0.0;
+    }
+}
+
+/// `wl_pointer.axis` units in one wheel notch — the same 15 the circular pad
+/// scroll emits per detent (`sensitivity * circular_step_degrees` at the
+/// defaults), so the stick and the pad agree on what a notch is.
+const SCROLL_NOTCH: f64 = 15.0;
+
+/// Whether a gamepad the evdev backend would adopt is plugged in right now.
+///
+/// The startup wait's second exit. `false` whenever the backend is switched off
+/// in the config, because a pad nothing is going to read is not a controller
+/// being present — that would leave the daemon awake with no input at all,
+/// which is worse than waiting.
+fn gamepad_present(config: &Config) -> bool {
+    config.device().evdev
+        && crate::evdev::gamepad_nodes().is_ok_and(|nodes| !nodes.is_empty())
+}
+
+/// The `"sources"` list for `status.json`: every controller the daemon can hear
+/// right now, puck first.
+fn source_names(puck: bool, evdev: Option<(&'static str, &'static str)>) -> Vec<String> {
+    let mut out = Vec::new();
+    if puck {
+        out.push("puck".to_string());
+    }
+    if let Some((label, _)) = evdev {
+        out.push(label.to_string());
+    }
+    out
 }
 
 /// Map a swipe's smoothed-position delta (normalized units, pad `+Y` up) to a
@@ -3798,21 +4219,39 @@ mod tests {
         hidraw::Report { node: PathBuf::from("/dev/hidraw0"), data }
     }
 
+    /// A raw 54-byte `0x42` with `A` down, so the forwarder — which now
+    /// decodes, rather than handing bytes to the loop — has something real to
+    /// decode.
+    fn raw_report_with_a() -> Vec<u8> {
+        let mut raw = vec![0u8; 54];
+        raw[0] = 0x42;
+        raw[1] = 0x07; // counter
+        raw[2] = 0x01; // byte 2 bit 0 = A
+        raw
+    }
+
     #[test]
-    fn forward_reports_emits_readers_ended_when_source_closes() {
+    fn forward_reports_decodes_and_emits_readers_ended_when_source_closes() {
         let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
         let (itx, irx) = mpsc::channel::<Input>();
-        rtx.send(report(vec![1, 2, 3])).unwrap();
-        rtx.send(report(vec![4])).unwrap();
+        rtx.send(report(raw_report_with_a())).unwrap();
+        // A report that is not a 0x42 — a battery or status report — is dropped
+        // here rather than in the loop. Same effect, one less thing the loop
+        // has to know about the puck.
+        rtx.send(report(vec![0x03, 0x01])).unwrap();
         drop(rtx); // every reader gone -> the source channel closes
 
         // Runs to completion: the source is already closed, so it drains the two
         // buffered reports and then announces the readers ended.
         forward_reports(rrx, itx);
 
-        assert!(matches!(irx.recv(), Ok(Input::Report(d)) if d == [1, 2, 3]));
-        assert!(matches!(irx.recv(), Ok(Input::Report(d)) if d == [4]));
-        assert!(matches!(irx.recv(), Ok(Input::ReadersEnded)));
+        let got = irx.recv().expect("a frame");
+        let Input::Frame { frame, raw } = got else { panic!("wanted a frame") };
+        assert_eq!(frame.source, report::Source::Puck);
+        assert_eq!(frame.counter, 0x07);
+        assert!(frame.pressed(report::Button::A));
+        assert_eq!(raw.as_deref(), Some(raw_report_with_a().as_slice()), "the relay's bytes");
+        assert!(matches!(irx.recv(), Ok(Input::ReadersEnded)), "the undecodable one was dropped");
         // The forwarder dropped its sender, so the loop's channel is now closed.
         assert!(irx.recv().is_err());
     }
@@ -3821,13 +4260,289 @@ mod tests {
     fn forward_reports_stops_without_sentinel_when_loop_gone() {
         let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
         let (itx, irx) = mpsc::channel::<Input>();
-        rtx.send(report(vec![9])).unwrap();
+        rtx.send(report(raw_report_with_a())).unwrap();
         drop(irx); // main loop is gone: sends fail
 
         // Returns on the failed send; must not panic and must not try to send a
         // sentinel into the dead channel.
         forward_reports(rrx, itx);
         drop(rtx);
+    }
+
+    /// The evdev backend's three events reach the loop in the same shape the
+    /// puck's do — and its frames carry no raw bytes, because there are none.
+    #[test]
+    fn forward_evdev_maps_every_event_and_stops_with_the_loop() {
+        let (etx, erx) = mpsc::channel::<crate::evdev::Event>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        etx.send(crate::evdev::Event::Adopted {
+            label: "elite",
+            layout: "xbox-elite-2",
+            name: "Xbox Wireless Controller".to_string(),
+        })
+        .unwrap();
+        let frame = report::Frame { source: report::Source::Evdev, ..Default::default() };
+        etx.send(crate::evdev::Event::Frame(frame)).unwrap();
+        etx.send(crate::evdev::Event::Released).unwrap();
+        drop(etx);
+        forward_evdev(erx, itx);
+
+        assert!(matches!(
+            irx.recv(),
+            Ok(Input::EvdevAdopted { label: "elite", layout: "xbox-elite-2", .. })
+        ));
+        let Ok(Input::Frame { frame, raw }) = irx.recv() else { panic!("wanted a frame") };
+        assert_eq!(frame.source, report::Source::Evdev);
+        assert!(raw.is_none(), "an evdev frame has no puck bytes to relay");
+        assert!(matches!(irx.recv(), Ok(Input::EvdevGone)));
+        assert!(irx.recv().is_err());
+
+        // And it gives up quietly when the loop is gone, like the other two
+        // forwarders.
+        let (etx, erx) = mpsc::channel::<crate::evdev::Event>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        etx.send(crate::evdev::Event::Released).unwrap();
+        drop(irx);
+        forward_evdev(erx, itx);
+        drop(etx);
+    }
+
+    // --- the second source -------------------------------------------------
+
+    /// Build an evdev frame the way the daemon really does: through the
+    /// backend's own builder, from kernel event codes.
+    fn xbox_frame(keys: &[u16], axes: &[(u16, i32)]) -> report::Frame {
+        use crate::evdev::*;
+        let mut b = FrameBuilder::new(AxisMap::from_parts(&[
+            (ABS_X, Axis::LeftX, AbsRange::signed(32767)),
+            (ABS_Y, Axis::LeftY, AbsRange::signed(32767)),
+            (ABS_RX, Axis::RightX, AbsRange::signed(32767)),
+            (ABS_RY, Axis::RightY, AbsRange::signed(32767)),
+            (ABS_Z, Axis::TriggerL, AbsRange::unsigned(1023)),
+            (ABS_RZ, Axis::TriggerR, AbsRange::unsigned(1023)),
+        ]));
+        let ev = |kind, code, value| InputEvent { tv_sec: 0, tv_usec: 0, kind, code, value };
+        for &k in keys {
+            b.apply(&ev(EV_KEY, k, 1));
+        }
+        for &(c, v) in axes {
+            b.apply(&ev(EV_ABS, c, v));
+        }
+        b.apply(&ev(EV_SYN, SYN_REPORT, 0)).expect("a SYN publishes a frame")
+    }
+
+    /// The whole point of the `Source` tag: a frame from the evdev backend goes
+    /// through the SAME gesture engine, the SAME bare-button layer and the SAME
+    /// config as a puck frame. Nothing above the decoder is source-aware.
+    #[test]
+    fn a_frame_from_the_evdev_source_resolves_the_same_bindings() {
+        use crate::evdev::{BTN_GRIPR, BTN_MODE, BTN_SOUTH};
+        use report::Button::*;
+
+        // Xbox button + the upper-right paddle: `guide+r4` on the owner's pad.
+        let xbox = xbox_frame(&[BTN_MODE, BTN_GRIPR], &[]);
+        let puck = frame_of(&[Steam, GripR4]);
+        assert_eq!(xbox.buttons, puck.buttons, "the same bits, from a different wire");
+        assert_ne!(xbox.source, puck.source);
+
+        let cfg = Config::from_toml_str(
+            "[bindings]\n\"guide+r4\" = \"workspace +1\"\n[buttons]\na = \"key enter\"\n",
+        )
+        .unwrap();
+        let modes = ModeEngine::new(&cfg);
+
+        // The gesture engine recognises the chord on either frame, and the
+        // config resolves it to the same action.
+        for f in [xbox, puck] {
+            let mut engine = GestureEngine::new();
+            let events = engine.update(&f, Instant::now());
+            assert!(
+                events.iter().any(|e| matches!(e, GestureEvent::GuideChord(GripR4))),
+                "guide+r4 from {:?}",
+                f.source
+            );
+            let action = cfg.resolve_in(&GestureEvent::GuideChord(GripR4), modes.state());
+            assert!(!matches!(action, Action::None), "bound from {:?}", f.source);
+        }
+
+        // And the bare-button layer: A presses the same key whichever
+        // controller it came from.
+        let xbox_a = xbox_frame(&[BTN_SOUTH], &[]);
+        let puck_a = frame_of(&[A]);
+        let mut from_xbox = live();
+        let mut from_puck = live();
+        let held_xbox =
+            from_xbox.reconcile(modes.buttons(), |b| xbox_a.pressed(b), none, true);
+        let held_puck =
+            from_puck.reconcile(modes.buttons(), |b| puck_a.pressed(b), none, true);
+        assert_eq!(held_xbox, held_puck);
+        assert_eq!(held_xbox.len(), 1, "A is bound and held");
+    }
+
+    /// The trigger full-pull the evdev backend synthesises is an ordinary
+    /// `Button::TriggerR2Full` by the time anything above sees it — which is
+    /// what lets the OSK's existing `commit` binding work on a pad with no
+    /// trackpad clicks.
+    #[test]
+    fn a_synthesised_trigger_pull_is_an_ordinary_button_to_the_layers_above() {
+        use crate::evdev::ABS_RZ;
+        let pulled = xbox_frame(&[], &[(ABS_RZ, 900)]); // 900/1023 = 0.88
+        assert!(pulled.pressed(report::Button::TriggerR2Full));
+        assert_eq!(commit_pad(report::Button::TriggerR2Full), OskPad::Right);
+        assert_eq!(button_pad(report::Button::TriggerR2Full), HapticPad::Right);
+    }
+
+    /// The pad-driven handlers go quiet on a padless source without knowing
+    /// anything about it: their touch gates simply never open, which is the
+    /// "safe by construction" claim the whole design rests on.
+    #[test]
+    fn the_pad_handlers_idle_on_a_source_with_no_pads() {
+        // Everything a hand could be doing on an Xbox pad at once.
+        let xbox = xbox_frame(
+            &[crate::evdev::BTN_SOUTH, crate::evdev::BTN_TR],
+            &[(crate::evdev::ABS_X, 30_000), (crate::evdev::ABS_RZ, 1023)],
+        );
+        assert!(!xbox.source.has_pads());
+        // `drive_cursor` gates on PadRightTouch, `drive_scroll` and the scrub
+        // on PadLeftTouch, `route_osk`'s pad router on both. None can open.
+        assert!(!xbox.pressed(report::Button::PadLeftTouch));
+        assert!(!xbox.pressed(report::Button::PadRightTouch));
+        assert!(!xbox.pressed(report::Button::PadLeftClick));
+        assert!(!xbox.pressed(report::Button::PadRightClick));
+        assert_eq!(xbox.left_pad, report::Pad::default());
+        assert_eq!(xbox.right_pad, report::Pad::default());
+        // …while the buttons, sticks and triggers are all live.
+        assert!(xbox.pressed(report::Button::A) && xbox.pressed(report::Button::BumperR1));
+        assert!(xbox.pressed(report::Button::TriggerR2Full));
+        assert!(xbox.left_stick.0 > 0);
+    }
+
+    /// Every haptic call site is source-agnostic because the drop happens in
+    /// exactly one place. A device with no actuators plays nothing, whatever
+    /// the config says.
+    #[test]
+    fn a_source_without_haptics_drops_every_pulse_in_one_place() {
+        let cfg = HapticsConfig::default();
+        assert!(cfg.enabled, "the test needs the feature on to prove the SOURCE gates it");
+        // `Haptic::Button` is off by default, so it would prove nothing here.
+        for what in [Haptic::Commit, Haptic::Crossing, Haptic::Scroll, Haptic::Gesture] {
+            assert!(
+                haptic_for(report::Source::Puck, &cfg, what).is_some(),
+                "{what:?} is enabled in the config"
+            );
+            assert!(
+                haptic_for(report::Source::Evdev, &cfg, what).is_none(),
+                "{what:?} has no actuator to play on"
+            );
+        }
+        // The config still has the last word for the puck: turning a trigger
+        // point off turns it off.
+        let quiet = HapticsConfig { enabled: false, ..cfg };
+        assert!(haptic_for(report::Source::Puck, &quiet, Haptic::Commit).is_none());
+    }
+
+    /// The loop's fourth deadline: armed only while a stick is deflected.
+    #[test]
+    fn the_stick_deadline_arms_only_while_a_stick_is_deflected() {
+        let cfg = crate::config::SticksConfig::default();
+        let mut sticks = crate::sticks::StickDrive::new();
+        let now = Instant::now();
+
+        // A centred Xbox frame: nothing to integrate, so the loop blocks.
+        sticks.observe(&xbox_frame(&[], &[]), &cfg, now);
+        assert_eq!(sticks.deadline(), None);
+
+        // Right stick over: armed.
+        sticks.observe(&xbox_frame(&[], &[(crate::evdev::ABS_RX, 30_000)]), &cfg, now);
+        assert!(sticks.deadline().is_some(), "a deflected stick wants a step");
+
+        // Back to centre and stepped: disarmed again.
+        sticks.observe(&xbox_frame(&[], &[]), &cfg, now);
+        sticks.stepped(&cfg, now);
+        assert_eq!(sticks.deadline(), None);
+
+        // A puck frame with a stick held right over — a guide flick in
+        // progress — must never arm it: the puck's cursor is its pads.
+        let puck = report::Frame { right_stick: (30_000, 0), ..report::Frame::default() };
+        sticks.observe(&puck, &cfg, now);
+        assert_eq!(sticks.deadline(), None);
+    }
+
+    /// The stick layers obey the *existing* guards, so there is no second
+    /// permission model: a stick cursor is a cursor.
+    #[test]
+    fn the_stick_gates_are_the_pad_gates() {
+        // With the guide up, the ambient cursor guard decides; with it held,
+        // only `h.cursor { guide_in = … }` can keep the sticks.
+        assert!(cursor_active(false, true, false), "ambient on, guide up");
+        assert!(!cursor_active(true, true, false), "the guide layer takes the sticks");
+        assert!(cursor_active(true, false, true), "unless guide_in says otherwise");
+
+        // And the keyboard takes both sticks while it is up, exactly as it
+        // takes both pads.
+        let gates = StickGates { cursor: true, scroll: true, osk: true };
+        assert!(gates.osk);
+    }
+
+    /// The startup wait's second exit. A machine with only an Xbox pad is a
+    /// perfectly good hyprpad session, so waiting forever for a puck that is
+    /// not coming would be the wrong answer — but a pad nothing is going to
+    /// read is not a controller being present, so the config knob wins.
+    #[test]
+    fn the_startup_wait_ends_on_a_gamepad_only_when_the_backend_is_armed() {
+        let off = Config::from_toml_str("[device]\nevdev = false\n").unwrap();
+        assert!(!gamepad_present(&off), "a backend that is off finds nothing");
+
+        // With the backend on the answer is whatever is actually plugged into
+        // the machine running the tests, which is not something to assert —
+        // but it must agree with the scan, and must never hang or panic.
+        let on = Config::from_toml_str("[device]\nevdev = true\n").unwrap();
+        let scanned = crate::evdev::gamepad_nodes().is_ok_and(|n| !n.is_empty());
+        assert_eq!(gamepad_present(&on), scanned);
+    }
+
+    /// Last-active-source wins, and the one case that would otherwise thrash:
+    /// a hand resting on the puck's grips while the other drives an Xbox pad.
+    #[test]
+    fn only_deliberate_input_takes_the_device_from_the_other_controller() {
+        use report::Button::*;
+        assert!(report::Frame::default().is_neutral());
+
+        // Proximity is not intent. The capacitive cluster fires on hand
+        // contact, so a hand simply on the puck must not claim the cursor —
+        // it would fight the other pad at the report rate.
+        for cap in [Cap0, Cap1, Cap2, Cap3] {
+            assert!(frame_of(&[cap]).is_neutral(), "{cap:?} is a hand, not a press");
+        }
+        assert!(frame_of(&[Cap0, Cap1, Cap2, Cap3]).is_neutral());
+
+        // A press, a click, a touch, a trigger or a stick is.
+        for b in [A, Steam, GripR4, PadLeftClick, PadRightTouch, DpadUp] {
+            assert!(!frame_of(&[b]).is_neutral(), "{b:?} is deliberate");
+        }
+        let pulled = report::Frame { r2: 9_000, ..report::Frame::default() };
+        assert!(!pulled.is_neutral(), "a trigger off zero is deliberate");
+
+        // A stick's idle offset is not, but a real push is. The threshold is
+        // the gesture engine's own centre, so there is one answer in the
+        // daemon to "did the user move a stick".
+        let dz = crate::gesture::DEADZONE as i16;
+        let idle = report::Frame { left_stick: (dz - 1, 0), ..report::Frame::default() };
+        assert!(idle.is_neutral(), "a resting stick is not a command");
+        let pushed = report::Frame { right_stick: (0, dz + 1), ..report::Frame::default() };
+        assert!(!pushed.is_neutral());
+    }
+
+    /// The `"sources"` list, puck first, and only what is actually there.
+    #[test]
+    fn the_status_source_list_names_every_live_controller() {
+        assert_eq!(source_names(true, None), vec!["puck"]);
+        assert_eq!(
+            source_names(true, Some(("elite", "xbox-elite-2"))),
+            vec!["puck", "elite"]
+        );
+        assert_eq!(source_names(false, Some(("gamepad", "xbox-elite-2"))), vec!["gamepad"]);
+        assert!(source_names(false, None).is_empty(), "no daemon-invented sources");
     }
 
     /// A frame with exactly these buttons down.
@@ -3973,7 +4688,8 @@ mod tests {
         let mut osk = OskHandle::new();
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
         let ctrl_c = KeyChord::parse("ctrl+c").unwrap();
@@ -4430,7 +5146,8 @@ mod tests {
         let mut osk = OskHandle::new();
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
 
@@ -4542,7 +5259,8 @@ mod tests {
         let mut osk = OskHandle::new();
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let idle = report::Frame::default();
         let l5 = frame_of(&[GripL5]);
 
@@ -4837,7 +5555,8 @@ mod tests {
         let mut kbd: Option<VirtualKeyboard> = None;
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let bit = |b: report::Button| -> u32 {
             (0..32)
                 .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
@@ -5207,7 +5926,8 @@ mod tests {
         let mut kbd: Option<VirtualKeyboard> = None;
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
 
@@ -5249,7 +5969,8 @@ mod tests {
         let mut kbd: Option<VirtualKeyboard> = None;
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
         let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
@@ -5280,7 +6001,8 @@ mod tests {
         let mut kbd: Option<VirtualKeyboard> = None;
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
         let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
@@ -5524,7 +6246,8 @@ mod tests {
         let mut osk = OskHandle::new();
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
-        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
         // In a game, where the guide-mouse lives: chords are the escape hatch

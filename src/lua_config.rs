@@ -132,8 +132,9 @@
 //! `string` are all there, as the owner's own configs use them).
 
 use crate::config::{
-    Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
-    KeyboardConfig, ModeDef, OskAction, ScrollConfig, ScrollMode, TransientExit, TransientSpec,
+    Action, ButtonAction, ButtonAlt, Config, CursorConfig, DeviceConfig, GamepadConfig, Guard,
+    HapticsConfig, KeyboardConfig, ModeDef, OskAction, ScrollConfig, ScrollMode, SticksConfig,
+    TransientExit, TransientSpec,
 };
 use crate::config::{mouse_code, parse_button, GestureKey, KeyChord};
 use crate::mode::Context;
@@ -667,6 +668,8 @@ fn finish(
         haptics: b.haptics,
         keyboard: b.keyboard,
         gamepad: b.gamepad,
+        sticks: b.sticks,
+        device: b.device,
         modes: b.modes,
         default_mode: Some(default),
         binding_guards: b.binding_guards,
@@ -758,6 +761,8 @@ struct Build {
     haptics: HapticsConfig,
     keyboard: KeyboardConfig,
     gamepad: GamepadConfig,
+    sticks: SticksConfig,
+    device: DeviceConfig,
     modes: Vec<ModeDef>,
     default_mode: Option<String>,
     predicates: Vec<Function>,
@@ -895,6 +900,8 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("haptics", section_haptics(lua, build)?)?;
     h.set("keyboard_config", section_keyboard(lua, build)?)?;
     h.set("gamepad", section_gamepad(lua, build)?)?;
+    h.set("sticks", section_sticks(lua, build)?)?;
+    h.set("device", section_device(lua, build)?)?;
 
     // --- bindings ---------------------------------------------------------
     h.set("bind", bind_fn(lua, build, &guard_mt, BindKind::Gesture)?)?;
@@ -1696,6 +1703,100 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                         ],
                     ))
                 }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `h.sticks { … }` — the `[sticks]` knobs: rate control for a controller
+/// whose sticks stand in for the puck's trackpads ([`crate::sticks`]).
+///
+/// Inert on the puck, whose pads drive everything and whose sticks are for
+/// guide flicks, so writing this block costs a puck-only setup nothing.
+///
+/// ```lua
+/// h.sticks {
+///   tick_ms = 4,                    -- integration step while a stick is deflected
+///   cursor = {                      -- right stick -> the desktop pointer
+///     deadzone = 0.12,              -- radial, as a fraction of full deflection
+///     outer    = 0.95,              -- deflection that counts as full
+///     curve    = 2.0,               -- 1.0 linear, 2.0 quadratic (finer low end)
+///     max_px_s = 1500,              -- pixels per second at full tilt
+///     smoothing_ms = 15,            -- EMA on the velocity; 0 turns it off
+///   },
+///   scroll = { max_units_s = 180 }, -- left stick; 15 units = one wheel notch
+///   osk    = { max_units_s = 2.4 }, -- both sticks as the keyboard's cursors
+/// }
+/// ```
+///
+/// The three groups take the same knobs, so a flat `cursor_max_px_s = 900` is
+/// accepted too — the same spelling the TOML front-end uses, and the reason
+/// both dialects go through [`crate::config::set_stick_knob`].
+fn section_sticks(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
+    let build = Rc::clone(build);
+    lua.create_function(move |_, t: Table| {
+        let mut b = build.borrow_mut();
+        for pair in t.pairs::<String, Value>() {
+            let (k, v) = pair?;
+            match k.as_str() {
+                "enabled" | "enable" | "on" => b.sticks.enabled = as_bool(&v, &k)?,
+                "tick_ms" | "step_ms" => b.sticks.tick_ms = as_f64(&v, &k)?.max(1.0) as u64,
+                // A nested sub-table: `cursor = { … }`.
+                "cursor" | "pointer" | "scroll" | "osk" | "keyboard" => {
+                    let Value::Table(sub) = &v else {
+                        return Err(err(format!(
+                            "h.sticks {{ {k} = … }} needs a table, got {}",
+                            v.type_name()
+                        )));
+                    };
+                    // Collect first so the borrow of `b` is not held across the
+                    // sub-table walk.
+                    let mut knobs: Vec<(String, f64)> = Vec::new();
+                    for entry in sub.clone().pairs::<String, Value>() {
+                        let (knob, val) = entry?;
+                        let n = as_f64(&val, &knob)?;
+                        knobs.push((knob, n));
+                    }
+                    let axis = crate::config::stick_axis_mut(&mut b.sticks, &k).map_err(err)?;
+                    for (knob, n) in knobs {
+                        crate::config::set_stick_axis_knob(axis, &knob, n).map_err(err)?;
+                    }
+                }
+                // The flat `<group>_<knob>` spelling, identical to TOML's.
+                other => {
+                    let n = as_f64(&v, &k)?;
+                    crate::config::set_stick_knob(&mut b.sticks, other, n).map_err(err)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `h.device { … }` — the `[device]` knobs: which input backends are armed and
+/// whether an adopted gamepad is grabbed.
+///
+/// ```lua
+/// h.device {
+///   evdev = true,   -- run the gamepad backend (crate::evdev) at all
+///   grab  = true,   -- EVIOCGRAB an adopted pad while hyprpad owns it
+/// }
+/// ```
+///
+/// `grab = true` is the default and wants to stay that way: the Bluetooth Xbox
+/// Elite's node is a *keyboard* to libinput, so ungrabbed its Profile button
+/// types `KEY_RECORD` into whatever is focused.
+fn section_device(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
+    let build = Rc::clone(build);
+    lua.create_function(move |_, t: Table| {
+        let mut b = build.borrow_mut();
+        for pair in t.pairs::<String, Value>() {
+            let (k, v) = pair?;
+            match k.as_str() {
+                "evdev" | "gamepad" | "xbox" => b.device.evdev = as_bool(&v, &k)?,
+                "grab" | "exclusive" => b.device.grab = as_bool(&v, &k)?,
+                other => return Err(unknown_key("h.device", other, &["evdev", "grab"])),
             }
         }
         Ok(())

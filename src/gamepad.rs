@@ -139,6 +139,10 @@ const UI_END_FF_ERASE: libc::c_ulong = 0x400c_55cb;
 const VENDOR: u16 = 0x045e;
 const PRODUCT: u16 = 0x028e;
 const DEVICE_NAME: &[u8] = b"hyprpad virtual gamepad";
+/// [`DEVICE_NAME`] as text, so the evdev backend can recognise our own
+/// output pad by name as well as by its sysfs path
+/// ([`crate::evdev::is_virtual`] is the real guard; this is belt and braces).
+pub const DEVICE_NAME_STR: &str = "hyprpad virtual gamepad";
 
 /// How many concurrent force-feedback effects the pad will store. Must be
 /// non-zero whenever `EV_FF` is advertised or `UI_DEV_CREATE` fails with

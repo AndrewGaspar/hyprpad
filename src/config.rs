@@ -1187,6 +1187,186 @@ impl Default for KeyboardConfig {
     }
 }
 
+/// One rate-controlled stick axis pair's tuning — a sub-table of `[sticks]`.
+///
+/// Three of these exist: the cursor (right stick), scrolling (left stick) and
+/// the on-screen keyboard's two cursors. They share a shape and differ only in
+/// what `max` counts.
+///
+/// The defaults are the research doc's starting points
+/// (`docs/research/xbox-elite.md` §3.1), and like every other feel knob in this
+/// file they are *tunable*, not tuned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StickAxisConfig {
+    /// Inner radial deadzone, as a fraction of full deflection. Below it the
+    /// stick commands nothing. Default `0.12` — above a worn stick's resting
+    /// offset, well below XInput's pessimistic 24 % (which is far too much for
+    /// a pointer), and a little over xpadneo's 9.4 %.
+    ///
+    /// Radial, not per-axis: a per-axis deadzone lets the diagonals engage at a
+    /// smaller push than the cardinals, and the cursor drifts diagonally.
+    pub deadzone: f64,
+    /// Outer edge: deflection at or beyond this counts as full. Default `0.95`
+    /// — a round gate never reaches `1.0` in the corners, and a stick that
+    /// cannot reach its own top speed feels broken.
+    pub outer: f64,
+    /// Response-curve exponent applied to the rescaled deflection. `1.0` is
+    /// linear; the default `2.0` is AntiMicroX's "Quadratic", which slows the
+    /// low end so fine targeting is possible without giving up the top speed.
+    pub curve: f64,
+    /// Output units per second at full deflection. The unit depends on which
+    /// axis pair this is:
+    /// - cursor: **pixels/s**. Default `1500` — between AntiMicroX's 1000 and
+    ///   xpadneo's 3200; a full-tilt sweep crosses a 2560-px panel in ~1.7 s.
+    /// - scroll: **`wl_pointer.axis` units/s**, where 15 units is one wheel
+    ///   notch (the same 15 the circular pad scroll emits per detent). Default
+    ///   `180` = 12 notches/s at full tilt.
+    /// - OSK: **normalised `[-1, 1]` units/s**. Default `2.4` — the keyboard is
+    ///   2.0 units wide, so 1.2 keyboard-widths per second.
+    pub max: f64,
+    /// Exponential smoothing time constant on the *velocity*, in milliseconds.
+    /// `0` disables it. Default `15` — enough to take the edge off a thumb's
+    /// own jitter without adding perceptible lag.
+    ///
+    /// Deliberately **not** a One Euro filter: a stick is a rate command, not a
+    /// noisy position to be differenced, so there is nothing for one to fix.
+    pub smoothing_ms: f64,
+}
+
+impl StickAxisConfig {
+    /// The shared shape, with only the top speed differing.
+    const fn with_max(max: f64) -> StickAxisConfig {
+        StickAxisConfig { deadzone: 0.12, outer: 0.95, curve: 2.0, max, smoothing_ms: 15.0 }
+    }
+}
+
+/// Rate-control knobs for a controller whose sticks stand in for the puck's
+/// trackpads (the `[sticks]` section / `h.sticks { … }`).
+///
+/// Live only for a source with no pads ([`crate::report::Source::has_pads`]) —
+/// on the puck the sticks are for guide flicks and the pads drive everything,
+/// and nothing here changes that. `docs/design/xbox-elite.md` has the model;
+/// [`crate::sticks`] is the implementation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SticksConfig {
+    /// Master switch. Default `true`: a padless controller with no stick
+    /// cursor would have no pointer at all, so this is on unless a config
+    /// deliberately turns it off.
+    pub enabled: bool,
+    /// Integration step, in milliseconds. Default `4` — the cadence the loop
+    /// already runs at under the puck, so hold timers and the button
+    /// reconcile see the same rhythm.
+    ///
+    /// This is a **deadline**, not a tick: the loop arms it only while a stick
+    /// is deflected (or a velocity is still decaying) and blocks indefinitely
+    /// otherwise, so an idle controller costs no wakeups at all.
+    pub tick_ms: u64,
+    /// The right stick's cursor.
+    pub cursor: StickAxisConfig,
+    /// The left stick's scrolling.
+    pub scroll: StickAxisConfig,
+    /// Both sticks as the on-screen keyboard's two per-hand cursors.
+    pub osk: StickAxisConfig,
+}
+
+impl Default for SticksConfig {
+    fn default() -> SticksConfig {
+        SticksConfig {
+            enabled: true,
+            tick_ms: 4,
+            cursor: StickAxisConfig::with_max(1500.0),
+            scroll: StickAxisConfig::with_max(180.0),
+            osk: StickAxisConfig::with_max(2.4),
+        }
+    }
+}
+
+/// Set one knob of one [`StickAxisConfig`] by name.
+///
+/// Shared by both front-ends so `[sticks] cursor_max_px_s = 900` and
+/// `h.sticks { cursor = { max_px_s = 900 } }` cannot drift apart, and so a
+/// typo produces the same message either way.
+pub(crate) fn set_stick_axis_knob(
+    axis: &mut StickAxisConfig,
+    knob: &str,
+    v: f64,
+) -> Result<(), String> {
+    match knob {
+        "deadzone" | "dead_zone" | "inner" => axis.deadzone = v,
+        "outer" | "outer_deadzone" => axis.outer = v,
+        "curve" | "exponent" | "response" => axis.curve = v,
+        // One value, three units, depending on which pair this is — so every
+        // spelling is accepted for every pair rather than pretending the
+        // parser knows which one it is looking at.
+        "max" | "max_px_s" | "max_units_s" | "max_speed" | "speed" => axis.max = v,
+        "smoothing_ms" | "smoothing" | "tau_ms" => axis.smoothing_ms = v,
+        other => {
+            return Err(format!(
+                "unknown stick setting '{other}' (want deadzone, outer, curve, \
+                 max_px_s/max_units_s, smoothing_ms)"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Set one `<pair>_<knob>` key of a [`SticksConfig`] — the TOML spelling of a
+/// nested sub-table.
+pub(crate) fn set_stick_knob(cfg: &mut SticksConfig, key: &str, v: f64) -> Result<(), String> {
+    let (pair, knob) = key.split_once('_').ok_or_else(|| {
+        format!(
+            "unknown [sticks] setting '{key}' (want enabled, tick_ms, or \
+             <cursor|scroll|osk>_<knob>)"
+        )
+    })?;
+    let axis = stick_axis_mut(cfg, pair)?;
+    set_stick_axis_knob(axis, knob, v)
+}
+
+/// The sub-table one group name refers to.
+pub(crate) fn stick_axis_mut<'a>(
+    cfg: &'a mut SticksConfig,
+    pair: &str,
+) -> Result<&'a mut StickAxisConfig, String> {
+    match pair {
+        "cursor" | "pointer" => Ok(&mut cfg.cursor),
+        "scroll" => Ok(&mut cfg.scroll),
+        "osk" | "keyboard" => Ok(&mut cfg.osk),
+        other => Err(format!(
+            "unknown stick group '{other}' (want cursor, scroll or osk)"
+        )),
+    }
+}
+
+/// Physical-input-source knobs (the `[device]` section / `h.device { … }`).
+///
+/// About hyprpad's *plumbing*, not about feel: which backends are armed and
+/// whether an adopted evdev pad is taken away from the rest of the system.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceConfig {
+    /// Whether to run the evdev backend at all ([`crate::evdev`]). Default
+    /// `true`; a machine that only ever uses the puck loses one idle thread by
+    /// turning it off.
+    pub evdev: bool,
+    /// Whether to `EVIOCGRAB` an adopted gamepad. Default `true`, and the
+    /// default matters: the Bluetooth Elite's node is a *keyboard* to
+    /// libinput, so without a grab its Profile button types `KEY_RECORD` into
+    /// whatever Hyprland has focused and its paddles/profile/trigger-locks
+    /// toggle a stray `KEY_UNKNOWN`. A grab also hides the wired pad from
+    /// games, which is what lets hyprpad's virtual pad be the only one they
+    /// see.
+    ///
+    /// Read when a pad is adopted, so a `hyprpad reload` that changes it takes
+    /// effect on the next reconnect rather than immediately.
+    pub grab: bool,
+}
+
+impl Default for DeviceConfig {
+    fn default() -> DeviceConfig {
+        DeviceConfig { evdev: true, grab: true }
+    }
+}
+
 /// Haptic-feedback knobs (the `[haptics]` config section).
 ///
 /// The puck has an actuator behind each trackpad ([`crate::haptics`]); firing a
@@ -1685,6 +1865,12 @@ pub struct Config {
     pub(crate) keyboard: KeyboardConfig,
     /// Virtual-gamepad knobs (`[gamepad]` section).
     pub(crate) gamepad: GamepadConfig,
+    /// Stick rate-control knobs (`[sticks]` section), for a controller with no
+    /// trackpads. Inert on the puck.
+    pub(crate) sticks: SticksConfig,
+    /// Input-source knobs (`[device]` section): which backends are armed, and
+    /// whether an adopted gamepad is grabbed.
+    pub(crate) device: DeviceConfig,
 
     // --- Modality (Lua front-end only; empty from TOML) --------------------
     /// The declared modes, **in definition order** — the order the rules are
@@ -1853,6 +2039,8 @@ impl Config {
         let mut haptics = HapticsConfig::default();
         let mut keyboard = KeyboardConfig::default();
         let mut gamepad = GamepadConfig::default();
+        let mut sticks = SticksConfig::default();
+        let mut device = DeviceConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
             let lineno = i + 1;
@@ -2170,6 +2358,51 @@ impl Config {
                         }
                     }
                 }
+                // Stick rate control, for a controller whose sticks stand in
+                // for the puck's trackpads. Three sub-tables (`cursor`,
+                // `scroll`, `osk`) share a shape; TOML has no nesting in this
+                // hand-rolled parser, so a sub-table is a `<pair>_<knob>`
+                // prefix here and a real nested table in the Lua front-end.
+                "sticks" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    match key.as_str() {
+                        "enabled" | "enable" | "on" => {
+                            sticks.enabled =
+                                parse_bool(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "tick_ms" | "step_ms" => {
+                            sticks.tick_ms = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?
+                                .max(1.0) as u64;
+                        }
+                        other => {
+                            let n = parse_f64(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                            set_stick_knob(&mut sticks, other, n)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                    }
+                }
+                // Which input backends are armed, and whether an adopted
+                // gamepad is taken away from the rest of the system.
+                "device" | "devices" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    let val = unquote(v);
+                    let flag = |slot: &mut bool| -> Result<(), String> {
+                        *slot = parse_bool(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        Ok(())
+                    };
+                    match key.as_str() {
+                        "evdev" | "gamepad" | "xbox" => flag(&mut device.evdev)?,
+                        "grab" | "exclusive" => flag(&mut device.grab)?,
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [device] setting '{other}' \
+                                 (want evdev, grab)"
+                            ))
+                        }
+                    }
+                }
                 _ => return Err(format!("line {lineno}: unknown section [{section}]")),
             }
         }
@@ -2190,6 +2423,8 @@ impl Config {
             haptics,
             keyboard,
             gamepad,
+            sticks,
+            device,
             // The TOML dialect declares no modes and no guards: everything is
             // unguarded, and an empty mode list is the signal that
             // `ModeEngine` should keep its built-in game/desktop behaviour.
@@ -2386,6 +2621,21 @@ impl Config {
     /// change.
     pub fn osk_learn_deny(&self) -> &[String] {
         &self.keyboard.learn_deny
+}
+
+    /// The stick rate-control knobs (`[sticks]` section); defaults from
+    /// [`SticksConfig::default`]. Read per integration step, so a reload
+    /// retunes the stick cursor without a restart — and inert entirely on a
+    /// source that has trackpads.
+    pub fn sticks(&self) -> &SticksConfig {
+        &self.sticks
+    }
+
+    /// The input-source knobs (`[device]` section); defaults from
+    /// [`DeviceConfig::default`]. Read once when the backend is armed and once
+    /// per adoption, not per frame.
+    pub fn device(&self) -> &DeviceConfig {
+        &self.device
     }
 
     /// The virtual-gamepad knobs (`[gamepad]` section); defaults from
@@ -3675,6 +3925,9 @@ deadzone = 0.001
         assert_eq!(d.scroll().circular_step_degrees, 15.0);
         assert_eq!(d.scroll().circular_min_radius, 0.35);
 
+        // See `the_stick_and_device_sections_parse_in_both_dialects` below for
+        // `[sticks]` and `[device]`.
+
         // A `[scroll]` section overrides individual knobs; bindings still parse.
         let c = Config::from_toml_str(
             r#"
@@ -4277,6 +4530,127 @@ rumble_intensity = 0.25
         for what in [TransientExit::Focus, TransientExit::Title, TransientExit::Click] {
             assert!(t.exits_on(what));
         }
+    }
+
+    /// The two sections the second input backend adds, in both front-ends —
+    /// and the point of the exercise: the flat TOML spelling and the nested
+    /// Lua one land on exactly the same value, because both go through
+    /// `set_stick_axis_knob`.
+    #[test]
+    fn the_stick_and_device_sections_parse_in_both_dialects() {
+        let d = Config::load_default();
+        assert!(d.sticks().enabled, "a padless pad with no stick cursor has no pointer");
+        assert_eq!(d.sticks().tick_ms, 4);
+        assert_eq!(d.sticks().cursor.deadzone, 0.12);
+        assert_eq!(d.sticks().cursor.curve, 2.0);
+        assert_eq!(d.sticks().cursor.max, 1500.0);
+        assert_eq!(d.sticks().scroll.max, 180.0);
+        assert_eq!(d.sticks().osk.max, 2.4);
+        assert!(d.device().evdev && d.device().grab);
+
+        let toml = Config::from_toml_str(
+            r#"
+[sticks]
+tick_ms = 8
+cursor_deadzone = 0.2
+cursor_curve = 1.0
+cursor_max_px_s = 900
+cursor_smoothing_ms = 0
+scroll_max_units_s = 240
+osk_max_units_s = 3
+
+[device]
+grab = false
+
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(toml.sticks().tick_ms, 8);
+        assert_eq!(toml.sticks().cursor.deadzone, 0.2);
+        assert_eq!(toml.sticks().cursor.curve, 1.0);
+        assert_eq!(toml.sticks().cursor.max, 900.0);
+        assert_eq!(toml.sticks().cursor.smoothing_ms, 0.0);
+        assert_eq!(toml.sticks().scroll.max, 240.0);
+        assert_eq!(toml.sticks().osk.max, 3.0);
+        assert_eq!(toml.sticks().cursor.outer, 0.95, "unmentioned knobs keep their defaults");
+        assert!(!toml.device().grab);
+        assert!(toml.device().evdev);
+        assert_eq!(
+            toml.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen,
+            "bindings still parse beside the new sections"
+        );
+
+        let lua = crate::lua_config::load_str(
+            r#"
+local h = hyprpad
+h.sticks {
+  tick_ms = 8,
+  cursor = { deadzone = 0.2, curve = 1.0, max_px_s = 900, smoothing_ms = 0 },
+  scroll = { max_units_s = 240 },
+  osk    = { max_units_s = 3 },
+}
+h.device { grab = false }
+h.bind("guide+a", h.fullscreen())
+"#,
+            "test.lua",
+        )
+        .expect("lua parses");
+        assert_eq!(lua.sticks(), toml.sticks(), "the two dialects agree exactly");
+        assert_eq!(lua.device(), toml.device());
+
+        // The flat `<group>_<knob>` spelling works in Lua too, and an unknown
+        // knob or group is an error rather than a silent no-op.
+        let flat = crate::lua_config::load_str(
+            "local h = hyprpad\nh.sticks { cursor_max_px_s = 900 }\n",
+            "test.lua",
+        )
+        .expect("flat spelling");
+        assert_eq!(flat.sticks().cursor.max, 900.0);
+        for bad in [
+            "[sticks]\ncursor_nope = 1\n",
+            "[sticks]\nnope_deadzone = 1\n",
+            "[device]\nnope = true\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad} should not parse");
+        }
+    }
+
+    /// The one binding a padless controller genuinely needs added.
+    ///
+    /// The built-in OSK map commits on the two pad *clicks*, which an Xbox pad
+    /// does not have; everything else in it — L2 Shift, R2 Enter, Y Space, X
+    /// Backspace, B/Menu dismiss — is already a button that pad has. So the
+    /// sample gives the commit a home, and the natural ones are the stick
+    /// clicks, because `commit_pad` reads the pad (here, the stick cursor)
+    /// under the same hand as the button.
+    #[test]
+    fn the_osk_commit_can_be_moved_off_the_pad_clicks() {
+        let c = Config::from_toml_str(
+            "[osk_buttons]\na = \"osk commit\"\nl3 = \"osk commit\"\nr3 = \"osk commit\"\n",
+        )
+        .expect("parse");
+        for b in [Button::A, Button::L3, Button::R3] {
+            assert_eq!(c.osk_buttons.get(&b), Some(&OskAction::Commit), "{b:?}");
+        }
+        let lua = crate::lua_config::load_str(
+            r#"
+local h = hyprpad
+h.osk_button("a",  h.osk "commit")
+h.osk_button("l3", h.osk "commit")
+h.osk_button("r3", h.osk "commit")
+"#,
+            "test.lua",
+        )
+        .expect("lua parses");
+        assert_eq!(lua.osk_buttons, c.osk_buttons, "both dialects, one map");
+        // The built-ins the Elite already has are untouched by adding these.
+        let live = c.osk_buttons_in(&ModeState::default());
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&OskAction::Key(KeyChord::plain(28))));
+        assert_eq!(live.get(&Button::TriggerL2Full), Some(&OskAction::Shift));
+        assert_eq!(live.get(&Button::B), Some(&OskAction::Dismiss));
     }
 
     #[test]

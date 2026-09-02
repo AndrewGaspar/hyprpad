@@ -1,0 +1,157 @@
+{
+  "schema": 1,
+  "id": "xbox-elite-2",
+  "name": "Xbox Elite Series 2",
+  "subtitle": "045e:0b00 / 0b22",
+
+  "_comment": [
+    "The second controller layout, and the proof that adding one is a file and",
+    "not a code change: Panel.qml reads every *.json in this directory and",
+    "names no controller anywhere. The daemon publishes which layout is live in",
+    "`status.json` (`\"layout\": \"xbox-elite-2\"` while an Xbox pad is the",
+    "active source) and `hyprpad-cheatsheet` forwards it in the summon payload.",
+    "",
+    "Differences from steam-controller-2026.json, all of them data:",
+    "",
+    "  * NO `lpad`, `rpad`, `lpad_click`, `rpad_click`, `quickaccess`. This pad",
+    "    has none of them. A puck-flavoured config summoned with this layout",
+    "    still shows those bindings — the widget parks anything it cannot anchor",
+    "    in `overflow` (Sheet.qml) — it just cannot point at them.",
+    "  * The sticks and the d-pad move: the Elite's left stick is HIGH and its",
+    "    d-pad sits below it, mirrored on the right. On this pad the sticks are",
+    "    also what drives the cursor and scrolling, so `lstick`/`rstick` are",
+    "    load-bearing here in a way they are not on the puck.",
+    "  * `steam` is the XBOX button. hyprpad's control id is unchanged, because",
+    "    the guide is a role and not a brand — every `guide+...` chord in a",
+    "    config works on either controller with no edit.",
+    "  * The four paddles keep hyprpad's grip names. On the controller itself",
+    "    they are lettered P1-P4, and the correspondence — the one SDL and the",
+    "    Linux kernel both settled on — is P1=R4, P2=R5, P3=L4, P4=L5: the",
+    "    UPPER pair first, then the lower. The sheet draws l4 above l5, which is",
+    "    already the right geometry.",
+    "",
+    "The paddles reach hyprpad only in the controller's profile slot 0 (no LED)",
+    "and only over USB, or over Bluetooth with udev-hid-bpf installed. See",
+    "docs/design/xbox-elite.md."
+  ],
+
+  "viewBox": { "width": 456, "height": 320 },
+
+  "_art_comment": [
+    "One entry, unlike the puck's two. Steam ships an Elite diagram —",
+    "steamui/images/controller/controller_config_controller_xboxelite.png — but",
+    "it is a RASTER, and the widget recolours SVG strokes to theme the drawing,",
+    "so it cannot be used. hyprpad draws its own instead."
+  ],
+  "art": [
+    {
+      "source": "bundled",
+      "path": "art/xbox-elite-2.svg",
+      "credit": "hyprpad's own schematic"
+    }
+  ],
+
+  "controls": {
+    "l2":          { "x": 86,  "y": 22,  "side": "left",  "hidden": true },
+    "l1":          { "x": 120, "y": 34,  "side": "left" },
+    "lstick":      { "x": 145, "y": 110, "side": "left" },
+    "l3":          { "x": 145, "y": 110, "side": "left" },
+    "view":        { "x": 196, "y": 122, "side": "left" },
+    "dpad_up":     { "x": 168, "y": 174, "side": "left" },
+    "dpad_left":   { "x": 146, "y": 196, "side": "left" },
+    "dpad_right":  { "x": 190, "y": 196, "side": "left" },
+    "dpad_down":   { "x": 168, "y": 218, "side": "left" },
+    "l4":          { "x": 100, "y": 252, "side": "left",  "hidden": true },
+    "l5":          { "x": 128, "y": 288, "side": "left",  "hidden": true },
+
+    "r2":          { "x": 370, "y": 22,  "side": "right", "hidden": true },
+    "r1":          { "x": 336, "y": 34,  "side": "right" },
+    "y":           { "x": 352, "y": 96,  "side": "right" },
+    "x":           { "x": 322, "y": 126, "side": "right" },
+    "b":           { "x": 382, "y": 126, "side": "right" },
+    "a":           { "x": 352, "y": 156, "side": "right" },
+    "menu":        { "x": 260, "y": 122, "side": "right" },
+    "rstick":      { "x": 288, "y": 196, "side": "right" },
+    "r3":          { "x": 288, "y": 196, "side": "right" },
+    "r4":          { "x": 356, "y": 252, "side": "right", "hidden": true },
+    "r5":          { "x": 328, "y": 288, "side": "right", "hidden": true },
+
+    "dpad":        { "x": 168, "y": 196, "side": "left" },
+
+    "steam":       { "x": 228, "y": 84,  "side": "right" }
+  },
+
+  "groups": {
+    "dpad": {
+      "label": "D-pad",
+      "members": {
+        "dpad_up": "up",
+        "dpad_down": "down",
+        "dpad_left": "left",
+        "dpad_right": "right"
+      },
+      "collapse": { "direction": "→", "label": "arrow keys" }
+    }
+  },
+
+  "_modifiers_comment": [
+    "`guide` says 'hold Xbox' rather than 'hold Steam' — the same modifier, the",
+    "name the reader's thumb is actually on."
+  ],
+  "modifiers": {
+    "guide": {
+      "image": "art/kenney/controller_icon.svg",
+      "text": "X",
+      "legend": "hold Xbox, then press"
+    },
+    "osk": {
+      "image": "art/kenney/keyboard.svg",
+      "text": "K",
+      "legend": "while the on-screen keyboard is up"
+    }
+  },
+
+  "_glyphs_comment": [
+    "Not one new art file. Kenney's Input Prompts set (art/kenney/, CC0 —",
+    "see ../art/LICENSES.md) turns out to already be right for an Xbox pad:",
+    "",
+    "  * the A/B/X/Y chips are lettered circles, and the Elite's face diamond",
+    "    carries the same four letters in the same four positions as the puck's;",
+    "  * `steam_lb.svg` and `steam_lt.svg` literally draw the strings 'LB' and",
+    "    'LT' — Xbox's own naming — so l1/l2 need nothing else;",
+    "  * the d-pad, stick and stick-press chips are plain shapes with no",
+    "    platform in them;",
+    "  * `controller_button_l4/l5/r4/r5.svg` are the generic grip pills, and the",
+    "    grip names are what a hyprpad config spells, so they are the right",
+    "    label even though the controller's own silkscreen says P1-P4.",
+    "",
+    "So the only new file in this whole layout is the drawing itself. The `text`",
+    "fallbacks name the Xbox control, for a checkout with the art stripped."
+  ],
+  "glyphs": {
+    "a":           { "image": "art/kenney/steam_button_a.svg",       "text": "A" },
+    "b":           { "image": "art/kenney/steam_button_b.svg",       "text": "B" },
+    "x":           { "image": "art/kenney/steam_button_x.svg",       "text": "X" },
+    "y":           { "image": "art/kenney/steam_button_y.svg",       "text": "Y" },
+    "dpad":        { "image": "art/kenney/steam_dpad.svg",           "text": "Dpad" },
+    "dpad_up":     { "image": "art/kenney/steam_dpad_up.svg",        "text": "Up" },
+    "dpad_down":   { "image": "art/kenney/steam_dpad_down.svg",      "text": "Dn" },
+    "dpad_left":   { "image": "art/kenney/steam_dpad_left.svg",      "text": "Lt" },
+    "dpad_right":  { "image": "art/kenney/steam_dpad_right.svg",     "text": "Rt" },
+    "l1":          { "image": "art/kenney/steam_lb.svg",             "text": "LB" },
+    "r1":          { "image": "art/kenney/steam_rb.svg",             "text": "RB" },
+    "l2":          { "image": "art/kenney/steam_lt.svg",             "text": "LT" },
+    "r2":          { "image": "art/kenney/steam_rt.svg",             "text": "RT" },
+    "l4":          { "image": "art/kenney/controller_button_l4.svg", "text": "P3" },
+    "l5":          { "image": "art/kenney/controller_button_l5.svg", "text": "P4" },
+    "r4":          { "image": "art/kenney/controller_button_r4.svg", "text": "P1" },
+    "r5":          { "image": "art/kenney/controller_button_r5.svg", "text": "P2" },
+    "l3":          { "image": "art/kenney/steam_stick_l_press.svg",  "text": "LS" },
+    "r3":          { "image": "art/kenney/steam_stick_l_press.svg",  "text": "RS" },
+    "lstick":      { "image": "art/kenney/steam_stick.svg",          "text": "LS" },
+    "rstick":      { "image": "art/kenney/steam_stick.svg",          "text": "RS" },
+    "menu":        { "image": "art/kenney/controller_button_options.svg", "text": "Menu" },
+    "view":        { "image": "art/kenney/controller_button_view.svg",    "text": "View" },
+    "steam":       { "image": "art/kenney/controller_icon.svg",      "text": "Xbox" }
+  }
+}

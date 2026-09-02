@@ -138,6 +138,18 @@ pub struct Status {
     /// Every mode that can become active, in resolution order — for a widget
     /// that wants to show more than the current one.
     pub modes: Vec<String>,
+    /// Every controller the daemon can hear right now, in preference order:
+    /// `"puck"` for the Steam Controller, and the evdev backend's own label
+    /// (`"elite"`, else `"gamepad"`) for a pad it has adopted
+    /// ([`crate::evdev::Node::label`]). Both can be present at once; which one
+    /// is *driving* is the last-active-source rule in [`crate::run`], and it is
+    /// `layout` that says which won.
+    pub sources: Vec<String>,
+    /// The cheat-sheet layout id for the **active** source —
+    /// `"steam-controller-2026"` or `"xbox-elite-2"`. The sheet's widget names
+    /// no controller anywhere; it loads `layouts/<id>.json`, so this one string
+    /// is the whole of "which drawing should I show".
+    pub layout: String,
     /// Seconds since the epoch at the last publish.
     pub updated: u64,
 }
@@ -154,8 +166,12 @@ impl Status {
         push_str(&mut o, self.relay.as_str());
         o.push_str(", \"source\": ");
         push_str(&mut o, self.source.as_str());
+        o.push_str(", \"layout\": ");
+        push_str(&mut o, &self.layout);
         let _ = write!(o, ", \"pid\": {}, \"modes\": ", self.pid);
         push_strs(&mut o, &self.modes);
+        o.push_str(", \"sources\": ");
+        push_strs(&mut o, &self.sources);
         let _ = write!(o, ", \"updated\": {}}}", self.updated);
         o.push('\n');
         o
@@ -240,6 +256,8 @@ impl StatusWriter {
                 source: Source::default(),
                 pid: std::process::id(),
                 modes: Vec::new(),
+                sources: Vec::new(),
+                layout: crate::report::LAYOUT_PUCK.to_string(),
                 updated: now_secs(),
             },
             base_mode: BUILTIN_DESKTOP.to_string(),
@@ -347,6 +365,29 @@ impl StatusWriter {
         self.publish();
     }
 
+    /// Record which controllers the daemon can hear. Called whenever either
+    /// backend gains or loses a device; publishes only on a real change.
+    pub fn set_sources(&mut self, sources: Vec<String>) {
+        if self.status.sources == sources {
+            return;
+        }
+        self.status.sources = sources;
+        self.publish();
+    }
+
+    /// Record the cheat-sheet layout id of the **active** source.
+    ///
+    /// Written by the daemon and only by the daemon: `hyprpad bindings --json`
+    /// deliberately never touches the device, so the one process that knows
+    /// which controller is in the user's hands is the one that publishes it.
+    pub fn set_layout(&mut self, layout: &str) {
+        if self.status.layout == layout {
+            return;
+        }
+        self.status.layout = layout.to_string();
+        self.publish();
+    }
+
     /// Write the current state atomically: temp file, then rename over the real
     /// one. The rename is what makes a concurrent reader safe — it either sees
     /// the whole old object or the whole new one, never a partial write.
@@ -374,6 +415,36 @@ impl Drop for StatusWriter {
         let _ = std::fs::remove_file(&paths.file);
         let _ = std::fs::remove_file(&paths.tmp);
     }
+}
+
+/// The cheat-sheet layout id of the controller currently in the user's hands,
+/// as the running daemon last published it — or the puck's when no daemon is
+/// running, which is also the only honest answer then.
+///
+/// Deliberately a *string scrape* rather than a JSON parse: this file has no
+/// serialization dependency in either direction ([`Status::to_json`] emits by
+/// hand), and one field is not worth acquiring one. The value the daemon writes
+/// is always one of a handful of fixed ids, so it never contains an escape.
+pub fn active_layout() -> String {
+    let fallback = || crate::report::LAYOUT_PUCK.to_string();
+    let Some(path) = status_file_path() else { return fallback() };
+    let Ok(text) = std::fs::read_to_string(path) else { return fallback() };
+    match read_string_field(&text, "layout") {
+        Some(v) if !v.is_empty() => v,
+        _ => fallback(),
+    }
+}
+
+/// Pull `"<name>": "<value>"` out of one of this module's own objects.
+///
+/// Only ever applied to a file [`Status::to_json`] wrote, whose string values
+/// are fixed ids with no escapes in them — so a scan to the next quote is
+/// exact, not approximate.
+fn read_string_field(text: &str, name: &str) -> Option<String> {
+    let key = format!("\"{name}\": \"");
+    let rest = text.split_once(&key)?.1;
+    let (value, _) = rest.split_once('"')?;
+    Some(value.to_string())
 }
 
 /// A human name for the puck, from the `HID_NAME` its hidraw node advertises in
@@ -495,6 +566,8 @@ mod tests {
             source: Source::Direct,
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
+            sources: vec!["puck".to_string()],
+            layout: "steam-controller-2026".to_string(),
             updated: 1_725_230_000,
         }
     }
@@ -505,8 +578,10 @@ mod tests {
             sample().to_json(),
             "{\"connected\": true, \"mode\": \"desktop\", \
              \"controller\": \"Steam Controller Puck\", \"relay\": \"xbox\", \
-             \"source\": \"direct\", \"pid\": 12345, \
+             \"source\": \"direct\", \"layout\": \"steam-controller-2026\", \
+             \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
+             \"sources\": [\"puck\"], \
              \"updated\": 1725230000}\n"
         );
     }
@@ -551,6 +626,62 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no republish");
         w.set_source(Source::Direct);
         assert!(std::fs::read_to_string(&file).unwrap().contains(r#""source": "direct""#));
+    }
+
+    /// `"sources"` lists every controller the daemon can hear; `"layout"` says
+    /// which of them is driving, in the one word the cheat sheet needs.
+    #[test]
+    fn json_carries_the_live_sources_and_the_active_layout() {
+        let mut s = sample();
+        assert!(s.to_json().contains(r#""sources": ["puck"]"#), "{}", s.to_json());
+        assert!(
+            s.to_json().contains(r#""layout": "steam-controller-2026""#),
+            "{}",
+            s.to_json()
+        );
+        s.sources = vec!["puck".to_string(), "elite".to_string()];
+        s.layout = "xbox-elite-2".to_string();
+        let j = s.to_json();
+        assert!(j.contains(r#""sources": ["puck", "elite"]"#), "{j}");
+        assert!(j.contains(r#""layout": "xbox-elite-2""#), "{j}");
+        // Both pads present is the ordinary two-controller case; which one is
+        // *driving* is `layout`'s job, not the list's.
+        s.sources.clear();
+        assert!(s.to_json().contains(r#""sources": []"#), "{}", s.to_json());
+    }
+
+    #[test]
+    fn setting_the_sources_and_layout_publishes_once_per_real_change() {
+        let dir = TempDir::new("sources");
+        let file = dir.path().join("status.json");
+        let mut w = StatusWriter::in_dir(dir.path());
+        w.set_sources(vec!["puck".to_string()]);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""sources": ["puck"]"#));
+        let before = std::fs::read_to_string(&file).unwrap();
+        w.set_sources(vec!["puck".to_string()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no republish");
+
+        w.set_layout("xbox-elite-2");
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""layout": "xbox-elite-2""#));
+        let before = std::fs::read_to_string(&file).unwrap();
+        w.set_layout("xbox-elite-2");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no republish");
+    }
+
+    /// `active_layout` is what `hyprpad bindings --json` reads. It must round
+    /// trip with what the writer publishes, and answer the puck when there is
+    /// no daemon rather than failing.
+    #[test]
+    fn the_published_layout_reads_back() {
+        let published = Status { layout: "xbox-elite-2".to_string(), ..sample() };
+        assert_eq!(
+            read_string_field(&published.to_json(), "layout").as_deref(),
+            Some("xbox-elite-2")
+        );
+        // The field is found by name, not by position.
+        assert_eq!(read_string_field(&published.to_json(), "mode").as_deref(), Some("desktop"));
+        assert_eq!(read_string_field(&published.to_json(), "nope"), None);
+        assert_eq!(read_string_field("", "layout"), None);
     }
 
     /// The `"relay"` field: which sink a focused game is actually given.

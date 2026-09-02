@@ -1,0 +1,109 @@
+<!--
+  hyprpad's own schematic of the Xbox Elite Wireless Controller Series 2.
+
+  Drawn from scratch for this repo (CC0 / own work, like the puck's), so it
+  ships and redistributes under the repo's licence. Unlike the puck, there is
+  no Valve SVG to prefer here: Steam's own Elite drawing
+  (`steamui/images/controller/controller_config_controller_xboxelite.png`) is a
+  RASTER file, and the widget recolours SVG strokes (`Callouts.recolor()`), so
+  it could not be themed. See ../LICENSES.md.
+
+  The viewBox is 456 x 320, the same as the puck's, so the two layouts scale
+  identically in the panel and one set of callout geometry serves both.
+
+  Strokes are `white`, exactly as the puck's file draws them, so ONE recolour
+  path in the widget themes either drawing.
+
+  Every control centre here is duplicated in layouts/xbox-elite-2.json; the
+  drawing and the anchor map have to agree, and the numbers in the comments are
+  what keeps that checkable by eye.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 456 320" width="456" height="320"
+     fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"
+     stroke-linecap="round">
+
+  <!-- Shoulder ridges (LB / RB), drawn above the body so a control the front
+       view cannot really show still has something to point at. -->
+  <path d="M84 58 q10 -26 44 -28 q22 -1 34 7" stroke-width="3"/>
+  <path d="M372 58 q-10 -26 -44 -28 q-22 -1 -34 7" stroke-width="3"/>
+  <!-- Trigger hints (LT / RT), tucked behind the bumpers and dashed, because
+       they are on the far side of the pad. -->
+  <path d="M74 48 q4 -22 22 -30" stroke-width="2" stroke-dasharray="4 4"/>
+  <path d="M382 48 q-4 -22 -22 -30" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <!-- Body: the Elite's silhouette — a narrow waist, two long grips, and the
+       asymmetric stick placement that is the whole difference from the puck. -->
+  <path d="M228 52
+           C 262 52 292 55 318 60
+           C 342 65 358 74 370 92
+           C 388 118 404 158 414 200
+           C 424 240 420 274 400 292
+           C 384 306 360 306 344 292
+           C 330 280 320 258 308 244
+           C 298 232 288 228 274 228
+           C 250 228 206 228 182 228
+           C 168 228 158 232 148 244
+           C 136 258 126 280 112 292
+           C  96 306  72 306  56 292
+           C  36 274  32 240  42 200
+           C  52 158  68 118  86  92
+           C  98  74 114  65 138  60
+           C 164  55 194  52 228  52 Z" stroke-width="3"/>
+
+  <!-- Grip inner edges. -->
+  <path d="M152 232 C 132 250 118 276 108 296"/>
+  <path d="M304 232 C 324 250 338 276 348 296"/>
+
+  <!-- LEFT STICK, (145, 110): the Elite's high-left stick. -->
+  <circle cx="145" cy="110" r="30"/>
+  <circle cx="145" cy="110" r="18"/>
+
+  <!-- D-PAD, centred (168, 196) — below the left stick, not beside it.
+       Directions: up (168,174) down (168,218) left (146,196) right (190,196). -->
+  <path d="M160 172 h16 a4 4 0 0 1 4 4 v8 a4 4 0 0 0 4 4 h8
+           a4 4 0 0 1 4 4 v16 a4 4 0 0 1 -4 4 h-8
+           a4 4 0 0 0 -4 4 v8 a4 4 0 0 1 -4 4 h-16
+           a4 4 0 0 1 -4 -4 v-8 a4 4 0 0 0 -4 -4 h-8
+           a4 4 0 0 1 -4 -4 v-16 a4 4 0 0 1 4 -4 h8
+           a4 4 0 0 0 4 -4 v-8 a4 4 0 0 1 4 -4 z"/>
+
+  <!-- FACE BUTTONS: Y (352,96) X (322,126) B (382,126) A (352,156).
+       Same diamond, same letters and same positions as the puck's — which is
+       why the vendored Kenney A/B/X/Y glyphs serve both layouts. -->
+  <circle cx="352" cy="96" r="14"/>
+  <circle cx="322" cy="126" r="14"/>
+  <circle cx="382" cy="126" r="14"/>
+  <circle cx="352" cy="156" r="14"/>
+
+  <!-- RIGHT STICK, (288, 196): low and inboard, mirroring the d-pad. -->
+  <circle cx="288" cy="196" r="30"/>
+  <circle cx="288" cy="196" r="18"/>
+
+  <!-- XBOX (guide) BUTTON, (228, 84) — hyprpad's `steam` control: the chord
+       modifier every binding hangs off. Drawn as the logo's ring and cross. -->
+  <circle cx="228" cy="84" r="18"/>
+  <path d="M218 74 q10 10 20 20"/>
+  <path d="M238 74 q-10 10 -20 20"/>
+
+  <!-- VIEW (196, 122) and MENU (260, 122), the two small pills either side. -->
+  <rect x="184" y="114" width="24" height="16" rx="8"/>
+  <path d="M190 120 h12"/>
+  <rect x="248" y="114" width="24" height="16" rx="8"/>
+  <path d="M254 118 h12"/>
+  <path d="M254 126 h12"/>
+
+  <!-- PROFILE button, (228, 150). Deliberately drawn but NOT in the layout's
+       `controls`: it cycles the controller's firmware profile slot and is not
+       bindable — and in slots 1-3 the firmware mutes the paddles, which is why
+       it matters enough to draw at all. -->
+  <circle cx="228" cy="150" r="7"/>
+
+  <!-- PADDLES P1-P4, on the BACK of the grips, so dashed like the triggers.
+       hyprpad's names are the grips': P1 = R4 (356,252), P2 = R5 (328,288),
+       P3 = L4 (100,252), P4 = L5 (128,288) — upper pair first, which is the
+       correspondence SDL and the kernel both settled on. -->
+  <rect x="86" y="245" width="28" height="14" rx="7" stroke-dasharray="4 3"/>
+  <rect x="114" y="281" width="28" height="14" rx="7" stroke-dasharray="4 3"/>
+  <rect x="342" y="245" width="28" height="14" rx="7" stroke-dasharray="4 3"/>
+  <rect x="314" y="281" width="28" height="14" rx="7" stroke-dasharray="4 3"/>
+</svg>
