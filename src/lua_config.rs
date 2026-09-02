@@ -3391,6 +3391,30 @@ mod tests {
         );
         assert_eq!(lua.scroll(), toml.scroll());
         assert_eq!(lua.haptics(), toml.haptics());
+        // The caret scrub is the third ambient handler, and its knobs compare
+        // whole exactly as the cursor's and the scroll's do.
+        assert_eq!(lua.scrub(), toml.scrub());
+        // Its guard is the `guide_in` treatment again, and it earns more here:
+        // `scrub_enabled_in` is the guard AND the section's own master switch,
+        // because a scrub no config asked for is off rather than "allowed
+        // everywhere". So this pair of answers pins three things at once —
+        // that both files still WRITE the section (deleting either turns the
+        // wheel off, and a silent pass would be the whole feature vanishing
+        // from one front-end), that both guard it to the desktop, and that
+        // neither leaves the left pad jogging a caret inside a game.
+        let in_desktop = crate::config::ModeState::new("desktop", Vec::new());
+        assert_eq!(
+            lua.scrub_enabled_in(&in_desktop),
+            toml.scrub_enabled_in(&in_desktop),
+            "the caret scrub differs between config.lua and config.toml on the desktop"
+        );
+        assert!(lua.scrub_enabled_in(&in_desktop), "the sample ships the scrub switched on");
+        assert_eq!(
+            lua.scrub_enabled_in(&in_game),
+            toml.scrub_enabled_in(&in_game),
+            "the caret scrub differs between config.lua and config.toml in a game"
+        );
+        assert!(!lua.scrub_enabled_in(&in_game), "the left pad belongs to the game");
         // A TOML config has no modes, so a Lua binding guarded INTO one has no
         // TOML counterpart to compare against: the cheat sheet's own Left/Right
         // paging exists only under `cheatsheet`, and R1's Tab only under
@@ -3461,6 +3485,16 @@ mode = "circular"
 sensitivity = 1.0
 circular_step_degrees = 15.0
 
+[scrub]
+detent_deg = 15.0
+min_radius = 0.35
+fast_deg_per_s = 360.0
+fast_min_detents = 2
+slow_deg_per_s = 180.0
+word_tier = true
+select = "l5"
+only_in = ["desktop"]
+
 [buttons]
 dpad_up = "key up"
 dpad_down = "key down"
@@ -3497,5 +3531,7 @@ l2 = "osk shift"
 "guide+rpad_click" = "mouse left"
 "guide+view" = "exec hyprpad-cheatsheet toggle"
 "guide+quickaccess" = "controller_off"
+"guide+l4" = "seq: key f; set_mode hints"
+"guide+l5" = "seq: key shift+f; set_mode hints"
 "#;
 }

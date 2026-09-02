@@ -105,9 +105,10 @@ end)
 
 -- A terminal running Claude Code. Same window class as any other terminal, so
 -- the rule has to look INSIDE the window: `process_tree_has` walks the focused
--- window's /proc descendants (once per focused pid, cached). Finnicky by
--- design — starting `claude` in an already-focused terminal needs a refocus to
--- be noticed. Behaviour TBD; the mode is declared but nothing is guarded into
+-- window's /proc descendants (once per focused pid, cached). No refocus needed:
+-- the terminal renaming itself drops that cache (`rescan_on_title_change`), and
+-- the periodic `process_rescan_ms` sweep catches a program that renames nothing.
+-- Behaviour TBD; the mode is declared but nothing is guarded into
 -- it yet, so it currently behaves exactly like the desktop.
 --
 -- Uncomment to try it, then guard bindings with `:only_in("claude")`:
@@ -171,6 +172,25 @@ h.scroll {
   sensitivity = 1.0,
   circular_step_degrees = 15.0,
   only_in = { "desktop", "omarchy-ui", "browser" },
+}
+
+-- The caret jog wheel (docs/research/text-scrub.md): with the guide HELD,
+-- circling the LEFT pad steps the caret, faster circling climbs to whole words,
+-- and holding `select` sends every step with Shift. Writing the block IS the
+-- opt-in — the values below are the defaults, spelled out to be tuned.
+--
+-- Guarded like the cursor above, minus `browser`, deliberately: `select` is L5
+-- and `guide+l5` is the link-hints chord down there, so leaving the scrub out
+-- of that one mode is what keeps the two off the same button.
+h.scrub {
+  detent_deg       = 15.0,   -- one caret step per 15 degrees (24 per revolution)
+  min_radius       = 0.35,   -- ignore the dead centre, where the angle is noise
+  fast_deg_per_s   = 360.0,  -- above one revolution/s the step doubles...
+  fast_min_detents = 2,      -- ...once two detents in a row are that fast
+  slow_deg_per_s   = 180.0,  -- and drops back below this (2:1, so it cannot chatter)
+  word_tier        = true,   -- top rung is ctrl+arrow, not x4 characters
+  select           = "l5",   -- hold the left grip to select as you scrub
+  only_in          = { "desktop", "omarchy-ui" },
 }
 
 h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
@@ -326,3 +346,54 @@ h.bind("guide+quickaccess", "Controller off", h.controller_off())
 
 -- R4 grip: screenshot (fullscreen = no picker to drag through).
 h.bind("guide+r4", "Screenshot", h.exec "omarchy screenshot fullscreen")   -- one press, whole screen; use "windows"/"region" for a picker
+
+-- ---------------------------------------------------------------------------
+-- Browser link hints (docs/research/browser-hints.md).
+--
+-- One chord types Vimium's `f` into the page and puts the pad into `hints`,
+-- where the bare buttons ARE the hint letters — chosen so Vimium's upper-cased
+-- labels read as the button you press (A/X/Y, N/S/W/E on the D-pad, Q/C on the
+-- bumpers, 1-4 on the grips, 5/6 on the stick clicks). Vimium must be told the
+-- same alphabet, or it will label the links with letters no button sends:
+-- Options -> "Characters used for link hints" = axynsweqc123456, and add
+-- `unmap x` under Custom key mappings so X is a hint letter rather than
+-- Vimium's own close-tab.
+--
+-- `hints` has NO rule and lets itself go (`:transient`) — nothing outside the
+-- page can say when Vimium's hints are gone, so the mode carries its own way
+-- out: three presses is Vimium's longest code, B cancels (eaten, never typed),
+-- following a link renames the window, a click dismisses the hints too, and 8 s
+-- ends a session you walked away from. A transient mode may not have a `:when`;
+-- `h.set_mode` is the only way in.
+-- ---------------------------------------------------------------------------
+
+h.mode("hints"):transient {
+  max_presses = 3,
+  exit_on = { "b", "focus", "title", "click" },
+  timeout_ms = 8000,
+}
+
+-- `h.seq` is the one action that is a list of actions, run in order on a single
+-- press: type into the page, THEN move the daemon into the mode whose buttons
+-- are that page's hint letters. An `h.key` inside a sequence is a tap, not a
+-- held output — there is no release edge for it to pair with.
+h.bind("guide+l4", "Link hints",            h.seq { h.key "f",       h.set_mode "hints" }):only_in("browser")
+h.bind("guide+l5", "Link hints -> new tab", h.seq { h.key "shift+f", h.set_mode "hints" }):only_in("browser")
+
+local hint = {
+  a = "a", x = "x", y = "y",
+  dpad_up = "n", dpad_down = "s", dpad_left = "w", dpad_right = "e",
+  l1 = "q", r1 = "c",
+  l4 = "1", l5 = "2", r4 = "3", r5 = "4",
+  l3 = "5", r3 = "6",
+}
+for btn, letter in pairs(hint) do
+  h.button(btn, "Hint " .. letter:upper(), h.key(letter)):only_in("hints")
+end
+
+-- B stays UNBOUND in `hints`: it is the mode's exit button, eaten not typed.
+-- The clicks are kept, because a hint you cannot reach is still a link you can
+-- point at — and a click is one of the mode's own exits.
+h.button("rpad_click", h.mouse "left"):only_in("hints")
+h.button("r2", h.mouse "left"):only_in("hints")
+h.button("l2", h.mouse "right"):only_in("hints")

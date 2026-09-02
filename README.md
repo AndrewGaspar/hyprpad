@@ -82,6 +82,7 @@ local h = hyprpad
 h.daemon  { own_lizard = true, steam_button_poweroff = "off" }  -- see "Powering the controller off"
 h.cursor  { sens = 0.06, hysteresis = 0.0008, only_in = { "desktop" } }
 h.scroll  { mode = "circular", only_in = { "desktop" } }
+h.scrub   { select = "l5", only_in = { "desktop" } }            -- guide + circle the left pad = caret
 h.haptics { cursor_spacing_px = 96 }
 h.gamepad { enabled = true }
 
@@ -93,6 +94,7 @@ h.bind("guide+stick_down", h.workspace "previous")
 h.bind("guide+dpad_down",  h.move_to_workspace "emptyn")
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
+h.bind("guide+l4", "Link hints", h.seq { h.key "f", h.set_mode "hints" })  -- several actions, in order
 h.bind("guide+quickaccess", "Controller off", h.controller_off())  -- turn the PAD off
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button, held with it
 h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
@@ -103,9 +105,9 @@ h.osk_button("l2",  h.osk "shift")                       -- the keyboard's own a
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
 `h.keyboard`, `h.key`, `h.mouse`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`,
-`h.controller_off`, `h.none`, and — on `h.osk_button` only — `h.osk`. A plain
-string (`"workspace +1"`) works too — it is parsed by the same grammar the TOML
-file uses.
+`h.controller_off`, `h.seq`, `h.none`, and — on `h.osk_button` only — `h.osk`.
+A plain string (`"workspace +1"`) works too — it is parsed by the same grammar
+the TOML file uses.
 
 `h.workspace` and `h.move_to_workspace` take a **Hyprland workspace selector**.
 `+1`/`-1` step to the next/previous *existing* workspace (Hyprland's `e±n`,
@@ -209,6 +211,29 @@ One caveat until the uhid/udev masking work lands: while Steam runs
 Input's chord layer), so the two mice may move together. That is Steam's side
 of the device, not something this binding can switch off.
 
+#### The caret jog wheel on the left pad
+
+`h.scrub { … }` gives the **left** pad a second job under a held guide: circling
+it steps the text caret, one arrow key per detent, which is how you fix a
+dictation error without reaching for the keyboard. Writing the block *is* the
+opt-in — the wheel is off until a config asks for it, and `enabled = false`
+inside the block switches it back off without deleting the tuning beside it. A
+detent is `detent_deg` of rotation (15°, so 24 to a revolution — the
+granularity the circular scroll is already tuned to); circling faster than
+`fast_deg_per_s` (360°/s, a revolution a second) for `fast_min_detents` detents
+in a row climbs a rung to two characters a step and then to whole words
+(`ctrl+arrow`, because a dictation error is word-shaped and a word jump lands on
+a boundary instead of somewhere inside one), and it drops back below
+`slow_deg_per_s` — half the fast threshold, a 2:1 gap so a thumb hovering near
+it cannot chatter between units. Holding `select` (`l5`, the left grip: under
+the fingers of the same hand whose thumb is circling) sends every step with
+Shift, turning the same motion into a selection — that one is a *level* read
+per frame rather than a binding, so give it a button the guide layer leaves
+alone, and the cheat sheet draws both on the same callout so a collision is
+visible. The guard is the cursor's and the scroll's (`only_in` / `not_in`), and
+it is read together with the master switch, so a scrub nobody asked for is off
+rather than live everywhere. TOML spells it `[scrub]`, same keys.
+
 ### Modes and guards
 
 A **mode** is a named context chosen by a predicate. Rules run in definition
@@ -297,6 +322,28 @@ Resolution precedence: **manual override** (`h.set_mode` / `h.clear_mode` bound
 to a chord) → **first matching rule** → **`default_mode`**. On any mode
 transition the daemon runs the same clean handoff a controller disconnect does:
 held clicks and keys released, the virtual pad neutralled, dampers reset.
+
+#### Sequences, and a mode that gives itself back
+
+Two spellings make the browser link hints work, and both are general.
+`h.seq { h.key "f", h.set_mode "hints" }` is the one action that is a **list**
+of actions, run in order on a single press: type into the focused window, *then*
+move the daemon into the mode whose bare buttons are that page's hint letters.
+Each step does what it would do alone, with one difference — an `h.key` inside a
+sequence is a **tap**, pressed and released on the spot, because a held key
+needs a release edge to pair with and a sequence has none. Sequences never nest.
+What it enters is declared `h.mode("hints"):transient { max_presses = 3,
+exit_on = { "b", "focus", "title", "click" }, timeout_ms = 8000 }`: a mode you
+can only *enter* — `h.set_mode` is the way in, and a transient mode may not also
+carry a `:when`, which the loader refuses by name — and which then lets go of
+itself, because nothing outside the page can report that Vimium's hints are
+gone. Every field is optional and "off" is the empty value rather than omission
+(`max_presses = 0`, `timeout_ms = 0`, `exit_on = {}`), so `:transient {}` alone
+is that whole contract: three presses, `b` cancels and that press is
+**consumed** rather than typed, a focus change or a rename or a click drops it,
+and eight seconds of silence ends a session you walked away from. Each of them
+ends in the same re-resolve and the same handoff a focus change runs. The
+sample config carries the whole arrangement, alphabet and all.
 
 ### Guardrails
 
