@@ -523,6 +523,10 @@ pub fn run() -> std::io::Result<()> {
         match hypr.active_window() {
             Ok(info) if !info.class.is_empty() => {
                 watch.address = info.address.clone();
+                // Same reason, for the keyboard: it must know which window its
+                // prediction context belongs to before the first announcement
+                // arrives, or that announcement looks like a move.
+                osk.seed_focus(&info.class, &info.address, config.osk_learn_deny());
                 let focus = crate::mode::Focus {
                     class: info.class.clone(),
                     title: info.title,
@@ -834,9 +838,19 @@ pub fn run() -> std::io::Result<()> {
                 // The keyboard's word prediction keys on the focused window:
                 // its typed context belonged to the field we just left, and the
                 // class decides whether it may learn what is typed here at all
-                // (docs/research/osk-prediction.md §5.3 rule 2 / §8.1).
-                if let HyprEvent::ActiveWindow { class, .. } = &ev {
-                    osk.focus_changed(class, config.osk_learn_deny());
+                // (docs/research/osk-prediction.md §5.3 rule 2 / §8.1). Both
+                // halves of the compositor's announcement go in — the class,
+                // then the address that identifies the window — because an
+                // `activewindow` line is not a focus *change*: Hyprland re-emits
+                // it for the window that already has focus, and resetting on
+                // each one wiped the typed context about once a second behind a
+                // terminal with a spinner in its title.
+                match &ev {
+                    HyprEvent::ActiveWindow { class, .. } => {
+                        osk.focus_changed(class, config.osk_learn_deny());
+                    }
+                    HyprEvent::ActiveWindowV2 { address } => osk.focus_window_changed(address),
+                    _ => {}
                 }
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());

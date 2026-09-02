@@ -206,6 +206,22 @@ pub fn learn_denied(class: &str, deny: &[String]) -> bool {
     deny.iter().any(|d| !d.is_empty() && class.contains(&d.to_ascii_lowercase()))
 }
 
+/// Which window the keyboard's typed prediction context belongs to.
+///
+/// Hyprland announces one focus change **twice** — `activewindow` (class and
+/// title) and then `activewindowv2` (the window's address) — and it re-announces
+/// both for the window that *already* has focus, so an announcement is not a
+/// change. The address is the window's identity, so it decides; the class is
+/// only the fallback for a compositor that has sent no address.
+#[derive(Debug, PartialEq, Eq)]
+enum FocusedWindow {
+    /// The focused window's address, from `activewindowv2`.
+    Address(String),
+    /// Its class, from `activewindow`, on a compositor that has yet to send an
+    /// address. Never reached once one has been seen.
+    Class(String),
+}
+
 /// A live handle to the on-screen keyboard child process.
 ///
 /// Construct once, up front — nothing is spawned until the first
@@ -233,6 +249,15 @@ pub struct OskHandle {
     /// importantly — so a keyboard *raised inside* a denied window starts
     /// gated, with no focus change to trigger it. `None` until a focus is seen.
     learn: Option<bool>,
+    /// The window the prediction context belongs to, as of the last reset.
+    /// `None` until the first focus is known (a startup seed, or the first
+    /// announcement off the event socket). Compared — never assumed — so
+    /// Hyprland re-announcing the window that already has focus costs nothing.
+    focus: Option<FocusedWindow>,
+    /// Every line `send` was asked to write, in order. Tests assert on it; a
+    /// real daemon writes to the child's stdin and keeps nothing.
+    #[cfg(test)]
+    sent: Vec<String>,
 }
 
 impl OskHandle {
@@ -253,6 +278,9 @@ impl OskHandle {
             spawn_failed: false,
             events: Some(events),
             learn: None,
+            focus: None,
+            #[cfg(test)]
+            sent: Vec::new(),
         }
     }
 
@@ -348,27 +376,91 @@ impl OskHandle {
         self.send(&candidate_cmd(false));
     }
 
-    /// The focused window changed. Two things follow from that, and this is the
-    /// one call the frame loop makes for both
+    /// The compositor announced the focused window's **class**
+    /// (`activewindow`). Two things follow from a focus change, and this is one
+    /// of the two calls the frame loop makes for them
     /// (`docs/research/osk-prediction.md` §5.3 rule 2 / §8.1):
     ///
-    /// * whatever the keyboard had typed belongs to the *previous* field, so its
-    ///   prediction context is reset;
     /// * `class` decides whether the personal word cache may learn here at all.
+    ///   Re-evaluated on every announcement, so the gate can never be missed;
+    ///   nothing goes down the wire unless the answer actually flipped.
+    /// * whatever the keyboard had typed belongs to the *previous* field, so a
+    ///   real focus change resets its prediction context — but this line only
+    ///   gets to decide that on a compositor that has sent no address.
+    ///   [`focus_window_changed`](Self::focus_window_changed) decides once one
+    ///   has, because **an `activewindow` line is an announcement, not a
+    ///   change**: Hyprland re-emits it for the window that already has focus
+    ///   (measured behind a terminal whose title carries a spinner: 3 in 3 s,
+    ///   with focus never moving), and resetting on each of those wiped what the
+    ///   user had typed about once a second.
     ///
     /// The learning gate is remembered even while the keyboard is down, so the
     /// next `show` starts correctly gated. Everything else is a no-op unless the
     /// keyboard is up.
     pub fn focus_changed(&mut self, class: &str, deny: &[String]) {
         let allow = !learn_denied(class, deny);
-        let changed = self.learn != Some(allow);
+        let gate_flipped = self.learn != Some(allow);
         self.learn = Some(allow);
+        let moved = match &self.focus {
+            // An addressed compositor: the `activewindowv2` line that follows
+            // this one carries the identity, and it decides.
+            Some(FocusedWindow::Address(_)) => false,
+            Some(FocusedWindow::Class(known)) => known.as_str() != class,
+            None => true,
+        };
+        if moved {
+            self.focus = Some(FocusedWindow::Class(class.to_string()));
+        }
         if !self.active {
             return;
         }
-        self.send("context reset");
-        if changed {
+        if moved {
+            self.send("context reset");
+        }
+        if gate_flipped {
             self.send(&learn_cmd(allow));
+        }
+    }
+
+    /// The compositor announced the focused window's **address**
+    /// (`activewindowv2`) — the window's identity, and the closest thing
+    /// hyprpad can see to the identity of the text *field* the typed context
+    /// really belongs to.
+    ///
+    /// The prediction context is reset only when that address is not the one it
+    /// was already gathered against, so a re-announcement of the focused window
+    /// (and the `windowtitle` churn that comes with it) leaves what the user
+    /// typed alone. The learning gate is not this line's business: the
+    /// `activewindow` line immediately before it carried the class and has
+    /// already re-evaluated it.
+    pub fn focus_window_changed(&mut self, address: &str) {
+        let moved = match &self.focus {
+            Some(FocusedWindow::Address(known)) => known.as_str() != address,
+            // The class half of *this* announcement, which has already decided:
+            // adopting its address is not a second focus change.
+            Some(FocusedWindow::Class(_)) => false,
+            None => true,
+        };
+        self.focus = Some(FocusedWindow::Address(address.to_string()));
+        if moved && self.active {
+            self.send("context reset");
+        }
+    }
+
+    /// Prime the focused window at startup, from `j/activewindow`, *without*
+    /// treating it as a change: the event socket announces only changes, so
+    /// without this the first re-announcement of the window that was already
+    /// focused when the daemon started would look like a move and wipe the
+    /// context. `class` still sets the learning gate, so a keyboard raised
+    /// before any focus event starts correctly gated.
+    ///
+    /// Only an address is an identity worth priming; a reply that carries none
+    /// leaves the first announcement to decide, which costs at most one reset
+    /// of a context that is still empty.
+    pub fn seed_focus(&mut self, class: &str, address: &str, deny: &[String]) {
+        self.learn = Some(!learn_denied(class, deny));
+        if !address.is_empty() {
+            self.focus = Some(FocusedWindow::Address(address.to_string()));
         }
     }
 
@@ -410,6 +502,8 @@ impl OskHandle {
     /// child is torn down so a later [`show`](Self::show) can respawn it.
     /// Returns whether the line was delivered.
     fn send(&mut self, line: &str) -> bool {
+        #[cfg(test)]
+        self.sent.push(line.to_string());
         let ok = match self.stdin.as_mut() {
             Some(stdin) => writeln!(stdin, "{line}").and_then(|()| stdin.flush()).is_ok(),
             None => return false,
@@ -528,6 +622,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hypr::HyprEvent;
 
     #[test]
     fn normalize_maps_full_scale_to_unit() {
@@ -653,6 +748,196 @@ mod tests {
         // Nothing was spawned to do any of it.
         assert!(osk.child.is_none() && osk.stdin.is_none());
         assert!(!osk.is_active());
+    }
+
+    /// Feed the keyboard exactly what the daemon's compositor arm feeds it
+    /// (`src/run.rs`, `Input::Compositor`): the class off an `activewindow`
+    /// line, the address off the `activewindowv2` line that follows it, and
+    /// nothing at all off a rename.
+    fn feed(osk: &mut OskHandle, ev: &HyprEvent, deny: &[String]) {
+        match ev {
+            HyprEvent::ActiveWindow { class, .. } => osk.focus_changed(class, deny),
+            HyprEvent::ActiveWindowV2 { address } => osk.focus_window_changed(address),
+            _ => {}
+        }
+    }
+
+    /// Hyprland's two lines for one focus change, in the order it sends them.
+    fn announce(class: &str, address: &str) -> [HyprEvent; 2] {
+        [
+            HyprEvent::ActiveWindow {
+                class: class.to_string(),
+                title: String::new(),
+                pid: None,
+            },
+            HyprEvent::ActiveWindowV2 { address: address.to_string() },
+        ]
+    }
+
+    /// A handle that behaves as if `show` had succeeded, with no child behind
+    /// it: `send` records the line and then reports the missing pipe, which
+    /// (unlike a broken one) leaves `active` alone.
+    fn shown() -> OskHandle {
+        let mut osk = OskHandle::new();
+        osk.active = true;
+        osk
+    }
+
+    /// How many times the keyboard was told to throw its typed context away.
+    fn resets(osk: &OskHandle) -> usize {
+        osk.sent.iter().filter(|l| *l == "context reset").count()
+    }
+
+    #[test]
+    fn the_context_resets_once_per_focus_change_not_once_per_announcement() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = shown();
+
+        // One focus change, announced the way Hyprland announces it.
+        for ev in announce("firefox", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(resets(&osk), 1, "a real focus change resets the context, once");
+
+        // The same window announced again and again — what a terminal with a
+        // spinner in its title produces (3 `activewindow` + 3 `activewindowv2`
+        // in 3 s, with focus never moving). Before this rule each of those
+        // wiped the suggestions the user was reading.
+        for _ in 0..3 {
+            for ev in announce("firefox", "55d89beaf480") {
+                feed(&mut osk, &ev, &deny);
+            }
+        }
+        assert_eq!(resets(&osk), 1, "focus never moved: the typed context must survive");
+
+        // Another window of the *same class* is still another window, and its
+        // field starts empty — the address is what says so.
+        for ev in announce("firefox", "55d89beaf999") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(resets(&osk), 2, "a second window is a second context");
+    }
+
+    #[test]
+    fn title_churn_behind_an_unmoved_focus_never_resets_the_context() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = shown();
+        for ev in announce("foot", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(resets(&osk), 1);
+
+        // 3 s of the event socket, measured with Claude Code spinning in the
+        // focused terminal: 34 `windowtitle` + 33 `windowtitlev2` renames, and
+        // 3 re-announcements of a focus that never moved. The renames are the
+        // mode engine's business; the keyboard is handed none of them, and the
+        // re-announcements carry the address it is already gathering against.
+        let mut stream: Vec<HyprEvent> = Vec::new();
+        for i in 0..34 {
+            stream.push(HyprEvent::WindowTitle {
+                address: "55d89beaf480".to_string(),
+                title: None,
+            });
+            if i < 33 {
+                stream.push(HyprEvent::WindowTitle {
+                    address: "55d89beaf480".to_string(),
+                    title: Some(format!("claude · {i}s")),
+                });
+            }
+            if i % 11 == 10 {
+                stream.extend(announce("foot", "55d89beaf480"));
+            }
+        }
+        for ev in &stream {
+            feed(&mut osk, ev, &deny);
+        }
+        assert_eq!(resets(&osk), 1, "a spinning title is not a focus change");
+    }
+
+    #[test]
+    fn a_re_announcement_leaves_the_learning_gate_where_it_was() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = shown();
+        for ev in announce("firefox", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(osk.learn, Some(true));
+        // Moving into a terminal gates learning — once, however often the move
+        // is announced.
+        for _ in 0..3 {
+            for ev in announce("foot", "55d89beaf999") {
+                feed(&mut osk, &ev, &deny);
+            }
+        }
+        assert_eq!(osk.learn, Some(false), "the gate still follows a real focus change");
+        assert_eq!(resets(&osk), 2);
+        assert_eq!(
+            osk.sent.iter().filter(|l| l.starts_with("learn ")).count(),
+            2,
+            "`learn on` then `learn off`, and nothing for the repeats"
+        );
+    }
+
+    #[test]
+    fn the_startup_seed_primes_the_focus_without_resetting_anything() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = shown();
+        osk.seed_focus("foot", "55d89beaf480", &deny);
+        assert_eq!(osk.learn, Some(false), "a terminal is seeded gated");
+        // The first announcement after a restart is the compositor repeating
+        // what the seed already knows, not a focus change.
+        for ev in announce("foot", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert!(osk.sent.is_empty(), "nothing at all went down the wire");
+        // Moving off the seeded window still does.
+        for ev in announce("firefox", "55d89beaf999") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(resets(&osk), 1);
+
+        // A seed with no address to prime still gates learning, and still
+        // costs at most the one reset of an empty context.
+        let mut bare = shown();
+        bare.seed_focus("firefox", "", &deny);
+        assert_eq!(bare.learn, Some(true));
+        for ev in announce("firefox", "55d89beaf480") {
+            feed(&mut bare, &ev, &deny);
+        }
+        assert_eq!(resets(&bare), 1);
+    }
+
+    #[test]
+    fn without_addresses_the_focus_falls_back_to_the_window_class() {
+        // A compositor that sends no `activewindowv2` keeps exactly the old
+        // behaviour, minus the re-announcements: the class is the identity, so
+        // two windows of one class read as one field. That is the best an
+        // address-less event stream allows.
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = shown();
+        osk.focus_changed("firefox", &deny);
+        assert_eq!(resets(&osk), 1, "the first focus of the session");
+        osk.focus_changed("firefox", &deny);
+        assert_eq!(resets(&osk), 1, "re-announced, same window");
+        osk.focus_changed("foot", &deny);
+        assert_eq!(resets(&osk), 2);
+    }
+
+    #[test]
+    fn a_focus_change_with_the_keyboard_down_sends_nothing_but_is_remembered() {
+        let deny: Vec<String> = LEARN_DENY.iter().map(|s| s.to_string()).collect();
+        let mut osk = OskHandle::new();
+        for ev in announce("firefox", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert!(osk.sent.is_empty() && !osk.is_active());
+        // Raising the keyboard here must not be followed by a reset the next
+        // time the compositor re-announces this same window.
+        osk.active = true;
+        for ev in announce("firefox", "55d89beaf480") {
+            feed(&mut osk, &ev, &deny);
+        }
+        assert_eq!(resets(&osk), 0);
     }
 
     #[test]
