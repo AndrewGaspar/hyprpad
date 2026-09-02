@@ -7,9 +7,12 @@
 //!
 //! - the guide (Steam) button opens a desktop layer while it is held;
 //! - buttons and stick flicks during that hold are chords, owned by the WM;
-//! - a *bare* guide tap (no chord during the hold) is reported as such so the
-//!   daemon can pass it through to Steam, whose own guide button acts on
-//!   release.
+//!   a chord button's lift is reported too ([`GestureEvent::GuideChordRelease`])
+//!   so a chord can hold an output for as long as it is down;
+//! - a *bare* guide tap (no chord during the hold, and nothing the daemon
+//!   chose to spend the hold on — [`GestureEngine::consume_hold`]) is reported
+//!   as such so the daemon can pass it through to Steam, whose own guide
+//!   button acts on release.
 //!
 //! Timing uses the monotonic [`Instant`] passed by the caller, never the frame
 //! counter (which is a wrapping `u8`): the engine is therefore robust to
@@ -42,6 +45,18 @@ pub enum GestureEvent {
     GuideEnter,
     /// A button was pressed while the guide was held.
     GuideChord(report::Button),
+    /// A button whose press was reported as a [`GuideChord`](Self::GuideChord)
+    /// lifted while the guide is **still** held. The other edge of a chord, for
+    /// a binding that holds an output for as long as the chord does (a mouse
+    /// button on `guide+rpad_click`, a modifier on `guide+l5`). Not a binding
+    /// key: nothing resolves against it.
+    ///
+    /// Reported only for buttons that chorded during *this* hold — a button
+    /// already down when the guide went down never chorded, so its lift is
+    /// nobody's business — and never for a button that lifts in the same
+    /// report as the guide: that frame is a [`GuideLeave`](Self::GuideLeave),
+    /// which ends every chord at once.
+    GuideChordRelease(report::Button),
     /// A stick was flicked past the flick threshold while the guide was held.
     GuideStickFlick { stick: Stick, dir: StickDir },
     /// The guide crossed [`HOLD_THRESHOLD`] while still held. Emitted once per
@@ -53,7 +68,9 @@ pub enum GestureEvent {
     GuideHold,
     /// Guide released. `was_chorded == false` means a bare tap that the daemon
     /// should pass through to Steam; `true` means the hold carried at least one
-    /// chord or flick and was consumed by the desktop layer.
+    /// chord or flick — or the daemon spent it on something of its own
+    /// ([`GestureEngine::consume_hold`]) — and was consumed by the desktop
+    /// layer.
     GuideLeave { was_chorded: bool },
 }
 
@@ -85,6 +102,10 @@ pub struct GestureEngine {
     guide_since: Instant,
     was_chorded: bool,
     hold_fired: bool,
+    /// The buttons that chorded during the current hold and are still down,
+    /// one bit per [`report::Button`] discriminant. A lift reports a
+    /// [`GestureEvent::GuideChordRelease`] only for a button in this set.
+    chorded: u32,
     /// Per-stick hysteresis: `true` means a fresh flick may fire; `false` means
     /// the stick is still deflected from the last flick and must recenter.
     left_armed: bool,
@@ -100,6 +121,7 @@ impl GestureEngine {
             guide_since: Instant::now(),
             was_chorded: false,
             hold_fired: false,
+            chorded: 0,
             left_armed: true,
             right_armed: true,
         }
@@ -117,6 +139,7 @@ impl GestureEngine {
             self.guide_since = now;
             self.was_chorded = false;
             self.hold_fired = false;
+            self.chorded = 0;
             // Only arm a stick that is already centered, so pressing guide with
             // a stick already deflected does not fire a spurious flick.
             self.left_armed = Self::centered(frame.left_stick);
@@ -124,12 +147,22 @@ impl GestureEngine {
             events.push(GestureEvent::GuideEnter);
         }
 
-        // While the guide is held: chords, flicks, and the hold threshold.
+        // While the guide is held: chords, their releases, flicks, and the hold
+        // threshold.
         if guide_now {
+            // Releases before presses, so a button that is (impossibly) both
+            // released and pressed in one report ends the old chord first.
+            for b in frame.edges_up(&self.prev) {
+                if self.chorded & Self::bit(b) != 0 {
+                    self.chorded &= !Self::bit(b);
+                    events.push(GestureEvent::GuideChordRelease(b));
+                }
+            }
             for b in frame.edges_down(&self.prev) {
                 if Self::chordable(b) {
                     events.push(GestureEvent::GuideChord(b));
                     self.was_chorded = true;
+                    self.chorded |= Self::bit(b);
                 }
             }
             for (stick, axis) in [
@@ -149,9 +182,12 @@ impl GestureEngine {
             }
         }
 
-        // Leaving the guide layer.
+        // Leaving the guide layer. Every chord ends here, whether or not its
+        // button is still down: the leave is the release for all of them, so
+        // no per-button release is reported for this frame.
         if !guide_now && self.guide_active {
             self.guide_active = false;
+            self.chorded = 0;
             events.push(GestureEvent::GuideLeave {
                 was_chorded: self.was_chorded,
             });
@@ -164,6 +200,27 @@ impl GestureEngine {
     /// Whether the guide layer is currently active (guide held).
     pub fn guide_active(&self) -> bool {
         self.guide_active
+    }
+
+    /// Mark the current hold as spent by the desktop layer, so its release is
+    /// reported as `GuideLeave { was_chorded: true }` — never as the bare tap
+    /// Steam would act on — exactly as recognising a chord does.
+    ///
+    /// For the things the engine cannot see as chords: the daemon calls this
+    /// when the right pad moves the cursor under a held guide (`h.cursor {
+    /// guide_in = … }`). The decision is the daemon's, not the engine's, because
+    /// on a mode where the pad does nothing under the guide a thumb resting on
+    /// it must *not* eat the tap. A no-op while no guide is held.
+    pub fn consume_hold(&mut self) {
+        if self.guide_active {
+            self.was_chorded = true;
+        }
+    }
+
+    /// The `chorded` bit for a button: the enum is `#[repr(u8)]` with fewer
+    /// than 32 variants, so the discriminant is the bit.
+    fn bit(b: report::Button) -> u32 {
+        1 << (b as u32)
     }
 
     /// Edge-triggered flick detector with hysteresis, run per stick per frame.
@@ -580,5 +637,131 @@ mod tests {
         let e = g.update(&frame(&[Button::Steam, Button::DpadUp]), t + ms(900));
         assert!(e.contains(&GestureEvent::GuideChord(Button::DpadUp)));
         assert!(e.contains(&GestureEvent::GuideHold));
+    }
+
+    #[test]
+    fn a_chord_buttons_lift_is_reported_while_the_guide_is_held() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::PadRightClick]), t + ms(8)),
+            vec![GestureEvent::GuideChord(Button::PadRightClick)]
+        );
+        // Held: nothing. Lifted with the guide still down: the release, once.
+        assert!(g.update(&frame(&[Button::Steam, Button::PadRightClick]), t + ms(12)).is_empty());
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(16)),
+            vec![GestureEvent::GuideChordRelease(Button::PadRightClick)]
+        );
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(20)).is_empty());
+        // Pressed again during the same hold: a fresh chord and a fresh release.
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::PadRightClick]), t + ms(24)),
+            vec![GestureEvent::GuideChord(Button::PadRightClick)]
+        );
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(28)),
+            vec![GestureEvent::GuideChordRelease(Button::PadRightClick)]
+        );
+        // The hold was chorded, so its end is not a bare tap.
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+    }
+
+    #[test]
+    fn two_chords_release_independently() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        g.update(&frame(&[Button::Steam, Button::GripL5]), t + ms(8));
+        g.update(&frame(&[Button::Steam, Button::GripL5, Button::A]), t + ms(12));
+        // L5 lifts, A stays: only L5's release.
+        assert_eq!(
+            g.update(&frame(&[Button::Steam, Button::A]), t + ms(16)),
+            vec![GestureEvent::GuideChordRelease(Button::GripL5)]
+        );
+        assert_eq!(
+            g.update(&frame(&[Button::Steam]), t + ms(20)),
+            vec![GestureEvent::GuideChordRelease(Button::A)]
+        );
+    }
+
+    #[test]
+    fn a_button_down_before_the_guide_never_reports_a_release() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        // A is already down when the guide arrives: it never chorded, so its
+        // lift under the guide is not a chord release either.
+        g.update(&frame(&[Button::A]), t);
+        assert_eq!(
+            g.update(&frame(&[Button::A, Button::Steam]), t + ms(4)),
+            vec![GestureEvent::GuideEnter]
+        );
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(8)).is_empty());
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn lifting_the_chord_with_the_guide_is_a_leave_not_a_release() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        g.update(&frame(&[Button::Steam, Button::BumperR1]), t + ms(8));
+        // Both lift in one report: the leave ends every chord, so no separate
+        // release is reported — the consumer releases everything on the leave.
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+        // And the chord is forgotten with the hold: the next hold starts clean,
+        // so a button still down from before it cannot report a stale release.
+        g.update(&frame(&[Button::BumperR1]), t + ms(44));
+        g.update(&frame(&[Button::BumperR1, Button::Steam]), t + ms(48));
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(52)).is_empty());
+    }
+
+    #[test]
+    fn consume_hold_marks_the_hold_chorded() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        // The daemon spent the hold on something the engine cannot see (the
+        // pad moved the cursor): the release must not read as a bare tap.
+        g.consume_hold();
+        assert!(g.update(&frame(&[Button::Steam]), t + ms(8)).is_empty());
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: true }]
+        );
+        // It does not carry over: the next hold is a fresh, bare one.
+        g.update(&frame(&[Button::Steam]), t + ms(100));
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(140)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+    }
+
+    #[test]
+    fn consume_hold_without_a_guide_is_a_no_op() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.consume_hold();
+        // Nothing to consume: the next hold is still a bare tap.
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(40)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
     }
 }

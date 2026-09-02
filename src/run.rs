@@ -14,7 +14,13 @@
 //! why it is ordered this way. Highest first:
 //!
 //! 1. **Guide** — `guide_active()`. Every per-frame handler drops out while the
-//!    guide button is held, in a game as much as on the desktop.
+//!    guide button is held, in a game as much as on the desktop — with one
+//!    opt-in exception: where `h.cursor { guide_in = … }` lists the active
+//!    mode, the **right pad keeps driving the desktop cursor under the guide**
+//!    ([`cursor_active`]), which is how a game is pointed at without leaving
+//!    it (Steam Input's own "guide + pad = mouse"). The guide layer is still
+//!    rank 1 there — the game gets nothing — the pad has simply been given to
+//!    the desktop's pointer instead of to nobody.
 //! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
 //! 3. **Game forwarding** — [`drive_gamepad`], when the active mode forwards
 //!    and neither layer above is claiming.
@@ -37,7 +43,7 @@
 //! | handler | consults |
 //! |---|---|
 //! | [`handle_gesture`] | `modes.allows_gesture(..)` + `config.resolve_in(.., modes.state())` |
-//! | [`drive_cursor`] | `modes.cursor_enabled()` |
+//! | [`drive_cursor`] | `modes.cursor_enabled()` with the guide up, `modes.cursor_guide_enabled()` with it held ([`cursor_active`]) |
 //! | [`drive_scroll`] | `modes.scroll_enabled()` |
 //! | [`fire_buttons`] / [`drive_buttons`] | `modes.buttons()` (already filtered by each binding's guard) |
 //! | [`drive_gamepad`] | `gamepad_forwarding(.., modes.forwards(), modes.desktop_yielded(), ..)` |
@@ -58,6 +64,22 @@
 //! exactly the path a guide chord takes once it has resolved
 //! ([`perform_action`]). Both obey one gate: off while the guide button is
 //! held and while the on-screen keyboard owns the pads.
+//!
+//! ## Held outputs on guide chords
+//!
+//! The mirror image: a guide chord takes any action a bare button takes, and a
+//! key or mouse button on one (`h.bind("guide+rpad_click", h.mouse "left")`)
+//! is **held** rather than fired — pressed when the chord is recognised,
+//! released when the chord button lifts ([`GestureEvent::GuideChordRelease`])
+//! or the guide is released, whichever comes first, and routed by code to the
+//! keyboard or the pointer exactly as a bare `Hold` binding is. That is what
+//! clicks while the guide-mouse above is active, and what a modifier on a grip
+//! (`guide+l5` = Shift) will hang off. [`ChordKeys`] tracks what is down; the
+//! mode handoff and the disconnect path release it beside [`ButtonKeys`].
+//!
+//! A hold spent this way — a chord, or the pad moving the cursor — is
+//! *consumed* ([`GestureEngine::consume_hold`]): its release is never handed on
+//! as the bare guide tap Steam acts on.
 
 use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode,
@@ -254,6 +276,9 @@ pub fn run() -> std::io::Result<()> {
         }
     };
     let mut button_keys = ButtonKeys::new();
+    // The outputs guide chords hold (`guide+rpad_click` = a mouse button), the
+    // chord-side twin of `button_keys`.
+    let mut chord_keys = ChordKeys::new();
 
     // Haptic feedback from the actuator behind each trackpad. Built
     // unconditionally: it opens nothing until the first pulse, so a
@@ -393,6 +418,7 @@ pub fn run() -> std::io::Result<()> {
                     &mut osk_route,
                     pointer.as_mut(),
                     &mut button_keys,
+                    &mut chord_keys,
                     &mut keyboard,
                     &mut gamepad,
                     &mut haptics,
@@ -456,6 +482,9 @@ pub fn run() -> std::io::Result<()> {
                     &mut prev_frame,
                 );
                 button_keys.release_all(&mut keyboard, pointer.as_mut());
+                // The fresh gesture engine above has forgotten the guide was
+                // held, so no `GuideLeave` will ever release these: do it here.
+                chord_keys.release_all(&mut keyboard, pointer.as_mut());
                 // Same contract for the game: a vanished controller must not
                 // leave the virtual pad holding its last frame, or a rumble
                 // running with nothing left to stop it.
@@ -493,11 +522,12 @@ pub fn run() -> std::io::Result<()> {
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());
                     status.set_mode(modes.active());
                     mode_handoff(
-                            &mut cursor,
+                        &mut cursor,
                         &mut scroll,
                         &mut osk_route,
-                            pointer.as_mut(),
+                        pointer.as_mut(),
                         &mut button_keys,
+                        &mut chord_keys,
                         &mut keyboard,
                         &mut gamepad,
                         &mut haptics,
@@ -523,8 +553,17 @@ pub fn run() -> std::io::Result<()> {
                     if debug {
                         eprintln!("[gesture] {ge:?} -> {:?}", config.resolve_in(&ge, modes.state()));
                     }
-                    mode_changed |=
-                        handle_gesture(&hypr, &config, &mut modes, &mut osk, &mut hx, ge);
+                    mode_changed |= handle_gesture(
+                        &hypr,
+                        &config,
+                        &mut modes,
+                        &mut osk,
+                        &mut hx,
+                        &mut chord_keys,
+                        &mut keyboard,
+                        pointer.as_mut(),
+                        ge,
+                    );
                 }
                 // Bare-button actions that *fire* (`h.button("l5", h.exec …)`):
                 // the same actions a chord performs, on a button's press edge.
@@ -550,11 +589,12 @@ pub fn run() -> std::io::Result<()> {
                     eprintln!("hyprpad: mode -> {} (manual)", modes.active());
                     status.set_mode(modes.active());
                     mode_handoff(
-                            &mut cursor,
+                        &mut cursor,
                         &mut scroll,
                         &mut osk_route,
-                            pointer.as_mut(),
+                        pointer.as_mut(),
                         &mut button_keys,
+                        &mut chord_keys,
                         &mut keyboard,
                         &mut gamepad,
                         hx.dev,
@@ -579,28 +619,38 @@ pub fn run() -> std::io::Result<()> {
                         now,
                     );
                     if let Some(ptr) = pointer.as_mut() {
-                        drive_cursor(ptr, &frame, &mut cursor, true, true, &mut hx, now);
+                        drive_cursor(ptr, &frame, &mut cursor, false, &mut hx, now);
                         drive_scroll(ptr, &frame, &mut scroll, true, true, &mut hx, now);
                     }
                 } else if let Some(ptr) = pointer.as_mut() {
                     // Ambient (non-guide) layer: the RIGHT pad drives the cursor
                     // and the LEFT pad drives scroll. The guide layer takes both
-                    // pads away; the active mode decides each independently, via
-                    // that handler's own guard (`h.cursor { only_in = … }`).
-                    drive_cursor(
+                    // pads away — except where `h.cursor { guide_in = … }` keeps
+                    // the right pad a mouse under a held guide — and the active
+                    // mode decides each independently, via that handler's own
+                    // guard (`h.cursor { only_in = … }`).
+                    let guide = engine.guide_active();
+                    let moved = drive_cursor(
                         ptr,
                         &frame,
                         &mut cursor,
-                        engine.guide_active(),
-                        !modes.cursor_enabled(),
+                        cursor_active(guide, modes.cursor_enabled(), modes.cursor_guide_enabled()),
                         &mut hx,
                         now,
                     );
+                    // A hold spent on pointing is not a bare tap: once the pad
+                    // has moved the cursor under the guide, its release must
+                    // not reach Steam as the guide button (docs/research/
+                    // text-scrub.md §5) — the same rule a chord's recognition
+                    // applies.
+                    if guide && moved {
+                        engine.consume_hold();
+                    }
                     drive_scroll(
                         ptr,
                         &frame,
                         &mut scroll,
-                        engine.guide_active(),
+                        guide,
                         !modes.scroll_enabled(),
                         &mut hx,
                         now,
@@ -819,8 +869,9 @@ fn mode_handoff(
     cursor: &mut CursorState,
     scroll: &mut ScrollState,
     osk_route: &mut OskRoute,
-    pointer: Option<&mut VirtualPointer>,
+    mut pointer: Option<&mut VirtualPointer>,
     button_keys: &mut ButtonKeys,
+    chord_keys: &mut ChordKeys,
     keyboard: &mut Option<VirtualKeyboard>,
     gamepad: &mut GamepadState,
     haptics: &mut Haptics,
@@ -832,7 +883,11 @@ fn mode_handoff(
     // frame -> fire again -> toggle the overlay closed -> flip back -> reset ->
     // ... an open/close loop for as long as the chord is held (observed live).
     release_outputs(cursor, scroll, osk_route);
-    button_keys.release_all(keyboard, pointer);
+    button_keys.release_all(keyboard, pointer.as_deref_mut());
+    // A chord's held output is let go too (a drag under the guide-mouse does
+    // not follow us into the next mode); the chord itself stays recognised,
+    // so its eventual release finds nothing to do rather than firing again.
+    chord_keys.release_all(keyboard, pointer);
     gamepad.release(haptics);
 }
 
@@ -884,31 +939,53 @@ impl CursorState {
     }
 }
 
-/// Drive the pointer's *motion* from the right trackpad for a single frame.
+/// Whether the right pad drives the desktop cursor on this frame.
 ///
-/// Active only on the ambient (non-guide) layer and when the arbiter is not
-/// suppressing desktop control: the guide layer owns the pad for workspace
-/// gestures, and a focused game owns it for itself. Mouse *buttons* are not
-/// this function's business: a pad click or trigger pull is a bare-button
-/// binding (`rpad_click = "mouse left"` by default), pressed and released by
-/// [`drive_buttons`] under its own gate.
+/// The cursor's two guards, joined by the guide button: with the guide **up**
+/// the ambient guard decides (`h.cursor { only_in = … }`, `ambient`); with it
+/// **held** only the guide guard can keep the pad (`h.cursor { guide_in = … }`,
+/// `under_guide`), and the ambient one is irrelevant — the guide layer takes
+/// the pad away by default, and a game mode that guards the ambient cursor
+/// out (so the game gets the pad) is exactly the one that wants it back under
+/// the guide. Pure, so the whole decision table is unit-testable.
+fn cursor_active(guide: bool, ambient: bool, under_guide: bool) -> bool {
+    if guide {
+        under_guide
+    } else {
+        ambient
+    }
+}
+
+/// Drive the pointer's *motion* from the right trackpad for a single frame.
+/// Returns whether the pointer actually moved.
+///
+/// `active` is [`cursor_active`]'s answer (or `false` while the on-screen
+/// keyboard owns the pads): off, the desktop's claim is released — all filter
+/// state forgotten, so re-entry never differences across the gap — and the
+/// frame is dropped. On, the pad is smoothed and differenced into pointer
+/// motion whoever is holding what: the guide-mouse of `h.cursor { guide_in =
+/// … }` is this same path, same damper, same texture haptic. Mouse *buttons*
+/// are not this function's business: a pad click or trigger pull is a
+/// bare-button binding (`rpad_click = "mouse left"` by default), pressed and
+/// released by [`drive_buttons`] — or, under the guide, a chord's held output
+/// ([`ChordKeys`]).
 fn drive_cursor(
     ptr: &mut VirtualPointer,
     frame: &report::Frame,
     st: &mut CursorState,
-    guide_active: bool,
-    suppressed: bool,
+    active: bool,
     hx: &mut HapticCtx,
     now: Instant,
-) {
-    if guide_active || suppressed {
+) -> bool {
+    if !active {
         // Release the desktop's claim: forget the tracking origin (all filter
         // state) so re-entry starts clean.
         st.damper.reset();
         st.travel_px = 0.0;
-        return;
+        return false;
     }
 
+    let mut moved = false;
     if frame.pressed(report::Button::PadRightTouch) {
         // Smooth the absolute pad position first, then difference the *smoothed*
         // position (pointer-damping doc §4): the One Euro Filter + hysteresis
@@ -920,6 +997,7 @@ fn drive_cursor(
         let (dx, dy) = st.damper.relative(s, st.sens, true);
         if dx != 0 || dy != 0 {
             ptr.move_relative(f64::from(dx), f64::from(dy));
+            moved = true;
             // Trackpad texture: one faint pulse per spacing of cursor travel
             // (Steam Input's friction feel), on the pad doing the driving. At
             // most one per frame — the remainder carries, so fast flicks don't
@@ -935,6 +1013,7 @@ fn drive_cursor(
         st.damper.reset();
         st.travel_px = 0.0;
     }
+    moved
 }
 
 /// Scroll units emitted per `1.0` of normalized finger travel at `sensitivity`
@@ -1173,6 +1252,66 @@ impl ButtonKeys {
         mut pointer: Option<&mut VirtualPointer>,
     ) {
         for (_, code) in self.held.drain() {
+            emit_button_code(kbd, pointer.as_deref_mut(), code, false);
+        }
+    }
+}
+
+/// Cross-frame state for the *held* outputs on guide chords: the evdev code
+/// each chord is holding down, keyed by the chord's button. The chord-side
+/// twin of [`ButtonKeys`], kept apart from it because the two have different
+/// edges — a bare binding follows its button's level through `reconcile`, a
+/// chord's output is pressed on recognition ([`handle_gesture`]) and released
+/// on [`GestureEvent::GuideChordRelease`] or the guide's release, whichever
+/// comes first. Nothing here is a binding lookup: by the time a code lands in
+/// this map every gate and guard has already passed.
+///
+/// Released beside [`ButtonKeys`] on the mode handoff and the disconnect path,
+/// so a click held under the guide-mouse is never stranded across either.
+struct ChordKeys {
+    held: HashMap<report::Button, u16>,
+}
+
+impl ChordKeys {
+    fn new() -> ChordKeys {
+        ChordKeys { held: HashMap::new() }
+    }
+
+    /// A chord on `btn` resolved to a held `code`: the `(code, pressed)` edges
+    /// to emit. Normally one press. Should the button already be holding an
+    /// output — its release was never seen, which a fresh gesture engine can
+    /// do — that one is let go first, so no code is ever pressed twice. Pure.
+    fn press(&mut self, btn: report::Button, code: u16) -> Vec<(u16, bool)> {
+        let mut events = Vec::with_capacity(2);
+        if let Some(old) = self.held.insert(btn, code) {
+            events.push((old, false));
+        }
+        events.push((code, true));
+        events
+    }
+
+    /// The chord button lifted under the guide: the code to release, if it
+    /// was holding one. A button holding nothing (its chord was not a key, or
+    /// the handoff already let it go) is `None`. Pure.
+    fn release(&mut self, btn: report::Button) -> Option<u16> {
+        self.held.remove(&btn)
+    }
+
+    /// Forget everything held, returning the codes to release. Pure.
+    fn drain(&mut self) -> Vec<u16> {
+        self.held.drain().map(|(_, code)| code).collect()
+    }
+
+    /// Release every held output now: on the guide's release, the mode
+    /// handoff, and the disconnect path. Same contract as
+    /// [`ButtonKeys::release_all`] — a missing device drops the edge, the
+    /// held set empties regardless.
+    fn release_all(
+        &mut self,
+        kbd: &mut Option<VirtualKeyboard>,
+        mut pointer: Option<&mut VirtualPointer>,
+    ) {
+        for code in self.drain() {
             emit_button_code(kbd, pointer.as_deref_mut(), code, false);
         }
     }
@@ -2034,14 +2173,40 @@ fn process_rescan_due(config: &Config, modes: &ModeEngine, watch: &FocusWatch) -
 
 /// Handle one recognized gesture. Returns whether it moved the active mode
 /// (via [`Action::SetMode`] / [`Action::ClearMode`]).
+///
+/// A chord that resolves to a key or mouse button ([`Action::Key`]) is not
+/// performed but **held** ([`ChordKeys`]): pressed here, on the keyboard or
+/// the pointer by code, and released when the chord button lifts or the guide
+/// does. Those two releases are handled first and gated by nothing — an output
+/// that was pressed gets released whatever mode or overlay we are in now.
+#[allow(clippy::too_many_arguments)]
 fn handle_gesture(
     hypr: &Hypr,
     config: &Config,
     modes: &mut ModeEngine,
     osk: &mut OskHandle,
     hx: &mut HapticCtx,
+    chords: &mut ChordKeys,
+    keyboard: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
     ge: GestureEvent,
 ) -> bool {
+    match ge {
+        // The other edge of a held chord output. Not a binding: nothing
+        // resolves against it, and a button holding nothing is nothing.
+        GestureEvent::GuideChordRelease(b) => {
+            if let Some(code) = chords.release(b) {
+                emit_button_code(keyboard, pointer, code, false);
+            }
+            return false;
+        }
+        // The guide's release ends every chord at once, chorded or not (a
+        // chord button still down is released by the leave, never by a
+        // `GuideChordRelease` of its own).
+        GestureEvent::GuideLeave { .. } => chords.release_all(keyboard, pointer.as_deref_mut()),
+        _ => {}
+    }
+
     // A bare guide tap belongs to Steam: do nothing so the client sees its own
     // button (it acts on release). Chords and flicks are ours.
     if let GestureEvent::GuideLeave { was_chorded: false } = ge {
@@ -2063,6 +2228,21 @@ fn handle_gesture(
     // While the keyboard is up it owns the pads: suppress every desktop gesture
     // except the keyboard toggle itself, so the toggle chord can still dismiss.
     if osk.is_active() && !matches!(action, Action::ToggleKeyboard { .. }) {
+        return false;
+    }
+
+    // A key or mouse button on a chord is held, not fired: press it now and
+    // let `GuideChordRelease` / `GuideLeave` above let it go — the chord-side
+    // twin of a bare `Hold` binding, down to the feedback: the press-edge tick
+    // under the hand that pressed it ([`Haptic::Button`]), not the chord buzz,
+    // because to the hand this is a button going down, and the pad click that
+    // is its usual home already has its own. On a flick or the guide hold a
+    // key still does nothing: there is no release edge to pair it with.
+    if let (GestureEvent::GuideChord(b), Action::Key(code)) = (ge, &action) {
+        hx.fire(Haptic::Button, button_pad(b));
+        for (code, pressed) in chords.press(b, *code) {
+            emit_button_code(keyboard, pointer.as_deref_mut(), code, pressed);
+        }
         return false;
     }
 
@@ -2263,6 +2443,7 @@ fn is_guide_scoped(ge: &GestureEvent) -> bool {
     matches!(
         ge,
         GestureEvent::GuideChord(_)
+            | GestureEvent::GuideChordRelease(_)
             | GestureEvent::GuideStickFlick { .. }
             | GestureEvent::GuideHold
             | GestureEvent::GuideEnter
@@ -2299,8 +2480,10 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
         Action::Dispatch(payload) => hypr.dispatch_raw(payload).map(|_| ()),
         // Handled in `perform_action` against the OSK handle, never reaches here.
         Action::ToggleKeyboard { .. } => Ok(()),
-        // Bare-button keys are emitted by `drive_buttons` against the virtual
-        // keyboard, not dispatched here; a `key` bound to a guide chord no-ops.
+        // A key is never dispatched: a bare button's is held by
+        // `drive_buttons`, a chord's by `handle_gesture` (which never gets
+        // here with one). What does arrive is a key on a flick or the guide
+        // hold, which has no release edge to pair with and so does nothing.
         Action::Key(_) => Ok(()),
         // Handled in `perform_action` against the mode engine, never here.
         Action::SetMode(_) | Action::ClearMode => Ok(()),
@@ -3123,12 +3306,14 @@ mod tests {
         let mut keyboard: Option<VirtualKeyboard> = None;
         let mut gamepad = GamepadState { tried: true, ..GamepadState::new() };
         let mut haptics = Haptics::new();
+        let mut chord_keys = ChordKeys::new();
         mode_handoff(
             &mut cursor,
             &mut scroll,
             &mut osk_route,
             None,
             &mut button_keys,
+            &mut chord_keys,
             &mut keyboard,
             &mut gamepad,
             &mut haptics,
@@ -3141,5 +3326,169 @@ mod tests {
             "held chord re-fired across the handoff: {again:?}"
         );
         assert!(engine.guide_active(), "edge state must survive the handoff");
+    }
+
+    #[test]
+    fn the_cursor_follows_its_ambient_guard_with_the_guide_up_and_guide_in_with_it_held() {
+        // (guide, ambient, under_guide). Guide up: the ambient guard alone
+        // decides, whatever `guide_in` says.
+        assert!(cursor_active(false, true, false));
+        assert!(cursor_active(false, true, true));
+        assert!(!cursor_active(false, false, false));
+        assert!(!cursor_active(false, false, true));
+        // Guide held: only `guide_in` can keep the pad. The default (nothing
+        // listed) is today's behaviour — the guide layer takes it away, on the
+        // desktop as much as in a game.
+        assert!(!cursor_active(true, true, false));
+        assert!(!cursor_active(true, false, false));
+        // The case this exists for: a game mode that guards the ambient cursor
+        // OUT (so the game gets the pad) and lists itself in `guide_in`, so
+        // holding the guide turns the pad into a mouse.
+        assert!(cursor_active(true, false, true));
+        assert!(cursor_active(true, true, true));
+
+        // The same table read off a live mode engine, on the built-in path a
+        // TOML config gets. The virtual pad must never see the pad meanwhile:
+        // the guide is rank 1, so forwarding is off for as long as it is held.
+        let cfg = Config::from_toml_str("[cursor]\nguide_in = [\"game\"]\n").unwrap();
+        let mut m = ModeEngine::new(&cfg);
+        m.focus_changed(&cfg, "steam_app_413080", "", None);
+        assert!(!cursor_active(false, m.cursor_enabled(), m.cursor_guide_enabled()));
+        assert!(cursor_active(true, m.cursor_enabled(), m.cursor_guide_enabled()));
+        assert!(gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), false, false));
+        assert!(!gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), true, false));
+        m.focus_changed(&cfg, "foot", "", None);
+        assert!(cursor_active(false, m.cursor_enabled(), m.cursor_guide_enabled()));
+        assert!(!cursor_active(true, m.cursor_enabled(), m.cursor_guide_enabled()));
+    }
+
+    #[test]
+    fn a_key_on_a_guide_chord_is_held_until_the_button_or_the_guide_lets_go() {
+        use report::Button::*;
+        let mut chords = ChordKeys::new();
+        // Recognition presses.
+        assert_eq!(chords.press(PadRightClick, 0x110), vec![(0x110, true)]);
+        assert_eq!(chords.held.get(&PadRightClick), Some(&0x110));
+        // The button lifting under the guide releases exactly that output,
+        // once; a button holding nothing is nothing.
+        assert_eq!(chords.release(PadRightClick), Some(0x110));
+        assert_eq!(chords.release(PadRightClick), None);
+        assert_eq!(chords.release(BumperR1), None);
+        assert!(chords.held.is_empty());
+
+        // Two chords held at once; the guide releasing ends both.
+        chords.press(PadRightClick, 0x110);
+        chords.press(GripL5, 42);
+        let mut all = chords.drain();
+        all.sort_unstable();
+        assert_eq!(all, vec![42, 0x110]);
+        assert!(chords.held.is_empty());
+
+        // A press with no release ever seen for that button (a fresh gesture
+        // engine after a reconnect) lets the old output go first.
+        chords.press(GripL5, 42);
+        assert_eq!(chords.press(GripL5, 54), vec![(42, false), (54, true)]);
+        assert_eq!(chords.held.len(), 1);
+
+        // The mode handoff releases it like a bare button's, with no devices
+        // to send to; so does the disconnect path (`release_all` directly).
+        let cc = CursorConfig::default();
+        let mut cursor = CursorState::new(&cc);
+        let mut scroll = ScrollState::new(&ScrollConfig::default(), &cc);
+        let mut osk_route = OskRoute::new(&cc);
+        let mut button_keys = ButtonKeys::new();
+        let mut keyboard: Option<VirtualKeyboard> = None;
+        let mut gamepad = GamepadState { tried: true, ..GamepadState::new() };
+        let mut haptics = Haptics::new();
+        mode_handoff(
+            &mut cursor,
+            &mut scroll,
+            &mut osk_route,
+            None,
+            &mut button_keys,
+            &mut chords,
+            &mut keyboard,
+            &mut gamepad,
+            &mut haptics,
+        );
+        assert!(chords.held.is_empty(), "the handoff strands nothing");
+        chords.press(PadRightClick, 0x110);
+        chords.release_all(&mut None, None);
+        assert!(chords.held.is_empty(), "nor does a disconnect");
+    }
+
+    #[test]
+    fn a_mouse_button_on_a_chord_clicks_through_handle_gesture_and_lets_go_on_either_edge() {
+        use report::Button::*;
+        // The owner's binding, through the real dispatch: gates, guard,
+        // resolution, then the hold instead of `perform_action`.
+        let cfg = Config::from_toml_str(
+            "[bindings]\n\"guide+rpad_click\" = \"mouse left\"\n\"guide+l5\" = \"key leftshift\"\n",
+        )
+        .expect("parse");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut chords = ChordKeys::new();
+        let mut kbd: Option<VirtualKeyboard> = None;
+        // In a game, where the guide-mouse lives: chords are the escape hatch
+        // and survive the built-in game mode.
+        modes.focus_changed(&cfg, "steam_app_413080", "", None);
+
+        macro_rules! gesture {
+            ($ge:expr) => {
+                handle_gesture(
+                    &hypr,
+                    &cfg,
+                    &mut modes,
+                    &mut osk,
+                    &mut hx,
+                    &mut chords,
+                    &mut kbd,
+                    None,
+                    $ge,
+                )
+            };
+        }
+
+        // Recognition presses and holds; nothing is performed, no mode moves.
+        assert!(!gesture!(GestureEvent::GuideChord(PadRightClick)));
+        assert_eq!(chords.held.get(&PadRightClick), Some(&PointerButton::Left.evdev()));
+        // A second chord holds beside it — a modifier on a grip.
+        assert!(!gesture!(GestureEvent::GuideChord(GripL5)));
+        assert_eq!(chords.held.len(), 2);
+        // The pad click lifting under the guide releases the click and only
+        // the click.
+        assert!(!gesture!(GestureEvent::GuideChordRelease(PadRightClick)));
+        assert_eq!(chords.held.len(), 1);
+        assert!(chords.held.contains_key(&GripL5));
+        // The guide letting go first releases whatever is left.
+        assert!(!gesture!(GestureEvent::GuideChord(PadRightClick)));
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true }));
+        assert!(chords.held.is_empty());
+        // A release for a button holding nothing, and a chord that is not a
+        // key, hold nothing. (An unbound chord resolves to `None` before it
+        // reaches the hold.)
+        assert!(!gesture!(GestureEvent::GuideChordRelease(BumperR1)));
+        assert!(!gesture!(GestureEvent::GuideChord(BumperR1)));
+        assert!(chords.held.is_empty());
+        // And a bare tap still belongs to Steam.
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: false }));
+    }
+
+    #[test]
+    fn a_chord_release_is_guide_scoped_and_bound_to_nothing() {
+        use report::Button::PadRightClick;
+        assert!(is_guide_scoped(&GestureEvent::GuideChordRelease(PadRightClick)));
+        let cfg = Config::from_toml_str("[bindings]\n\"guide+rpad_click\" = \"mouse left\"\n")
+            .unwrap();
+        assert_eq!(
+            cfg.resolve(&GestureEvent::GuideChordRelease(PadRightClick)),
+            Action::None,
+            "the release edge carries no binding of its own"
+        );
     }
 }

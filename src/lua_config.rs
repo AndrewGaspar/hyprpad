@@ -49,7 +49,7 @@
 //! h.default_mode "desktop"
 //!
 //! -- Per-binding guards: every binding decides for itself where it is live.
-//! h.cursor { only_in = { "desktop" } }
+//! h.cursor { only_in = { "desktop" }, guide_in = { "game" } } -- guide + pad = mouse in a game
 //! h.button("a", h.key "enter"):only_in("desktop")
 //! h.bind("guide+l1", h.workspace "-1"):not_in("game")
 //! h.bind("guide+i", h.exec "…"):when(function(ctx) return ctx.focus.pid ~= nil end)
@@ -584,6 +584,7 @@ fn finish(
         button_descs: b.button_descs,
         osk_button_descs: b.osk_button_descs,
         cursor_guard: b.cursor_guard,
+        cursor_guide_guard: b.cursor_guide_guard,
         scroll_guard: b.scroll_guard,
         lua: Some(Rc::new(runtime)),
     })
@@ -649,6 +650,9 @@ struct Build {
     process_rescan_ms: Option<u64>,
     cursor: CursorConfig,
     cursor_guard: Guard,
+    /// `h.cursor { guide_in = … }`: where the pad stays a mouse under a held
+    /// guide. `None` until the file says so.
+    cursor_guide_guard: Option<Guard>,
     scroll: ScrollConfig,
     scroll_guard: Guard,
     haptics: HapticsConfig,
@@ -731,6 +735,11 @@ impl Build {
             if let Some(g) = g {
                 out.push((label, g));
             }
+        }
+        // Not a slot (nothing chains onto it), but a guard all the same, and
+        // a typo in it would silently leave the guide-held pad dead.
+        if let Some(g) = &self.cursor_guide_guard {
+            out.push(("the cursor under a held guide (guide_in)".to_string(), g));
         }
         out
     }
@@ -1166,7 +1175,10 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
 }
 
 /// `h.cursor { … }` — the `[cursor]` knobs, plus the guard keys that make the
-/// cursor a first-class guardable "virtual binding".
+/// cursor a first-class guardable "virtual binding": `only_in` / `not_in` for
+/// where the pad drives the cursor with the guide up, and `guide_in` for where
+/// it keeps doing so **while the guide is held** (the Steam-Input-style
+/// guide-mouse; off unless listed).
 fn section_cursor(
     lua: &Lua,
     build: &Rc<RefCell<Build>>,
@@ -1190,6 +1202,16 @@ fn section_cursor(
                 "deadzone" | "dead_zone" => b.cursor.deadzone = as_f64(&v, &k)?,
                 "only_in" => inline = Some(Guard::OnlyIn(mode_list(vec![v])?)),
                 "not_in" => inline = Some(Guard::NotIn(mode_list(vec![v])?)),
+                "guide_in" | "guide_only_in" => {
+                    let modes = mode_list(vec![v])?;
+                    if modes.is_empty() {
+                        return Err(err(
+                            "guide_in needs at least one mode name (leave it out to keep \
+                             the pad off under the guide)",
+                        ));
+                    }
+                    b.cursor_guide_guard = Some(Guard::OnlyIn(modes));
+                }
                 other => {
                     return Err(unknown_key(
                         "h.cursor",
@@ -1203,6 +1225,7 @@ fn section_cursor(
                             "deadzone",
                             "only_in",
                             "not_in",
+                            "guide_in",
                         ],
                     ))
                 }
@@ -2041,6 +2064,42 @@ mod tests {
             c.resolve_in(&GestureEvent::GuideChord(Button::BumperR1), &game),
             Action::Workspace(WorkspaceTarget::Relative(1))
         );
+    }
+
+    #[test]
+    fn guide_in_makes_the_pad_a_mouse_under_the_guide_in_the_listed_modes() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.cursor { sens = 0.06, only_in = { "desktop" }, guide_in = { "game" } }
+            "#,
+        );
+        let game = ModeState::new("game", vec![]);
+        // Two independent guards on one pad: with the guide up it is the
+        // desktop's cursor and the game's pad; with the guide held it is a
+        // mouse in the game and nothing on the desktop (where the guide layer
+        // keeps taking it away).
+        assert!(c.cursor_enabled_in(&desktop()) && !c.cursor_enabled_in(&game));
+        assert!(c.cursor_guide_enabled_in(&game) && !c.cursor_guide_enabled_in(&desktop()));
+        assert_eq!(c.cursor().sens, 0.06, "the knobs still parse beside it");
+
+        // A bare string is a list of one, as for only_in.
+        let one = load(r#"hyprpad.mode("game") hyprpad.cursor { guide_in = "game" }"#);
+        assert!(one.cursor_guide_enabled_in(&game));
+
+        // Left out: off everywhere — today's behaviour.
+        let off = load(r#"hyprpad.mode("game") hyprpad.cursor { only_in = { "desktop" } }"#);
+        assert!(!off.cursor_guide_enabled_in(&game) && !off.cursor_guide_enabled_in(&desktop()));
+
+        // A mode nobody declared is refused at load, like any other guard —
+        // a silent typo here would leave the guide-held pad dead.
+        let e = load_str(r#"hyprpad.cursor { guide_in = { "gmae" } }"#, "t.lua").unwrap_err();
+        assert!(e.contains("guide_in") && e.contains("'gmae'"), "{e}");
+        // And an empty list is a typo too: leave the key out for off.
+        let e = load_str(r#"hyprpad.cursor { guide_in = {} }"#, "t.lua").unwrap_err();
+        assert!(e.contains("guide_in needs at least one mode name"), "{e}");
     }
 
     #[test]

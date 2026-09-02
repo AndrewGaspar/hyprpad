@@ -124,6 +124,41 @@ keyboard without the modifier. `h.none` is not something a button can do —
 remove the line instead. `h.osk_button` stays keys-only: it types through the
 on-screen keyboard's own virtual keyboard.
 
+The mirror image holds for chords: `h.key` / `h.mouse` on a guide chord is a
+**held** output too — pressed when the chord is recognised, released when the
+chord button lifts or the guide is released, whichever comes first, and routed
+to the keyboard or the pointer by code exactly like a bare button's.
+`h.bind("guide+rpad_click", h.mouse "left")` clicks (and drags) under the
+guide; `h.bind("guide+l5", h.key "leftshift")` is a modifier on a grip. On a
+stick flick or `guide_hold` a key still does nothing — there is no release
+edge to pair it with. A held chord ticks the pad under the hand that pressed
+it (`h.haptics { buttons = true }`), not the chord buzz.
+
+#### The pad as a mouse inside a game
+
+`h.cursor { only_in = { "desktop" } }` gives the right pad to the game while a
+game has focus. `guide_in` gives it back **while the guide button is held**:
+
+```lua
+h.cursor { sens = 0.06, only_in = { "desktop" }, guide_in = { "game" } }
+h.bind("guide+rpad_click", "Click (guide mouse)", h.mouse "left"):only_in("game")
+```
+
+Hold the guide in a game and the right pad moves the desktop cursor — same
+damper, same texture haptic as on the desktop — and the pad click, bound as a
+chord, clicks. Steam's built-in controls use the same modality. The game gets
+nothing while the guide is held (the guide layer is rank 1; the virtual pad
+is neutralled on the way in), and a hold spent on pointing is *consumed*, so
+releasing the guide afterwards is not handed to Steam as a guide tap. Default
+is nowhere: without `guide_in` the guide layer takes the pad away everywhere,
+as before. TOML spells it `[cursor] guide_in = ["game"]`, against the built-in
+mode names.
+
+One caveat until the uhid/udev masking work lands: while Steam runs
+**unmasked** it sees the same controller and acts on guide+pad itself (Steam
+Input's chord layer), so the two mice may move together. That is Steam's side
+of the device, not something this binding can switch off.
+
 ### Modes and guards
 
 A **mode** is a named context chosen by a predicate. Rules run in definition

@@ -30,7 +30,7 @@
 //! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
 //! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
 //! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
-//! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
+//! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]); `guide_in = ["game"]` lists the modes where the pad drives the cursor *while the guide is held* |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
 //! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
 //! | `[gamepad]` | the virtual pad fed to games under focus, and its rumble back-channel ([`GamepadConfig`]) |
@@ -113,6 +113,11 @@ pub enum Action {
     /// Emit a raw evdev code. Bound to a *bare* controller button in the
     /// `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
     /// button is held and released when it lifts, so the kernel auto-repeats.
+    /// On a **guide chord** (`"guide+rpad_click" = "mouse left"`) it is held
+    /// the same way: pressed when the chord is recognised, released when the
+    /// chord button lifts or the guide is released, whichever comes first. On
+    /// a stick flick or `guide_hold` it does nothing — there is no release
+    /// edge to pair it with.
     ///
     /// The code space is evdev's own, so it names a mouse button as readily as
     /// a key: a `KEY_*` code is typed through
@@ -284,8 +289,9 @@ pub(crate) enum GestureKey {
 
 impl GestureKey {
     /// The binding key a gesture event resolves against, or `None` for the
-    /// lifecycle events that carry no binding — `GuideEnter` and a *chorded*
-    /// `GuideLeave`.
+    /// lifecycle events that carry no binding — `GuideEnter`, a *chorded*
+    /// `GuideLeave`, and a chord button's release (the daemon pairs that with
+    /// the chord it already resolved; nothing is bound to it).
     pub(crate) fn of(ev: &gesture::GestureEvent) -> Option<GestureKey> {
         use gesture::GestureEvent as E;
         match ev {
@@ -293,7 +299,7 @@ impl GestureKey {
             E::GuideStickFlick { stick, dir } => Some(GestureKey::Flick(*stick, *dir)),
             E::GuideLeave { was_chorded: false } => Some(GestureKey::Tap),
             E::GuideHold => Some(GestureKey::Hold),
-            E::GuideEnter | E::GuideLeave { was_chorded: true } => None,
+            E::GuideEnter | E::GuideLeave { was_chorded: true } | E::GuideChordRelease(_) => None,
         }
     }
 
@@ -390,6 +396,18 @@ pub(crate) fn key_code(name: &str) -> Result<u16, String> {
         "end" => 107,       // KEY_END
         "pageup" | "pgup" => 104, // KEY_PAGEUP
         "pagedown" | "pgdn" => 109, // KEY_PAGEDOWN
+        "delete" | "del" => 111, // KEY_DELETE
+        // The modifiers. Only meaningful *held* — with a bare button or a
+        // guide chord (`h.bind("guide+l5", h.key "leftshift")`), where the
+        // daemon keeps them down for as long as the button is.
+        "leftshift" | "shift" => 42, // KEY_LEFTSHIFT
+        "rightshift" => 54,          // KEY_RIGHTSHIFT
+        "leftctrl" | "ctrl" | "control" => 29, // KEY_LEFTCTRL
+        "rightctrl" => 97,           // KEY_RIGHTCTRL
+        "leftalt" | "alt" => 56,     // KEY_LEFTALT
+        "rightalt" | "altgr" => 100, // KEY_RIGHTALT
+        "leftmeta" | "meta" | "super" => 125, // KEY_LEFTMETA
+        "rightmeta" => 126,          // KEY_RIGHTMETA
         // The mouse buttons, under their evdev names: `key btn_left` is the
         // same binding `mouse left` is. Routed to the pointer by the daemon.
         "btn_left" => BTN_LEFT,
@@ -911,6 +929,15 @@ pub struct Config {
     pub(crate) osk_button_descs: HashMap<report::Button, String>,
     /// The guard on the cursor "virtual binding" (`h.cursor { only_in = … }`).
     pub(crate) cursor_guard: Guard,
+    /// Where the right pad drives the desktop cursor **while the guide is
+    /// held** (`h.cursor { guide_in = { "game" } }` / `[cursor] guide_in =
+    /// ["game"]`) — the Steam-Input-style "guide + pad = mouse" that lets a
+    /// game be pointed at without leaving it. `None` (the default) is today's
+    /// behaviour: the guide layer takes the pad away everywhere. Independent
+    /// of `cursor_guard`, which says where the pad drives the cursor with the
+    /// guide *up*; both front-ends set it, and it is a [`Guard`] rather than a
+    /// mode list so a `:when` predicate can drive it one day too.
+    pub(crate) cursor_guide_guard: Option<Guard>,
     /// The guard on the scroll "virtual binding" (`h.scroll { only_in = … }`).
     pub(crate) scroll_guard: Guard,
     /// The live Lua state behind a `config.lua`, holding the mode rules and
@@ -1005,6 +1032,7 @@ impl Config {
         let mut rescan_on_title_change = None;
         let mut process_rescan_ms = None;
         let mut cursor = CursorConfig::default();
+        let mut cursor_guide_guard = None;
         let mut scroll = ScrollConfig::default();
         let mut haptics = HapticsConfig::default();
         let mut gamepad = GamepadConfig::default();
@@ -1104,6 +1132,21 @@ impl Config {
                 // alias for `[cursor]`.
                 "cursor" | "damping" => {
                     let key = unquote(k).to_ascii_lowercase();
+                    // The one non-numeric knob: the modes in which the pad
+                    // drives the cursor while the guide is held. A TOML
+                    // config declares no modes, so the names it can mean are
+                    // the built-in pair (`game`, `desktop`).
+                    if matches!(key.as_str(), "guide_in" | "guide_only_in") {
+                        let modes = parse_string_list(v);
+                        if modes.is_empty() {
+                            return Err(format!(
+                                "line {lineno}: {key} needs at least one mode name \
+                                 (e.g. guide_in = [\"game\"])"
+                            ));
+                        }
+                        cursor_guide_guard = Some(Guard::OnlyIn(modes));
+                        continue;
+                    }
                     let val = parse_f64(&unquote(v))
                         .map_err(|e| format!("line {lineno}: {e}"))?;
                     match key.as_str() {
@@ -1229,12 +1272,15 @@ impl Config {
             rescan_on_title_change,
             process_rescan_ms,
             cursor,
+            cursor_guide_guard,
             scroll,
             haptics,
             gamepad,
             // The TOML dialect declares no modes and no guards: everything is
             // unguarded, and an empty mode list is the signal that
             // `ModeEngine` should keep its built-in game/desktop behaviour.
+            // (`guide_in` above is the one guard it can spell, against the
+            // built-in mode names.)
             ..Config::default()
         })
     }
@@ -1476,9 +1522,17 @@ impl Config {
     }
 
     /// Whether the right pad drives the desktop cursor in `st`
-    /// (`h.cursor { only_in = { "desktop" } }`).
+    /// (`h.cursor { only_in = { "desktop" } }`) — with the guide **up**.
     pub fn cursor_enabled_in(&self, st: &ModeState) -> bool {
         self.cursor_guard.allows(st)
+    }
+
+    /// Whether the right pad drives the desktop cursor in `st` **while the
+    /// guide is held** (`h.cursor { guide_in = { "game" } }`). `false`
+    /// everywhere unless the config says otherwise: the guide layer takes the
+    /// pad away by default.
+    pub fn cursor_guide_enabled_in(&self, st: &ModeState) -> bool {
+        self.cursor_guide_guard.as_ref().is_some_and(|g| g.allows(st))
     }
 
     /// Whether the left pad scrolls in `st` (`h.scroll { only_in = … }`).
@@ -1495,7 +1549,8 @@ impl Config {
             .chain(self.button_guards.values())
             .chain(self.osk_button_guards.values())
             .chain(self.button_alts.iter().map(|a| &a.guard))
-            .chain([&self.cursor_guard, &self.scroll_guard]);
+            .chain([&self.cursor_guard, &self.scroll_guard])
+            .chain(self.cursor_guide_guard.iter());
         let from_guards = guards.filter_map(|g| match g {
             Guard::When(i) => Some(*i + 1),
             _ => None,
@@ -1603,6 +1658,23 @@ fn strip_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+/// Parse a list of strings — `["game", "desktop"]`, or a bare `"game"` for a
+/// list of one — into its (unquoted, trimmed, non-empty) items. The only list
+/// the TOML dialect reads, so it is a splitter rather than a grammar: a comma
+/// inside a quoted name is not something a mode name can contain.
+fn parse_string_list(raw: &str) -> Vec<String> {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .unwrap_or(t);
+    inner
+        .split(',')
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Strip a single pair of matching surrounding quotes, if present.
@@ -1919,6 +1991,14 @@ mod tests {
         assert_eq!(key_code("space"), Ok(57));
         assert_eq!(key_code("tab"), Ok(15));
         assert_eq!(key_code("esc"), Ok(1));
+        // The modifiers, for a held chord (`guide+l5` = Shift) or bare button.
+        assert_eq!(key_code("leftshift"), Ok(42));
+        assert_eq!(key_code("shift"), Ok(42));
+        assert_eq!(key_code("rightshift"), Ok(54));
+        assert_eq!(key_code("ctrl"), Ok(29));
+        assert_eq!(key_code("alt"), Ok(56));
+        assert_eq!(key_code("super"), Ok(125));
+        assert_eq!(key_code("delete"), Ok(111));
         assert_eq!(key_code("escape"), Ok(1));
         assert_eq!(key_code("pageup"), Ok(104));
         assert_eq!(key_code("pgdn"), Ok(109));
@@ -2550,6 +2630,50 @@ rumble_intensity = 0.25
         assert_eq!(c.osk_buttons_in(&anywhere), *c.osk_buttons());
         assert!(c.cursor_enabled_in(&anywhere) && c.scroll_enabled_in(&anywhere));
         assert_eq!(c.gesture_guard(&GestureEvent::GuideChord(Button::A)), &Guard::Always);
+        // The one guard that defaults to "nowhere": the guide layer takes the
+        // pad away unless a config lists the modes where it stays a mouse.
+        assert!(c.cursor_guide_guard.is_none());
+        assert!(!c.cursor_guide_enabled_in(&anywhere));
+        assert!(!c.cursor_guide_enabled_in(&ModeState::new("game", vec![])));
+    }
+
+    #[test]
+    fn guide_in_lists_the_modes_where_the_pad_stays_a_mouse_under_the_guide() {
+        let c = Config::from_toml_str("[cursor]\nsens = 0.06\nguide_in = [\"game\"]\n")
+            .expect("parse");
+        assert_eq!(c.cursor().sens, 0.06, "the numeric knobs still parse beside it");
+        assert_eq!(c.cursor_guide_guard, Some(Guard::OnlyIn(vec!["game".into()])));
+        let game = ModeState::new("game", vec![]);
+        let desktop = ModeState::new("desktop", vec![]);
+        assert!(c.cursor_guide_enabled_in(&game));
+        assert!(!c.cursor_guide_enabled_in(&desktop));
+        // Orthogonal to where the pad drives the cursor with the guide up: a
+        // TOML config leaves that unguarded, so both are live in `game` — one
+        // with the guide held, one without.
+        assert!(c.cursor_enabled_in(&game));
+
+        // A bare string is a list of one; `[damping]` is the same section.
+        let one = Config::from_toml_str("[damping]\nguide_in = \"desktop\"\n").expect("parse");
+        assert_eq!(one.cursor_guide_guard, Some(Guard::OnlyIn(vec!["desktop".into()])));
+        let two = Config::from_toml_str("[cursor]\nguide_in = ['game', \"desktop\"]\n")
+            .expect("parse");
+        assert!(two.cursor_guide_enabled_in(&game) && two.cursor_guide_enabled_in(&desktop));
+
+        // An empty list is a typo, not "off" — leave the key out for off.
+        let e = Config::from_toml_str("[cursor]\nguide_in = []\n").unwrap_err();
+        assert!(e.contains("guide_in needs at least one mode name"), "{e}");
+        // And it is the only non-numeric knob: anything else is still a number.
+        assert!(Config::from_toml_str("[cursor]\nsens = [\"game\"]\n").is_err());
+    }
+
+    #[test]
+    fn string_lists_split_on_commas_and_shed_their_quotes() {
+        assert_eq!(parse_string_list("[\"game\"]"), vec!["game"]);
+        assert_eq!(parse_string_list("[ 'game' , \"desktop\" ]"), vec!["game", "desktop"]);
+        assert_eq!(parse_string_list("\"game\""), vec!["game"]);
+        assert_eq!(parse_string_list("game"), vec!["game"]);
+        assert!(parse_string_list("[]").is_empty());
+        assert!(parse_string_list("[ , ]").is_empty());
     }
 
     #[test]

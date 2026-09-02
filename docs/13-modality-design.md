@@ -236,6 +236,42 @@ Still open: the slow-timer `/proc` re-walk (so starting `claude` in an
 already-focused terminal switches mode without a refocus), per-mode binding
 overrides, and the further conditions (process_running, time, battery).
 
+### The guide-held cursor (`feat-guide-mouse`)
+
+The one place the guide layer *keeps* an ambient handler rather than taking it
+away. `h.cursor` carries a second guard:
+
+```lua
+h.cursor { only_in = { "desktop" }, guide_in = { "game" } }
+h.bind("guide+rpad_click", h.mouse "left"):only_in("game")
+```
+
+`only_in` is where the right pad drives the cursor with the guide **up**;
+`guide_in` is where it goes on doing so with the guide **held** — Steam Input's
+own "guide + pad = mouse", so a game can be pointed at without leaving it. The
+frame arm's rule is `cursor_active(guide, ambient, under_guide)` in
+`src/run.rs`: guide up → `only_in` decides; guide held → only `guide_in` can
+keep the pad. Default is nowhere. Two consequences fall out of the precedence:
+
+* The game gets nothing meanwhile — the guide is rank 1, forwarding is off for
+  as long as it is held, so `desktop_yielded()` is untouched and the
+  "forward = true but the cursor is live" warning never fires for it.
+* A hold spent on pointing is **consumed** (`GestureEngine::consume_hold()` on
+  the first cursor motion), so releasing the guide afterwards is not handed to
+  Steam as a bare guide tap — the rule `docs/research/text-scrub.md` §5 asks
+  of every guide-scoped pad handler.
+
+Clicking is a *held chord output*: a `h.key` / `h.mouse` on a guide chord is
+pressed on recognition and released on the chord button's lift
+(`GestureEvent::GuideChordRelease`) or the guide's, whichever first — tracked
+in `ChordKeys` beside `ButtonKeys` and released with it on the mode handoff and
+disconnect. This also makes `h.bind("guide+l5", h.key "leftshift")` a modifier
+on a grip, which the text-scrub design wants.
+
+Known interaction: while Steam runs unmasked it acts on guide+pad itself
+(Steam Input's chord layer), so two mice move together; the uhid/udev masking
+work is what removes that, not this feature.
+
 ## Open questions for the owner (superseded — see decisions above)
 
 1. **Category granularity** — is the six-category set (cursor/scroll/buttons/
