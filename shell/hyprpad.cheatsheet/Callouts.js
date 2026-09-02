@@ -246,7 +246,9 @@ function collapse(group, rows) {
   var buckets = {}
   var order = []
   for (var i = 0; i < rows.length; i++) {
-    var key = rows[i].modifier + " " + (rows[i].guarded ? rows[i].guard : "")
+    // A separator neither half can contain, spelled as an escape: a raw one
+    // in the source makes this file look binary to every tool that reads it.
+    var key = rows[i].modifier + "\u0000" + (rows[i].guarded ? rows[i].guard : "")
     if (!buckets[key]) { buckets[key] = []; order.push(key) }
     buckets[key].push(rows[i])
   }
