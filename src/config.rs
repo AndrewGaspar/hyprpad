@@ -1914,6 +1914,18 @@ impl Config {
         self.lua.is_some() && !self.modes.is_empty()
     }
 
+    /// Whether this config asks about the session lock, and so whether the
+    /// daemon should watch it ([`crate::hypr::watch_locked`]).
+    ///
+    /// Same shape and same rule as [`needs_focus_pid`](Self::needs_focus_pid),
+    /// with one extra question: a config with modes still pays nothing unless
+    /// some predicate of it actually mentions `locked`. A TOML config never
+    /// does — it has no predicates at all — so the lock poll is exactly as
+    /// opt-in as the process-tree sweep.
+    pub fn watches_lock(&self) -> bool {
+        !self.modes.is_empty() && self.lua().is_some_and(|rt| rt.reads_locked())
+    }
+
     /// The guard on a gesture binding, or [`Guard::Always`] when it carries
     /// none. Lifecycle events that can never be bound also read `Always` — they
     /// resolve to [`Action::None`] anyway.

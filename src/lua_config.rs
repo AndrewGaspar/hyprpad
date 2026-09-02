@@ -82,8 +82,18 @@
 //! ```
 //!
 //! `ctx.layers` is an array of namespaces (so `ipairs` and `#` work) with
-//! `:has(name)` and `:list()` on it. See [`crate::mode`] for how a mode is
-//! resolved.
+//! `:has(name)` and `:list()` on it.
+//!
+//! The third source is `ctx.locked` — a plain boolean, true while the session
+//! is locked. The lock screen is an `ext-session-lock-v1` surface, so it is
+//! neither a window nor a layer and the other two are blind to it:
+//!
+//! ```lua
+//! h.mode("locked").when(function(ctx) return ctx.locked end)
+//! h.button("a", h.key "enter"):when(function(ctx) return not ctx.locked end)
+//! ```
+//!
+//! See [`crate::mode`] for how a mode is resolved.
 //!
 //! ## Guardrails (the non-negotiable part)
 //!
@@ -168,6 +178,11 @@ pub struct LuaRuntime {
     /// tree must never be polled for changes in it
     /// ([`crate::mode::ModeEngine::process_rescan_useful`]).
     walks_process_tree: bool,
+    /// Whether the loaded file mentions `locked` at all. Decided the same way,
+    /// at load, by scanning the source: a config that never asks about the
+    /// session lock must never make the daemon poll the compositor for it
+    /// ([`crate::hypr::watch_locked`]).
+    reads_locked: bool,
     /// Predicate ids that have already logged a failure, so a permanently
     /// broken predicate complains once instead of on every focus change.
     complained: RefCell<Vec<usize>>,
@@ -194,6 +209,22 @@ impl LuaRuntime {
     /// does not mention it cannot possibly call it, and is never polled.
     pub fn walks_process_tree(&self) -> bool {
         self.walks_process_tree
+    }
+
+    /// Whether any predicate in this config reads `ctx.locked`. Decided at load
+    /// from the source text, by the same rule and with the same bias as
+    /// [`walks_process_tree`](Self::walks_process_tree): a file that says
+    /// `locked` anywhere may still never read it (one wasted 0.2 ms socket
+    /// round trip a second), but a file that never says the word cannot read
+    /// it, and is never polled for it.
+    ///
+    /// The needle is the bare word rather than `ctx.locked`, so the indirect
+    /// spellings — a predicate that took `ctx` under another name, or reached
+    /// it as `ctx["locked"]` — are caught too. Over-matching here costs a
+    /// socket round trip; under-matching would cost a mode that silently never
+    /// resolves.
+    pub fn reads_locked(&self) -> bool {
+        self.reads_locked
     }
 
     /// Drop the focused window's cached `/proc` walk so the next predicate that
@@ -257,6 +288,10 @@ impl LuaRuntime {
         let ctx = self.lua.create_table()?;
         ctx.set("focus", f)?;
         ctx.set("layers", self.layers_table(cx)?)?;
+        // A plain boolean, and deliberately so: there is exactly one thing to
+        // ask about a lock, and `ctx.locked` reads the way a guard wants to
+        // spell it — `:when(function(ctx) return not ctx.locked end)`.
+        ctx.set("locked", cx.locked)?;
         Ok(ctx)
     }
 
@@ -501,8 +536,14 @@ pub fn load_str(src: &str, name: &str) -> Result<Config, String> {
     // *source*, not of anything the file did while it ran: a rule that only ever
     // calls `process_tree_has` on a class it has not seen yet would otherwise
     // look unused at load time and never be polled.
-    finish(b, lua, deadline, src.contains("process_tree_has"))
-        .map_err(|e| format!("{name}: {e}"))
+    finish(
+        b,
+        lua,
+        deadline,
+        src.contains("process_tree_has"),
+        src.contains("locked"),
+    )
+    .map_err(|e| format!("{name}: {e}"))
 }
 
 /// Install the instruction-count watchdog hook.
@@ -530,6 +571,7 @@ fn finish(
     lua: Lua,
     deadline: Rc<Cell<Option<Instant>>>,
     walks_process_tree: bool,
+    reads_locked: bool,
 ) -> Result<Config, String> {
     // A `default_mode` nobody declared is a convenience, not a typo: declare it
     // implicitly (with no rule) so `h.default_mode "desktop"` alone works.
@@ -574,6 +616,7 @@ fn finish(
         deadline,
         procs: Rc::new(RefCell::new(ProcCache::default())),
         walks_process_tree,
+        reads_locked,
         complained: RefCell::new(Vec::new()),
     };
 
@@ -1670,15 +1713,20 @@ mod tests {
     /// A context in which only the focused window is interesting — most of
     /// them, since `ctx.layers` has its own tests.
     fn focused(focus: Focus) -> Context {
-        Context { focus, layers: Default::default() }
+        Context { focus, ..Context::default() }
     }
 
     /// A context in which only the overlays are interesting.
     fn showing(namespaces: &[&str]) -> Context {
         Context {
-            focus: Focus::default(),
             layers: namespaces.iter().map(|s| s.to_string()).collect(),
+            ..Context::default()
         }
+    }
+
+    /// A context in which only the session lock is interesting.
+    fn locked_session() -> Context {
+        Context { locked: true, ..Context::default() }
     }
 
     fn desktop() -> ModeState {
@@ -2386,6 +2434,93 @@ mod tests {
         assert!(rt.eval_predicate(rule(2), &two), "# counts the array part");
         assert!(rt.eval_predicate(rule(3), &two), ":list() is sorted");
         assert!(rt.eval_predicate(rule(4), &two), "ipairs walks it");
+    }
+
+    /// `ctx.locked` is the third half of the context (the lock screen is
+    /// neither a window nor a layer), and it has to work in both places a
+    /// predicate can live: a mode's selection rule, and a binding's `:when`
+    /// guard. The guard form is the one the owner asked for — "keep this button
+    /// off the password field" without declaring a mode for it.
+    #[test]
+    fn predicates_see_the_session_lock() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("locked").when(function(ctx) return ctx.locked end)
+            h.mode("desktop")
+            h.button("a", h.key "enter"):when(function(ctx) return not ctx.locked end)
+            h.bind("guide+b", h.key "escape"):when(function(ctx) return not ctx.locked end)
+            "#,
+        );
+        let rt = c.lua().expect("lua runtime");
+        let rule = c.modes()[0].rule.unwrap();
+        assert!(rt.eval_predicate(rule, &locked_session()), "locked");
+        assert!(!rt.eval_predicate(rule, &Context::default()), "unlocked");
+        // False, not nil: a rule that spells `ctx.locked == false` must work as
+        // readily as one that spells `not ctx.locked`.
+        let c2 = load(
+            r#"
+            local h = hyprpad
+            h.mode("unlocked").when(function(ctx) return ctx.locked == false end)
+            h.mode("desktop")
+            "#,
+        );
+        let rt2 = c2.lua().expect("lua runtime");
+        assert!(rt2.eval_predicate(c2.modes()[0].rule.unwrap(), &Context::default()));
+        assert!(!rt2.eval_predicate(c2.modes()[0].rule.unwrap(), &locked_session()));
+
+        // And the `:when` guards. A guard is evaluated from the predicate
+        // results a re-resolve already collected, so this is the state the
+        // engine would build in each context.
+        let slots = c.predicate_slots();
+        let results = |cx: &Context| {
+            (0..slots).map(|i| rt.eval_predicate(i, cx)).collect::<Vec<_>>()
+        };
+        let unlocked = ModeState::new("desktop", results(&Context::default()));
+        let locked = ModeState::new("locked", results(&locked_session()));
+        assert_eq!(
+            c.buttons_in(&unlocked).get(&Button::A),
+            Some(&Hold(28.into())),
+            "A is Enter with the session unlocked"
+        );
+        assert!(c.buttons_in(&locked).is_empty(), "and nothing at all while locked");
+        assert!(matches!(
+            c.resolve_in(&GestureEvent::GuideChord(Button::B), &locked),
+            Action::None
+        ));
+    }
+
+    /// The lock poll is opt-in, exactly as the process-tree sweep is: a config
+    /// that never says `locked` must never make the daemon ask the compositor
+    /// about it.
+    #[test]
+    fn only_a_config_that_asks_about_the_lock_is_polled_for_it() {
+        let asks = load(
+            r#"
+            local h = hyprpad
+            h.mode("locked").when(function(ctx) return ctx.locked end)
+            h.mode("desktop")
+            "#,
+        );
+        assert!(asks.lua().unwrap().reads_locked());
+        assert!(asks.watches_lock());
+
+        let does_not = load(
+            r#"
+            local h = hyprpad
+            h.mode("game").when(function(ctx) return ctx.focus.class == "steam" end)
+            h.mode("desktop")
+            "#,
+        );
+        assert!(!does_not.lua().unwrap().reads_locked());
+        assert!(!does_not.watches_lock());
+
+        // Modes are the other half of the gate: a file that mentions the lock
+        // but declares nothing cannot resolve on it either. (`h.default_mode`
+        // declares one implicitly, so this really is the no-modes case only for
+        // a config that declares none at all — which is every `config.toml`.)
+        let toml = Config::from_toml_str("[buttons]\na = \"key enter\"\n").expect("toml");
+        assert!(!toml.watches_lock(), "a TOML config has no predicates to ask with");
     }
 
     /// The same button, bound once per mode. A single binding per button was

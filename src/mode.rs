@@ -25,8 +25,9 @@
 //!
 //! Rules and `:when` guards are Lua predicates, and they run **on a context
 //! change only** — a focus change, a rename of the focused window, a fullscreen
-//! change, an overlay opening or closing, a manual override, a config reload,
-//! or the periodic process-tree rescan. Never per input frame: the resolved
+//! change, an overlay opening or closing, the session locking or unlocking, a
+//! manual override, a config reload, or the periodic process-tree rescan.
+//! Never per input frame: the resolved
 //! mode, the guard results, and the filtered button maps are all cached in this
 //! struct, and the per-frame handlers only read them.
 //!
@@ -56,11 +57,15 @@ pub const BUILTIN_DESKTOP: &str = "desktop";
 
 /// The observable world a mode rule selects on, whole.
 ///
-/// Two sources, both from the compositor and both cheap: the focused *window*
-/// ([`Focus`]) and the *overlays* on screen. The second exists because an
-/// overlay is a context a focus-only engine cannot see — a layer-shell surface
-/// takes the keyboard without any `activewindow` event behind it, so nothing
-/// but `openlayer`/`closelayer` says hyprpad's own cheat sheet is up and modal.
+/// Three sources, all from the compositor and all cheap: the focused *window*
+/// ([`Focus`]), the *overlays* on screen, and whether the session is *locked*.
+/// The second exists because an overlay is a context a focus-only engine cannot
+/// see — a layer-shell surface takes the keyboard without any `activewindow`
+/// event behind it, so nothing but `openlayer`/`closelayer` says hyprpad's own
+/// cheat sheet is up and modal. The third exists because the lock is a context
+/// neither of the first two can see: it is a surface of a *third* kind, and to
+/// an engine watching only windows and layers a locked session and an idle
+/// desktop are the same picture.
 ///
 /// Reaches Lua as `ctx`, one table per re-resolve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,6 +82,19 @@ pub struct Context {
     /// `ctx.layers:list()` read the same way twice running — a rule that
     /// renders the set must not watch it reshuffle.
     pub layers: BTreeSet<String>,
+    /// Whether the session is locked. `ctx.locked`.
+    ///
+    /// The third context source, and the one *neither* of the others can see.
+    /// Omarchy's lock screen is an `ext-session-lock-v1` surface: it is not a
+    /// window (no `activewindow`) and not layer-shell (no `openlayer`, and it
+    /// never appears in `hyprctl layers`), so to a focus-and-overlay engine a
+    /// locked session looks exactly like the desktop — with the difference
+    /// that every bare button now types into a password field.
+    ///
+    /// Fed by [`crate::hypr::watch_locked`], which polls `j/locked` on the
+    /// command socket the daemon already holds; see there for why this is a
+    /// poll and not an event.
+    pub locked: bool,
 }
 
 /// The focused window a mode rule selects on.
@@ -300,6 +318,28 @@ impl ModeEngine {
             return false;
         }
         self.ctx.layers = layers;
+        self.refresh(config)
+    }
+
+    /// The session locked or unlocked ([`crate::hypr::HyprEvent::Locked`]).
+    ///
+    /// Both the startup seed and every later change come through here — a bool
+    /// has no "whole set" to replace, so unlike the overlays there is no
+    /// separate seeding entry point, and a report of the state we already hold
+    /// is not a context change and re-resolves nothing. That is what makes the
+    /// poll behind it free: it fires every interval and costs one comparison
+    /// until the answer actually moves.
+    ///
+    /// Same gating as [`layer_changed`](Self::layer_changed): a config that
+    /// declares no modes — the TOML front-end, the only one that can have none
+    /// — resolves on window class alone, so the lock cannot change its answer
+    /// and it is never asked for. The poll is gated on the same question one
+    /// level up, so this is belt and braces rather than the load-bearing test.
+    pub fn lock_changed(&mut self, config: &Config, locked: bool) -> bool {
+        if config.modes().is_empty() || self.ctx.locked == locked {
+            return false;
+        }
+        self.ctx.locked = locked;
         self.refresh(config)
     }
 
@@ -938,6 +978,112 @@ mod tests {
         assert_eq!(m.buttons().get(&Button::B), Some(&Hold(14.into())));
         // Closing what is not open re-resolves nothing.
         assert!(!m.layer_changed(&c, "hyprpad-cheatsheet", false));
+    }
+
+    /// The reason `ctx.locked` exists, end to end on the file the owner will
+    /// actually drop in: while the session is locked, nothing the pad does
+    /// reaches the password field.
+    ///
+    /// The `locked` mode declares no bindings of its own. What makes it empty
+    /// is that every bare button, both mouse clicks, the cursor and the scroll
+    /// are `:only_in` *other* modes — so this asserts the effect the sample's
+    /// comment claims, rather than trusting it.
+    #[test]
+    fn a_locked_session_takes_the_bare_buttons_away() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "foot", "ajg@framework", None);
+        assert_eq!(m.active(), "desktop");
+        assert_eq!(m.buttons().len(), 9);
+
+        // The screen locks. No window changed and no layer opened — the lock is
+        // a surface of neither kind — so this is the only thing that says so.
+        assert!(m.lock_changed(&c, true));
+        assert_eq!(m.active(), "locked");
+        assert!(m.buttons().is_empty(), "no bare button types into the password field");
+        assert!(!m.cursor_enabled(), "and the pad is not a pointer on it");
+        assert!(!m.scroll_enabled());
+        assert!(!m.cursor_guide_enabled(), "not even under the guide");
+        assert!(!m.forwards(), "nothing to forward to");
+        // Specifically the four the owner named.
+        for b in [Button::DpadUp, Button::DpadDown, Button::DpadLeft, Button::DpadRight] {
+            assert_eq!(m.buttons().get(&b), None, "{b:?} must not be an arrow key here");
+        }
+        assert_eq!(m.buttons().get(&Button::A), None, "A must not be Enter here");
+        assert_eq!(m.buttons().get(&Button::B), None, "B must not be Backspace here");
+        assert_eq!(m.buttons().get(&Button::PadRightClick), None);
+        // The guide chords are unguarded, so they survive this mode as they
+        // survive every other — deliberately: a chord cannot reach the field,
+        // and the keyboard is the one way to type at a lock screen on purpose.
+        assert_ne!(
+            c.resolve_in(&GestureEvent::GuideChord(Button::GripR5), m.state()),
+            Action::None,
+            "guide+R5 (play/pause) still works from a locked screen"
+        );
+        assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::GripR5), true));
+
+        // Unlocking hands it all back, and the focused window never moved.
+        assert!(m.lock_changed(&c, false));
+        assert_eq!(m.active(), "desktop");
+        assert_eq!(m.buttons().len(), 9);
+    }
+
+    /// The lock beats every other rule, because it is drawn over everything:
+    /// locking over a game must not leave the pad forwarding into it, and
+    /// locking with the cheat sheet up must not leave B on Escape.
+    #[test]
+    fn a_locked_session_wins_over_every_other_mode() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+
+        m.focus_changed(&c, "steam_app_413080", "Portal 2", None);
+        assert_eq!(m.active(), "game");
+        assert!(m.lock_changed(&c, true));
+        assert_eq!(m.active(), "locked");
+        assert!(!m.forwards(), "the lock has the keyboard, not the game");
+        assert!(m.lock_changed(&c, false));
+        assert_eq!(m.active(), "game");
+
+        // ...and over the sheet, which is itself above the game.
+        m.focus_changed(&c, "foot", "ajg@framework", None);
+        assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
+        assert_eq!(m.active(), "cheatsheet");
+        assert!(m.lock_changed(&c, true));
+        assert_eq!(m.active(), "locked");
+        assert!(m.buttons().is_empty());
+    }
+
+    /// The seed. `j/locked` is asked once at startup for the same reason the
+    /// focus and the overlays are: a daemon started — or restarted — while the
+    /// screen is already locked would otherwise spend the whole lock in
+    /// `desktop`. And a report of the state already held is not a transition,
+    /// which is what makes the poll behind it free.
+    #[test]
+    fn the_session_lock_is_seeded_at_startup_and_costs_nothing_while_it_holds() {
+        let c = sample_config();
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.active(), "desktop", "the engine starts unlocked");
+
+        // Startup seeding is the same call as any later change.
+        assert!(m.lock_changed(&c, true), "the seed is a context change");
+        assert_eq!(m.active(), "locked");
+        // Every later poll that finds the same answer re-resolves nothing, so
+        // no handoff runs and no predicate is evaluated.
+        for _ in 0..5 {
+            assert!(!m.lock_changed(&c, true));
+        }
+        assert_eq!(m.active(), "locked");
+        assert!(m.lock_changed(&c, false));
+        assert!(!m.lock_changed(&c, false), "and neither does unlocking twice");
+
+        // A config with no modes — every `config.toml` — never tracks the lock
+        // at all, exactly as it never tracks the overlays. It is not polled
+        // either (`Config::watches_lock`), so this is the second gate.
+        let toml = Config::from_toml_str("[buttons]\na = \"key enter\"\n").expect("toml");
+        let mut t = ModeEngine::new(&toml);
+        assert!(!t.lock_changed(&toml, true));
+        assert_eq!(t.active(), "desktop");
+        assert_eq!(t.buttons().len(), 1, "and its bare button is untouched");
     }
 
     /// The sheet is *modal*: it is drawn over whatever is focused, so it has to

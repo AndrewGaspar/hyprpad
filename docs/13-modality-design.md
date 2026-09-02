@@ -29,8 +29,12 @@ near-term needs:
   optional per-mode binding overrides. Modes layer over a base so each only
   states its deltas.
 - **Context** — the current world the daemon can observe: focused window class /
-  title / fullscreen, the process tree inside the focused window, a manual
-  override, (later) running processes, time, battery, etc.
+  title / fullscreen, the process tree inside the focused window, the
+  layer-shell overlays on screen (`ctx.layers`), whether the session is locked
+  (`ctx.locked`), a manual override, (later) running processes, time, battery,
+  etc. The last two of those are the ones a focus-only engine cannot see — an
+  overlay and a lock surface both take the keyboard with no `activewindow`
+  behind them.
 - **Rule** — `context predicate → mode`. Rules are ordered; first match wins.
 - **ModeEngine** — subsumes `Arbiter`: tracks Context, re-resolves the active
   Mode on every context change, and exposes the resolved Mode's flags to the loop.

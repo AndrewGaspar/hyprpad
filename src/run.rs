@@ -422,6 +422,54 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
+    // Seed the session lock, and start watching it. Third context source, same
+    // reason as the first two — a daemon started while the screen is locked
+    // must not spend the lock in `desktop`, typing D-pad arrows into a password
+    // field — but with one difference: there is no event to fall back on. The
+    // compositor emits nothing on socket2 for `ext-session-lock-v1`, so the
+    // seed and the watch are the *same* `j/locked` query, once here and once a
+    // second in a thread (`hypr::watch_locked` weighs that against the
+    // alternatives). Gated on a config that actually asks: `watches_lock` is
+    // false for every TOML config and for any `config.lua` that never mentions
+    // the lock, and then not a single query is made.
+    //
+    // Keyed off the config as it stands *now*, like the lizard-ownership wiring
+    // above: a `hyprpad reload` that introduces the first `ctx.locked`
+    // predicate re-resolves against it (the engine's context is still whatever
+    // was last seeded) but does not start the watcher — adding the lock to a
+    // config that never had it wants a restart. Taking it away is free, because
+    // no rule reads it any more.
+    if config.watches_lock() {
+        let locked = match hypr.locked() {
+            Ok(locked) => {
+                if modes.lock_changed(&config, locked) {
+                    eprintln!("hyprpad: session is locked, mode '{}'", modes.active());
+                }
+                locked
+            }
+            Err(e) => {
+                eprintln!("warning: could not seed the session lock state ({e})");
+                false
+            }
+        };
+        match crate::hypr::watch_locked(locked, crate::hypr::LOCK_POLL_INTERVAL) {
+            Ok(events) => {
+                let tx_l = tx.clone();
+                std::thread::spawn(move || {
+                    for e in events {
+                        if tx_l.send(Input::Compositor(e)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            Err(e) => eprintln!("warning: not watching the session lock ({e})"),
+        }
+    }
+    // The seeds above may have moved the mode (a daemon started under the lock,
+    // or over a game); the status file was written before them, so say so.
+    status.set_mode(modes.active());
+
     loop {
         // The periodic process-tree rescan (`process_rescan_ms`), the title-less
         // half of noticing a program that starts under the focused window.
@@ -539,6 +587,8 @@ pub fn run() -> std::io::Result<()> {
                 let why = match &ev {
                     HyprEvent::WindowTitle { .. } => " (title change)",
                     HyprEvent::Layer { .. } => " (overlay)",
+                    HyprEvent::Locked(true) => " (session locked)",
+                    HyprEvent::Locked(false) => " (session unlocked)",
                     _ => "",
                 };
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
@@ -2452,6 +2502,11 @@ fn update_modes(
         // An overlay came up or went away. No compositor round trip: the
         // namespace is the whole event, and the engine keeps the set.
         HyprEvent::Layer { namespace, open } => modes.layer_changed(config, &namespace, open),
+        // The session locked or unlocked. Synthesized by `hypr::watch_locked`
+        // today and read off the wire if the fork ever emits it; either way it
+        // is an ordinary context change from here on, and a restatement of the
+        // state we hold costs one comparison.
+        HyprEvent::Locked(on) => modes.lock_changed(config, on),
         _ => false,
     }
 }
@@ -4321,6 +4376,39 @@ mod tests {
         assert!(chords.held.is_empty());
         // And a bare tap still belongs to Steam.
         assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: false }));
+    }
+
+    /// The lock, all the way through the daemon's event arm: a
+    /// [`HyprEvent::Locked`] — however it arrived, off the wire or synthesized
+    /// by the poll — is an ordinary context change and needs no compositor
+    /// round trip to become one (the `Hypr` here is detached; touching it would
+    /// fail).
+    #[test]
+    fn a_lock_event_moves_the_mode_with_no_compositor_round_trip() {
+        let c = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("locked").when(function(ctx) return ctx.locked end)
+            h.mode("desktop")
+            h.button("a", h.key "enter"):only_in("desktop")
+            "#,
+            "test.lua",
+        )
+        .expect("config should load");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&c);
+        let mut w = FocusWatch::new();
+        assert_eq!(modes.active(), "desktop");
+        assert_eq!(modes.buttons().len(), 1);
+
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, HyprEvent::Locked(true)));
+        assert_eq!(modes.active(), "locked");
+        assert!(modes.buttons().is_empty());
+        // A repeat is not a transition, so the caller runs no second handoff.
+        assert!(!update_modes(&mut modes, &c, &hypr, &mut w, HyprEvent::Locked(true)));
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, HyprEvent::Locked(false)));
+        assert_eq!(modes.active(), "desktop");
+        assert_eq!(modes.buttons().len(), 1);
     }
 
     #[test]
