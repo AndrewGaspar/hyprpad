@@ -169,8 +169,10 @@ h.button("r1", "Next sheet tab", h.key "right"):only_in("cheatsheet")
 -- opens shares the `omarchy-keyboard-panel` layer — already in the `omarchy-ui`
 -- allowlist above — and Tab inside one closes it and opens its neighbour, so
 -- R1 walks the ring that `guide+dpad_up` (below) opens: Agents, Bluetooth,
--- Network, Audio, Display, Power. R1's second alternate, and as exclusive as
--- the first: under a panel we are in `omarchy-ui`, never in `cheatsheet`.
+-- Network, Audio, Display, Power — and Shift+Tab on L1 walks it backwards.
+-- The bumpers' second alternate, and as exclusive as the first: under a panel
+-- we are in `omarchy-ui`, never in `cheatsheet`.
+h.button("l1", "Previous panel", h.key "shift+tab"):only_in("omarchy-ui")
 h.button("r1", "Next panel", h.key "tab"):only_in("omarchy-ui")
 
 -- Browser tabs on the bumpers (docs/research/browser-hints.md §6): Chrome's
@@ -207,8 +209,8 @@ h.bind("guide+r1",          "Workspace right",     h.workspace "+1")
 h.bind("guide+l1",          "Workspace left",      h.workspace "-1")
 h.bind("guide+stick_right", "Workspace right",     h.workspace "+1")
 h.bind("guide+stick_left",  "Workspace left",      h.workspace "-1")
-h.bind("guide+x",           "New workspace",       h.dispatch 'hl.dsp.focus({ workspace = "emptyn" })')
-h.bind("guide+stick_down",  "Previous workspace",  h.dispatch 'hl.dsp.focus({ workspace = "previous" })')
+h.bind("guide+x",           h.workspace "emptyn")
+h.bind("guide+stick_down",  h.workspace "previous")
 h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle")
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")
@@ -222,14 +224,15 @@ h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" }
 -- click there too. Elsewhere the bare `rpad_click` binding is already one.
 h.bind("guide+rpad_click",  "Click (guide mouse)", h.mouse "left"):only_in("game")
 
--- `guide+x` and the stick's down flick above are HypXRland workspace
--- selectors (docs/research/empty-workspace.md): `emptyn` is the first empty
--- workspace to the RIGHT of this one, created at the end if none is free, and
--- `previous` is where you were before it. They go through `h.dispatch` until
--- `h.workspace` learns them. "B closes, X opens", the right stick is a whole
--- family (left/right = ±1, down = back), and D-pad down takes the focused
--- window along to the new one.
-h.bind("guide+dpad_down",   "Window to new workspace", h.dispatch 'hl.dsp.window.move({ workspace = "emptyn", follow = true })')
+-- `guide+x` and the stick's down flick above are Hyprland workspace selectors
+-- (docs/research/empty-workspace.md), handed straight to `h.workspace`:
+-- `emptyn` is the first empty workspace to the RIGHT of this one, created at
+-- the end if none is free, and `previous` is where you were before it. They
+-- need no description of their own — the sheet words a selector itself ("Next
+-- empty workspace"). "B closes, X opens", the right stick is a whole family
+-- (left/right = ±1, down = back), and D-pad down takes the focused window
+-- along to the new one.
+h.bind("guide+dpad_down",   h.move_to_workspace "emptyn")
 
 -- Up to the bar (docs/research/bar-navigation.md, phase 0): opens the first
 -- panel of the bar's right section; R1 then walks the rest, the D-pad and A

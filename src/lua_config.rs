@@ -2644,9 +2644,9 @@ l2 = "osk shift"
 "guide+l1" = "workspace -1"
 "guide+stick_right" = "workspace +1"
 "guide+stick_left"  = "workspace -1"
-"guide+x" = 'dispatch hl.dsp.focus({ workspace = "emptyn" })'
-"guide+stick_down" = 'dispatch hl.dsp.focus({ workspace = "previous" })'
-"guide+dpad_down" = 'dispatch hl.dsp.window.move({ workspace = "emptyn", follow = true })'
+"guide+x" = "workspace emptyn"
+"guide+stick_down" = "workspace previous"
+"guide+dpad_down" = "movetoworkspace emptyn"
 "guide+dpad_up" = "exec omarchy-shell -q shell togglePanelAt right 1"
 "guide+a" = "exec voxtype record toggle"
 "guide+b" = "dispatch hl.dsp.window.close()"

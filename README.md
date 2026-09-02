@@ -88,9 +88,9 @@ h.gamepad { enabled = true }
 h.bind("guide+r1", "Workspace right", h.workspace "+1")  -- desc is optional
 h.bind("guide+menu", h.exec "omarchy-menu")
 h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
-h.bind("guide+x",  "New workspace",      h.dispatch 'hl.dsp.focus({ workspace = "emptyn" })')
-h.bind("guide+stick_down", "Previous workspace", h.dispatch 'hl.dsp.focus({ workspace = "previous" })')
-h.bind("guide+dpad_down",  "Window to new workspace", h.dispatch 'hl.dsp.window.move({ workspace = "emptyn", follow = true })')
+h.bind("guide+x",  h.workspace "emptyn")                 -- first empty workspace to the right
+h.bind("guide+stick_down", h.workspace "previous")
+h.bind("guide+dpad_down",  h.move_to_workspace "emptyn")
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button, held with it
@@ -115,10 +115,7 @@ compositor verbatim, so the whole selector grammar is available:
 free), `"empty"`, `"emptym"`, `"previous"`, `"next"`, `"r+1"`, `"m-1"`,
 `"special"`, `"special:term"`. A *named* workspace is spelled out —
 `h.workspace "name:foo"` — because a bare word is a **selector, not a name**.
-The `guide+x` / `guide+stick_down` / `guide+dpad_down` lines above therefore
-also read `h.workspace "emptyn"`, `h.workspace "previous"` and
-`h.move_to_workspace "emptyn"`. (See `docs/research/empty-workspace.md` for what
-each selector resolves to.)
+(See `docs/research/empty-workspace.md` for what each selector resolves to.)
 
 `h.key` takes a **combo**: modifier names joined to the key with `+`, as in
 `h.key "shift+tab"`, `h.key "ctrl+left"`, `h.key "ctrl+shift+tab"` or
