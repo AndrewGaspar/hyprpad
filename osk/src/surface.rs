@@ -83,8 +83,18 @@ pub struct PanelSpec {
 ///   centre reflow *requires* an independent exclusive zone on each edge. The
 ///   cost is two surfaces to keep in sync; the benefit is real two-sided reflow
 ///   and each thumb owning its own physical surface.
-pub fn panels_for(mode: LayoutMode, reflow: bool, keyboard: &Keyboard, geom: &Geom) -> Vec<PanelSpec> {
-    let eng = LayoutEngine::new(keyboard, mode);
+///
+/// `strip` is how many candidate slots the prediction strip holds (0 for none);
+/// it is part of the content, so it grows the panel's height and, in reflow
+/// mode, the bottom exclusive zone with it.
+pub fn panels_for(
+    mode: LayoutMode,
+    reflow: bool,
+    keyboard: &Keyboard,
+    geom: &Geom,
+    strip: usize,
+) -> Vec<PanelSpec> {
+    let eng = LayoutEngine::new(keyboard, mode).with_strip(strip);
     let size = |role: PanelRole| {
         let (w, h) = eng.content_size(role, geom);
         (w.ceil() as u32, h.ceil() as u32)
@@ -140,7 +150,7 @@ mod tests {
 
     #[test]
     fn bottom_deck_is_one_bottom_centered_content_sized_panel() {
-        let p = panels_for(LayoutMode::BottomDeck, true, &kb(), &geom());
+        let p = panels_for(LayoutMode::BottomDeck, true, &kb(), &geom(), 0);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].role, PanelRole::Bottom);
         // Bottom edge only → compositor centres it horizontally.
@@ -157,7 +167,7 @@ mod tests {
 
     #[test]
     fn overlay_mode_sets_zero_exclusive_zone() {
-        let p = panels_for(LayoutMode::BottomDeck, false, &kb(), &geom());
+        let p = panels_for(LayoutMode::BottomDeck, false, &kb(), &geom(), 0);
         assert_eq!(p[0].exclusive_zone, 0);
         // Same surface/anchor as reflow — only the zone differs.
         assert!(p[0].anchor.contains(Anchor::BOTTOM));
@@ -167,7 +177,7 @@ mod tests {
     #[test]
     fn side_split_is_two_opposite_edge_content_sized_columns() {
         let full_h: u32 = 1254; // this machine's usable height; columns must be shorter
-        let p = panels_for(LayoutMode::SideSplit, true, &kb(), &geom());
+        let p = panels_for(LayoutMode::SideSplit, true, &kb(), &geom(), 0);
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].role, PanelRole::LeftColumn);
         assert!(p[0].anchor.contains(Anchor::LEFT));
@@ -189,5 +199,21 @@ mod tests {
     #[test]
     fn tier_is_overlay_never_top() {
         assert!(matches!(LAYER, Layer::Overlay));
+    }
+
+    #[test]
+    fn a_candidate_strip_grows_the_panel_and_its_exclusive_zone() {
+        let g = geom();
+        let plain = panels_for(LayoutMode::BottomDeck, true, &kb(), &g, 0);
+        let with = panels_for(LayoutMode::BottomDeck, true, &kb(), &g, 3);
+        assert_eq!(plain[0].width, with[0].width, "the strip changes no width");
+        let grew = with[0].height - plain[0].height;
+        assert!(
+            grew >= g.strip_height as u32 && grew <= (g.strip_height + g.gap).ceil() as u32 + 1,
+            "the strip adds its own band plus the row gap, got {grew}"
+        );
+        // Reflow still reserves exactly the panel height, strip included, so
+        // content is not left behind the suggestions.
+        assert_eq!(with[0].exclusive_zone, with[0].height as i32);
     }
 }

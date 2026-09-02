@@ -13,7 +13,7 @@
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 
-use crate::layout::{Key, KeyRole, PlacedKey, ShiftModel};
+use crate::layout::{Key, KeyRole, PlacedKey, Rect, ShiftModel};
 use crate::theme::{Color, Theme};
 
 /// Which input source a highlight comes from — mirrors osk-technology.md §4.5's
@@ -61,6 +61,22 @@ pub struct Cursor {
 pub struct Chrome {
     pub shift: ShiftModel,
     pub reflow: bool,
+}
+
+/// One slot of the candidate strip, ready to draw
+/// (osk-prediction.md §7.2). An empty `text` draws the slot's well with no
+/// legend — the strip keeps its space rather than shifting the key rows when
+/// there is nothing to suggest (§7.4: layout stability matters more to an
+/// absolute-cursor keyboard than the strip does).
+#[derive(Clone, Debug)]
+pub struct StripSlot {
+    pub rect: Rect,
+    pub text: String,
+    /// The candidate `R1` would accept. Exactly one slot is highlighted while
+    /// there is anything to accept.
+    pub selected: bool,
+    /// A pad's cursor is resting on this slot, and which pad's.
+    pub hover: Option<HighlightKind>,
 }
 
 /// A mutable view over an shm buffer as ARGB8888 pixels.
@@ -200,16 +216,21 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Draw a whole panel: themed background, every placed key (legends reflecting
-/// the live shift state, Shift/Caps lit when engaged), then any per-pad
-/// highlights, then the trackpad cursor sprites on top. All colours and
-/// dimensions are read from `theme` — no hardcoded cursor / highlight / active
-/// colours in this path.
+/// Draw a whole panel: themed background, the candidate strip, every placed key
+/// (legends reflecting the live shift state, Shift/Caps lit when engaged), then
+/// any per-pad highlights, then the trackpad cursor sprites on top. All colours
+/// and dimensions are read from `theme` — no hardcoded cursor / highlight /
+/// active colours in this path.
+///
+/// `strip` is empty when no prediction model is loaded, which is what makes the
+/// keyboard pixel-identical to the one before prediction existed.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_panel(
     canvas: &mut Canvas,
     theme: &Theme,
     keys: &[Key],
     placed: &[PlacedKey],
+    strip: &[StripSlot],
     highlights: &[Highlight],
     cursors: &[Cursor],
     chrome: Chrome,
@@ -220,6 +241,25 @@ pub fn draw_panel(
     let shift_active = chrome.shift.is_active();
 
     canvas.fill_rect(0, 0, canvas.w, canvas.h, col.surface_bg);
+
+    // The candidate strip, drawn first so a pad cursor still floats over it.
+    for slot in strip {
+        let (x, y, w, h) =
+            (slot.rect.x as i32, slot.rect.y as i32, slot.rect.w as i32, slot.rect.h as i32);
+        // Hover wins over selection, as it does for keys: where the pad is
+        // pointing must always be visible.
+        let fill = match (slot.hover, slot.selected) {
+            (Some(kind), _) => kind.color(theme),
+            (None, true) => col.strip_highlight,
+            (None, false) => col.strip_fill,
+        };
+        let bw = if slot.hover.is_some() || slot.selected { border.max(2) } else { border };
+        canvas.fill_round_rect(x, y, w, h, corner, col.key_border);
+        canvas.fill_round_rect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, (corner - bw).max(0), fill);
+        if !slot.text.is_empty() {
+            canvas.text_centered(&slot.text, (x, y, w, h), theme.font.scale_max, col.key_label);
+        }
+    }
 
     for pk in placed {
         let key = &keys[pk.key];

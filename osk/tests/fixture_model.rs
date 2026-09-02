@@ -64,6 +64,50 @@ fn a_predictor_over_the_committed_model_completes_and_predicts() {
     assert_eq!(p.candidates(&ctx, "k", 1)[0].text, "keyboard");
 }
 
+/// The one test that touches a *real* model, when there is one to touch.
+///
+/// The shipped model is built, not committed (see
+/// `osk/tools/build-model/DATA-LICENSES.md`), so this is a no-op unless
+/// `$HYPRPAD_OSK_MODEL` points at one — which is exactly how the keyboard finds
+/// it too. Run it after a build:
+///
+/// ```sh
+/// HYPRPAD_OSK_MODEL=~/.local/share/hyprpad-osk/en.model cargo test --test fixture_model -- --nocapture
+/// ```
+#[test]
+fn a_real_model_opens_predicts_and_stays_inside_the_latency_budget() {
+    let Some(path) = std::env::var_os("HYPRPAD_OSK_MODEL").map(PathBuf::from) else {
+        eprintln!("HYPRPAD_OSK_MODEL unset — skipping the real-model check");
+        return;
+    };
+    let m = model::Model::open(&path).expect("the named model opens");
+    eprintln!("model: {} words, {}", m.len(), m.attribution().lines().next().unwrap_or(""));
+    assert!(m.len() > 10_000, "a real English model has tens of thousands of words");
+
+    let p = Predictor::with_model(m);
+    let mut ctx = Context::new();
+    ctx.push_str("this is an ex");
+    let got = p.candidates(&ctx, "ex", 3);
+    assert!(!got.is_empty());
+    eprintln!("  \"this is an ex\" -> {:?}", got.iter().map(|c| &c.text).collect::<Vec<_>>());
+
+    // A single-letter prefix after a common word is the worst case: the widest
+    // fst range and a full successor list.
+    let mut worst = Context::new();
+    worst.push_str("the s");
+    for _ in 0..50 {
+        let _ = p.candidates(&worst, "s", 3);
+    }
+    let start = std::time::Instant::now();
+    const N: u32 = 500;
+    for _ in 0..N {
+        let _ = p.candidates(&worst, "s", 3);
+    }
+    let per = start.elapsed() / N;
+    eprintln!("  worst-case query: {per:?} (budget 1 ms, bound 5 ms)");
+    assert!(per.as_micros() < 5_000, "real-model query took {per:?}");
+}
+
 #[test]
 fn the_builder_binary_rebuilds_the_fixture_byte_for_byte() {
     // The binary is what the pipeline's last step actually runs, so exercise it

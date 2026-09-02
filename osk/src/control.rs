@@ -25,6 +25,12 @@
 //! key <keycode> [mod…]             # commit a raw evdev keycode directly (test/daemon),
 //!                                  # optionally with modifier keycodes held around it
 //! type <text…>                     # type an ASCII string (test helper)
+//! candidate accept [n]             # accept the highlighted (or nth) suggestion — R1
+//! candidate next|prev              # move the highlight along the strip — L1
+//! context reset                    # forget the typed context (daemon sends it on focus change)
+//! learn on|off                     # gate the personal word cache (deny-listed windows)
+//! predict on|off                   # show / hide the suggestion strip entirely
+//! forget                           # delete every learned word
 //! quit                             # exit the process
 //! ```
 //!
@@ -69,8 +75,34 @@ pub enum Command {
     Key { keycode: u16, mods: Vec<u16> },
     /// Type an ASCII string.
     Type { text: String },
+    /// Act on the prediction strip (osk-prediction.md §7.2 — the daemon binds
+    /// `R1` to `candidate accept` and `L1` to `candidate next`; the OSK never
+    /// reads controller input itself).
+    Candidate { what: CandidateCmd },
+    /// Forget the typed context. The daemon sends this on every focus change
+    /// while the keyboard is up: whatever we knew about the field stopped being
+    /// true (§8.1, `compose`).
+    ContextReset,
+    /// Gate the personal word cache. The daemon sends `learn off` for password
+    /// managers, polkit agents and terminals (§5.3 rule 2).
+    Learn { on: bool },
+    /// Show or hide the suggestion strip entirely.
+    Predict { on: bool },
+    /// Delete every learned word (§5.3 rule 7, "delete learned words").
+    Forget,
     /// Exit the process.
     Quit,
+}
+
+/// What a `candidate` command asks of the strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateCmd {
+    /// Accept the highlighted candidate, or the `n`th one when given.
+    Accept(Option<usize>),
+    /// Move the highlight one slot along, wrapping.
+    Next,
+    /// Move the highlight one slot back, wrapping.
+    Prev,
 }
 
 /// Parse one protocol line into a [`Command`], or an error string describing
@@ -151,6 +183,35 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Key { keycode, mods })
         }
         "type" => Ok(Command::Type { text: rest.to_string() }),
+        "candidate" | "suggest" => {
+            let mut p = rest.split_whitespace();
+            match p.next() {
+                Some("accept") | Some("commit") | None => {
+                    let n = match p.next() {
+                        None => None,
+                        Some(tok) => Some(
+                            tok.parse::<usize>()
+                                .map_err(|_| format!("bad candidate index '{tok}'"))?,
+                        ),
+                    };
+                    Ok(Command::Candidate { what: CandidateCmd::Accept(n) })
+                }
+                Some("next") => Ok(Command::Candidate { what: CandidateCmd::Next }),
+                Some("prev") | Some("previous") => {
+                    Ok(Command::Candidate { what: CandidateCmd::Prev })
+                }
+                Some(other) => {
+                    Err(format!("bad candidate action '{other}' (want accept [n]|next|prev)"))
+                }
+            }
+        }
+        "context" => match rest.split_whitespace().next() {
+            Some("reset") | Some("clear") | None => Ok(Command::ContextReset),
+            Some(other) => Err(format!("bad context action '{other}' (want reset)")),
+        },
+        "learn" => Ok(Command::Learn { on: parse_on_off(rest, "learn")? }),
+        "predict" => Ok(Command::Predict { on: parse_on_off(rest, "predict")? }),
+        "forget" => Ok(Command::Forget),
         "" => Err("empty line".into()),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -162,6 +223,16 @@ fn parse_pad(tok: Option<&str>) -> Result<Pad, String> {
         Some("R") | Some("r") | Some("right") => Ok(Pad::Right),
         Some(other) => Err(format!("bad pad '{other}' (want L|R)")),
         None => Err("missing pad (L|R)".into()),
+    }
+}
+
+/// `on|off` (with the usual synonyms) for the gate commands.
+fn parse_on_off(rest: &str, verb: &str) -> Result<bool, String> {
+    match rest.split_whitespace().next() {
+        Some("on") | Some("yes") | Some("true") | Some("enable") => Ok(true),
+        Some("off") | Some("no") | Some("false") | Some("disable") => Ok(false),
+        Some(other) => Err(format!("bad {verb} '{other}' (want on|off)")),
+        None => Err(format!("{verb} needs on|off")),
     }
 }
 
@@ -435,5 +506,29 @@ mod tests {
         assert_eq!(parse("quit"), Ok(Command::Quit));
         assert!(parse("").is_err());
         assert!(parse("frobnicate").is_err());
+    }
+
+    #[test]
+    fn parses_the_prediction_vocabulary() {
+        use CandidateCmd::*;
+        assert_eq!(parse("candidate accept"), Ok(Command::Candidate { what: Accept(None) }));
+        assert_eq!(parse("candidate accept 2"), Ok(Command::Candidate { what: Accept(Some(2)) }));
+        assert_eq!(parse("candidate"), Ok(Command::Candidate { what: Accept(None) }));
+        assert_eq!(parse("candidate next"), Ok(Command::Candidate { what: Next }));
+        assert_eq!(parse("candidate prev"), Ok(Command::Candidate { what: Prev }));
+        assert!(parse("candidate sideways").unwrap_err().contains("bad candidate action"));
+        assert!(parse("candidate accept x").unwrap_err().contains("bad candidate index"));
+
+        assert_eq!(parse("context reset"), Ok(Command::ContextReset));
+        assert_eq!(parse("context"), Ok(Command::ContextReset));
+        assert!(parse("context sideways").is_err());
+
+        assert_eq!(parse("learn off"), Ok(Command::Learn { on: false }));
+        assert_eq!(parse("learn on"), Ok(Command::Learn { on: true }));
+        assert!(parse("learn").unwrap_err().contains("on|off"));
+        assert!(parse("learn maybe").is_err());
+        assert_eq!(parse("predict off"), Ok(Command::Predict { on: false }));
+        assert_eq!(parse("predict on"), Ok(Command::Predict { on: true }));
+        assert_eq!(parse("forget"), Ok(Command::Forget));
     }
 }
