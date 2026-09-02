@@ -18,8 +18,10 @@
 // # The callout model
 //
 // A callout is a control, not a binding family. A row inside it is one
-// binding: a modifier glyph saying what you hold (the Steam button, the
-// on-screen keyboard, or nothing at all), the label, and a dim tag for a
+// binding, and it opens with the CHORD that fires it — the button's own glyph,
+// with a modifier glyph and a "+" in front when something has to be held first
+// (the Steam button, the on-screen keyboard) — so every row reads as what you
+// press. Then the direction a flick wants, the label, and a dim tag for a
 // binding that only lives in some modes. That is the whole of it — there is no
 // table underneath the drawing that the reader has to join back to a button by
 // eye, which is what the first version got wrong.
@@ -38,6 +40,20 @@ Item {
   property string pluginDir: ""
   property string artSvg: ""          // recoloured diagram SVG source text
   property string toggleChord: ""     // the chord that summons this sheet
+
+  // The layout's two art maps — one entry per control, one per modifier — and
+  // how a delegate draws an entry from either: the file the layout points at,
+  // or its `text` fallback for a layout that ships no art at all.
+  readonly property var glyphs: (layout && layout.glyphs) ? layout.glyphs : ({})
+  readonly property var modifiers: (layout && layout.modifiers) ? layout.modifiers : ({})
+
+  function artSource(spec) {
+    return (spec && spec.image && pluginDir)
+      ? "file://" + pluginDir + "/" + spec.image : ""
+  }
+  function artText(spec, fallback) {
+    return (spec && spec.text) ? spec.text : fallback
+  }
 
   // --- palette ------------------------------------------------------------
   property color palBackground: "#0B1418"
@@ -66,9 +82,10 @@ Item {
 
   // Inside a box.
   readonly property int glyphSize: 18     // the control's chip, in the header
-  readonly property int modSize: 14       // the modifier glyph, on a row
+  readonly property int rowGlyph: 14      // either half of a row's chord
   readonly property int arrowW: 13        // the direction column
-  readonly property int cellGap: 6
+  readonly property int cellGap: 6        // column to column across a row
+  readonly property int chordGap: 4       // inside a chord, around the "+"
   readonly property int boxPadH: 8
   readonly property int boxPadTop: 5
   readonly property int boxPadBottom: 7
@@ -98,17 +115,37 @@ Item {
     return tm.advanceWidth
   }
 
+  // One row's chord: the button it lands on, behind the modifier it is held
+  // under and the "+" that joins them.
+  function chordWidth(r) {
+    return r.modifier === ""
+      ? rowGlyph
+      : rowGlyph + 2 * chordGap + measure(mPlus, "+") + rowGlyph
+  }
+
+  // The chord column is reserved at the widest chord in the BOX — a bare row
+  // in a box that also has a held one still starts its label in the same
+  // place, and the chords right-align into it, so the buttons stack in one
+  // column with the modifiers hanging off to their left.
+  function boxChordWidth(c) {
+    var w = 0
+    for (var i = 0; i < c.rows.length; i++) {
+      var cw = chordWidth(c.rows[i])
+      if (cw > w) w = cw
+    }
+    return Math.ceil(w)
+  }
+
   // A box is exactly as wide as its widest line, so nothing is ever clipped
   // and a lane of terse labels does not reserve room it will not use.
   function boxWidth(c) {
     var w = glyphSize + cellGap + measure(mHeader, c.controlLabel)
     for (var i = 0; i < c.rows.length; i++) {
       var r = c.rows[i]
-      var rw = 0
-      // The direction and modifier columns are reserved for the whole box, not
+      // The chord and direction columns are reserved for the whole box, not
       // per row, so the labels in one callout line up under each other.
+      var rw = c.chordW + cellGap
       if (c.hasDirection) rw += arrowW + cellGap
-      if (c.hasModifier) rw += modSize + cellGap
       rw += measure(r.described ? mRow : mRowItalic, r.label)
       if (r.guarded) rw += cellGap + measure(mTag, "· " + r.guard)
       if (rw > w) w = rw
@@ -135,6 +172,7 @@ Item {
       // the control. Pointing at the middle of a five-row box points at a
       // binding rather than at the thing bound.
       c.link = boxPadTop + headerH / 2
+      c.chordW = boxChordWidth(c)
       c.w = boxWidth(c)
       ;(c.side === "left" ? left : right).push(c)
     }
@@ -255,6 +293,10 @@ Item {
   TextMetrics {
     id: mTag
     font.family: root.fontFamily; font.pixelSize: root.fontCaption
+  }
+  TextMetrics {
+    id: mPlus
+    font.family: root.fontFamily; font.pixelSize: root.fontSmall
   }
 
   // --- chrome -------------------------------------------------------------
@@ -473,34 +515,33 @@ Item {
       Layout.fillWidth: true
       spacing: 18
 
+      // One entry per modifier the live config actually uses, spelled the way
+      // the rows above spell it: the glyph, a "+", and what holding it means.
       Repeater {
         model: root.modifierKeys
         delegate: Row {
           id: legendItem
           required property var modelData
           spacing: 6
-          readonly property var spec: (root.layout && root.layout.modifiers)
-            ? root.layout.modifiers[modelData] : null
+          readonly property var spec: root.modifiers[modelData]
 
           Item {
-            width: root.modSize; height: root.modSize
+            width: root.rowGlyph; height: root.rowGlyph
             anchors.verticalCenter: parent.verticalCenter
             Image {
               id: legendGlyph
               anchors.fill: parent
               fillMode: Image.PreserveAspectFit
               smooth: true
-              sourceSize.width: root.modSize * 3
-              sourceSize.height: root.modSize * 3
-              source: (legendItem.spec && legendItem.spec.image && root.pluginDir)
-                ? "file://" + root.pluginDir + "/" + legendItem.spec.image : ""
+              sourceSize.width: root.rowGlyph * 3
+              sourceSize.height: root.rowGlyph * 3
+              source: root.artSource(legendItem.spec)
               visible: status === Image.Ready
             }
             Text {
               anchors.centerIn: parent
               visible: !legendGlyph.visible
-              text: (legendItem.spec && legendItem.spec.text)
-                ? legendItem.spec.text : ""
+              text: root.artText(legendItem.spec, "")
               color: root.palAccent
               font.family: root.fontFamily
               font.pixelSize: root.fontCaption
@@ -509,8 +550,8 @@ Item {
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: "= " + ((legendItem.spec && legendItem.spec.legend)
-                          ? legendItem.spec.legend : legendItem.modelData)
+            text: "+ … = " + ((legendItem.spec && legendItem.spec.legend)
+                              ? legendItem.spec.legend : legendItem.modelData)
             color: root.palMuted
             font.family: root.fontFamily
             font.pixelSize: root.fontCaption
@@ -519,23 +560,17 @@ Item {
       }
 
       Text {
-        text: "no glyph = press it on its own"
-        color: root.palMuted
-        font.family: root.fontFamily
-        font.pixelSize: root.fontCaption
-      }
-      Text {
-        text: "· dim tag = only in that mode"
-        color: root.palMuted
-        font.family: root.fontFamily
-        font.pixelSize: root.fontCaption
-      }
-      Text {
-        text: "italic = label derived from the action, not described in the config"
+        text: "italic = label derived from the action"
         color: root.palMuted
         font.family: root.fontFamily
         font.pixelSize: root.fontCaption
         font.italic: true
+      }
+      Text {
+        text: "dim = only in that mode"
+        color: root.palMuted
+        font.family: root.fontFamily
+        font.pixelSize: root.fontCaption
       }
     }
 
@@ -605,12 +640,7 @@ Item {
                 smooth: true
                 sourceSize.width: root.glyphSize * 3
                 sourceSize.height: root.glyphSize * 3
-                source: {
-                  var g = root.layout && root.layout.glyphs
-                    ? root.layout.glyphs[callout.modelData.control] : null
-                  return (g && g.image && root.pluginDir)
-                    ? "file://" + root.pluginDir + "/" + g.image : ""
-                }
+                source: root.artSource(root.glyphs[callout.modelData.control])
                 visible: status === Image.Ready
               }
               // The layout's `text` fallback, for a glyph file that is missing
@@ -618,11 +648,8 @@ Item {
               Text {
                 anchors.centerIn: parent
                 visible: !glyphImage.visible
-                text: {
-                  var g = root.layout && root.layout.glyphs
-                    ? root.layout.glyphs[callout.modelData.control] : null
-                  return g && g.text ? g.text : callout.modelData.control
-                }
+                text: root.artText(root.glyphs[callout.modelData.control],
+                                   callout.modelData.control)
                 color: root.palAccent
                 font.family: root.fontFamily
                 font.pixelSize: root.fontCaption
@@ -654,8 +681,80 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: root.cellGap
 
-              // Reserved for the whole box, so labels line up whether or not a
-              // given row has an arrow or a modifier.
+              // The chord this row fires on: what you hold, a "+", and the
+              // button it lands on. The column is reserved for the whole box
+              // and the chord right-aligned inside it, so the buttons stack in
+              // one column with the held modifiers hanging off to their left.
+              Item {
+                width: callout.modelData.chordW; height: root.rowH
+
+                Row {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: root.chordGap
+
+                  Item {
+                    width: root.rowGlyph; height: root.rowGlyph
+                    visible: row.modelData.modifier !== ""
+                    Image {
+                      id: modImage
+                      anchors.fill: parent
+                      fillMode: Image.PreserveAspectFit
+                      smooth: true
+                      sourceSize.width: root.rowGlyph * 3
+                      sourceSize.height: root.rowGlyph * 3
+                      source: root.artSource(root.modifiers[row.modelData.modifier])
+                      visible: status === Image.Ready
+                    }
+                    Text {
+                      anchors.centerIn: parent
+                      visible: !modImage.visible
+                      text: root.artText(root.modifiers[row.modelData.modifier],
+                                         row.modelData.modifier)
+                      color: root.palAccent
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fontCaption
+                      font.bold: true
+                    }
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: row.modelData.modifier !== ""
+                    text: "+"
+                    color: root.palMuted
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fontSmall
+                  }
+
+                  Item {
+                    width: root.rowGlyph; height: root.rowGlyph
+                    Image {
+                      id: rowGlyphImage
+                      anchors.fill: parent
+                      fillMode: Image.PreserveAspectFit
+                      smooth: true
+                      sourceSize.width: root.rowGlyph * 3
+                      sourceSize.height: root.rowGlyph * 3
+                      source: root.artSource(root.glyphs[row.modelData.glyph])
+                      visible: status === Image.Ready
+                    }
+                    Text {
+                      anchors.centerIn: parent
+                      visible: !rowGlyphImage.visible
+                      text: root.artText(root.glyphs[row.modelData.glyph],
+                                         row.modelData.glyph)
+                      color: root.palAccent
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fontCaption
+                      font.bold: true
+                    }
+                  }
+                }
+              }
+
+              // Reserved for the whole box, so the labels line up whether or
+              // not a given row is a flick.
               Item {
                 width: root.arrowW; height: root.rowH
                 visible: callout.modelData.hasDirection
@@ -666,42 +765,6 @@ Item {
                   color: root.palText
                   font.family: root.fontFamily
                   font.pixelSize: root.fontBody
-                }
-              }
-
-              Item {
-                width: root.modSize; height: root.rowH
-                visible: callout.modelData.hasModifier
-                Image {
-                  id: modImage
-                  anchors.centerIn: parent
-                  width: root.modSize; height: root.modSize
-                  fillMode: Image.PreserveAspectFit
-                  smooth: true
-                  sourceSize.width: root.modSize * 3
-                  sourceSize.height: root.modSize * 3
-                  source: {
-                    var m = row.modelData.modifier
-                    if (!m || !root.layout || !root.layout.modifiers) return ""
-                    var spec = root.layout.modifiers[m]
-                    return (spec && spec.image && root.pluginDir)
-                      ? "file://" + root.pluginDir + "/" + spec.image : ""
-                  }
-                  visible: status === Image.Ready
-                }
-                Text {
-                  anchors.centerIn: parent
-                  visible: !modImage.visible && row.modelData.modifier !== ""
-                  text: {
-                    var m = row.modelData.modifier
-                    var spec = (root.layout && root.layout.modifiers)
-                      ? root.layout.modifiers[m] : null
-                    return spec && spec.text ? spec.text : m
-                  }
-                  color: root.palAccent
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontCaption
-                  font.bold: true
                 }
               }
 
