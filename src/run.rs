@@ -548,14 +548,40 @@ pub fn run() -> std::io::Result<()> {
             continue;
         }
 
+        // A transient mode's timer (`h.mode("hints"):transient { timeout_ms =
+        // … }`). Checked here beside the rescan and folded into the receive
+        // deadline below for the same reason: nothing else is going to wake
+        // this loop when the user simply stops pressing, and "the hints are
+        // still up eight seconds later" is exactly the case the timer exists
+        // for.
+        let transient_at = modes.transient_deadline();
+        if transient_at.is_some_and(|at| at <= Instant::now()) {
+            if modes.check_deadline(&config, Instant::now()) {
+                eprintln!("hyprpad: mode -> {} (transient timeout)", modes.active());
+                status.set_mode(modes.active());
+                mode_handoff(
+                    &mut cursor,
+                    &mut scroll,
+                    &mut osk_route,
+                    pointer.as_mut(),
+                    &mut button_keys,
+                    &mut chord_keys,
+                    &mut keyboard,
+                    &mut gamepad,
+                    &mut haptics,
+                );
+            }
+            continue;
+        }
+
         // The earliest deadline this iteration must wake for: the reconnect
-        // re-scan while the controller is away, and the process rescan whenever
-        // it is armed. With neither, this is the plain blocking receive it has
-        // always been.
-        let wake = match (waiting.then_some(next_scan), rescan_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        // re-scan while the controller is away, the process rescan whenever it
+        // is armed, and a transient mode's timer while one is running. With
+        // none of them, this is the plain blocking receive it has always been.
+        let wake = [waiting.then_some(next_scan), rescan_at, transient_at]
+            .into_iter()
+            .flatten()
+            .min();
         let input = match wake {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(input) => input,
@@ -712,12 +738,31 @@ pub fn run() -> std::io::Result<()> {
                 // below for the held bindings, since an action fired here may
                 // have raised the keyboard.
                 let buttons_active = !engine.guide_active() && !osk.is_active();
+                // A transient mode counts the presses that resolve in it, and
+                // one of them may BE its exit. Both questions are asked here,
+                // before the button layer, against the map the press resolved
+                // against: an exit press clears the mode now and is masked out
+                // of the frame the layer sees, while the press cap only marks
+                // the budget spent — the press that spends it still has to
+                // reach the window, so the clearing waits for `settle_presses`
+                // at the bottom of the frame.
+                let mut eaten: Vec<report::Button> = Vec::new();
+                for b in press_edges(&frame, &prev_frame, buttons_active) {
+                    let out = modes.note_press(&config, b);
+                    mode_changed |= out.changed;
+                    if out.consumed {
+                        eaten.push(b);
+                    }
+                }
+                let button_frame = frame.without(&eaten);
                 mode_changed |= fire_buttons(
                     &hypr,
                     &config,
                     &mut modes,
                     &mut osk,
-                    &frame,
+                    &mut keyboard,
+                    pointer.as_mut(),
+                    &button_frame,
                     &prev_frame,
                     buttons_active,
                     &mut hx,
@@ -837,10 +882,10 @@ pub fn run() -> std::io::Result<()> {
                 // guard passes, so a game mode that guards them out yields an
                 // empty map and `reconcile` releases anything held.
                 let buttons_active = !engine.guide_active() && !osk.is_active();
-                drive_buttons(
+                let clicked = drive_buttons(
                     &mut keyboard,
                     pointer.as_mut(),
-                    &frame,
+                    &button_frame,
                     &prev_frame,
                     modes.buttons(),
                     &mut button_keys,
@@ -868,6 +913,41 @@ pub fn run() -> std::io::Result<()> {
                     now,
                     debug,
                 );
+                // A transient mode's last two exits, settled once this frame's
+                // outputs are on the wire.
+                //
+                // The press cap waits until HERE — and not for tidiness: the
+                // press that spends the last of the budget is the keystroke
+                // that picked the link, and clearing on the spot would run the
+                // handoff, close the bare-button layer and swallow it. It has
+                // gone out by now; the handoff below releases it, which is
+                // what everything that acts on a key's press edge (Vimium
+                // included) wants.
+                //
+                // A click emitted this frame is an exit of its own: Vimium's
+                // hints go on any click, so the daemon goes with them.
+                let mut expired = modes.settle_presses(&config);
+                if clicked {
+                    expired |= modes.note_click(&config);
+                }
+                if expired {
+                    eprintln!("hyprpad: mode -> {} (transient exit)", modes.active());
+                    status.set_mode(modes.active());
+                    mode_handoff(
+                        &mut cursor,
+                        &mut scroll,
+                        &mut osk_route,
+                        pointer.as_mut(),
+                        &mut button_keys,
+                        &mut chord_keys,
+                        &mut keyboard,
+                        &mut gamepad,
+                        &mut haptics,
+                    );
+                }
+                // The *unmasked* frame: a press eaten by a transient exit is
+                // down on the next frame's `prev` too, so it never comes back
+                // as a fresh edge while the button stays held.
                 prev_frame = frame;
             }
         }
@@ -1830,8 +1910,52 @@ fn emit_chord(
     mut pointer: Option<&mut VirtualPointer>,
     chord: &KeyChord,
     pressed: bool,
-) {
+) -> bool {
+    let mut clicked = false;
     for (code, down) in chord_edges(chord, pressed) {
+        clicked |= emit_button_code(kbd, pointer.as_deref_mut(), code, down);
+    }
+    clicked
+}
+
+/// How long a tapped key stays down ([`tap_chord`]).
+///
+/// The on-screen keyboard's own figure (`osk/src/output.rs`), and for the same
+/// reason: a press and a release in the same instant is a legal evdev sequence
+/// but an easy one for a client to coalesce, and 6 ms is below any human
+/// threshold while being a whole event loop to everything downstream.
+const TAP_HOLD: Duration = Duration::from_millis(6);
+
+/// The `(code, pressed)` edges a **tapped** chord expands to: the press edges
+/// and then, with nothing in between but [`TAP_HOLD`], the release edges.
+///
+/// Pure, and the whole definition of "a key in a sequence is a tap": the key
+/// goes down and comes straight back up inside the one press, with its
+/// modifiers bracketing it exactly as they do on a held binding
+/// ([`chord_edges`]) — so `h.seq { h.key "shift+f", … }` lands as a real
+/// Shift+F and not as two loose keystrokes.
+fn tap_edges(chord: &KeyChord) -> Vec<(u16, bool)> {
+    let mut edges = chord_edges(chord, true);
+    edges.extend(chord_edges(chord, false));
+    edges
+}
+
+/// Tap a key or mouse button — press, [`TAP_HOLD`], release — for a step of an
+/// [`Action::Seq`] that has no release edge of its own to pair with.
+fn tap_chord(
+    kbd: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
+    chord: &KeyChord,
+) {
+    let mut waited = false;
+    for (code, down) in tap_edges(chord) {
+        // The key is held for the length of the tap, not for zero time: a
+        // press and a release in the same instant is legal evdev but an easy
+        // pair for a client to coalesce into nothing.
+        if !down && !waited {
+            std::thread::sleep(TAP_HOLD);
+            waited = true;
+        }
         emit_button_code(kbd, pointer.as_deref_mut(), code, down);
     }
 }
@@ -1840,22 +1964,31 @@ fn emit_chord(
 /// device (uinput or the virtual-pointer protocol unavailable) makes the edge a
 /// no-op for that code only; the other device keeps working, and the held set
 /// is updated regardless so nothing is remembered as down that was never sent.
+///
+/// Returns whether a **mouse button actually went down** on the wire — the one
+/// fact a transient mode wants back from the output layer
+/// ([`ModeEngine::note_click`]): Vimium's hints exit on any click, so a mode
+/// that says `exit_on = { "click" }` follows them out. A click that went
+/// nowhere (no virtual pointer) is not a click.
 fn emit_button_code(
     kbd: &mut Option<VirtualKeyboard>,
     pointer: Option<&mut VirtualPointer>,
     code: u16,
     pressed: bool,
-) {
+) -> bool {
     match route(code) {
-        Route::Pointer(mb) => {
-            if let Some(ptr) = pointer {
+        Route::Pointer(mb) => match pointer {
+            Some(ptr) => {
                 ptr.button(mb, pressed);
+                pressed
             }
-        }
+            None => false,
+        },
         Route::Keyboard => {
             if let Some(kbd) = kbd.as_mut() {
                 kbd.key(code, pressed);
             }
+            false
         }
     }
 }
@@ -1872,6 +2005,9 @@ fn emit_button_code(
 /// Feedback fires on the **press edge only** ([`Haptic::Button`], off by
 /// default): a held D-pad auto-repeats in the kernel — which produces no further
 /// events here, so a repeat never buzzes — and a release is not a keystroke.
+///
+/// Returns whether a mouse button went down this frame, for the transient-mode
+/// click exit ([`emit_button_code`]).
 #[allow(clippy::too_many_arguments)]
 fn drive_buttons(
     kbd: &mut Option<VirtualKeyboard>,
@@ -1882,14 +2018,16 @@ fn drive_buttons(
     st: &mut ButtonKeys,
     active: bool,
     hx: &mut HapticCtx,
-) {
+) -> bool {
     let events = st.reconcile(bindings, |b| frame.pressed(b), |b| prev.pressed(b), active);
+    let mut clicked = false;
     for (btn, chord, pressed) in events {
-        emit_chord(kbd, pointer.as_deref_mut(), &chord, pressed);
+        clicked |= emit_chord(kbd, pointer.as_deref_mut(), &chord, pressed);
         if pressed {
             hx.fire(Haptic::Button, button_pad(btn));
         }
     }
+    clicked
 }
 
 /// The bare-button actions due to *fire* this frame: every
@@ -1917,6 +2055,23 @@ fn fire_edges(
         .collect()
 }
 
+/// Every bare button that went down this frame, or nothing while the layer is
+/// gated off — the presses a transient mode is *offered*
+/// ([`ModeEngine::note_press`], which decides which of them count).
+///
+/// Deliberately unfiltered by the binding map, unlike [`fire_edges`]: a
+/// transient mode's named exit matters whatever it is bound to, or to nothing
+/// at all — B is the cancel precisely because the hints mode leaves it
+/// unbound. The engine holds the resolved map and applies it to the presses
+/// that *are* about bindings (the press cap). Pure, so the selection is
+/// testable without a device.
+fn press_edges(frame: &report::Frame, prev: &report::Frame, active: bool) -> Vec<report::Button> {
+    if !active {
+        return Vec::new();
+    }
+    frame.edges_down(prev).collect()
+}
+
 /// Fire the bare-button actions due this frame ([`fire_edges`]), each through
 /// [`perform_action`] — the path a guide chord takes once it has resolved, so
 /// `h.exec` (with `HYPRPAD_MODE`), `h.dispatch`, `h.workspace`, `h.keyboard`,
@@ -1932,6 +2087,8 @@ fn fire_buttons(
     config: &Config,
     modes: &mut ModeEngine,
     osk: &mut OskHandle,
+    keyboard: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
     frame: &report::Frame,
     prev: &report::Frame,
     active: bool,
@@ -1940,7 +2097,15 @@ fn fire_buttons(
     let mut mode_changed = false;
     for (btn, action) in fire_edges(modes.buttons(), frame, prev, active) {
         hx.fire(Haptic::Button, button_pad(btn));
-        mode_changed |= perform_action(hypr, config, modes, osk, &action);
+        mode_changed |= perform_action(
+            hypr,
+            config,
+            modes,
+            osk,
+            keyboard,
+            pointer.as_deref_mut(),
+            &action,
+        );
     }
     mode_changed
 }
@@ -3025,10 +3190,13 @@ fn handle_gesture(
     // key still does nothing: there is no release edge to pair it with.
     if let (GestureEvent::GuideChord(b), Action::Key(chord)) = (ge, &action) {
         hx.fire(Haptic::Button, button_pad(b));
+        let mut clicked = false;
         for (chord, pressed) in chords.press(b, *chord) {
-            emit_chord(keyboard, pointer.as_deref_mut(), &chord, pressed);
+            clicked |= emit_chord(keyboard, pointer.as_deref_mut(), &chord, pressed);
         }
-        return false;
+        // A click under the guide is a click: a transient mode that exits on
+        // one goes here too, exactly as it does for the bare pad click.
+        return clicked && modes.note_click(config);
     }
 
     // Past every gate: the gesture *landed*. Buzz both actuators before acting,
@@ -3037,7 +3205,7 @@ fn handle_gesture(
     // gives — nothing else about a chord is visible or audible.
     hx.fire(Haptic::Gesture, HapticPad::Both);
 
-    perform_action(hypr, config, modes, osk, &action)
+    perform_action(hypr, config, modes, osk, keyboard, pointer, &action)
 }
 
 /// Perform one resolved action: the tail every binding shares once its own
@@ -3051,8 +3219,40 @@ fn perform_action(
     config: &Config,
     modes: &mut ModeEngine,
     osk: &mut OskHandle,
+    keyboard: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
     action: &Action,
 ) -> bool {
+    // A sequence is its steps through this same function, in order: one press,
+    // several things, each meaning what it means alone. The "the mode moved"
+    // answer is the OR — `h.seq { h.key "f", h.set_mode "hints" }` moved it,
+    // whichever step did — and a `set_mode` applies where it stands, so a
+    // later step runs in the new mode.
+    if let Action::Seq(steps) = action {
+        let mut moved = false;
+        for step in steps {
+            moved |= match step {
+                // The one difference a sequence makes: a key is TAPPED, not
+                // held. A held output needs a release edge to pair with, and
+                // by the time the button lifts the sequence is long over.
+                Action::Key(chord) => {
+                    tap_chord(keyboard, pointer.as_deref_mut(), chord);
+                    false
+                }
+                other => perform_action(
+                    hypr,
+                    config,
+                    modes,
+                    osk,
+                    keyboard,
+                    pointer.as_deref_mut(),
+                    other,
+                ),
+            };
+        }
+        return moved;
+    }
+
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
     if let Action::ToggleKeyboard { mode, reflow } = action {
         toggle_keyboard(osk, *mode, *reflow);
@@ -3368,6 +3568,9 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
             controller_off();
             Ok(())
         }
+        // Unrolled into its steps by `perform_action`, each of which arrives
+        // here on its own; a whole sequence never does.
+        Action::Seq(_) => Ok(()),
         Action::None => Ok(()),
     }
 }
@@ -4116,14 +4319,176 @@ mod tests {
 
         // Forcing game mode from the desktop is a change; forcing it again is not.
         let force_game = Action::SetMode(BUILTIN_GAME.into());
-        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &force_game));
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &force_game));
         assert_eq!(modes.active(), BUILTIN_GAME);
-        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &force_game));
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &force_game));
         // Clearing it hands the decision back to the rules (nothing focused:
         // desktop); clearing an override that is not there changes nothing.
-        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &Action::ClearMode));
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &Action::ClearMode));
         assert_eq!(modes.active(), BUILTIN_DESKTOP);
-        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &Action::ClearMode));
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &Action::ClearMode));
+    }
+
+    #[test]
+    fn a_sequence_performs_its_steps_in_order() {
+        use crate::mode::{BUILTIN_DESKTOP, BUILTIN_GAME};
+        let hypr = Hypr::detached();
+        let cfg = Config::load_default();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        macro_rules! perform {
+            ($a:expr) => {
+                perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &$a)
+            };
+        }
+
+        // Order, not set semantics: the LAST `set_mode` is where we end up.
+        let both = Action::Seq(vec![
+            Action::SetMode(BUILTIN_GAME.into()),
+            Action::SetMode(BUILTIN_DESKTOP.into()),
+        ]);
+        assert!(perform!(both), "the sequence moved the mode, so the caller runs the handoff");
+        assert_eq!(modes.active(), BUILTIN_DESKTOP);
+
+        // The hints shape: a key then a mode. The key step must not swallow
+        // the sequence — the `set_mode` after it still lands, and the "mode
+        // moved" answer is the OR over the steps.
+        let hints = Action::Seq(vec![
+            Action::Key(KeyChord::parse("f").unwrap()),
+            Action::SetMode(BUILTIN_GAME.into()),
+        ]);
+        assert!(perform!(hints));
+        assert_eq!(modes.active(), BUILTIN_GAME);
+
+        // A sequence that moves nothing says so, however many steps it has.
+        let quiet = Action::Seq(vec![
+            Action::Key(KeyChord::parse("f").unwrap()),
+            Action::Key(KeyChord::parse("shift+f").unwrap()),
+        ]);
+        assert!(!perform!(quiet));
+        assert_eq!(modes.active(), BUILTIN_GAME);
+        // And `clear_mode` inside one is the ordinary clear.
+        assert!(perform!(Action::Seq(vec![Action::ClearMode])));
+        assert_eq!(modes.active(), BUILTIN_DESKTOP);
+    }
+
+    #[test]
+    fn a_sequence_on_a_guide_chord_performs_rather_than_holding() {
+        // The entry chord, through the real dispatch. A lone `h.key` on a
+        // chord is a HELD output; a `h.seq` containing one is not — it is
+        // performed on recognition, taps its key, and its `set_mode` lands.
+        use report::Button::*;
+        let cfg = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("hints"):transient {}
+            h.mode("desktop")
+            h.bind("guide+l4", "Link hints", h.seq { h.key "f", h.set_mode "hints" })
+            "#,
+            "t.lua",
+        )
+        .expect("config should load");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut chords = ChordKeys::new();
+        let mut kbd: Option<VirtualKeyboard> = None;
+
+        // Recognition performs the whole sequence and reports the mode move,
+        // so the caller runs the handoff.
+        assert!(handle_gesture(
+            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
+            GestureEvent::GuideChord(GripL4),
+        ));
+        assert_eq!(modes.active(), "hints");
+        assert!(chords.held.is_empty(), "a sequence holds nothing: its key was tapped");
+        // The chord's release therefore has nothing to let go of.
+        assert!(!handle_gesture(
+            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
+            GestureEvent::GuideChordRelease(GripL4),
+        ));
+        assert_eq!(modes.active(), "hints");
+    }
+
+    #[test]
+    fn a_key_inside_a_sequence_is_a_tap_not_a_hold() {
+        // KEY_F = 33, KEY_LEFTSHIFT = 42. A sequence has no release edge to
+        // pair a held key with — by the time the button lifts the sequence is
+        // long over — so the key goes down and comes straight back up.
+        let f = KeyChord::parse("f").unwrap();
+        assert_eq!(tap_edges(&f), vec![(33, true), (33, false)]);
+        // With modifiers bracketing it exactly as a held binding's do, so
+        // `h.key "shift+f"` in a sequence is a real Shift+F and not two loose
+        // keystrokes.
+        let shift_f = KeyChord::parse("shift+f").unwrap();
+        assert_eq!(
+            tap_edges(&shift_f),
+            vec![(42, true), (33, true), (33, false), (42, false)]
+        );
+        // The two halves are the held binding's own edges, in order — one
+        // definition of "what pressing this chord means", not two.
+        assert_eq!(
+            tap_edges(&shift_f),
+            [chord_edges(&shift_f, true), chord_edges(&shift_f, false)].concat()
+        );
+    }
+
+    #[test]
+    fn a_transient_exit_press_is_counted_before_the_button_layer_and_masked_out_of_it() {
+        // The frame arm's own order, in miniature: the press edges are noted
+        // against the mode they resolved in, an exit press clears the mode and
+        // is masked out of the frame the bare-button layer then sees.
+        use report::Button::*;
+        let cfg = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("hints"):transient { max_presses = 3, exit_on = { "b" }, timeout_ms = 0 }
+            h.mode("browser").when(function(ctx) return ctx.focus.class == "google-chrome" end)
+            h.mode("desktop")
+            h.button("a", h.key "a"):only_in("hints")
+            h.button("b", h.key "backspace"):only_in("browser")
+            "#,
+            "t.lua",
+        )
+        .expect("config should load");
+        let mut modes = ModeEngine::new(&cfg);
+        modes.focus_changed(&cfg, "google-chrome", "Some page", None);
+        modes.set_mode(&cfg, "hints");
+
+        let idle = report::Frame::default();
+        let b_down = frame_of(&[B]);
+        // The daemon offers the engine every press edge the layer is open for
+        // — B is the exit precisely BECAUSE the hints mode leaves it unbound,
+        // so a map-filtered list would never surface it.
+        assert_eq!(press_edges(&b_down, &idle, true), vec![B]);
+        assert!(press_edges(&b_down, &idle, false).is_empty());
+        // The engine applies the map where the map is what matters: only a
+        // press this mode binds spends one of the three, so a stray grip does
+        // not.
+        assert_eq!(modes.note_press(&cfg, GripL4), crate::mode::PressOutcome::default());
+        assert_eq!(modes.note_press(&cfg, A), crate::mode::PressOutcome::default());
+        assert!(!modes.settle_presses(&cfg));
+        assert_eq!(modes.active(), "hints");
+
+        // B is the exit: consumed, and the mode goes.
+        let out = modes.note_press(&cfg, B);
+        assert_eq!(out, crate::mode::PressOutcome { consumed: true, changed: true });
+        assert_eq!(modes.active(), "browser");
+
+        // Masked out, the frame the button layer sees has no B in it — so the
+        // browser's `b` = Backspace does not fire on the way out...
+        let masked = b_down.without(&[B]);
+        assert!(fire_edges(modes.buttons(), &masked, &idle, true).is_empty());
+        let mut keys = ButtonKeys { held: HashMap::new(), open: true };
+        assert!(keys
+            .reconcile(modes.buttons(), |b| masked.pressed(b), |b| idle.pressed(b), true)
+            .is_empty());
+        // ...and the UNMASKED frame is what becomes `prev`, so B still being
+        // held on the next frame is not a fresh edge either.
+        assert!(press_edges(&b_down, &b_down, true).is_empty());
     }
 
     #[test]
@@ -4145,15 +4510,15 @@ mod tests {
         let l5 = frame_of(&[GripL5]);
 
         // Under the guide layer the press is a chord's, not ours.
-        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, false, &mut hx));
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &l5, &idle, false, &mut hx));
         assert_eq!(modes.active(), BUILTIN_DESKTOP);
         // On the desktop the press edge forces the game mode — and says so.
-        assert!(fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, true, &mut hx));
+        assert!(fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &l5, &idle, true, &mut hx));
         assert_eq!(modes.active(), BUILTIN_GAME);
         // Held: nothing more. And in the game the bare buttons are not live at
         // all (the built-in path empties the map), so a fresh press is inert.
-        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &l5, true, &mut hx));
-        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &l5, &idle, true, &mut hx));
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &l5, &l5, true, &mut hx));
+        assert!(!fire_buttons(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &l5, &idle, true, &mut hx));
         assert!(modes.buttons().is_empty());
     }
 

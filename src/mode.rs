@@ -16,6 +16,9 @@
 //! * **Fullscreen is not a game trigger.** `ctx.focus.fullscreen` is available
 //!   to a rule that explicitly wants it; nothing ships using it.
 //! * **A manual override is first class** and beats the rules.
+//! * **A mode may be transient** — it gives itself back
+//!   ([`crate::config::TransientSpec`]), which is what makes a mode usable for
+//!   a context nothing outside hyprpad can report the end of.
 //!
 //! ## Resolution
 //!
@@ -31,6 +34,22 @@
 //! mode, the guard results, and the filtered button maps are all cached in this
 //! struct, and the per-frame handlers only read them.
 //!
+//! ## Transient overrides
+//!
+//! An override normally stays until a `clear_mode`. A mode declared
+//! `h.mode("hints"):transient { … }` instead carries its own way out, because
+//! the thing it models has no event to leave on: Vimium's link hints are
+//! entirely inside the page, and nothing reaches hyprpad when they go
+//! (docs/research/browser-hints.md Δ4). Such a mode has no rule — the only way
+//! in is [`crate::config::Action::SetMode`] — and it clears itself on the
+//! first of five things: the press budget running out
+//! ([`ModeEngine::note_press`] / [`ModeEngine::settle_presses`]), a named exit
+//! button whose press is then *consumed*, a focus change, a title change, a
+//! mouse click ([`ModeEngine::note_click`]), or the timer
+//! ([`ModeEngine::check_deadline`]). Every one of them ends in the same
+//! `refresh` and the same "did the mode move?" answer, so the daemon runs the
+//! same clean handoff it runs for a focus change.
+//!
 //! ## The built-in behaviour
 //!
 //! A config that declares no modes at all — every `config.toml`, and a
@@ -41,10 +60,11 @@
 //! once for the file, once for the modes.
 
 use crate::arbitrate::Arbiter;
-use crate::config::{ButtonAction, Config, ModeState, OskAction};
+use crate::config::{ButtonAction, Config, ModeState, OskAction, TransientExit, TransientSpec};
 use crate::gesture::GestureEvent;
 use crate::report;
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 /// The name the built-in (no modes declared) behaviour uses for "a game window
 /// holds focus", and the name a `config.lua` conventionally gives the same
@@ -119,6 +139,45 @@ pub struct Focus {
     pub fullscreen: bool,
 }
 
+/// A live manual override: the forced mode, plus the bookkeeping a
+/// [`TransientSpec`] mode needs to give itself back.
+///
+/// The spec is copied in at [`ModeEngine::set_mode`] rather than looked up per
+/// press, so the counting is a field read on the hot path and a reload that
+/// retunes `max_presses` does not silently re-arm an override already in
+/// flight (the next entry gets the new numbers).
+#[derive(Debug)]
+struct Manual {
+    /// The mode being forced.
+    name: String,
+    /// Its transient contract, or `None` for an ordinary override — which
+    /// never counts, never times out, and never clears itself.
+    spec: Option<TransientSpec>,
+    /// Bare-button presses that have resolved in this mode since it was
+    /// entered, against [`TransientSpec::max_presses`].
+    presses: u32,
+    /// Whether the last of the press budget has been spent, so the override
+    /// is due to go as soon as that press has been *delivered*
+    /// ([`ModeEngine::settle_presses`]).
+    spent: bool,
+    /// When the timer runs out, from [`TransientSpec::timeout_ms`]. `None`
+    /// when there is no timer.
+    deadline: Option<Instant>,
+}
+
+/// What the daemon must do with a bare-button press it has just noted against
+/// a transient mode ([`ModeEngine::note_press`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PressOutcome {
+    /// This press **is** the mode's exit (`exit_on = { "b" }`), so it must not
+    /// also be delivered to the focused window: B means "cancel the hints",
+    /// not "cancel the hints and then type B into the page".
+    pub consumed: bool,
+    /// The active mode moved, so the caller runs the same handoff every other
+    /// transition gets.
+    pub changed: bool,
+}
+
 /// Tracks context, resolves the active mode, and caches everything the
 /// per-frame handlers need to know about it.
 #[derive(Debug)]
@@ -127,8 +186,9 @@ pub struct ModeEngine {
     /// overlays — kept whole so a predicate never sees half of a change.
     ctx: Context,
     /// The manual override, top of the precedence. `Some` until a
-    /// [`crate::config::Action::ClearMode`].
-    manual: Option<String>,
+    /// [`crate::config::Action::ClearMode`] — or, for a **transient** mode,
+    /// until it clears itself ([`Manual`]).
+    manual: Option<Manual>,
     /// The built-in game-class matcher, used only when the config declares no
     /// modes. Keeping the original type here is deliberate: the no-modes path
     /// is *literally* the behaviour it always had, not a re-implementation.
@@ -203,6 +263,13 @@ impl ModeEngine {
         self.arbiter.focus_changed(&focus.class);
         self.arbiter.set_fullscreen(focus.fullscreen);
         self.ctx.focus = focus;
+        // A transient mode that exits on a focus change goes with the same
+        // re-resolve, not one of its own: one call, one answer, and the rules
+        // never run against a context that is new but an override that is
+        // stale.
+        if self.exits_on(TransientExit::Focus) {
+            self.drop_manual();
+        }
         self.refresh(config)
     }
 
@@ -225,6 +292,11 @@ impl ModeEngine {
         }
         self.ctx.focus.title = title.to_string();
         self.forget_process_tree(config);
+        // The hints case this exists for: following a link in the current tab
+        // moves no focus and opens no window — the page just renames itself.
+        if self.exits_on(TransientExit::Title) {
+            self.drop_manual();
+        }
         self.refresh(config)
     }
 
@@ -345,8 +417,20 @@ impl ModeEngine {
 
     /// Force `name` as the active mode, overriding the rules
     /// ([`crate::config::Action::SetMode`]).
+    /// A mode the config declared `:transient` starts its counter and its
+    /// timer here: this is the only way into one, since a transient mode is
+    /// barred from winning by rule
+    /// ([`refresh_declared`](Self::refresh_declared)). Re-entering a mode
+    /// already forced restarts both, so pressing the hints chord again means
+    /// "fresh hints" rather than "half a mode already spent".
     pub fn set_mode(&mut self, config: &Config, name: &str) -> bool {
-        self.manual = Some(name.to_string());
+        let spec = config.transient_of(name).cloned();
+        let deadline = spec
+            .as_ref()
+            .filter(|s| s.timeout_ms > 0)
+            .map(|s| Instant::now() + Duration::from_millis(s.timeout_ms));
+        self.manual =
+            Some(Manual { name: name.to_string(), spec, presses: 0, spent: false, deadline });
         // The built-in path has no mode table to consult, so tell the arbiter
         // directly: forcing anything but `game` is the "force desktop" override
         // it already models.
@@ -357,9 +441,132 @@ impl ModeEngine {
     /// Drop the manual override so the rules decide again
     /// ([`crate::config::Action::ClearMode`]).
     pub fn clear_mode(&mut self, config: &Config) -> bool {
+        self.drop_manual();
+        self.refresh(config)
+    }
+
+    // --- transient overrides (docs/research/browser-hints.md Δ4) ----------
+
+    /// Note one bare-button press against a transient override's bookkeeping.
+    /// Called on **every** bare-button press edge the layer is open for; which
+    /// of them matter is decided here, where both halves of the answer live:
+    ///
+    /// * a **named exit button** counts whatever it is bound to, or to
+    ///   nothing at all — B is the cancel precisely *because* the hints mode
+    ///   leaves it unbound;
+    /// * the **press cap** counts only presses that resolved in this mode
+    ///   ([`buttons`](Self::buttons)), so a stray grip while the hints are up
+    ///   does not spend one of the three.
+    ///
+    /// Two answers, because the two exits want opposite timing
+    /// ([`PressOutcome`]):
+    ///
+    /// * a **named exit button** ends the mode here and now, and its press is
+    ///   swallowed — the caller must not deliver it;
+    /// * the **press cap** only marks the budget spent, because the press that
+    ///   spends it is the one that picked the link and still has to reach the
+    ///   window. [`settle_presses`](Self::settle_presses) does the clearing,
+    ///   after the button layer has run.
+    ///
+    /// A no-op with no transient override in flight, which is every mode the
+    /// daemon is normally in.
+    pub fn note_press(&mut self, config: &Config, button: report::Button) -> PressOutcome {
+        if self.transient_exit_button(button) {
+            self.drop_manual();
+            return PressOutcome { consumed: true, changed: self.refresh(config) };
+        }
+        if !self.buttons.contains_key(&button) {
+            return PressOutcome::default();
+        }
+        if let Some(m) = self.manual.as_mut() {
+            if let Some(cap) = m.spec.as_ref().map(|s| s.max_presses).filter(|&c| c > 0) {
+                m.presses += 1;
+                m.spent = m.presses >= cap;
+            }
+        }
+        PressOutcome::default()
+    }
+
+    /// Clear a transient override whose press budget ran out, now that this
+    /// frame's presses have been delivered. Returns whether the active mode
+    /// moved.
+    ///
+    /// Split from [`note_press`](Self::note_press) for one reason: the last
+    /// hint letter both completes the code *and* ends the mode, and it has to
+    /// be typed before the mode goes — clearing on the spot would run the
+    /// handoff, close the bare-button layer, and swallow the very keystroke
+    /// that picked the link.
+    pub fn settle_presses(&mut self, config: &Config) -> bool {
+        if !self.manual.as_ref().is_some_and(|m| m.spent) {
+            return false;
+        }
+        self.drop_manual();
+        self.refresh(config)
+    }
+
+    /// A mouse button was emitted while a transient mode was live (`exit_on =
+    /// { "click" }`). Vimium's hints exit on any click, so the daemon follows
+    /// them out rather than being left holding a mode whose letters would now
+    /// type into the page.
+    pub fn note_click(&mut self, config: &Config) -> bool {
+        self.expire_on(config, TransientExit::Click)
+    }
+
+    /// The instant a transient override times out, or `None` when nothing is
+    /// timing. The daemon folds this into the loop's receive deadline, so an
+    /// idle session still wakes to let go of the mode.
+    pub fn transient_deadline(&self) -> Option<Instant> {
+        self.manual.as_ref().and_then(|m| m.deadline)
+    }
+
+    /// Let go of a transient override whose timer has run out at `now`.
+    /// Returns whether the active mode moved.
+    ///
+    /// The override goes whenever the deadline has passed, even when the rules
+    /// resolve straight back to the same name — otherwise the deadline would
+    /// still be in the past on the next iteration and the loop would spin on
+    /// it.
+    pub fn check_deadline(&mut self, config: &Config, now: Instant) -> bool {
+        if self.manual.as_ref().and_then(|m| m.deadline).is_none_or(|at| at > now) {
+            return false;
+        }
+        self.drop_manual();
+        self.refresh(config)
+    }
+
+    /// Whether a press of `button` would be eaten by the active transient
+    /// mode's exit — the question the daemon asks *before* the bare-button
+    /// layer, to know which press edges to keep out of the frame it delivers.
+    pub fn transient_exit_button(&self, button: report::Button) -> bool {
+        self.manual
+            .as_ref()
+            .and_then(|m| m.spec.as_ref())
+            .is_some_and(|s| s.exits_on_button(button))
+    }
+
+    /// Drop a transient override that lists `what` among its exits, and
+    /// re-resolve. `false` — and no re-resolve at all — when there is no
+    /// transient override, or it does not exit this way.
+    fn expire_on(&mut self, config: &Config, what: TransientExit) -> bool {
+        if !self.exits_on(what) {
+            return false;
+        }
+        self.drop_manual();
+        self.refresh(config)
+    }
+
+    /// Whether the override in flight is transient and lists `what`.
+    fn exits_on(&self, what: TransientExit) -> bool {
+        self.manual.as_ref().and_then(|m| m.spec.as_ref()).is_some_and(|s| s.exits_on(what))
+    }
+
+    /// Forget the manual override, without re-resolving. Every caller
+    /// refreshes right after — often folding the drop into a re-resolve the
+    /// context change was going to do anyway, so no rule ever sees the
+    /// override half-gone.
+    fn drop_manual(&mut self) {
         self.manual = None;
         self.arbiter.set_force_desktop(false);
-        self.refresh(config)
     }
 
     /// Re-resolve against a freshly loaded config (the `hyprpad reload` path).
@@ -369,14 +576,13 @@ impl ModeEngine {
     /// naming a mode the new config does not declare is dropped rather than
     /// stranding the daemon in a mode that no longer exists.
     pub fn reconfigure(&mut self, config: &Config) -> bool {
-        if let Some(name) = self.manual.clone() {
+        if let Some(name) = self.manual.as_ref().map(|m| m.name.clone()) {
             if !config.modes().is_empty() && !config.modes().iter().any(|m| m.name == name) {
                 eprintln!(
                     "hyprpad: manual mode override '{name}' is not declared by the new config; \
                      dropping it"
                 );
-                self.manual = None;
-                self.arbiter.set_force_desktop(false);
+                self.drop_manual();
             }
         }
         self.refresh(config)
@@ -503,12 +709,13 @@ impl ModeEngine {
     /// The no-modes-declared path: today's `Arbiter` behaviour, expressed in
     /// the mode vocabulary.
     fn refresh_builtin(&mut self, config: &Config) {
-        let game = match self.manual.as_deref() {
+        let forced = self.manual.as_ref().map(|m| m.name.as_str());
+        let game = match forced {
             Some(name) => name == BUILTIN_GAME,
             None => self.arbiter.suppressed(),
         };
-        let active = match (&self.manual, game) {
-            (Some(name), _) => name.clone(),
+        let active = match (forced, game) {
+            (Some(name), _) => name.to_string(),
             (None, true) => BUILTIN_GAME.to_string(),
             (None, false) => BUILTIN_DESKTOP.to_string(),
         };
@@ -538,11 +745,18 @@ impl ModeEngine {
         }
 
         // Precedence: manual override > first matching rule > default_mode.
+        //
+        // A transient mode is skipped in the rule scan even if it somehow
+        // carries one (the loader refuses that combination): a mode that
+        // counts its own presses and times itself out is a mode you *enter*,
+        // and resolving into it by rule would arm a contract nobody asked for
+        // and clear it out from under the window that selected it.
         let active = match &self.manual {
-            Some(name) => name.clone(),
+            Some(m) => m.name.clone(),
             None => config
                 .modes()
                 .iter()
+                .filter(|m| m.transient.is_none())
                 .find(|m| m.rule.is_some_and(|i| results.get(i).copied().unwrap_or(false)))
                 .map(|m| m.name.clone())
                 .unwrap_or_else(|| config.default_mode().to_string()),
@@ -727,6 +941,169 @@ mod tests {
         assert!(m.clear_mode(&c));
         assert_eq!(m.active(), "game");
         assert!(m.forwards());
+    }
+
+    // --- transient modes (docs/research/browser-hints.md Δ4) -------------
+
+    /// The browser-hints shape: a `browser` mode selected by class, and a
+    /// rule-less `hints` mode that gives itself back. The letters are on `a`
+    /// and `x` so there is something for a press to resolve against.
+    const HINTS_CONFIG: &str = r#"
+        local h = hyprpad
+        h.mode("hints"):transient { max_presses = 3,
+                                    exit_on = { "b", "focus", "title", "click" },
+                                    timeout_ms = 8000 }
+        h.mode("browser").when(function(ctx) return ctx.focus.class == "google-chrome" end)
+        h.mode("desktop")
+        h.default_mode "desktop"
+
+        h.button("a", h.key "a"):only_in("hints")
+        h.button("x", h.key "x"):only_in("hints")
+        h.button("b", h.key "backspace"):only_in("browser", "desktop")
+    "#;
+
+    /// In `hints`, on a browser window — where every one of these tests starts.
+    fn in_hints(c: &Config) -> ModeEngine {
+        let mut m = ModeEngine::new(c);
+        m.focus_changed(c, "google-chrome", "Some page", None);
+        assert_eq!(m.active(), "browser");
+        assert!(m.set_mode(c, "hints"));
+        assert_eq!(m.active(), "hints");
+        m
+    }
+
+    #[test]
+    fn a_transient_mode_clears_itself_after_its_last_press() {
+        let c = lua(HINTS_CONFIG);
+        let mut m = in_hints(&c);
+
+        // Two presses spend two of the three; nothing moves, and neither
+        // press is consumed — they are hint letters and must reach the page.
+        for _ in 0..2 {
+            assert_eq!(m.note_press(&c, Button::A), PressOutcome::default());
+            assert!(!m.settle_presses(&c));
+            assert_eq!(m.active(), "hints");
+        }
+        // The third spends the last of the budget. It is still not consumed —
+        // it is the keystroke that picked the link — so the mode does not go
+        // until `settle_presses`, after the button layer has delivered it.
+        assert_eq!(m.note_press(&c, Button::X), PressOutcome::default());
+        assert_eq!(m.active(), "hints", "the last letter must be typed before the mode goes");
+        assert!(m.settle_presses(&c));
+        assert_eq!(m.active(), "browser", "and then the rules decide again");
+        // Settling twice is not two transitions.
+        assert!(!m.settle_presses(&c));
+    }
+
+    #[test]
+    fn a_transient_modes_exit_button_is_consumed_not_delivered() {
+        let c = lua(HINTS_CONFIG);
+        let mut m = in_hints(&c);
+        // B is the cancel: the press ends the mode AND is swallowed, so the
+        // browser's `b` = Backspace does not also fire on the way out.
+        assert_eq!(
+            m.note_press(&c, Button::B),
+            PressOutcome { consumed: true, changed: true }
+        );
+        assert_eq!(m.active(), "browser");
+        // Out of the mode, B is an ordinary press again.
+        assert_eq!(m.note_press(&c, Button::B), PressOutcome::default());
+        assert_eq!(m.active(), "browser");
+    }
+
+    #[test]
+    fn a_transient_mode_goes_with_the_focus_or_the_title() {
+        let c = lua(HINTS_CONFIG);
+        // Following a link in the current tab moves no focus and opens no
+        // window: the page just renames itself.
+        let mut m = in_hints(&c);
+        assert!(m.title_changed(&c, "Another page"));
+        assert_eq!(m.active(), "browser");
+        // A rename to the title we already hold is not a context change and
+        // must not drop anything.
+        let mut m = in_hints(&c);
+        assert!(!m.title_changed(&c, "Some page"));
+        assert_eq!(m.active(), "hints");
+        // And a focus change — a link that opened a foreground tab, or the
+        // user going somewhere else entirely.
+        let mut m = in_hints(&c);
+        assert!(m.focus_changed(&c, "foot", "shell", None));
+        assert_eq!(m.active(), "desktop", "one re-resolve, against the NEW context");
+    }
+
+    #[test]
+    fn a_transient_mode_goes_on_a_click() {
+        let c = lua(HINTS_CONFIG);
+        let mut m = in_hints(&c);
+        // Vimium's hints exit on any click, so the daemon goes with them.
+        assert!(m.note_click(&c));
+        assert_eq!(m.active(), "browser");
+        // A click outside a transient mode is nothing to the engine.
+        assert!(!m.note_click(&c));
+    }
+
+    #[test]
+    fn a_transient_mode_times_out() {
+        let c = lua(HINTS_CONFIG);
+        let mut m = in_hints(&c);
+        let at = m.transient_deadline().expect("the timer is running");
+        // Not a moment before.
+        assert!(!m.check_deadline(&c, at - Duration::from_millis(1)));
+        assert_eq!(m.active(), "hints");
+        assert!(m.check_deadline(&c, at));
+        assert_eq!(m.active(), "browser");
+        assert_eq!(m.transient_deadline(), None, "and the timer stops with the mode");
+
+        // Re-entering restarts both the timer and the counter, so a second
+        // press of the hints chord means fresh hints.
+        let mut m = in_hints(&c);
+        m.note_press(&c, Button::A);
+        m.note_press(&c, Button::A);
+        assert!(!m.set_mode(&c, "hints"), "already there — no transition");
+        m.note_press(&c, Button::A);
+        assert!(!m.settle_presses(&c), "the counter started over");
+        assert_eq!(m.active(), "hints");
+    }
+
+    #[test]
+    fn a_transient_mode_never_wins_by_rule() {
+        // The loader refuses `:transient` beside a `:when` outright
+        // (lua_config), so this is the engine's own half of the same rule:
+        // even handed a rule, a transient mode is skipped in the scan. It is
+        // declared FIRST here, so without the skip it would win.
+        let mut c = lua(HINTS_CONFIG);
+        let browser_rule = c.modes()[1].rule;
+        assert!(browser_rule.is_some());
+        c.modes[0].rule = browser_rule;
+
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "google-chrome", "Some page", None);
+        assert_eq!(m.active(), "browser", "a mode you enter is never a mode you fall into");
+        // Entering it by hand still works, and it still clears itself.
+        assert!(m.set_mode(&c, "hints"));
+        assert!(m.note_click(&c));
+        assert_eq!(m.active(), "browser");
+    }
+
+    #[test]
+    fn an_ordinary_manual_override_is_untouched_by_any_of_it() {
+        // Everything above is gated on the mode being declared `:transient`.
+        // The `h.set_mode "desktop"` escape hatch must still stick through a
+        // focus change, a click and any number of presses.
+        let c = lua(HINTS_CONFIG);
+        let mut m = ModeEngine::new(&c);
+        m.focus_changed(&c, "google-chrome", "Some page", None);
+        assert!(m.set_mode(&c, "desktop"));
+        assert_eq!(m.transient_deadline(), None);
+        for _ in 0..5 {
+            assert_eq!(m.note_press(&c, Button::B), PressOutcome::default());
+        }
+        assert!(!m.settle_presses(&c));
+        assert!(!m.note_click(&c));
+        m.focus_changed(&c, "google-chrome", "Some page", None);
+        assert_eq!(m.active(), "desktop", "an override is an override until it is cleared");
+        assert!(m.clear_mode(&c));
+        assert_eq!(m.active(), "browser");
     }
 
     #[test]

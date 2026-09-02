@@ -64,7 +64,7 @@ use std::fmt::Write as _;
 
 use crate::config::{
     osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, KeyChord, ModeState,
-    OskAction, WorkspaceTarget,
+    OskAction, TransientExit, TransientSpec, WorkspaceTarget,
 };
 use crate::gesture::{Stick, StickDir};
 use crate::report::Button;
@@ -155,6 +155,15 @@ pub struct ModeRow {
     /// Whether the daemon hardwires this context rather than the config
     /// declaring it — see [`OSK_MODE`].
     pub builtin: bool,
+    /// How this mode gives itself back, in words — `"transient · 3 presses ·
+    /// exit on B, focus, title, click · 8s"` — or `None` for an ordinary mode
+    /// that stays until something moves it.
+    ///
+    /// This is the *only* place a reader learns that entering `hints` is not
+    /// a one-way door: the mode is a tab like any other, and nothing else on
+    /// the sheet says it will let go on its own
+    /// ([`crate::config::TransientSpec`]).
+    pub transient: Option<String>,
     /// The section whose rows ARE this context, for a built-in one: the reader
     /// is in it exactly when those bindings are the ones that work. `None` for
     /// a declared mode, whose rows are decided by each binding's guard.
@@ -384,6 +393,7 @@ impl Sheet {
                     has_rule: m.rule.is_some(),
                     default: m.name == default_mode,
                     builtin: false,
+                    transient: m.transient.as_ref().map(transient_note),
                     section: None,
                     active,
                     conditional,
@@ -404,6 +414,7 @@ impl Sheet {
             has_rule: false,
             default: false,
             builtin: true,
+            transient: None,
             section: Some(Section::OskButton.wire()),
             active: osk
                 .iter()
@@ -772,8 +783,53 @@ pub fn action_string(a: &Action) -> String {
         Action::SetMode(m) => format!("set_mode {m}"),
         Action::ClearMode => "clear_mode".to_string(),
         Action::ControllerOff => "controller_off".to_string(),
+        // The `seq: a; b` spelling `Action::parse` reads back, steps in order.
+        Action::Seq(steps) => format!(
+            "seq: {}",
+            steps.iter().map(action_string).collect::<Vec<_>>().join("; ")
+        ),
         Action::None => "none".to_string(),
     }
+}
+
+/// A transient mode's contract in words, for the mode row: `"transient · 3
+/// presses · exit on B, focus, title, click · 8s"`.
+///
+/// Only the parts that are switched on appear, so `transient { max_presses =
+/// 0, exit_on = { "b" }, timeout_ms = 0 }` reads `"transient · exit on B"` —
+/// the reader should be able to tell at a glance which of the three ways out
+/// actually exist.
+pub fn transient_note(t: &TransientSpec) -> String {
+    let mut parts = vec!["transient".to_string()];
+    match t.max_presses {
+        0 => {}
+        1 => parts.push("1 press".to_string()),
+        n => parts.push(format!("{n} presses")),
+    }
+    if !t.exit_on.is_empty() {
+        let names: Vec<String> = t
+            .exit_on
+            .iter()
+            .map(|e| match e {
+                TransientExit::Button(b) => button_label(*b),
+                TransientExit::Focus => "focus".to_string(),
+                TransientExit::Title => "title".to_string(),
+                TransientExit::Click => "click".to_string(),
+            })
+            .collect();
+        parts.push(format!("exit on {}", names.join(", ")));
+    }
+    if t.timeout_ms > 0 {
+        // Whole seconds where they are whole, so the common 8000 does not read
+        // as "8.0s" and a 500 ms timer is still legible.
+        let secs = t.timeout_ms as f64 / 1000.0;
+        parts.push(if secs.fract() == 0.0 {
+            format!("{secs:.0}s")
+        } else {
+            format!("{secs}s")
+        });
+    }
+    parts.join(" · ")
 }
 
 /// The action's verb, for the widget to colour by.
@@ -792,6 +848,7 @@ pub fn action_kind(a: &Action) -> &'static str {
         // Its own kind, not `exec`: nothing else on the sheet acts on the
         // hardware in the reader's hand, and the widget colours by this.
         Action::ControllerOff => "controller",
+        Action::Seq(_) => "seq",
         Action::None => "none",
     }
 }
@@ -1024,7 +1081,30 @@ pub fn derive_label(a: &Action) -> String {
         Action::SetMode(m) => format!("Force {m} mode"),
         Action::ClearMode => "Back to automatic mode".to_string(),
         Action::ControllerOff => "Turn the controller off".to_string(),
+        // The steps in order, each in its short in-sequence form: "F, then
+        // Hints" says what one press does far better than "Shift+F, then
+        // Force hints mode" would.
+        Action::Seq(steps) => steps
+            .iter()
+            .map(step_label)
+            .collect::<Vec<_>>()
+            .join(", then "),
         Action::None => "Unbound".to_string(),
+    }
+}
+
+/// One step of a sequence, labelled for the middle of a list rather than for a
+/// row of its own.
+///
+/// The mode verbs are the whole difference: alone, `set_mode hints` is "Force
+/// hints mode", which is a sentence; as the tail of "type F, then …" the mode
+/// name *is* the label. Everything else reads the same either way and goes
+/// through [`derive_label`] unchanged.
+fn step_label(a: &Action) -> String {
+    match a {
+        Action::SetMode(m) => capitalize(m),
+        Action::ClearMode => "automatic".to_string(),
+        other => derive_label(other),
     }
 }
 
@@ -1204,6 +1284,11 @@ impl Sheet {
                 ", \"forward\": {}, \"has_rule\": {}, \"default\": {}, \"builtin\": {}",
                 m.forward, m.has_rule, m.default, m.builtin
             );
+            o.push_str(", \"transient\": ");
+            match &m.transient {
+                Some(note) => push_str(&mut o, note),
+                None => o.push_str("null"),
+            }
             o.push_str(", \"section\": ");
             match m.section {
                 Some(s) => push_str(&mut o, s),
@@ -1280,6 +1365,9 @@ impl Sheet {
             notes.push(if m.has_rule { "rule".to_string() } else { "no rule".to_string() });
             if m.forward {
                 notes.push("forwards raw input".to_string());
+            }
+            if let Some(note) = &m.transient {
+                notes.push(note.clone());
             }
             let _ = writeln!(o, "  {} ({})", m.name, notes.join(", "));
             let _ = writeln!(o, "    live {}/{}: {}", m.active.len(), total, wrap(&m.active, 6));
@@ -1678,6 +1766,12 @@ mod tests {
             Action::Key(0x112.into()),
             Action::SetMode("game".into()),
             Action::ClearMode,
+            Action::Seq(vec![Action::Key(33.into()), Action::SetMode("hints".into())]),
+            Action::Seq(vec![
+                Action::Key(KeyChord::parse("shift+f").unwrap()),
+                Action::SetMode("hints".into()),
+            ]),
+            Action::Seq(vec![Action::Exec("true".into()), Action::ClearMode]),
             Action::None,
         ] {
             let s = action_string(&a);
@@ -2327,5 +2421,97 @@ mod tests {
         ] {
             assert!(t.contains(want), "missing {want:?} in\n{t}");
         }
+    }
+
+    // --- h.seq and transient modes (docs/research/browser-hints.md) --------
+
+    #[test]
+    fn a_sequence_reads_as_its_steps_joined() {
+        // "F, then Hints" says what one press does; "Shift+F, then Force hints
+        // mode" would be two sentences pretending to be a label.
+        let hints = Action::Seq(vec![Action::Key(33.into()), Action::SetMode("hints".into())]);
+        assert_eq!(derive_label(&hints), "F, then Hints");
+        assert_eq!(action_string(&hints), "seq: key f; set_mode hints");
+        assert_eq!(action_kind(&hints), "seq");
+
+        let bg = Action::Seq(vec![
+            Action::Key(KeyChord::parse("shift+f").unwrap()),
+            Action::SetMode("hints".into()),
+        ]);
+        assert_eq!(derive_label(&bg), "Shift+F, then Hints");
+
+        // `clear_mode` gets the same in-sequence shortening, and everything
+        // that is not a mode verb reads exactly as it does on a row of its own.
+        let out = Action::Seq(vec![Action::Key(1.into()), Action::ClearMode]);
+        assert_eq!(derive_label(&out), "Escape, then automatic");
+        let three = Action::Seq(vec![
+            Action::Exec("omarchy-menu".into()),
+            Action::Key(33.into()),
+            Action::SetMode("hints".into()),
+        ]);
+        assert_eq!(derive_label(&three), "Omarchy menu, then F, then Hints");
+    }
+
+    #[test]
+    fn a_transient_mode_says_so_in_its_row() {
+        let c = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("hints"):transient { max_presses = 3,
+                                        exit_on = { "b", "focus", "title", "click" },
+                                        timeout_ms = 8000 }
+            h.mode("browser").when(function(ctx) return ctx.focus.class == "google-chrome" end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.bind("guide+l4", "Link hints", h.seq { h.key "f", h.set_mode "hints" })
+                :only_in("browser")
+            h.button("a", h.key "a"):only_in("hints")
+            "#,
+            "t.lua",
+        )
+        .expect("config should load");
+        let s = Sheet::build(&c, None);
+
+        let hints = s.modes.iter().find(|m| m.name == "hints").expect("a hints tab");
+        assert_eq!(
+            hints.transient.as_deref(),
+            Some("transient · 3 presses · exit on B, focus, title, click · 8s")
+        );
+        assert!(!hints.has_rule, "a transient mode is entered, never resolved into");
+        // The ordinary modes carry nothing, so the widget can tell them apart.
+        assert!(s.modes.iter().find(|m| m.name == "browser").unwrap().transient.is_none());
+
+        // The mode summary shows it beside the mode's other notes...
+        let t = s.to_text();
+        assert!(
+            t.contains("hints (no rule, transient · 3 presses · exit on B, focus, title, click · 8s)"),
+            "the mode row must carry the contract:\n{t}"
+        );
+        // ...and the chord that enters it reads as what it does.
+        assert!(t.contains("Link hints"), "{t}");
+        // The JSON carries it too, null where there is none.
+        let j = s.to_json();
+        assert!(j.contains(r#""transient": "transient · 3 presses"#), "{j}");
+        assert!(j.contains(r#""transient": null"#), "{j}");
+    }
+
+    #[test]
+    fn the_transient_note_shows_only_what_is_switched_on() {
+        use crate::report::Button::B;
+        // Off is the empty value, so a spec with two of the three ways out
+        // turned off must not advertise them.
+        let only_b = TransientSpec {
+            max_presses: 0,
+            exit_on: vec![TransientExit::Button(B)],
+            timeout_ms: 0,
+        };
+        assert_eq!(transient_note(&only_b), "transient · exit on B");
+        // One press is one press.
+        let one = TransientSpec { max_presses: 1, exit_on: Vec::new(), timeout_ms: 500 };
+        assert_eq!(transient_note(&one), "transient · 1 press · 0.5s");
+        // And a mode with no way out at all still says it is transient — an
+        // odd config, but not a silent one.
+        let never = TransientSpec { max_presses: 0, exit_on: Vec::new(), timeout_ms: 0 };
+        assert_eq!(transient_note(&never), "transient");
     }
 }
