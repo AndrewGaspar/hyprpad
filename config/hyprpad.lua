@@ -70,9 +70,9 @@ end)
 -- A browser: Google Chrome, and Omarchy's web apps (Chrome in `--app` mode,
 -- class `chrome-<host>__-Default`). Class-keyed like `game`, so it sits below
 -- the layer-keyed modes — an open menu or the cheat sheet still wins — and
--- above `desktop`, the fallback. For now it is a NAME for browser-specific
--- bindings to be guarded into: every desktop guard below lists it too, so a
--- browser behaves exactly like the desktop until those land
+-- above `desktop`, the fallback. Every desktop guard below lists it too, so
+-- a browser behaves exactly like the desktop except where a binding says
+-- otherwise — today the bumpers, which switch tabs
 -- (docs/research/browser-hints.md).
 h.mode("browser").when(function(ctx)
   local c = ctx.focus.class:lower()
@@ -172,7 +172,14 @@ h.button("r1", "Next sheet tab", h.key "right"):only_in("cheatsheet")
 -- the first: under a panel we are in `omarchy-ui`, never in `cheatsheet`.
 h.button("r1", "Next panel", h.key "tab"):only_in("omarchy-ui")
 
--- L1/R1 = previous/next browser tab arrive with bare-button actions.
+-- Browser tabs on the bumpers (docs/research/browser-hints.md §6): Chrome's
+-- own Ctrl+Shift+Tab / Ctrl+Tab, sent by the compositor to the focused
+-- window — a bare button carrying a dispatch fires once, on the press edge.
+-- Guarded into `browser`, so the bumpers still page the cheat sheet and walk
+-- the bar's panels elsewhere, and `guide+l1`/`guide+r1` still change
+-- workspace everywhere.
+h.button("l1", "Previous browser tab", h.dispatch 'hl.dsp.send_shortcut({ mods = "CTRL SHIFT", key = "Tab" })'):only_in("browser")
+h.button("r1", "Next browser tab",     h.dispatch 'hl.dsp.send_shortcut({ mods = "CTRL", key = "Tab" })'):only_in("browser")
 
 -- While the on-screen keyboard is up, these tap keys THROUGH the OSK
 -- (Deck-style helpers) so you never hunt for them with a cursor. Unguarded on

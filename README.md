@@ -168,9 +168,9 @@ h.button("b", "Close cheat sheet", h.key "escape"):only_in("cheatsheet")
 ```
 
 Modes are exclusive, so at most one of them is ever live. The sample's
-`browser` mode (Google Chrome, and Omarchy's `chrome-*` web apps) exists so
-browser-only bindings have a context to be guarded into; the desktop guards list
-it as well, so a browser behaves exactly like the desktop until those land.
+`browser` mode (Google Chrome, and Omarchy's `chrome-*` web apps) is where the
+browser-only bindings live — L1/R1 switch tabs there — and the desktop guards
+list it as well, so everything else behaves exactly as on the desktop.
 
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:
