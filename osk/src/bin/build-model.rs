@@ -1,7 +1,7 @@
 //! `hyprpad-osk-build-model` — turn a word list into a prediction model.
 //!
-//! The second half of the offline pipeline described in
-//! `osk/tools/build-model/README.md`: the Python script downloads and merges the
+//! The second half of the offline pipeline described under "Prediction" in
+//! `osk/README.md`: the Python script downloads and merges the
 //! data sources and writes the plain-text word list
 //! ([`hyprpad_osk::predict::wordlist`]); this writes the binary model the
 //! keyboard maps at runtime ([`hyprpad_osk::predict::model`]).

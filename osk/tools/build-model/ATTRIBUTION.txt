@@ -4,8 +4,9 @@ Unigram frequencies from wordfreq (large_en), Robyn Speer et al.,
 https://github.com/rspeer/wordfreq — data licensed CC BY-SA 4.0.
 Word validity and casing from SCOWL / Hunspell en_US as distributed with
 LibreOffice, https://github.com/LibreOffice/dictionaries — MIT-like licence.
-Bigram successor counts from the Leipzig Corpora Collection (English news),
-Universitat Leipzig, https://wortschatz.uni-leipzig.de/ — CC BY 4.0.
+Bigram successor counts from the Leipzig Corpora Collection (English news 2016,
+2019, 2020 and 2023, plus English Wikipedia 2016), Universitat Leipzig,
+https://wortschatz.uni-leipzig.de/ — CC BY 4.0.
 
 This derived model is licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)
 because wordfreq's data is share-alike. The hyprpad-osk program that reads it is

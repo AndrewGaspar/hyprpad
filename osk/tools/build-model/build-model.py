@@ -38,7 +38,6 @@ documented upgrade path. See DATA-LICENSES.md.
 import argparse
 import collections
 import gzip
-import math
 import os
 import sys
 import tarfile
@@ -50,7 +49,16 @@ WORDFREQ_URL = (
 SCOWL_DIC_URL = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/en/en_US.dic"
 LEIPZIG_BASE = "https://downloads.wortschatz-leipzig.de/corpora"
 
-DEFAULT_CORPORA = ["eng_news_2023_1M", "eng_news_2020_1M"]
+# The corpora merged by default: four years of English news plus Wikipedia,
+# ~1.4 GB of downloads for ~915 k in-vocabulary bigram types. More years (or
+# more registers) is the cheap way to add coverage; --corpus replaces this list.
+DEFAULT_CORPORA = [
+    "eng_news_2023_1M",
+    "eng_news_2020_1M",
+    "eng_news_2019_1M",
+    "eng_news_2016_1M",
+    "eng_wikipedia_2016_1M",
+]
 
 # A token we will never put in the lexicon, whatever the source says.
 MAX_WORD_CHARS = 30
@@ -191,8 +199,11 @@ def build_vocab(freqs, scowl, limit, scowl_only):
 
     Returns an ordered dict word -> probability, commonest first.
     """
+    # `sorted`, not the set's own order: Python randomises string hashing per
+    # process, and two SCOWL stems can fold to the same lower-case key, so
+    # iterating the set directly would make the build non-reproducible.
     scowl_lower = {}
-    for stem in scowl:
+    for stem in sorted(scowl):
         if any(c.isupper() for c in stem) and shapely(stem):
             scowl_lower.setdefault(stem.lower(), stem)
 

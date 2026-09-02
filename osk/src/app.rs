@@ -711,17 +711,14 @@ impl Osk {
 
     fn commit_key_index(&mut self, k: usize, qh: &QueueHandle<Self>) {
         let key = self.keyboard.keys[k].clone();
-        // What this key does to the composition buffer, decided before the
-        // shift latch moves on (a Char's legend depends on the level it commits
-        // at). `None` for a key that types nothing.
-        let edit = match key.role {
-            KeyRole::Char => key.display_label(self.shift.commits_shifted(&key)).chars().next().map(Edit::Char),
-            KeyRole::Space => Some(Edit::Char(' ')),
-            KeyRole::Enter => Some(Edit::Char('\n')),
-            KeyRole::Tab => Some(Edit::Char('\t')),
-            KeyRole::Backspace => Some(Edit::Backspace),
-            _ => None,
-        };
+        // What this key does to the composition buffer, decided before the shift
+        // latch moves on. Derived from the **keystroke**, not the legend: the
+        // field sees a keycode and a shift level, and a symbols-layer key's
+        // legend does not always agree with what a held Shift makes it type. A
+        // key that types nothing (Shift, Caps, the toggles, an inert meta key)
+        // has no keystroke and so no edit.
+        let edit = keystroke_for(&key, self.shift)
+            .and_then(|(code, shifted)| Edit::for_keycode(code, shifted));
         match key.role {
             KeyRole::Shift => {
                 self.shift = self.shift.tap_shift(); // Off→OneShot→Stuck→Off (§4.6)
@@ -747,12 +744,27 @@ impl Osk {
                 }
             }
         }
-        if let Some(edit) = edit {
-            self.apply_edit(edit, true);
-            self.refresh_candidates();
-        }
+        self.account_for(keystroke_for(&key, self.shift), edit);
         self.rebuild_highlights();
         self.mark_all_dirty();
+    }
+
+    /// Fold one committed keystroke into the composition buffer and re-rank.
+    ///
+    /// A keystroke we *cannot* account for — the `<` / `>` arrow keys moving the
+    /// text cursor, or a modified chord like Ctrl+Backspace — invalidates
+    /// everything the buffer thought it knew about the field, exactly as a focus
+    /// change does. Resetting is the honest answer: the alternative is
+    /// completing against a prefix that is no longer under the cursor.
+    fn account_for(&mut self, stroke: Option<(u16, bool)>, edit: Option<Edit>) {
+        match (stroke, edit) {
+            (_, Some(edit)) => {
+                self.apply_edit(edit, true);
+                self.refresh_candidates();
+            }
+            (Some(_), None) => self.reset_context(),
+            (None, None) => {}
+        }
     }
 
     /// Mirror one keystroke into the composition buffer, and — when `user` and
@@ -783,13 +795,10 @@ impl Osk {
         // A bare keycode from a bound button (the Deck map's Y = Space,
         // X = Backspace, R2 = Enter) is the user typing, so it counts as
         // context. A chord with modifiers is an editing command, not a
-        // character, and is left out rather than guessed at.
-        if mods.is_empty() {
-            if let Some(edit) = Edit::for_keycode(keycode, shift) {
-                self.apply_edit(edit, true);
-                self.refresh_candidates();
-            }
-        }
+        // character — Ctrl+Backspace eats a whole word — so it is treated as
+        // unaccountable and resets the buffer rather than being guessed at.
+        let edit = mods.is_empty().then(|| Edit::for_keycode(keycode, shift)).flatten();
+        self.account_for(Some((keycode, shift)), edit);
         if self.ensure_vkbd() {
             if let Some(kbd) = self.vkbd.as_mut() {
                 kbd.tap_with_mods(keycode, shift, mods);
@@ -1471,6 +1480,50 @@ mod tests {
         assert_eq!(ctx.partial(), "");
         assert_eq!(ctx.prev_word(), Some("hello"));
         assert_eq!(ctx.just_closed_word(), Some("hello"), "so the word is offered to the cache");
+    }
+
+    #[test]
+    fn every_key_that_types_is_accounted_for_in_the_context() {
+        // If a key could type into the field without reaching the composition
+        // buffer, the predictor would be ranking against text that is not on
+        // screen. Every key of both layers, at both shift levels: one that emits
+        // a keystroke must yield an edit, and one that emits none must not.
+        for layer in [Layer::Base, Layer::Symbols] {
+            let kb = layer.keyboard();
+            for level in [ShiftModel::default(), ShiftModel::default().with_held(true)] {
+                for key in &kb.keys {
+                    let stroke = keystroke_for(key, level);
+                    let edit = stroke.and_then(|(c, s)| Edit::for_keycode(c, s));
+                    match key.role {
+                        KeyRole::Char
+                        | KeyRole::Space
+                        | KeyRole::Enter
+                        | KeyRole::Tab
+                        | KeyRole::Backspace => {
+                            assert!(
+                                edit.is_some(),
+                                "{layer:?} key {:?} types {stroke:?} but records nothing",
+                                key.label
+                            );
+                        }
+                        KeyRole::Shift
+                        | KeyRole::Caps
+                        | KeyRole::LayerToggle
+                        | KeyRole::DisplayToggle => {
+                            assert!(stroke.is_none(), "{:?} must type nothing", key.label);
+                        }
+                        // The meta keys are the `<`/`>` arrows: they type a
+                        // keystroke but no character, which is exactly the case
+                        // `account_for` answers by resetting the buffer — the
+                        // text cursor moved and the partial word is no longer
+                        // under it.
+                        KeyRole::Meta => {
+                            assert!(stroke.is_some() && edit.is_none(), "{:?}", key.label);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
