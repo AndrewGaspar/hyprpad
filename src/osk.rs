@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 
+use crate::config::KeyChord;
+
 /// Which OSK layout to show. Mirrors the `show <bottom|split>` grammar; the
 /// two-region dual-trackpad model is the same in both modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,8 +151,17 @@ fn shift_cmd(down: bool) -> String {
 /// Format a `key` command line: the OSK taps this raw evdev keycode on its
 /// virtual keyboard. Used by the Deck-style helper buttons (`[osk_buttons]`,
 /// e.g. Y = Space) so common keys need no cursor hunting.
-fn key_cmd(keycode: u16) -> String {
-    format!("key {keycode}")
+///
+/// A [`KeyChord`]'s modifiers follow the keycode (`key 14 29` = Ctrl+Backspace),
+/// which keeps the one-code form the wire has always had: a plain key still
+/// serializes to `key 14` and an older keyboard binary reads it unchanged.
+fn key_cmd(chord: &KeyChord) -> String {
+    let mut line = format!("key {}", chord.code());
+    for &m in chord.mods() {
+        line.push(' ');
+        line.push_str(&m.to_string());
+    }
+    line
 }
 
 /// A live handle to the on-screen keyboard child process.
@@ -253,14 +264,15 @@ impl OskHandle {
         self.send(&shift_cmd(down));
     }
 
-    /// Tap a raw evdev keycode through the OSK's virtual keyboard (the
-    /// `[osk_buttons]` Deck-style helpers, e.g. Y = Space, X = Backspace).
+    /// Tap a key — with any modifiers held around it — through the OSK's
+    /// virtual keyboard (the `[osk_buttons]` Deck-style helpers, e.g. Y =
+    /// Space, X = Backspace, and combos like `h.key "ctrl+backspace"`).
     /// Ignored unless the keyboard is shown.
-    pub fn key(&mut self, keycode: u16) {
+    pub fn key(&mut self, chord: &KeyChord) {
         if !self.active {
             return;
         }
-        self.send(&key_cmd(keycode));
+        self.send(&key_cmd(chord));
     }
 
     /// Ensure a child is running; returns whether we have a usable control
@@ -477,7 +489,12 @@ mod tests {
         // distinct from the latch levels `off|oneshot|stuck|on`.
         assert_eq!(shift_cmd(true), "shift down");
         assert_eq!(shift_cmd(false), "shift up");
-        assert_eq!(key_cmd(57), "key 57");
+        assert_eq!(key_cmd(&KeyChord::plain(57)), "key 57");
+        // A combo trails its modifiers, in press order, after the key.
+        let ctrl_bs = KeyChord::parse("ctrl+backspace").expect("parse");
+        assert_eq!(key_cmd(&ctrl_bs), "key 14 29");
+        let ctrl_shift_tab = KeyChord::parse("ctrl+shift+tab").expect("parse");
+        assert_eq!(key_cmd(&ctrl_shift_tab), "key 15 29 42");
     }
 
     #[test]

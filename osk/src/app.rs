@@ -272,7 +272,7 @@ impl Osk {
             Command::ShiftHeld { down } => self.set_held_shift(down),
             Command::Layer { target } => self.set_layer(target.unwrap_or_else(|| self.layer.toggled())),
             Command::Reflow { on } => self.set_reflow(on, qh),
-            Command::Key { keycode } => self.type_keycode(keycode),
+            Command::Key { keycode, mods } => self.type_keycode(keycode, &mods),
             Command::Type { text } => self.type_str(&text),
             Command::Quit => self.exit = true,
         }
@@ -493,8 +493,16 @@ impl Osk {
         self.mark_all_dirty();
     }
 
-    fn type_keycode(&mut self, keycode: u16) {
-        self.tap(keycode, self.shift.is_active());
+    /// The daemon's `key <code> [mod…]`: tap the code with those modifiers
+    /// held around it, and with the keyboard's own Shift folded in if its latch
+    /// (or a held L2) is up — the same rule a key committed off the layout gets.
+    fn type_keycode(&mut self, keycode: u16, mods: &[u16]) {
+        let shift = self.shift.is_active();
+        if self.ensure_vkbd() {
+            if let Some(kbd) = self.vkbd.as_mut() {
+                kbd.tap_with_mods(keycode, shift, mods);
+            }
+        }
     }
 
     fn type_str(&mut self, text: &str) {
