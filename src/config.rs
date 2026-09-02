@@ -28,7 +28,8 @@
 //! |---|---|
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
 //! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
-//! | `[osk_buttons]` | what buttons do while the on-screen keyboard is up — a key typed through it, or one of its own actions (`osk commit\|shift\|dismiss`) — layered over the built-in Deck map ([`osk_builtins`]) |
+//! | `[osk_buttons]` | what buttons do while the on-screen keyboard is up — a key typed through it, or one of its own actions (`osk commit\|shift\|dismiss\|accept\|next`) — layered over the built-in Deck map ([`osk_builtins`]) |
+//! | `[keyboard]` | the on-screen keyboard's own settings ([`KeyboardConfig`]): `learn_deny`, the window classes its word predictor must never learn in |
 //! | `[daemon]` | daemon-wide switches (`own_lizard`, `steam_button_poweroff`, `sleep_inactivity_timeout`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]); `guide_in = ["game"]` lists the modes where the pad drives the cursor *while the guide is held* |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
@@ -553,6 +554,15 @@ pub enum OskAction {
     /// Close the keyboard (`osk dismiss`, `h.osk "dismiss"`; `close` and
     /// `hide` are aliases): B and Menu.
     Dismiss,
+    /// Accept the keyboard's highlighted word suggestion (`osk accept`,
+    /// `h.osk "accept"`): R1, the PS5/Xbox convention
+    /// (`docs/research/osk-prediction.md` §7.1/§7.2). It types the rest of the
+    /// word and a space, so accepting repeatedly chains a phrase.
+    CandidateAccept,
+    /// Move the suggestion strip's highlight one slot along, wrapping
+    /// (`osk next`, `h.osk "next"`): L1. Pairs with R1 so neither thumb has to
+    /// leave the bumpers to pick a different word.
+    CandidateNext,
     /// Nothing — how a config takes a built-in away from a button
     /// (`menu = "none"`, `h.osk_button("menu", h.none())`).
     None,
@@ -578,7 +588,7 @@ impl OskAction {
         };
         match verb.to_ascii_lowercase().as_str() {
             "osk" => osk_verb(rest).ok_or_else(|| {
-                format!("unknown on-screen keyboard action '{rest}' (want osk commit|shift|dismiss)")
+                format!("unknown on-screen keyboard action '{rest}' (want osk commit|shift|dismiss|accept|next)")
             }),
             "key" | "mouse" | "click" => match Action::parse(s)? {
                 Action::Key(c) if is_mouse_code(c.code()) => Err(OSK_MOUSE_ERR.to_string()),
@@ -586,7 +596,7 @@ impl OskAction {
                 other => Err(format!("'{s}' is not a key ({other:?})")),
             },
             _ => Err("osk_buttons values must be a 'key <name>', one of the keyboard's own \
-                      actions ('osk commit|shift|dismiss'), or none"
+                      actions ('osk commit|shift|dismiss|accept|next'), or none"
                 .to_string()),
         }
     }
@@ -598,6 +608,8 @@ fn osk_verb(word: &str) -> Option<OskAction> {
         "commit" | "type" => Some(OskAction::Commit),
         "shift" => Some(OskAction::Shift),
         "dismiss" | "close" | "hide" => Some(OskAction::Dismiss),
+        "accept" | "suggest" => Some(OskAction::CandidateAccept),
+        "next" | "cycle" => Some(OskAction::CandidateNext),
         _ => None,
     }
 }
@@ -613,7 +625,15 @@ fn osk_verb(word: &str) -> Option<OskAction> {
 /// | R2 (full pull) | Enter |
 /// | Y | Space |
 /// | X | Backspace |
+/// | R1 | accept the highlighted word suggestion |
+/// | L1 | move the suggestion highlight along |
 /// | B, Menu | close the keyboard |
+///
+/// R1/L1 follow the console convention — PS5 accepts a prediction with R1, and
+/// nobody makes you point at the suggestion strip
+/// (`docs/research/osk-prediction.md` §7.1/§7.2). Both bumpers were unbound
+/// while the keyboard was up, so nothing was taken away to make room. With no
+/// prediction model installed the keyboard has no strip and both are no-ops.
 ///
 /// These are always on: a config's `osk_buttons` are layered **over** them
 /// ([`Config::osk_buttons_in`]), never in place of them, so a config that lists
@@ -630,6 +650,8 @@ pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'stat
         (TriggerR2Full, OskAction::Key(KeyChord::plain(28)), "Enter"),
         (Y, OskAction::Key(KeyChord::plain(57)), "Space"),
         (X, OskAction::Key(KeyChord::plain(14)), "Backspace"),
+        (BumperR1, OskAction::CandidateAccept, "Accept suggestion"),
+        (BumperL1, OskAction::CandidateNext, "Next suggestion"),
         (B, OskAction::Dismiss, "Close the keyboard"),
         (Menu, OskAction::Dismiss, "Close the keyboard"),
     ]
@@ -1136,6 +1158,35 @@ impl Default for ScrubConfig {
     }
 }
 
+/// On-screen keyboard knobs (the `[keyboard]` config section / `h.keyboard_config`).
+///
+/// Distinct from `[osk_buttons]`, which says what a *button* does while the
+/// keyboard is up; these are the keyboard's own settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardConfig {
+    /// Window classes the keyboard must not learn typed words in — password
+    /// managers, polkit agents, lock screens, and terminals
+    /// (`docs/research/osk-prediction.md` §5.3 rule 2, following SwiftKey and
+    /// ibus-typing-booster). Matched case-insensitively as a substring of the
+    /// focused window's class, so `1password` catches both `1Password` and
+    /// `com.1password.desktop`.
+    ///
+    /// The daemon sends `learn off` to the keyboard whenever focus lands on a
+    /// match, and `learn on` when it leaves. Setting this **replaces** the
+    /// default list ([`crate::osk::LEARN_DENY`]); an empty list turns the
+    /// window gate off entirely (the keyboard's own shape filters — no digits,
+    /// no symbols, nothing over 24 characters — still apply).
+    pub learn_deny: Vec<String>,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> KeyboardConfig {
+        KeyboardConfig {
+            learn_deny: crate::osk::LEARN_DENY.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
 /// Haptic-feedback knobs (the `[haptics]` config section).
 ///
 /// The puck has an actuator behind each trackpad ([`crate::haptics`]); firing a
@@ -1630,6 +1681,8 @@ pub struct Config {
     pub(crate) scrub: ScrubConfig,
     /// Haptic-feedback knobs (`[haptics]` section).
     pub(crate) haptics: HapticsConfig,
+    /// On-screen keyboard knobs (`[keyboard]` section / `h.keyboard_config`).
+    pub(crate) keyboard: KeyboardConfig,
     /// Virtual-gamepad knobs (`[gamepad]` section).
     pub(crate) gamepad: GamepadConfig,
 
@@ -1731,6 +1784,16 @@ l2 = "mouse right"
 y = "key space"
 x = "key backspace"
 
+# The on-screen keyboard's own settings (not its button table, above). The word
+# predictor learns the words you commit, so that it can complete them later; it
+# never learns a token with a digit or a symbol, or one over 24 characters, and
+# it never learns at all in a window whose class matches this list — password
+# managers, polkit agents, the lock screen, and terminals, where a typed secret
+# is routine. Setting learn_deny REPLACES this list; learn_deny = [] turns the
+# window gate off. Matching is case-insensitive and by substring.
+[keyboard]
+learn_deny = ["1password", "keepassxc", "bitwarden", "polkit", "org.kde.polkit-kde-authentication-agent-1", "gnome-keyring", "hyprlock", "foot", "kitty", "alacritty", "ghostty"]
+
 # Left trackpad scrolls the desktop (ambient) layer; the right pad keeps driving
 # the cursor. All knobs are tunable starting points.
 [scroll]
@@ -1788,6 +1851,7 @@ impl Config {
         let mut scrub = ScrubConfig::default();
         let mut scrub_guard = Guard::Always;
         let mut haptics = HapticsConfig::default();
+        let mut keyboard = KeyboardConfig::default();
         let mut gamepad = GamepadConfig::default();
         let mut section = String::new();
         for (i, raw_line) in s.lines().enumerate() {
@@ -2053,6 +2117,21 @@ impl Config {
                         }
                     }
                 }
+                // The on-screen keyboard's own settings (not its button table —
+                // that is `[osk_buttons]`).
+                "keyboard" | "osk" => {
+                    let key = unquote(k).to_ascii_lowercase();
+                    match key.as_str() {
+                        "learn_deny" | "no_learn" | "never_learn" => {
+                            keyboard.learn_deny = parse_string_list(v);
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {lineno}: unknown [keyboard] setting '{other}'"
+                            ));
+                        }
+                    }
+                }
                 // Virtual-gamepad knobs: the master switch, whether the guide
                 // button reaches the game, and the rumble back-channel.
                 "gamepad" => {
@@ -2109,6 +2188,7 @@ impl Config {
             scrub,
             scrub_guard,
             haptics,
+            keyboard,
             gamepad,
             // The TOML dialect declares no modes and no guards: everything is
             // unguarded, and an empty mode list is the signal that
@@ -2293,6 +2373,19 @@ impl Config {
     /// retunes the feel live.
     pub fn haptics(&self) -> &HapticsConfig {
         &self.haptics
+    }
+
+    /// The on-screen keyboard's knobs (`[keyboard]` section /
+    /// `h.keyboard_config`); defaults from [`KeyboardConfig::default`].
+    pub fn keyboard(&self) -> &KeyboardConfig {
+        &self.keyboard
+    }
+
+    /// The window classes the keyboard must not learn typed words in — what the
+    /// daemon hands [`crate::osk::OskHandle::focus_changed`] on every focus
+    /// change.
+    pub fn osk_learn_deny(&self) -> &[String] {
+        &self.keyboard.learn_deny
     }
 
     /// The virtual-gamepad knobs (`[gamepad]` section); defaults from
@@ -3216,19 +3309,54 @@ mod tests {
         assert_eq!(OskAction::parse("osk dismiss"), Ok(Dismiss));
         assert_eq!(OskAction::parse("osk close"), Ok(Dismiss));
         assert_eq!(OskAction::parse("osk hide"), Ok(Dismiss));
+        // The prediction strip's two verbs (R1/L1 by default).
+        assert_eq!(OskAction::parse("osk accept"), Ok(CandidateAccept));
+        assert_eq!(OskAction::parse("OSK Accept"), Ok(CandidateAccept));
+        assert_eq!(OskAction::parse("osk suggest"), Ok(CandidateAccept));
+        assert_eq!(OskAction::parse("osk next"), Ok(CandidateNext));
+        assert_eq!(OskAction::parse("osk cycle"), Ok(CandidateNext));
         assert_eq!(OskAction::parse("key space"), Ok(Key(57.into())));
         assert_eq!(OskAction::parse("  key enter "), Ok(Key(28.into())));
         assert_eq!(OskAction::parse("none"), Ok(None));
         assert_eq!(OskAction::parse(""), Ok(None));
 
         let e = OskAction::parse("osk frobnicate").unwrap_err();
-        assert!(e.contains("commit|shift|dismiss"), "{e}");
+        assert!(e.contains("commit|shift|dismiss|accept|next"), "{e}");
         assert!(OskAction::parse("osk").is_err(), "a bare `osk` is not a binding");
         for not_a_binding in ["exec foo", "keyboard split", "workspace +1", "set_mode game"] {
             let e = OskAction::parse(not_a_binding).unwrap_err();
             assert!(e.contains("osk_buttons values must be"), "{not_a_binding}: {e}");
         }
         assert!(OskAction::parse("key frobnicate").unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
+    fn the_keyboard_section_carries_the_learn_deny_list() {
+        // The default list is the shipped one, and the DEFAULT_TOML block
+        // restates it — so the living documentation cannot drift from the code.
+        let d = Config::load_default();
+        assert_eq!(d.keyboard(), &KeyboardConfig::default());
+        assert_eq!(d.osk_learn_deny(), d.keyboard().learn_deny.as_slice());
+        assert!(d.osk_learn_deny().iter().any(|s| s == "1password"));
+        assert!(d.osk_learn_deny().iter().any(|s| s == "foot"));
+
+        // A config REPLACES the list rather than adding to it.
+        let c = Config::from_toml_str("[keyboard]\nlearn_deny = [\"obsidian\", \"vault\"]\n")
+            .expect("parse");
+        assert_eq!(c.osk_learn_deny(), ["obsidian".to_string(), "vault".to_string()]);
+        assert!(crate::osk::learn_denied("Obsidian", c.osk_learn_deny()));
+        assert!(!crate::osk::learn_denied("1Password", c.osk_learn_deny()));
+
+        // An empty list turns the window gate off entirely.
+        let c = Config::from_toml_str("[keyboard]\nlearn_deny = []\n").expect("parse");
+        assert!(c.osk_learn_deny().is_empty());
+        assert!(!crate::osk::learn_denied("1Password", c.osk_learn_deny()));
+
+        // `[osk]` is an alias for the same section, and an unknown key is named.
+        let c = Config::from_toml_str("[osk]\nnever_learn = [\"vault\"]\n").expect("parse");
+        assert_eq!(c.osk_learn_deny(), ["vault".to_string()]);
+        let e = Config::from_toml_str("[keyboard]\nfrobnicate = 1\n").unwrap_err();
+        assert!(e.contains("unknown [keyboard] setting 'frobnicate'"), "{e}");
     }
 
     #[test]
@@ -3244,7 +3372,7 @@ mod tests {
         );
         // …but its own verbs are bindings for [osk_buttons], and the error
         // says where they go instead of calling `commit` a bad layout.
-        for verb in ["commit", "shift", "dismiss"] {
+        for verb in ["commit", "shift", "dismiss", "accept", "next"] {
             let e = Action::parse(&format!("osk {verb}")).unwrap_err();
             assert!(e.contains("[osk_buttons]"), "{e}");
             assert!(e.contains("not an action"), "{e}");
@@ -3264,11 +3392,13 @@ mod tests {
                 (Button::X, Key(c)) => assert_eq!(c.code(), key_code("backspace").unwrap()),
                 (Button::PadLeftClick | Button::PadRightClick, Commit) => {}
                 (Button::TriggerL2Full, Shift) => {}
+                (Button::BumperR1, CandidateAccept) => {}
+                (Button::BumperL1, CandidateNext) => {}
                 (Button::B | Button::Menu, Dismiss) => {}
                 other => panic!("unexpected built-in {other:?}"),
             }
         }
-        assert_eq!(osk_builtins().count(), 8);
+        assert_eq!(osk_builtins().count(), 10);
 
         // No config at all: the built-ins are what the keyboard gets.
         let bare = Config::from_toml_str("").expect("empty config");
@@ -3278,7 +3408,10 @@ mod tests {
         assert_eq!(live.get(&Button::TriggerR2Full), Some(&Key(28.into())));
         assert_eq!(live.get(&Button::PadLeftClick), Some(&Commit));
         assert_eq!(live.get(&Button::B), Some(&Dismiss));
-        assert_eq!(live.len(), 8);
+        // The bumpers drive the prediction strip: R1 accepts, L1 cycles.
+        assert_eq!(live.get(&Button::BumperR1), Some(&CandidateAccept));
+        assert_eq!(live.get(&Button::BumperL1), Some(&CandidateNext));
+        assert_eq!(live.len(), 10);
 
         // The owner's config restates Y and X and lists nothing else: the pad
         // clicks, the triggers and B/Menu are all still there.
@@ -3294,11 +3427,12 @@ mod tests {
         assert_eq!(c.osk_buttons().get(&Button::Menu), Some(&None), "the raw table keeps `none`");
         let live = c.osk_buttons_in(&anywhere);
         assert_eq!(live.get(&Button::TriggerR2Full), Some(&Commit), "rebound over the built-in");
-        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15.into())), "added");
+        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15.into())), "rebound over the built-in");
         assert_eq!(live.get(&Button::Menu), Option::None, "taken away, nothing in its place");
         assert_eq!(live.get(&Button::B), Some(&Dismiss), "the other built-ins survive");
         assert_eq!(live.get(&Button::TriggerL2Full), Some(&Shift));
-        assert_eq!(live.len(), 8, "one in, one out");
+        assert_eq!(live.get(&Button::BumperR1), Some(&CandidateAccept), "R1 keeps accepting");
+        assert_eq!(live.len(), 9, "one taken away, none added");
     }
 
     #[test]

@@ -19,6 +19,13 @@ repository = "https://github.com/AndrewGaspar/hyprpad"
 name = "hyprpad-osk"
 path = "src/main.rs"
 
+# The offline model builder: reads the pipeline's word-list text and writes the
+# binary prediction model (`osk/tools/build-model/`). It shares the format code
+# with the keyboard itself, so the writer and the reader can never drift.
+[[bin]]
+name = "hyprpad-osk-build-model"
+path = "src/bin/build-model.rs"
+
 [dependencies]
 # Renderer + layer-shell boilerplate. smithay-client-toolkit wraps the
 # zwlr_layer_shell_v1 dance (create/configure/ack) and gives us an shm
@@ -37,6 +44,14 @@ wayland-client = { version = "0.31", features = ["dlopen"] }
 # cairo/pango/fontconfig C dependency, fully self-contained. Theming/real font
 # rendering is deferred (osk-technology.md §4.7).
 font8x8 = "0.3"
+
+# The prediction lexicon: an ordered map with prefix range scans, mmap-able and
+# ~5 bytes/key (osk-prediction.md §4.3). MIT/Unlicense, pure Rust, no build deps.
+fst = "0.4"
+
+# Maps the prediction model in place so the ~3-4 MB artifact costs page cache
+# rather than heap, and startup costs no parse (osk-prediction.md §8.3).
+memmap2 = "0.9"
 
 # The uinput keyboard is hand-rolled `libc` ioctls, copied/adapted from the
 # parent crate's src/output.rs (VirtualKeyboard). uinput + real evdev keycodes

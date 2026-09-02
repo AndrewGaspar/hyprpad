@@ -8,6 +8,9 @@
 //!   on dismiss).
 //! * [`crate::render`] — draws each panel into an shm buffer.
 //! * [`crate::output`] — the uinput keyboard that actually types.
+//! * [`crate::predict`] — the candidate strip: what to suggest, what the
+//!   keyboard has typed so far, and what an accepted candidate costs in
+//!   keystrokes.
 
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
@@ -35,15 +38,21 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::control::{Channel, Command};
+use crate::control::{CandidateCmd, Channel, Command};
 use crate::layout::{
-    Key, Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, ShiftModel,
-    ShiftState,
+    Key, Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, Rect,
+    ShiftModel, ShiftState, STRIP_SLOTS,
 };
 use crate::output::VirtualKeyboard;
-use crate::render::{self, Canvas, Chrome, Cursor, Highlight, HighlightKind};
+use crate::predict::{Candidate, CandidateKind, Context, Predictor};
+use crate::render::{self, Canvas, Chrome, Cursor, Highlight, HighlightKind, StripSlot};
 use crate::surface;
 use crate::theme::Theme;
+
+/// `KEY_BACKSPACE` — the one evdev code the accept path names directly rather
+/// than reaching through a [`Key`]. (The trailing space goes through
+/// [`Edit::Char`], so it shares `key_for`'s single mapping.)
+const KEY_BACKSPACE: u16 = 14;
 
 /// The floor on how often a single panel is redrawn. At ~6 ms this caps drawing
 /// at ~165 Hz (this class of panel's max useful rate, matching a 165 Hz
@@ -71,6 +80,10 @@ struct PanelSurface {
     want: (u32, u32),
     configured: bool,
     placed: Vec<PlacedKey>,
+    /// The candidate strip's slot rectangles on this panel. Empty when there is
+    /// no model, which is what makes a prediction-less keyboard pixel-identical
+    /// to the one before prediction existed.
+    strip: Vec<Rect>,
     highlights: Vec<Highlight>,
     /// The trackpad cursor sprite(s) to draw on this panel (per-pad, §4.5).
     cursors: Vec<Cursor>,
@@ -128,8 +141,10 @@ pub struct Osk {
     vkbd: Option<VirtualKeyboard>,
 
     // Concurrent per-pad focus (osk-technology.md §4.5): both live at once.
-    left_focus: Option<usize>,
-    right_focus: Option<usize>,
+    // A pad can rest on a key or on a candidate slot — both are hit-tested the
+    // same way, so both are one [`Target`].
+    left_focus: Option<Target>,
+    right_focus: Option<Target>,
     // Each pad's last absolute normalized position (input) and the panel-local
     // pixel point it maps to (for drawing the cursor sprite). Kept per pad so
     // both cursors stay live at once and survive a re-place (§4.1/§4.5).
@@ -142,13 +157,126 @@ pub struct Osk {
     shift: ShiftModel,
     trackpad_scale: f32,
 
+    /// Word completion and next-word prediction. A predictor with no model is
+    /// inert: no strip, no learning, no geometry change.
+    predictor: Predictor,
+    /// What this keyboard has typed since it was shown — the only context phase
+    /// 1 has (osk-prediction.md §1/§8.1).
+    context: Context,
+    /// The current suggestions, best first, at most [`STRIP_SLOTS`].
+    candidates: Vec<Candidate>,
+    /// Which candidate `candidate accept` (R1) would take.
+    selected: usize,
+    /// The word being typed came from the daemon's scripted `type`, not from the
+    /// user, so it must never be learned (osk-prediction.md §8.5 rule 4).
+    /// Cleared when the word closes.
+    scripted_word: bool,
+
     pub exit: bool,
+}
+
+/// What a pad's cursor is resting on: a key, or a slot of the candidate strip.
+/// Both are plain rectangle hit tests over the same panel, so a pad clicking a
+/// suggestion is the same gesture as a pad clicking a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Key(usize),
+    Candidate(usize),
+}
+
+/// One character-level change to the text: what a keystroke does to the field,
+/// and therefore to the composition buffer.
+///
+/// Splitting this out is what makes an accepted candidate testable without a
+/// uinput device: [`accept_edits`] is a pure function from `(partial word,
+/// candidate)` to the sequence of edits, and [`Edit::keystroke`] is the one
+/// place that turns an edit into an evdev code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edit {
+    /// Remove the last character — only ever one the OSK itself typed.
+    Backspace,
+    /// Type one character.
+    Char(char),
+}
+
+impl Edit {
+    /// The evdev keystroke this edit costs, or `None` for a character the
+    /// US-ASCII uinput backend cannot type (`crate::output::key_for`).
+    pub(crate) fn keystroke(self) -> Option<(u16, bool)> {
+        match self {
+            Edit::Backspace => Some((KEY_BACKSPACE, false)),
+            Edit::Char(c) => crate::output::key_for(c),
+        }
+    }
+
+    /// The edit a raw keycode from the daemon performs, if it is one we can
+    /// account for. Derived from `key_for` rather than a second table, so the
+    /// two can never disagree about what a code types.
+    pub(crate) fn for_keycode(code: u16, shift: bool) -> Option<Edit> {
+        if code == KEY_BACKSPACE {
+            return Some(Edit::Backspace);
+        }
+        (0x20u8..=0x7e)
+            .map(char::from)
+            .chain(['\n', '\t'])
+            .find(|&c| crate::output::key_for(c) == Some((code, shift)))
+            .map(Edit::Char)
+    }
+}
+
+/// Which slot the strip highlights when the candidates change.
+///
+/// Gboard's convention (osk-prediction.md §7.2): the typed word sits on the
+/// left and the best *suggestion* is the one highlighted, so `R1` is never a
+/// no-op that retypes what was just typed. With no typed word in slot 0 the
+/// highlight is leftmost-best, which is also what open question 8 leans to
+/// because it reads naturally with `L1` = next.
+pub(crate) fn default_selection(candidates: &[Candidate]) -> usize {
+    usize::from(candidates.len() > 1 && candidates[0].kind == CandidateKind::Typed)
+}
+
+/// The slot `step` moves the highlight to, or `None` when there is nothing to
+/// move to — an empty strip, or a strip of one. `L1` on an empty strip must do
+/// nothing at all rather than wrap onto a slot that is not there.
+pub(crate) fn cycled(selected: usize, n: usize, step: isize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    let next = (selected as isize + step).rem_euclid(n as isize) as usize;
+    (next != selected).then_some(next)
+}
+
+/// The keystrokes that turn the partial word `partial` into `candidate`,
+/// followed by a space.
+///
+/// Only the characters that actually differ are retyped: the common prefix
+/// stays, so accepting "hello" over a typed "hel" costs `l`, `l`, `o`, space
+/// rather than three backspaces and six characters. That matters — every tap
+/// costs ~12 ms of keystroke replay (osk-prediction.md §7.3) — and it is also
+/// the safe thing to do: the backspaces only ever remove characters this
+/// keyboard typed in this session (§8.6).
+pub(crate) fn accept_edits(partial: &str, candidate: &str) -> Vec<Edit> {
+    let common = partial
+        .chars()
+        .zip(candidate.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut edits = Vec::new();
+    for _ in 0..partial.chars().count() - common {
+        edits.push(Edit::Backspace);
+    }
+    edits.extend(candidate.chars().skip(common).map(Edit::Char));
+    edits.push(Edit::Char(' '));
+    edits
 }
 
 impl Osk {
     /// Connect, bind globals, and run the poll loop until `quit`/EOF. `theme`
-    /// is the resolved active theme (from [`crate::theme::ThemeSource`]).
-    pub fn run(mut channel: Channel, theme: Theme) -> Result<(), String> {
+    /// is the resolved active theme (from [`crate::theme::ThemeSource`]);
+    /// `predictor` is the prediction model, or [`Predictor::disabled`] when
+    /// none was found — in which case the keyboard behaves exactly as it did
+    /// before prediction existed (osk-prediction.md §8.3).
+    pub fn run(mut channel: Channel, theme: Theme, predictor: Predictor) -> Result<(), String> {
         let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
         let (globals, mut event_queue) =
             registry_queue_init(&conn).map_err(|e| format!("registry init: {e}"))?;
@@ -186,6 +314,11 @@ impl Osk {
             right_px: None,
             shift: ShiftModel::default(),
             trackpad_scale: 1.0,
+            predictor,
+            context: Context::new(),
+            candidates: Vec::new(),
+            selected: 0,
+            scripted_word: false,
             exit: false,
         };
 
@@ -195,8 +328,14 @@ impl Osk {
             .map_err(|e| format!("initial roundtrip: {e}"))?;
 
         eprintln!(
-            "hyprpad-osk: ready (namespace '{}', theme '{}', key_size {}px)",
-            surface::NAMESPACE, osk.theme.name, osk.theme.geom.key_size
+            "hyprpad-osk: ready (namespace '{}', theme '{}', key_size {}px, prediction {})",
+            surface::NAMESPACE,
+            osk.theme.name,
+            osk.theme.geom.key_size,
+            match osk.predictor.model() {
+                Some(m) => format!("on, {} words", m.len()),
+                None => "off (no model)".to_string(),
+            }
         );
 
         while !osk.exit {
@@ -256,6 +395,9 @@ impl Osk {
                 if !alive {
                     osk.exit = true; // stdin EOF
                 }
+                if osk.exit {
+                    osk.predictor.save();
+                }
             }
         }
 
@@ -264,8 +406,22 @@ impl Osk {
 
     fn handle(&mut self, cmd: Command, qh: &QueueHandle<Self>) {
         match cmd {
-            Command::Show { mode, reflow } => self.show(mode, reflow, qh),
-            Command::Hide => self.hide(),
+            // A raise and a dismiss bracket one field's worth of typing, so the
+            // context is reset at both ends (osk-prediction.md §0.3). The
+            // *internal* re-shows — a reflow or predict toggle recreating the
+            // surfaces — deliberately go straight to `show`/`hide` and keep it,
+            // exactly as they keep the shift latch and the layer.
+            Command::Show { mode, reflow } => {
+                self.show(mode, reflow, qh);
+                self.reset_context();
+            }
+            Command::Hide => {
+                self.hide();
+                self.reset_context();
+                // Flush the learned words while we are idle, rather than only at
+                // exit — which a kill would skip.
+                self.predictor.save();
+            }
             Command::Cursor { pad, nx, ny } => self.update_cursor(pad, nx, ny),
             Command::Commit { pad } => self.commit(pad, qh),
             Command::Shift { state } => self.set_shift(state),
@@ -274,7 +430,26 @@ impl Osk {
             Command::Reflow { on } => self.set_reflow(on, qh),
             Command::Key { keycode, mods } => self.type_keycode(keycode, &mods),
             Command::Type { text } => self.type_str(&text),
-            Command::Quit => self.exit = true,
+            Command::Candidate { what } => match what {
+                CandidateCmd::Accept(n) => self.accept_candidate(n.unwrap_or(self.selected)),
+                CandidateCmd::Next => self.cycle_candidate(1),
+                CandidateCmd::Prev => self.cycle_candidate(-1),
+            },
+            Command::ContextReset => self.reset_context(),
+            Command::Learn { on } => {
+                self.predictor.set_learn(on);
+                eprintln!("hyprpad-osk: learn -> {on}");
+            }
+            Command::Predict { on } => self.set_predict(on, qh),
+            Command::Forget => {
+                self.predictor.forget_all();
+                eprintln!("hyprpad-osk: forgot every learned word");
+                self.refresh_candidates();
+            }
+            Command::Quit => {
+                self.predictor.save();
+                self.exit = true;
+            }
         }
     }
 
@@ -285,7 +460,8 @@ impl Osk {
         self.hide(); // destroy first — never stack surfaces
         self.mode = mode;
         self.reflow = reflow;
-        let specs = surface::panels_for(mode, reflow, &self.keyboard, &self.theme.geom);
+        let specs =
+            surface::panels_for(mode, reflow, &self.keyboard, &self.theme.geom, self.strip_slots());
         for spec in specs {
             let wl_surface = self.compositor.create_surface(qh);
             let layer = self.layer_shell.create_layer_surface(
@@ -307,6 +483,7 @@ impl Osk {
                 want: (spec.width, spec.height),
                 configured: false,
                 placed: Vec::new(),
+                strip: Vec::new(),
                 highlights: Vec::new(),
                 cursors: Vec::new(),
                 buffer: None,
@@ -338,6 +515,65 @@ impl Osk {
         // keyboard was up; it cannot outlive the keyboard. The latch can — a
         // re-show keeps Caps — so only the held bit is dropped.
         self.shift = self.shift.with_held(false);
+    }
+
+    /// How many candidate slots the strip has: three when a model is loaded and
+    /// prediction is on, none otherwise. Drives both the surface size and the
+    /// placement, so the two can never disagree.
+    fn strip_slots(&self) -> usize {
+        if self.predictor.is_ready() {
+            STRIP_SLOTS
+        } else {
+            0
+        }
+    }
+
+    /// The layout engine for the current keyboard, mode and strip.
+    fn engine(&self) -> LayoutEngine<'_> {
+        LayoutEngine::new(&self.keyboard, self.mode).with_strip(self.strip_slots())
+    }
+
+    /// Forget what has been typed and re-derive the (now empty) candidates.
+    /// `show`, `hide`, and the daemon's `context reset` on a focus change.
+    fn reset_context(&mut self) {
+        self.context.reset();
+        self.scripted_word = false;
+        self.refresh_candidates();
+    }
+
+    /// Re-rank the candidate strip from the current context, and redraw.
+    ///
+    /// Called after every commit — a few times a second at most, never on
+    /// cursor motion — so the ≤ 1 ms budget (osk-prediction.md §7.3) is paid
+    /// nowhere near the frame path.
+    fn refresh_candidates(&mut self) {
+        let before = self.candidates.len();
+        self.candidates = if self.predictor.is_ready() {
+            let partial = self.context.partial().to_string();
+            self.predictor.candidates(&self.context, &partial, STRIP_SLOTS)
+        } else {
+            Vec::new()
+        };
+        self.selected = default_selection(&self.candidates);
+        if before != 0 || !self.candidates.is_empty() {
+            self.mark_all_dirty();
+        }
+    }
+
+    /// `predict on|off`. Switching prediction on or off changes the panel's
+    /// height (the strip is content), so the surfaces are recreated exactly as a
+    /// reflow toggle does.
+    fn set_predict(&mut self, on: bool, qh: &QueueHandle<Self>) {
+        if self.predictor.is_ready() == on {
+            return;
+        }
+        self.predictor.set_enabled(on);
+        self.refresh_candidates();
+        eprintln!("hyprpad-osk: predict -> {on}");
+        if !self.panels.is_empty() {
+            let (mode, reflow) = (self.mode, self.reflow);
+            self.show(mode, reflow, qh);
+        }
     }
 
     /// Clear both pads' focus and cursor state (on show/hide/layer swap).
@@ -404,7 +640,7 @@ impl Osk {
 
     /// The key a pad currently focuses (for the no-op dedup in
     /// [`Self::update_cursor`]).
-    fn pad_focus(&self, pad: Pad) -> Option<usize> {
+    fn pad_focus(&self, pad: Pad) -> Option<Target> {
         match pad {
             Pad::Left => self.left_focus,
             Pad::Right => self.right_focus,
@@ -436,10 +672,16 @@ impl Osk {
             return;
         }
         let role = self.panels[idx].role;
-        let eng = LayoutEngine::new(&self.keyboard, self.mode);
+        let eng = self.engine();
         let (px, py) = eng.map_cursor(pad, role, &self.theme.geom, (nx, ny), self.trackpad_scale);
-        let hit = LayoutEngine::hit_test(&self.panels[idx].placed, px, py)
-            .map(|i| self.panels[idx].placed[i].key);
+        // The strip and the keys occupy disjoint bands, so the order of the two
+        // hit tests is only a matter of which is cheaper to try first.
+        let hit = LayoutEngine::hit_test_strip(&self.panels[idx].strip, px, py)
+            .map(Target::Candidate)
+            .or_else(|| {
+                LayoutEngine::hit_test(&self.panels[idx].placed, px, py)
+                    .map(|i| Target::Key(self.panels[idx].placed[i].key))
+            });
         match pad {
             Pad::Left => {
                 self.left_focus = hit;
@@ -452,18 +694,31 @@ impl Osk {
         }
     }
 
-    /// Commit the key under `pad`'s cursor (trackpad click-down, §4.2).
+    /// Commit whatever is under `pad`'s cursor (trackpad click-down, §4.2) — a
+    /// key, or a candidate the pad is pointing at. Clicking a suggestion is the
+    /// discoverable path; `R1` is the fast one (osk-prediction.md §7.2).
     fn commit(&mut self, pad: Pad, qh: &QueueHandle<Self>) {
         let focus = match pad {
             Pad::Left => self.left_focus,
             Pad::Right => self.right_focus,
         };
-        let Some(k) = focus else { return };
-        self.commit_key_index(k, qh);
+        match focus {
+            Some(Target::Key(k)) => self.commit_key_index(k, qh),
+            Some(Target::Candidate(i)) => self.accept_candidate(i),
+            None => {}
+        }
     }
 
     fn commit_key_index(&mut self, k: usize, qh: &QueueHandle<Self>) {
         let key = self.keyboard.keys[k].clone();
+        // What this key does to the composition buffer, decided before the shift
+        // latch moves on. Derived from the **keystroke**, not the legend: the
+        // field sees a keycode and a shift level, and a symbols-layer key's
+        // legend does not always agree with what a held Shift makes it type. A
+        // key that types nothing (Shift, Caps, the toggles, an inert meta key)
+        // has no keystroke and so no edit.
+        let edit = keystroke_for(&key, self.shift)
+            .and_then(|(code, shifted)| Edit::for_keycode(code, shifted));
         match key.role {
             KeyRole::Shift => {
                 self.shift = self.shift.tap_shift(); // Off→OneShot→Stuck→Off (§4.6)
@@ -489,8 +744,47 @@ impl Osk {
                 }
             }
         }
+        self.account_for(keystroke_for(&key, self.shift), edit);
         self.rebuild_highlights();
         self.mark_all_dirty();
+    }
+
+    /// Fold one committed keystroke into the composition buffer and re-rank.
+    ///
+    /// A keystroke we *cannot* account for — the `<` / `>` arrow keys moving the
+    /// text cursor, or a modified chord like Ctrl+Backspace — invalidates
+    /// everything the buffer thought it knew about the field, exactly as a focus
+    /// change does. Resetting is the honest answer: the alternative is
+    /// completing against a prefix that is no longer under the cursor.
+    fn account_for(&mut self, stroke: Option<(u16, bool)>, edit: Option<Edit>) {
+        match (stroke, edit) {
+            (_, Some(edit)) => {
+                self.apply_edit(edit, true);
+                self.refresh_candidates();
+            }
+            (Some(_), None) => self.reset_context(),
+            (None, None) => {}
+        }
+    }
+
+    /// Mirror one keystroke into the composition buffer, and — when `user` and
+    /// the keystroke closed a word — offer that word to the personal cache.
+    ///
+    /// `user` is false for the daemon's scripted `type <text>`: that is not the
+    /// user typing, so it must never be learned (osk-prediction.md §8.5 rule 4).
+    fn apply_edit(&mut self, edit: Edit, user: bool) {
+        match edit {
+            Edit::Backspace => self.context.backspace(),
+            Edit::Char(c) => self.context.push_char(c),
+        }
+        if !user {
+            self.scripted_word = true;
+        }
+        let Some(word) = self.context.just_closed_word().map(str::to_string) else { return };
+        let scripted = std::mem::take(&mut self.scripted_word);
+        if user && !scripted {
+            self.predictor.note_word(&word);
+        }
     }
 
     /// The daemon's `key <code> [mod…]`: tap the code with those modifiers
@@ -498,6 +792,13 @@ impl Osk {
     /// (or a held L2) is up — the same rule a key committed off the layout gets.
     fn type_keycode(&mut self, keycode: u16, mods: &[u16]) {
         let shift = self.shift.is_active();
+        // A bare keycode from a bound button (the Deck map's Y = Space,
+        // X = Backspace, R2 = Enter) is the user typing, so it counts as
+        // context. A chord with modifiers is an editing command, not a
+        // character — Ctrl+Backspace eats a whole word — so it is treated as
+        // unaccountable and resets the buffer rather than being guessed at.
+        let edit = mods.is_empty().then(|| Edit::for_keycode(keycode, shift)).flatten();
+        self.account_for(Some((keycode, shift)), edit);
         if self.ensure_vkbd() {
             if let Some(kbd) = self.vkbd.as_mut() {
                 kbd.tap_with_mods(keycode, shift, mods);
@@ -511,6 +812,47 @@ impl Osk {
                 kbd.type_text(text);
             }
         }
+        // Scripted input still counts as context — the next word really does
+        // follow it — but it is never learned from.
+        for c in text.chars() {
+            if crate::output::key_for(c).is_some() {
+                self.apply_edit(Edit::Char(c), false);
+            }
+        }
+        self.refresh_candidates();
+    }
+
+    /// Accept candidate `idx`: type whatever turns the partial word into it,
+    /// plus a trailing space, through the same `tap` path a key uses
+    /// (osk-prediction.md §7.2/§8.2). Then re-rank, so `R1`-`R1`-`R1` chains
+    /// next-word predictions into a phrase.
+    ///
+    /// Nothing happens when there is no such candidate — an unbound-feeling
+    /// `R1` is better than a surprise keystroke.
+    fn accept_candidate(&mut self, idx: usize) {
+        let Some(cand) = self.candidates.get(idx).cloned() else { return };
+        let partial = self.context.partial().to_string();
+        for edit in accept_edits(&partial, &cand.text) {
+            if let Some((code, shift)) = edit.keystroke() {
+                self.tap(code, shift);
+                self.apply_edit(edit, true);
+            }
+        }
+        // A one-shot Shift was spent on the word we just replaced.
+        self.shift = self.shift.after_char();
+        self.refresh_candidates();
+        self.rebuild_highlights();
+        self.mark_all_dirty();
+    }
+
+    /// Move the strip's highlight by `step` slots, wrapping — the daemon's
+    /// `L1`. Emits `event candidate <n> <text>` so the daemon can tick the
+    /// actuator on the change, the same way it does for a key crossing.
+    fn cycle_candidate(&mut self, step: isize) {
+        let Some(next) = cycled(self.selected, self.candidates.len(), step) else { return };
+        self.selected = next;
+        emit_event(&format!("candidate {} {}", next, self.candidates[next].text));
+        self.mark_all_dirty();
     }
 
     fn tap(&mut self, keycode: u16, shift: bool) {
@@ -544,13 +886,43 @@ impl Osk {
         Self::push_highlight(&mut self.panels, self.right_focus, HighlightKind::RightPad);
     }
 
-    fn push_highlight(panels: &mut [PanelSurface], focus: Option<usize>, kind: HighlightKind) {
-        let Some(k) = focus else { return };
+    fn push_highlight(panels: &mut [PanelSurface], focus: Option<Target>, kind: HighlightKind) {
+        // A pad resting on a candidate highlights the strip, not a key; the
+        // strip's own draw reads the focus back out (see [`Osk::strip_view`]).
+        let Some(Target::Key(k)) = focus else { return };
         for p in panels.iter_mut() {
             if p.placed.iter().any(|pk| pk.key == k) {
                 p.highlights.push(Highlight { key: k, kind });
             }
         }
+    }
+
+    /// The candidate strip as the renderer wants it, for one panel: the slot
+    /// rectangles with their text, the highlight `R1` would accept, and any pad
+    /// resting on a slot.
+    fn strip_view(&self, panel: usize) -> Vec<StripSlot> {
+        let hover = |i: usize| -> Option<HighlightKind> {
+            // The right pad wins a tie only because something has to; both
+            // cursors are still drawn.
+            if self.right_focus == Some(Target::Candidate(i)) {
+                Some(HighlightKind::RightPad)
+            } else if self.left_focus == Some(Target::Candidate(i)) {
+                Some(HighlightKind::LeftPad)
+            } else {
+                None
+            }
+        };
+        self.panels[panel]
+            .strip
+            .iter()
+            .enumerate()
+            .map(|(i, rect)| StripSlot {
+                rect: *rect,
+                text: self.candidates.get(i).map(|c| c.text.clone()).unwrap_or_default(),
+                selected: i == self.selected && i < self.candidates.len(),
+                hover: hover(i),
+            })
+            .collect()
     }
 
     /// Recompute each panel's cursor-sprite list from the per-pad pixel points.
@@ -603,11 +975,12 @@ impl Osk {
                 continue;
             }
             let role = self.panels[i].role;
-            let placed = {
-                let eng = LayoutEngine::new(&self.keyboard, self.mode);
-                eng.place(role, &self.theme.geom)
+            let (placed, strip) = {
+                let eng = self.engine();
+                (eng.place(role, &self.theme.geom), eng.strip_rects(role, &self.theme.geom))
             };
             self.panels[i].placed = placed;
+            self.panels[i].strip = strip;
         }
         // Indices changed with the key set; re-derive focus/cursor from the
         // stored pad positions.
@@ -668,7 +1041,16 @@ impl Osk {
         for i in 0..self.panels.len() {
             if self.panel_due(i, now) {
                 let chrome = self.chrome();
-                draw_panel(&mut self.pool, &self.theme, &self.keyboard, &mut self.panels[i], chrome, qh);
+                let strip = self.strip_view(i);
+                draw_panel(
+                    &mut self.pool,
+                    &self.theme,
+                    &self.keyboard,
+                    &mut self.panels[i],
+                    &strip,
+                    chrome,
+                    qh,
+                );
             }
         }
     }
@@ -743,11 +1125,12 @@ impl Osk {
         // Placement is content-sized from the theme geometry (not stretched to
         // the configured size), so it always agrees with the `[-1,1]` cursor
         // mapping. In practice the configured size equals this content size.
-        let placed = {
-            let eng = LayoutEngine::new(&self.keyboard, self.mode);
-            eng.place(role, &self.theme.geom)
+        let (placed, strip) = {
+            let eng = self.engine();
+            (eng.place(role, &self.theme.geom), eng.strip_rects(role, &self.theme.geom))
         };
         self.panels[idx].placed = placed;
+        self.panels[idx].strip = strip;
         self.panels[idx].configured = true;
         // A pad may already be resting over this newly-placed panel — re-derive
         // its focus/cursor so a resize/first-configure doesn't drop it.
@@ -779,11 +1162,13 @@ impl Osk {
 /// outstanding) and set `frame_pending`, so the next draw waits for the
 /// display's frame clock — or, if the compositor withholds the callback, for the
 /// [`FRAME_FALLBACK`] deadline — rather than firing per control command.
+#[allow(clippy::too_many_arguments)]
 fn draw_panel(
     pool: &mut SlotPool,
     theme: &Theme,
     keyboard: &Keyboard,
     panel: &mut PanelSurface,
+    strip: &[StripSlot],
     chrome: Chrome,
     qh: &QueueHandle<Osk>,
 ) {
@@ -803,7 +1188,16 @@ fn draw_panel(
     };
     {
         let mut canvas = Canvas::new(canvas_bytes, w, h);
-        render::draw_panel(&mut canvas, theme, &keyboard.keys, &panel.placed, &panel.highlights, &panel.cursors, chrome);
+        render::draw_panel(
+            &mut canvas,
+            theme,
+            &keyboard.keys,
+            &panel.placed,
+            strip,
+            &panel.highlights,
+            &panel.cursors,
+            chrome,
+        );
     }
     let surface = panel.layer.wl_surface();
     // Ask for a frame callback only when one is not already outstanding: on a
@@ -1022,6 +1416,161 @@ mod tests {
         // State-changing keys type nothing; an inert meta key types nothing.
         assert_eq!(keystroke_for(key("Shift"), held), None);
         assert_eq!(keystroke_for(key("Push"), held), None);
+    }
+
+    /// The evdev codes a sequence of edits actually emits — what the field sees.
+    fn keystrokes(edits: &[Edit]) -> Vec<(u16, bool)> {
+        edits.iter().filter_map(|e| e.keystroke()).collect()
+    }
+
+    #[test]
+    fn accepting_a_completion_types_only_the_remainder_and_a_space() {
+        let edits = accept_edits("hel", "hello");
+        assert_eq!(
+            edits,
+            vec![Edit::Char('l'), Edit::Char('o'), Edit::Char(' ')],
+            "the typed prefix is kept; only the tail is replayed"
+        );
+        // …and that lands as real keystrokes through the same `key_for` the
+        // keys use: KEY_L, KEY_O, KEY_SPACE.
+        assert_eq!(keystrokes(&edits), vec![(38, false), (24, false), (57, false)]);
+    }
+
+    #[test]
+    fn accepting_a_next_word_prediction_types_the_whole_word() {
+        // Nothing typed yet: no backspaces, the whole candidate, then a space.
+        let edits = accept_edits("", "world");
+        assert_eq!(edits.iter().filter(|e| **e == Edit::Backspace).count(), 0);
+        assert_eq!(edits.last(), Some(&Edit::Char(' ')));
+        assert_eq!(edits.len(), 6);
+    }
+
+    #[test]
+    fn accepting_a_differently_cased_or_corrected_word_backspaces_the_difference() {
+        // "Hello" over a typed "hel": the very first character differs, so all
+        // three go and the candidate is typed whole.
+        let edits = accept_edits("hel", "Hello");
+        assert_eq!(&edits[..3], &[Edit::Backspace, Edit::Backspace, Edit::Backspace]);
+        assert_eq!(edits.len(), 3 + 5 + 1);
+        // The capital really is typed with Shift held.
+        assert_eq!(keystrokes(&edits)[3], (35, true), "KEY_H with shift");
+
+        // A shorter candidate over a longer partial: the extra characters go.
+        let edits = accept_edits("helloo", "hello");
+        assert_eq!(edits, vec![Edit::Backspace, Edit::Char(' ')]);
+
+        // Accepting exactly what was typed costs one space and nothing else —
+        // the "typed word is candidate 0" case must not retype the word.
+        assert_eq!(accept_edits("hello", "hello"), vec![Edit::Char(' ')]);
+    }
+
+    #[test]
+    fn an_accepted_candidate_is_mirrored_into_the_context_it_came_from() {
+        // The edits and the composition buffer are driven from the same list, so
+        // replaying them onto the context leaves it exactly as the field looks.
+        let mut ctx = Context::new();
+        ctx.push_str("the hel");
+        for edit in accept_edits(ctx.partial(), "hello") {
+            match edit {
+                Edit::Backspace => ctx.backspace(),
+                Edit::Char(c) => ctx.push_char(c),
+            }
+        }
+        assert_eq!(ctx.text(), "the hello ");
+        assert_eq!(ctx.partial(), "");
+        assert_eq!(ctx.prev_word(), Some("hello"));
+        assert_eq!(ctx.just_closed_word(), Some("hello"), "so the word is offered to the cache");
+    }
+
+    #[test]
+    fn every_key_that_types_is_accounted_for_in_the_context() {
+        // If a key could type into the field without reaching the composition
+        // buffer, the predictor would be ranking against text that is not on
+        // screen. Every key of both layers, at both shift levels: one that emits
+        // a keystroke must yield an edit, and one that emits none must not.
+        for layer in [Layer::Base, Layer::Symbols] {
+            let kb = layer.keyboard();
+            for level in [ShiftModel::default(), ShiftModel::default().with_held(true)] {
+                for key in &kb.keys {
+                    let stroke = keystroke_for(key, level);
+                    let edit = stroke.and_then(|(c, s)| Edit::for_keycode(c, s));
+                    match key.role {
+                        KeyRole::Char
+                        | KeyRole::Space
+                        | KeyRole::Enter
+                        | KeyRole::Tab
+                        | KeyRole::Backspace => {
+                            assert!(
+                                edit.is_some(),
+                                "{layer:?} key {:?} types {stroke:?} but records nothing",
+                                key.label
+                            );
+                        }
+                        KeyRole::Shift
+                        | KeyRole::Caps
+                        | KeyRole::LayerToggle
+                        | KeyRole::DisplayToggle => {
+                            assert!(stroke.is_none(), "{:?} must type nothing", key.label);
+                        }
+                        // The meta keys are the `<`/`>` arrows: they type a
+                        // keystroke but no character, which is exactly the case
+                        // `account_for` answers by resetting the buffer — the
+                        // text cursor moved and the partial word is no longer
+                        // under it.
+                        KeyRole::Meta => {
+                            assert!(stroke.is_some() && edit.is_none(), "{:?}", key.label);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_highlight_cycles_and_does_nothing_when_there_is_nothing_to_cycle() {
+        // Three candidates, L1 walks them and wraps.
+        assert_eq!(cycled(0, 3, 1), Some(1));
+        assert_eq!(cycled(1, 3, 1), Some(2));
+        assert_eq!(cycled(2, 3, 1), Some(0));
+        // …and back the other way.
+        assert_eq!(cycled(0, 3, -1), Some(2));
+        assert_eq!(cycled(2, 3, -1), Some(1));
+        // Nothing to move to: an empty strip, or a strip of exactly one.
+        assert_eq!(cycled(0, 0, 1), None);
+        assert_eq!(cycled(0, 1, 1), None);
+        assert_eq!(cycled(0, 1, -1), None);
+    }
+
+    #[test]
+    fn the_best_suggestion_is_highlighted_not_the_word_already_typed() {
+        let cand = |text: &str, kind| Candidate { text: text.into(), kind, score: 0.0 };
+        // Nothing to highlight.
+        assert_eq!(default_selection(&[]), 0);
+        // A pure completion list: the best one, on the left.
+        let completions =
+            vec![cand("hello", CandidateKind::Completion), cand("help", CandidateKind::Completion)];
+        assert_eq!(default_selection(&completions), 0);
+        // The typed word in slot 0 pushes the highlight to the best suggestion,
+        // so R1 offers something rather than retyping the word.
+        let with_typed =
+            vec![cand("helm", CandidateKind::Typed), cand("hello", CandidateKind::Completion)];
+        assert_eq!(default_selection(&with_typed), 1);
+        // …unless the typed word is all there is.
+        assert_eq!(default_selection(&with_typed[..1]), 0);
+    }
+
+    #[test]
+    fn a_keycode_from_the_daemon_is_accounted_for_in_the_context() {
+        // The Deck map's Y = Space, X = Backspace, R2 = Enter must reach the
+        // composition buffer, or the context would drift from the field.
+        assert_eq!(Edit::for_keycode(57, false), Some(Edit::Char(' ')));
+        assert_eq!(Edit::for_keycode(14, false), Some(Edit::Backspace));
+        assert_eq!(Edit::for_keycode(28, false), Some(Edit::Char('\n')));
+        assert_eq!(Edit::for_keycode(30, false), Some(Edit::Char('a')));
+        assert_eq!(Edit::for_keycode(30, true), Some(Edit::Char('A')));
+        // A code that types no character is not guessed at.
+        assert_eq!(Edit::for_keycode(29, false), None, "KEY_LEFTCTRL types nothing");
+        assert_eq!(Edit::for_keycode(103, false), None, "KEY_UP types nothing");
     }
 
     #[test]

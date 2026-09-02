@@ -31,6 +31,8 @@ hyprpad-osk
 printf 'show bottom\ntype hello world\nhide\nquit\n' | hyprpad-osk --stdin
 # drive the two pad cursors, toggle shift, and type "!" via the shifted 1 key:
 printf 'show bottom\ncursor L -0.45 0.15\ncursor R 0.45 0.15\nshift stuck\nlayer symbols\nquit\n' | hyprpad-osk --stdin
+# with word prediction (see "Prediction" below for how to build a model)
+hyprpad-osk --model ~/.local/share/hyprpad-osk/en.model
 ```
 
 The hyprpad daemon will eventually drive the socket, forwarding the controller's
@@ -108,6 +110,7 @@ drops to ≈13 % (≈17 % split), with no visible flashing.
 | `render` | CPU renderer: keys + labels + highlights into an ARGB8888 shm buffer. |
 | `output` | The **uinput** keyboard (real evdev keycodes → types everywhere incl. XWayland), adapted from the parent crate's proven `src/output.rs`. |
 | `control` | The line-based control channel (unix socket or stdin) with a dual-trackpad-shaped vocabulary. |
+| `predict` | Word completion and next-word prediction: the mmap'd unigram/bigram model, the composition buffer of what the keyboard typed, the personal word cache, and the ranker over all three (`osk-prediction.md` phase 1). |
 | `app` | Binds the globals, owns the live surfaces, runs the poll loop over Wayland + the control channel. |
 
 ### The layout data model — one model, two modes
@@ -161,6 +164,12 @@ layer <base|symbols|toggle>             switch the base QWERTY ↔ numeric/symbo
 reflow <on|off>                         displace (on, exclusive zone) vs overlay/float (off)
 key <keycode>                           commit a raw evdev keycode directly
 type <text>                             type an ASCII string
+candidate accept [n]                    accept the highlighted (or nth) suggestion — R1
+candidate next|prev                     move the strip's highlight — L1
+context reset                           forget the typed context (focus change)
+learn on|off                            gate the personal word cache
+predict on|off                          show / hide the suggestion strip entirely
+forget                                  delete every learned word
 quit                                    exit
 ```
 
@@ -189,7 +198,8 @@ Commands come **in**; a small stream of machine-readable events goes **out on
 stdout**, one per line:
 
 ```
-event crossed <L|R>      # that pad's cursor moved onto a NEW key
+event crossed <L|R>          # that pad's cursor moved onto a NEW key
+event candidate <n> <text>   # the suggestion strip's highlight moved
 ```
 
 Human-oriented logs stay on **stderr** (every `hyprpad-osk:` line), so a parent
@@ -208,6 +218,170 @@ The daemon (`src/osk.rs`) pipes stdout, reads it on a thread, and turns each lin
 into a `tick` on that pad — gated by the `[haptics] crossing` config knob. Its
 parser ignores any line it does not recognize, so this crate can add events (or
 print anything else) without breaking an older daemon.
+
+## Prediction
+
+Word completion and next-word prediction, phase 1 of
+`docs/research/osk-prediction.md` (referenced below as **§**). A three-candidate
+strip sits above the top key row; `R1` accepts the highlighted suggestion and
+`L1` moves the highlight along, and either pad can hover and click a slot.
+
+**With no model installed there is no strip at all** — no extra panel height, no
+learning, no behaviour change of any kind. Prediction is opt-in by building the
+model.
+
+### The model
+
+A small in-process predictor, not an adopted engine: nothing in the Linux
+ecosystem is both maintained and shaped for this (§3). The model is a
+**unigram + per-word bigram-successor table**, mmap'd and used in place:
+
+* an `fst::Map` lexicon (word → id, ids in the fst's own sorted order),
+* one `u8` unigram probability per id,
+* per-word successor lists — delta-varint ids plus a `u8` score, capped at 32.
+
+Both scores are on AOSP LatinIME's log scale (255 = probability 1, each step a
+factor of 1.15), so unigram and bigram are directly comparable and **stupid
+backoff** (Brants et al. 2007) is one branch:
+
+```text
+S(w | prev) = c(prev,w) / c(prev)   when the bigram is stored
+            = 0.4 · P(w)            otherwise
+```
+
+The AOSP ranking rules the doc names are kept (§2.1/§8.6): the **typed word is
+always candidate 0** when it is a real word or when nothing else is confident,
+candidates are deduplicated, and **nothing is ever auto-replaced** — with an
+exact cursor and a deliberate click, what you typed is evidence, not noise.
+
+Measured on the shipped 60,000-word model: a worst-case query (a one-letter
+prefix after a common word) takes **~82 µs**, against a 1 ms budget (§7.3).
+Candidates are recomputed on *commits* only — a few times a second — never on
+cursor motion, so prediction never competes with the frame path.
+
+### Data, and its licence
+
+| Part | Source | Licence |
+|---|---|---|
+| Unigram probabilities | [wordfreq](https://github.com/rspeer/wordfreq) `large_en` | **CC BY-SA 4.0** (data) |
+| Validity + casing | SCOWL / Hunspell `en_US` (LibreOffice dictionaries) | MIT-like |
+| Bigram successors | [Leipzig Corpora Collection](https://wortschatz.uni-leipzig.de/) English news + Wikipedia | **CC BY 4.0** |
+
+**The built model is CC BY-SA 4.0**, because wordfreq's data is share-alike. The
+code stays MIT/Apache-2.0 — the licence applies to the data artifact, not to the
+program that reads it. Google Books Ngrams v3 (CC BY 3.0) is the research doc's
+first choice for bigrams and is ~230 GB for English 2-grams alone; the builder
+reads a locally downloaded subset of it with `--books-dir`, so that upgrade is a
+download away rather than a code change.
+`tools/build-model/DATA-LICENSES.md` has the full analysis and the sources that
+were deliberately **not** used.
+
+### Building the model
+
+Two steps, so the format-critical half is ordinary Rust with ordinary tests and
+the network-and-gigabytes half is a script you run once:
+
+```sh
+# 1. download + merge the data into a plain-text word list (~1.4 GB of downloads,
+#    cached under --cache; a few minutes)
+python3 tools/build-model/build-model.py --out ~/tmp/osk-prediction/en.words
+
+# 2. turn that into the binary model the keyboard maps
+mkdir -p ~/.local/share/hyprpad-osk
+cargo run --release --bin hyprpad-osk-build-model -- \
+    ~/tmp/osk-prediction/en.words ~/.local/share/hyprpad-osk/en.model \
+    --attribution-file tools/build-model/ATTRIBUTION.txt
+```
+
+That is 1.69 MB for 60,000 words and 386,894 bigrams, and it is reproducible
+— both halves of the pipeline are deterministic, so the same sources always
+produce the same file. The keyboard finds it at
+`$XDG_DATA_HOME/hyprpad-osk/en.model` (then `$XDG_DATA_DIRS`), or wherever
+`--model` / `$HYPRPAD_OSK_MODEL` says. **The artifact is not committed to git**;
+`data/fixture.words` and `data/fixture.model` are a ~130-word hand-authored
+fixture the test suite predicts against, so no test ever needs the download.
+
+The build is deterministic — the same word list always produces the same bytes —
+and `tests/fixture_model.rs` checks the committed fixture against a rebuild. If
+you change `data/fixture.words`, rebuild `data/fixture.model` the same way.
+
+### Controls
+
+| Control | Does |
+|---|---|
+| `R1` | accept the highlighted candidate: types the rest of the word plus a space |
+| `L1` | move the highlight one slot along, wrapping |
+| either pad | hover a slot and click/trigger it, like a key |
+
+The highlight defaults to the best *suggestion*: when the typed word occupies
+slot 0, the highlight starts on slot 1, so `R1` is never a no-op that retypes
+what you just typed (Gboard's convention, §7.2). Accepting types only the
+characters that differ — "hel" + "hello" costs `l`, `o`, space — which matters
+when every tap is ~12 ms of keystroke replay, and the backspaces it does emit
+only ever remove characters this keyboard typed in this session (§8.6). After
+an accept the strip immediately shows next-word predictions, so `R1`-`R1`-`R1`
+chains a phrase.
+
+The daemon sends `candidate accept` / `candidate next`; the OSK reads no
+controller input of its own. They are bound as `osk accept` / `osk next` in the
+daemon's keyboard button table, on R1/L1 by default and rebindable like any
+other (`h.osk_button("r4", h.osk "accept")`).
+
+### Context
+
+Phase 1 has **no view of the focused application's text buffer** (§1), so the
+context is exactly what this keyboard typed since it was shown: one string, with
+Backspace popping one character. Every path that types feeds it — a committed
+key, the daemon's `key <code>` (Y = Space, X = Backspace, R2 = Enter all reach
+it), an accepted candidate, and the scripted `type <text>`. It is reset on
+`show`, on `hide`, and on `context reset`, which the daemon sends on every focus
+change while the keyboard is up — and on any keystroke it cannot account for:
+the `<`/`>` arrow keys move the text cursor, and a modified chord like
+Ctrl+Backspace eats a whole word, so after either the buffer no longer describes
+what is in front of the cursor. Resetting is the honest answer; completing
+against a stale prefix is not.
+
+### Learning, and its gates
+
+The keyboard remembers words you commit, in
+`$XDG_DATA_HOME/hyprpad-osk/learned.json` (mode 0600, human-readable, delete it
+whenever you like). AOSP's forgetting curve: a word is **only offered after a
+second sighting** (`MIN_VISIBLE_LEVEL = 2`) and loses a level per 15 idle days,
+so a word typed once never surfaces and an unused one fades.
+
+Every gate the research doc lists (§5.3) is in place:
+
+* **Shape.** Never a token with a digit or a symbol, never one over 24
+  characters, never a single character. That alone keeps API keys, PINs and card
+  numbers out — and a hand-edited store cannot smuggle one back in, since rows
+  are re-filtered on load.
+* **Window.** The daemon sends `learn off` when focus lands on a class in
+  `[keyboard] learn_deny` / `h.keyboard_config { learn_deny = {...} }` —
+  password managers, polkit agents, the lock screen, and terminals by default.
+  The gate is remembered while the keyboard is down and re-stated on `show`, so
+  a keyboard raised *inside* a password manager starts gated.
+* **Provenance.** A word typed by the daemon's scripted `type <text>` is context
+  but is never learned from (§8.5 rule 4).
+* **Completion.** Only a word closed by a separator or an accepted candidate is
+  ever offered to the cache.
+
+`forget` deletes every learned word and removes the file. `predict off` hides
+the strip entirely without unloading the model.
+
+### What is next
+
+* **Phase 2 — real context.** Bind `zwp_input_method_v2` opportunistically and
+  **never** with `grab_keyboard` (§6.4): its value is not typing but
+  `content_type` (password/PIN/sensitive → suggestions and learning off),
+  `surrounding_text` (real context after a focus change), and
+  `commit_string`/`delete_surrounding_text` for clean whole-word replacement in
+  apps that speak text-input-v3. fcitx5 holds the single IME slot on the dev
+  machine, so the cleaner long-term fix may be a HypXRland-side channel that
+  exposes the focused text-input's content type regardless (§6.6).
+* **Phase 3 — quality.** Trigram successors, and a ~1 M-parameter GRU rerank in
+  `candle`/`tract` on a worker thread with a 16 ms deadline. Gboard's own
+  numbers put the neural lift at ~3.5 points of top-1 over n-grams (§2.7), so
+  this is a rerank, not a foundation.
 
 ## Done / Stubbed / Deferred — mapped to `osk-technology.md`
 
@@ -328,4 +502,9 @@ environment quirks worth recording:
 
 ## Licence
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0 for the code.
+
+The **prediction model** is a separate artifact with its own terms — it is built,
+not committed, and it is CC BY-SA 4.0 because wordfreq's data is share-alike.
+See `tools/build-model/DATA-LICENSES.md` and `tools/build-model/ATTRIBUTION.txt`,
+which is also baked into every model file's header.

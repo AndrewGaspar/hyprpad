@@ -1,0 +1,221 @@
+# hyprpad-osk prediction model — TINY TEST FIXTURE.
+#
+# The committed input the test suite builds `fixture.model` from, so no test
+# ever needs the multi-gigabyte data pipeline (osk/tools/build-model/). It is
+# the same format the real pipeline emits: a word and its unigram probability,
+# then its successors indented, each with S(successor | word).
+#
+# Hand-authored: ~130 common English words with approximate frequencies plus the
+# handful the predictor's tests name, and a small set of plausible bigrams. The
+# numbers are illustrative, not measured — this file exists to pin the FORMAT
+# and the RANKING RULES, not to predict English.
+#
+# Rebuild the model from it with:
+#   cargo run --bin hyprpad-osk-build-model -- data/fixture.words data/fixture.model
+the 0.056
+  first 0.006
+  time 0.008
+  way 0.004
+  world 0.0035
+  most 0.004
+  other 0.005
+  keyboard 0.0008
+  screen 0.0006
+  game 0.0009
+  quick 0.0005
+  people 0.002
+  new 0.0015
+  day 0.0012
+  year 0.0018
+  settings 0.0002
+be 0.028
+to 0.026
+  be 0.03
+  the 0.05
+  do 0.02
+  get 0.01
+  make 0.008
+of 0.025
+  the 0.35
+  a 0.05
+and 0.024
+a 0.021
+  new 0.008
+  good 0.007
+  game 0.003
+  word 0.002
+  keyboard 0.0009
+in 0.017
+  the 0.3
+  a 0.07
+that 0.011
+have 0.01
+I 0.01
+  think 0.05
+  know 0.04
+  want 0.03
+  have 0.06
+it 0.01
+  is 0.08
+  was 0.06
+is 0.01
+for 0.0095
+not 0.009
+was 0.009
+on 0.0078
+  the 0.3
+  a 0.06
+with 0.0072
+he 0.0069
+as 0.0066
+you 0.0064
+  can 0.04
+  are 0.04
+  want 0.02
+  know 0.02
+do 0.0062
+at 0.006
+are 0.006
+this 0.0057
+  is 0.09
+  one 0.02
+but 0.0055
+his 0.0053
+by 0.0051
+from 0.0049
+they 0.0047
+we 0.0045
+  are 0.05
+  can 0.03
+  have 0.03
+say 0.0043
+her 0.0041
+she 0.0039
+or 0.0038
+an 0.0037
+will 0.0036
+my 0.0035
+one 0.0034
+all 0.0033
+would 0.0032
+there 0.0031
+their 0.003
+what 0.0029
+  is 0.1
+  do 0.06
+  about 0.02
+so 0.0028
+up 0.0027
+out 0.0026
+if 0.0025
+about 0.0024
+who 0.0023
+get 0.0022
+which 0.0021
+go 0.002
+play 0.002
+  the 0.06
+  games 0.02
+  a 0.04
+me 0.0019
+when 0.0018
+make 0.0017
+can 0.0016
+  be 0.06
+  you 0.03
+  not 0.02
+like 0.0015
+time 0.0014
+no 0.0013
+just 0.0012
+him 0.0011
+know 0.0011
+take 0.001
+people 0.00099
+into 0.00095
+year 0.0009
+your 0.00088
+good 0.00085
+some 0.00082
+could 0.0008
+them 0.00078
+see 0.00075
+other 0.00072
+than 0.0007
+then 0.00068
+now 0.00065
+look 0.00062
+only 0.0006
+come 0.00058
+its 0.00055
+over 0.00053
+think 0.00051
+also 0.00049
+back 0.00047
+after 0.00045
+use 0.00043
+two 0.00041
+how 0.0004
+  to 0.2
+  do 0.08
+  about 0.03
+our 0.00038
+work 0.00036
+first 0.00035
+well 0.00033
+way 0.00032
+even 0.0003
+new 0.00029
+want 0.00028
+because 0.00027
+any 0.00026
+these 0.00025
+give 0.00024
+day 0.00023
+most 0.00022
+us 0.00021
+word 0.0002
+thank 0.00016
+  you 0.9
+please 0.00016
+words 0.00015
+quick 0.00012
+  brown 0.35
+  way 0.02
+key 0.00012
+thanks 0.00012
+  for 0.3
+game 0.00012
+quickly 0.0001
+games 0.0001
+hello 0.0009
+  world 0.3
+  there 0.1
+  hyprland 0.02
+help 0.0008
+  me 0.2
+  you 0.15
+  with 0.1
+world 0.0009
+computer 0.00009
+cat 0.00009
+dog 0.00009
+search 0.00009
+type 0.00009
+player 0.00009
+brown 0.00007
+  fox 0.4
+  dog 0.03
+screen 0.00007
+settings 0.00006
+sat 0.00006
+keys 0.00005
+keyboard 0.00004
+terminal 0.00004
+fox 0.00003
+typing 0.00003
+controller 0.00003
+helm 0.00002
+wayland 0.0000009
+hyprland 0.0000006
+Wayland 0.0000004

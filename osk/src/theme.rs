@@ -80,6 +80,13 @@ pub struct Colors {
     /// Active Shift / Caps indicator — the fill a Shift or Caps key takes while
     /// its state is engaged (the Deck's `.ShiftActive` / `.ToggleOn`, §4.6).
     pub shift_active: Color,
+    /// Fill of an unselected slot in the candidate strip
+    /// (osk-prediction.md §7.2). Deliberately quieter than a keycap: the strip
+    /// is a suggestion, not a key.
+    pub strip_fill: Color,
+    /// Fill of the **highlighted** candidate — the one `R1` accepts. This is
+    /// the strip's whole affordance, so it is the loudest colour on the row.
+    pub strip_highlight: Color,
 }
 
 /// Geometry tokens. These are what make the surface **size-to-content**: the
@@ -102,6 +109,13 @@ pub struct Geom {
     /// Diameter, in px, of the per-pad trackpad cursor sprite (the Deck's
     /// ~30x30 pointer, §4.1). The renderer draws a filled disc of this size.
     pub cursor_size: f32,
+    /// Height, in px, of the candidate strip above the top key row
+    /// (osk-prediction.md §7.2). Shorter than a key row — a suggestion should
+    /// not cost as much vertical space as the letters — but tall enough that a
+    /// pad cursor can land on it. Only ever added to the panel's height when a
+    /// prediction model is loaded, so a keyboard without one is pixel-identical
+    /// to what it was before.
+    pub strip_height: f32,
 }
 
 /// Font tokens. The kickoff renderer uses an embedded 8x8 bitmap font, so the
@@ -144,6 +158,8 @@ impl Default for Theme {
                 pressed: Color(0xFF_D0_B0_50),       // committed accent (amber)
                 cursor_stroke: Color(0xF0_F2_F4_F8), // near-white cursor halo
                 shift_active: Color(0xFF_D8_5A_9E),  // shift/caps engaged (magenta)
+                strip_fill: Color(0xFF_1B_1F_27),    // quiet suggestion slot
+                strip_highlight: Color(0xFF_3C_A0_5A), // the candidate R1 accepts
             },
             geom: Geom {
                 key_size: 72.0,
@@ -152,6 +168,7 @@ impl Default for Theme {
                 corner: 8.0,
                 border_width: 1.0,
                 cursor_size: 30.0,
+                strip_height: 44.0,
             },
             font: FontSpec { scale_max: 3 },
         }
@@ -281,6 +298,8 @@ fn apply_token(theme: &mut Theme, section: &str, key: &str, val: &str, lineno: u
                 "pressed" => theme.colors.pressed = c,
                 "cursor_stroke" => theme.colors.cursor_stroke = c,
                 "shift_active" => theme.colors.shift_active = c,
+                "strip_fill" => theme.colors.strip_fill = c,
+                "strip_highlight" => theme.colors.strip_highlight = c,
                 _ => eprintln!("hyprpad-osk: theme.toml:{lineno}: unknown colors.{key}, ignored"),
             }
         }
@@ -293,6 +312,7 @@ fn apply_token(theme: &mut Theme, section: &str, key: &str, val: &str, lineno: u
                 "corner" => theme.geom.corner = n.max(0.0),
                 "border_width" => theme.geom.border_width = n.max(0.0),
                 "cursor_size" => theme.geom.cursor_size = n.max(4.0),
+                "strip_height" => theme.geom.strip_height = n.max(12.0),
                 _ => eprintln!("hyprpad-osk: theme.toml:{lineno}: unknown geometry.{key}, ignored"),
             }
         }

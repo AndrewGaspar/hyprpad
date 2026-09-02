@@ -133,7 +133,7 @@
 
 use crate::config::{
     Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
-    ModeDef, OskAction, ScrollConfig, ScrollMode, TransientExit, TransientSpec,
+    KeyboardConfig, ModeDef, OskAction, ScrollConfig, ScrollMode, TransientExit, TransientSpec,
 };
 use crate::config::{mouse_code, parse_button, GestureKey, KeyChord};
 use crate::mode::Context;
@@ -665,6 +665,7 @@ fn finish(
         scroll: b.scroll,
         scrub: b.scrub,
         haptics: b.haptics,
+        keyboard: b.keyboard,
         gamepad: b.gamepad,
         modes: b.modes,
         default_mode: Some(default),
@@ -755,6 +756,7 @@ struct Build {
     scrub: crate::config::ScrubConfig,
     scrub_guard: Guard,
     haptics: HapticsConfig,
+    keyboard: KeyboardConfig,
     gamepad: GamepadConfig,
     modes: Vec<ModeDef>,
     default_mode: Option<String>,
@@ -891,6 +893,7 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("scroll", section_scroll(lua, build, &guard_mt)?)?;
     h.set("scrub", section_scrub(lua, build, &guard_mt)?)?;
     h.set("haptics", section_haptics(lua, build)?)?;
+    h.set("keyboard_config", section_keyboard(lua, build)?)?;
     h.set("gamepad", section_gamepad(lua, build)?)?;
 
     // --- bindings ---------------------------------------------------------
@@ -1565,6 +1568,49 @@ fn section_scrub(
     })
 }
 
+/// `h.keyboard_config { … }` — the `[keyboard]` knobs (the on-screen keyboard's
+/// own settings, as distinct from `h.osk_button`, which says what a *button*
+/// does while it is up).
+///
+/// The name carries `_config` because `h.keyboard` is already the action that
+/// raises the keyboard (`h.bind("guide+y", h.keyboard "split")`).
+fn section_keyboard(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
+    let build = Rc::clone(build);
+    lua.create_function(move |_, t: Table| {
+        let mut b = build.borrow_mut();
+        for pair in t.pairs::<String, Value>() {
+            let (k, v) = pair?;
+            match k.as_str() {
+                "learn_deny" | "no_learn" | "never_learn" => {
+                    b.keyboard.learn_deny = as_string_list(&v, &k)?;
+                }
+                other => return Err(unknown_key("h.keyboard_config", other, &["learn_deny"])),
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A Lua array of strings, for `h.keyboard_config { learn_deny = { … } }`.
+fn as_string_list(v: &Value, key: &str) -> mlua::Result<Vec<String>> {
+    let Value::Table(t) = v else {
+        return Err(err(format!("{key} must be a list of strings, e.g. {{ \"1password\" }}")));
+    };
+    let mut out = Vec::new();
+    for item in t.clone().sequence_values::<Value>() {
+        match item? {
+            Value::String(s) => out.push(s.to_str()?.to_string()),
+            other => {
+                return Err(err(format!(
+                    "{key} must hold strings, got a {}",
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `h.haptics { … }` — the `[haptics]` knobs.
 fn section_haptics(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
@@ -2061,6 +2107,34 @@ mod tests {
         assert_eq!(c.gamepad().identity, crate::uhid::Identity::Deck);
         // Untouched knobs keep their built-in defaults, exactly as in TOML.
         assert_eq!(c.cursor().one_euro_beta, CursorConfig::default().one_euro_beta);
+    }
+
+    #[test]
+    fn keyboard_config_sets_the_learn_deny_list() {
+        // Not given: the shipped default list, same as TOML.
+        let c = load("local h = hyprpad\nh.daemon { own_lizard = true }\n");
+        assert_eq!(c.osk_learn_deny(), KeyboardConfig::default().learn_deny.as_slice());
+
+        // Given: it REPLACES the default, as `[keyboard] learn_deny` does.
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.keyboard_config { learn_deny = { "obsidian", "vault" } }
+            "#,
+        );
+        assert_eq!(c.osk_learn_deny(), ["obsidian".to_string(), "vault".to_string()]);
+        // …and an empty list turns the window gate off, exactly as in TOML.
+        let c = load("local h = hyprpad\nh.keyboard_config { learn_deny = {} }\n");
+        assert!(c.osk_learn_deny().is_empty());
+
+        // The errors name the call and the key.
+        let e = load_str("hyprpad.keyboard_config { frobnicate = 1 }", "t.lua").unwrap_err();
+        assert!(e.contains("h.keyboard_config"), "{e}");
+        assert!(e.contains("learn_deny"), "{e}");
+        let e = load_str("hyprpad.keyboard_config { learn_deny = \"foot\" }", "t.lua").unwrap_err();
+        assert!(e.contains("must be a list of strings"), "{e}");
+        let e = load_str("hyprpad.keyboard_config { learn_deny = { 42 } }", "t.lua").unwrap_err();
+        assert!(e.contains("must hold strings"), "{e}");
     }
 
     #[test]

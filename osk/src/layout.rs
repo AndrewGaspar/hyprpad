@@ -567,11 +567,74 @@ pub enum Pad {
 pub struct LayoutEngine<'k> {
     keyboard: &'k Keyboard,
     pub mode: LayoutMode,
+    /// How many candidate slots the strip above the top key row holds; `0` for
+    /// no strip at all (no model loaded, or prediction switched off).
+    ///
+    /// The strip is part of the *content*, so it is in
+    /// [`Self::content_size`] and it pushes the keys down in [`Self::place`] —
+    /// which means a keyboard with no model is laid out exactly as it was
+    /// before prediction existed, to the pixel.
+    pub strip: usize,
 }
+
+/// How many candidates the strip shows. Three, as Gboard and the phone
+/// keyboards settled on (osk-prediction.md §7.2); five is possible in
+/// Split mode's wider columns and is not what phase 1 does.
+pub const STRIP_SLOTS: usize = 3;
 
 impl<'k> LayoutEngine<'k> {
     pub fn new(keyboard: &'k Keyboard, mode: LayoutMode) -> Self {
-        LayoutEngine { keyboard, mode }
+        LayoutEngine { keyboard, mode, strip: 0 }
+    }
+
+    /// The same engine with a candidate strip of `slots` cells.
+    pub fn with_strip(mut self, slots: usize) -> Self {
+        self.strip = slots;
+        self
+    }
+
+    /// The vertical space the strip occupies, including the gap below it.
+    /// Zero when there is no strip.
+    fn strip_band(&self, g: &Geom) -> f32 {
+        if self.strip == 0 {
+            0.0
+        } else {
+            g.strip_height + g.gap
+        }
+    }
+
+    /// The candidate strip's slot rectangles for `panel`, left to right, in the
+    /// same absolute panel-local pixel space as [`Self::place`].
+    ///
+    /// The slots span the panel's content width and sit in the band above the
+    /// top key row. In [`LayoutMode::SideSplit`] each column gets its own full
+    /// set, so whichever thumb is nearer has the candidates in reach — the
+    /// duplicate-in-both-columns option from osk-prediction.md §7.2.
+    pub fn strip_rects(&self, panel: PanelRole, g: &Geom) -> Vec<Rect> {
+        if self.strip == 0 {
+            return Vec::new();
+        }
+        let (w, _) = self.content_size(panel, g);
+        let content_w = w - 2.0 * g.margin;
+        if content_w <= 0.0 {
+            return Vec::new();
+        }
+        let n = self.strip as f32;
+        let slot_w = (content_w - g.gap * (n - 1.0)) / n;
+        (0..self.strip)
+            .map(|i| Rect {
+                x: g.margin + i as f32 * (slot_w + g.gap),
+                y: g.margin,
+                w: slot_w,
+                h: g.strip_height,
+            })
+            .collect()
+    }
+
+    /// Hit-test a panel-local point against strip slots — the same
+    /// `elementFromPoint` rule the keys get, so a pad can click a candidate.
+    pub fn hit_test_strip(rects: &[Rect], px: f32, py: f32) -> Option<usize> {
+        rects.iter().position(|r| r.contains(px, py))
     }
 
     /// The rows this panel actually holds, each as `(row, key indices, total
@@ -621,7 +684,7 @@ impl<'k> LayoutEngine<'k> {
         let n_rows = rows.len() as f32;
         let max_units = rows.iter().map(|(_, _, u)| *u).fold(0.0_f32, f32::max);
         let content_w = g.key_size * max_units + g.gap * (max_units - 1.0);
-        let content_h = g.key_size * n_rows + g.gap * (n_rows - 1.0);
+        let content_h = g.key_size * n_rows + g.gap * (n_rows - 1.0) + self.strip_band(g);
         (content_w + 2.0 * g.margin, content_h + 2.0 * g.margin)
     }
 
@@ -646,12 +709,16 @@ impl<'k> LayoutEngine<'k> {
 
         let key_w = |units: f32| units * g.key_size + (units - 1.0) * g.gap;
 
+        // The candidate strip, when there is one, occupies the band directly
+        // under the top margin; the key grid starts below it.
+        let top = g.margin + self.strip_band(g);
+
         let mut placed = Vec::new();
         for (ord, (_, indices, total_units)) in rows.iter().enumerate() {
             let row_w = key_w(*total_units);
             // Centre this row within the content width.
             let mut x = g.margin + (content_w - row_w) / 2.0;
-            let y = g.margin + ord as f32 * (g.key_size + g.gap);
+            let y = top + ord as f32 * (g.key_size + g.gap);
             for &i in indices {
                 let w = key_w(self.keyboard.keys[i].units);
                 placed.push(PlacedKey {
@@ -991,6 +1058,70 @@ mod tests {
         }
         assert_eq!(Layer::Base.toggled(), Layer::Symbols);
         assert_eq!(Layer::Symbols.toggled(), Layer::Base);
+    }
+
+    #[test]
+    fn the_candidate_strip_sits_above_the_keys_and_spans_the_content_width() {
+        let kb = Keyboard::qwerty();
+        let g = geom();
+        let plain = LayoutEngine::new(&kb, LayoutMode::BottomDeck);
+        let with = LayoutEngine::new(&kb, LayoutMode::BottomDeck).with_strip(STRIP_SLOTS);
+
+        // No strip means the geometry is exactly what it was before prediction.
+        assert!(plain.strip_rects(PanelRole::Bottom, &g).is_empty());
+        assert_eq!(plain.place(PanelRole::Bottom, &g)[0].rect, {
+            let mut r = with.place(PanelRole::Bottom, &g)[0].rect;
+            r.y -= g.strip_height + g.gap;
+            r
+        });
+
+        let rects = with.strip_rects(PanelRole::Bottom, &g);
+        assert_eq!(rects.len(), STRIP_SLOTS);
+        // Above every key, and clear of the top row by the row gap.
+        let top_key = with.place(PanelRole::Bottom, &g)[0].rect;
+        assert!(rects[0].y + rects[0].h + g.gap <= top_key.y + 0.01);
+        // Left to right, equal widths, spanning margin..width-margin.
+        let (w, _) = with.content_size(PanelRole::Bottom, &g);
+        assert!((rects[0].x - g.margin).abs() < 0.01);
+        let last = rects.last().unwrap();
+        assert!((last.x + last.w - (w - g.margin)).abs() < 0.01);
+        for pair in rects.windows(2) {
+            assert!(pair[1].x > pair[0].x);
+            assert!((pair[0].w - pair[1].w).abs() < 0.01);
+            assert!((pair[1].x - (pair[0].x + pair[0].w) - g.gap).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn both_split_columns_carry_their_own_strip() {
+        let kb = Keyboard::qwerty();
+        let g = geom();
+        let eng = LayoutEngine::new(&kb, LayoutMode::SideSplit).with_strip(STRIP_SLOTS);
+        for role in [PanelRole::LeftColumn, PanelRole::RightColumn] {
+            let rects = eng.strip_rects(role, &g);
+            assert_eq!(rects.len(), STRIP_SLOTS, "{role:?} needs its own candidates");
+            let (w, _) = eng.content_size(role, &g);
+            assert!(rects.last().unwrap().x + rects.last().unwrap().w <= w - g.margin + 0.01);
+        }
+    }
+
+    #[test]
+    fn a_pad_can_hit_test_the_strip_like_a_key() {
+        let kb = Keyboard::qwerty();
+        let g = geom();
+        let eng = LayoutEngine::new(&kb, LayoutMode::BottomDeck).with_strip(STRIP_SLOTS);
+        let rects = eng.strip_rects(PanelRole::Bottom, &g);
+        for (i, r) in rects.iter().enumerate() {
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            assert_eq!(LayoutEngine::hit_test_strip(&rects, cx, cy), Some(i));
+            // …and that point is NOT on a key: the two hit tests never overlap.
+            assert_eq!(LayoutEngine::hit_test(&eng.place(PanelRole::Bottom, &g), cx, cy), None);
+        }
+        // The gap between slots hits nothing.
+        assert_eq!(LayoutEngine::hit_test_strip(&rects, rects[0].x + rects[0].w + 1.0, rects[0].y + 2.0), None);
+        // A point on the top key row is not in the strip either.
+        let key = eng.place(PanelRole::Bottom, &g)[0].rect;
+        assert_eq!(LayoutEngine::hit_test_strip(&rects, key.x + 2.0, key.y + 2.0), None);
     }
 
     #[test]

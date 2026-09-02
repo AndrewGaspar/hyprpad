@@ -861,6 +861,8 @@ pub fn osk_action_string(a: OskAction) -> String {
         OskAction::Commit => "osk commit".to_string(),
         OskAction::Shift => "osk shift".to_string(),
         OskAction::Dismiss => "osk dismiss".to_string(),
+        OskAction::CandidateAccept => "osk accept".to_string(),
+        OskAction::CandidateNext => "osk next".to_string(),
         OskAction::None => "none".to_string(),
     }
 }
@@ -870,7 +872,11 @@ pub fn osk_action_string(a: OskAction) -> String {
 pub fn osk_action_kind(a: OskAction) -> &'static str {
     match a {
         OskAction::Key(_) => "key",
-        OskAction::Commit | OskAction::Shift | OskAction::Dismiss => "osk",
+        OskAction::Commit
+        | OskAction::Shift
+        | OskAction::Dismiss
+        | OskAction::CandidateAccept
+        | OskAction::CandidateNext => "osk",
         OskAction::None => "none",
     }
 }
@@ -884,6 +890,8 @@ pub fn derive_osk_label(a: OskAction) -> String {
         OskAction::Commit => "Type the key under the cursor".to_string(),
         OskAction::Shift => "Shift (hold)".to_string(),
         OskAction::Dismiss => "Close the keyboard".to_string(),
+        OskAction::CandidateAccept => "Accept suggestion".to_string(),
+        OskAction::CandidateNext => "Next suggestion".to_string(),
         OskAction::None => "Unbound".to_string(),
     }
 }
@@ -1981,7 +1989,9 @@ mod tests {
         // built-in Deck map under it — a context listing only `y` would be
         // unusable.
         assert!(osk.active.contains(&"y".to_string()));
-        for chord in ["lpad", "rpad", "lpad_click", "rpad_click", "l2", "r2", "x", "b", "menu"] {
+        for chord in
+            ["lpad", "rpad", "lpad_click", "rpad_click", "l2", "r2", "x", "b", "menu", "r1", "l1"]
+        {
             assert!(osk.active.contains(&chord.to_string()), "no built-in row for {chord}");
         }
         // No declared mode claims them: while the keyboard is up, nothing else
@@ -2005,6 +2015,17 @@ mod tests {
         assert_eq!((close.label.as_str(), close.action.as_str()), ("Close the keyboard", "osk dismiss"));
         assert_eq!(builtin(&s, "b").action, "osk dismiss");
         assert_eq!(builtin(&s, "x").label, "Backspace");
+        // The word-prediction strip's bumpers (osk-prediction.md §7.2).
+        let r1 = builtin(&s, "r1");
+        assert_eq!(
+            (r1.label.as_str(), r1.action.as_str(), r1.action_kind),
+            ("Accept suggestion", "osk accept", "osk")
+        );
+        let l1 = builtin(&s, "l1");
+        assert_eq!(
+            (l1.label.as_str(), l1.action.as_str(), l1.action_kind),
+            ("Next suggestion", "osk next", "osk")
+        );
         assert_eq!(close.section, Section::OskButton);
         assert!(close.described, "a built-in row is authored, not derived");
         assert_eq!(close.guard, Guard::OnlyIn(vec![OSK_MODE.to_string()]));
@@ -2018,6 +2039,11 @@ mod tests {
         assert!(j.contains("\"builtin\": true"), "modes carry `builtin` in\n{j}");
         assert!(j.contains("\"section\": \"osk_button\""), "and the section in\n{j}");
         check_json(&j);
+
+        // …and the rendered tab a reader actually sees.
+        let t = s.to_text();
+        assert!(t.contains("Accept suggestion"), "{t}");
+        assert!(t.contains("Next suggestion"), "{t}");
     }
 
     #[test]

@@ -691,6 +691,13 @@ pub fn run() -> std::io::Result<()> {
                     HyprEvent::Locked(false) => " (session unlocked)",
                     _ => "",
                 };
+                // The keyboard's word prediction keys on the focused window:
+                // its typed context belonged to the field we just left, and the
+                // class decides whether it may learn what is typed here at all
+                // (docs/research/osk-prediction.md §5.3 rule 2 / §8.1).
+                if let HyprEvent::ActiveWindow { class, .. } = &ev {
+                    osk.focus_changed(class, config.osk_learn_deny());
+                }
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
                     eprintln!("hyprpad: mode -> {}{why}", modes.active());
                     status.set_mode(modes.active());
@@ -3341,6 +3348,10 @@ enum OskOp {
     ShiftDown,
     /// The last Shift-bound button came up (or the keyboard is closing).
     ShiftUp,
+    /// Accept the keyboard's highlighted word suggestion (R1).
+    CandidateAccept,
+    /// Move the suggestion strip's highlight along (L1).
+    CandidateNext,
     /// Close the keyboard.
     Dismiss,
 }
@@ -3415,6 +3426,8 @@ impl OskRoute {
                     }
                     self.shift_holders.push(b);
                 }
+                Some(OskAction::CandidateAccept) => ops.push(OskOp::CandidateAccept),
+                Some(OskAction::CandidateNext) => ops.push(OskOp::CandidateNext),
                 Some(OskAction::Dismiss) => {
                     if !self.shift_holders.is_empty() {
                         ops.push(OskOp::ShiftUp);
@@ -3493,6 +3506,15 @@ fn route_osk(
             }
             OskOp::ShiftDown => osk.hold_shift(true),
             OskOp::ShiftUp => osk.hold_shift(false),
+            // Accepting a suggestion types a whole word, so it earns the same
+            // commit pulse a key does; moving the highlight is a lighter
+            // change, and the keyboard reports it back as
+            // `event candidate <n> <text>` for a tick of its own.
+            OskOp::CandidateAccept => {
+                osk.candidate_accept();
+                hx.fire(Haptic::Commit, HapticPad::Right);
+            }
+            OskOp::CandidateNext => osk.candidate_next(),
             OskOp::Dismiss => osk.hide(),
         }
     }
