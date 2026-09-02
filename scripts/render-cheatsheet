@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Render the bindings cheat-sheet offscreen to a PNG -- no display, no Quickshell,
+# no Omarchy. Feeds Sheet.qml the LIVE `hyprpad bindings --json`, the layout, and the
+# controller diagram exactly as the plugin does (Valve's SVG is read from the local
+# Steam install at render time and never copied anywhere).
+#
+#   scripts/render-cheatsheet [out.png] [layout-id]     (default: ./cheatsheet.png, steam-controller-2026)
+#
+# Used to verify the sheet against a config change, or to grab a screenshot when the
+# session is locked (the compositor paints its lock over a real grim capture).
+set -euo pipefail
+OUT="${1:-$PWD/cheatsheet.png}"; LAYOUT_ID="${2:-steam-controller-2026}"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PLUGIN="$HERE/shell/hyprpad.cheatsheet"
+STEAM="${STEAM_ROOT:-$HOME/.local/share/Steam}"
+command -v qml6 >/dev/null || { echo "render-cheatsheet: needs qml6 (qt6-declarative)" >&2; exit 1; }
+command -v hyprpad >/dev/null || { echo "render-cheatsheet: hyprpad not on PATH" >&2; exit 1; }
+WORK="$(mktemp -d "$HOME/tmp/render-cheatsheet.XXXXXX" 2>/dev/null || mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+hyprpad bindings --json > "$WORK/sheet.json"
+python3 - "$PLUGIN" "$LAYOUT_ID" "$STEAM" "$WORK" "$OUT" <<'PY'
+import json, sys, os
+P, LID, STEAM, WORK, OUT = sys.argv[1:6]
+layout = json.load(open(f"{P}/layouts/{LID}.json"))
+svg = ""
+for a in layout.get("art", []):
+    path = (STEAM if a.get("source") == "steam" else P) + "/" + a["path"]
+    if os.path.exists(path):
+        svg = open(path).read(); break
+js = json.dumps
+harness = f'''import QtQuick
+import QtQuick.Window
+import "file://{P}" as Plugin
+import "file://{P}/Callouts.js" as Callouts
+Window {{
+  id: win; width: 2048; height: 1280; visible: true; color: "#060b0e"
+  Plugin.Sheet {{
+    id: sheet; anchors.centerIn: parent
+    sheet: JSON.parse({js(open(f"{WORK}/sheet.json").read())})
+    layout: JSON.parse({js(json.dumps(layout))})
+    pluginDir: {js(P)}
+    artSvg: Callouts.recolor({js(svg)}, "#D9CDB4")
+    toggleChord: "guide+view"
+  }}
+  Timer {{ interval: 2500; running: true
+    onTriggered: win.contentItem.grabToImage(function(r) {{ r.saveToFile({js(OUT)}); Qt.quit() }}) }}
+  Timer {{ interval: 20000; running: true; onTriggered: Qt.quit() }}
+}}
+'''
+open(f"{WORK}/harness.qml", "w").write(harness)
+PY
+QT_QPA_PLATFORM=offscreen QT_LOGGING_RULES='*.debug=false' timeout 60 qml6 "$WORK/harness.qml" >/dev/null 2>&1 || true
+[[ -s "$OUT" ]] && echo "rendered $OUT" || { echo "render-cheatsheet: no output produced" >&2; exit 1; }
