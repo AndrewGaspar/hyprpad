@@ -195,47 +195,10 @@ pub fn run() -> std::io::Result<()> {
     // widget can show "daemon up, controller not here yet" rather than nothing.
     let mut status = StatusWriter::create();
 
-    // Wait for the controller rather than exiting when it isn't there yet. The
-    // loop below already survives the puck *leaving*; this makes startup
-    // symmetric, so a daemon launched at login (or restarted while the puck is
-    // unplugged / asleep on a dead dongle) simply sits until it appears —
-    // "leave it running" has to include "start it before the controller".
+    // Load the config BEFORE the controller wait, because the wait now has to
+    // ask it a question: whether the gamepad backend is armed, and therefore
+    // whether a pad on `/dev/input` counts as "a controller is here".
     //
-    // The wait polls exactly what the reconnect wait polls — `PuckSource::acquire`
-    // — so both paths ask the broker first and fall back to opening the nodes
-    // directly, and neither can be satisfied by a puck that is listed in `/sys`
-    // but not actually openable.
-    let source = {
-        let mut source = hidraw::PuckSource::acquire();
-        if source.is_none() {
-            // Distinguish the two ways this can fail, because they need
-            // different things from the user. A puck that is *listed* in `/sys`
-            // but not obtainable is a half-finished host install — the udev rule
-            // took the nodes away and no broker is handing them back — and
-            // "waiting for a controller" would be a misleading thing to say
-            // about a controller that is plugged in.
-            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
-            if listed > 0 {
-                eprintln!(
-                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
-                     obtained — the udev rule is installed and the fd broker is not \
-                     reachable. Run `hyprpad setup --check`. Waiting…"
-                );
-            } else {
-                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
-            }
-            while source.is_none() {
-                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
-                source = hidraw::PuckSource::acquire();
-            }
-        }
-        let source = source.expect("the loop only exits with a source in hand");
-        eprintln!("hyprpad: controller found ({} node(s), {})", source.len(), source.label());
-        source
-    };
-    let node_count = source.len();
-    status.set_source(status::Source::of(&source));
-    status.set_connected(true);
     // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
     // live (see the `Input::Reload` arm and `apply_reload`).
     let mut config = match Config::load() {
@@ -253,6 +216,64 @@ pub fn run() -> std::io::Result<()> {
             Config::load_default()
         }
     };
+
+    // Wait for *a* controller rather than exiting when there isn't one yet. The
+    // loop below already survives a controller *leaving*; this makes startup
+    // symmetric, so a daemon launched at login (or restarted while the puck is
+    // unplugged / asleep on a dead dongle) simply sits until one appears —
+    // "leave it running" has to include "start it before the controller".
+    //
+    // The puck half polls exactly what the reconnect wait polls —
+    // `PuckSource::acquire` — so both paths ask the broker first and fall back
+    // to opening the nodes directly, and neither can be satisfied by a puck
+    // that is listed in `/sys` but not actually openable.
+    //
+    // The gamepad half is why this returns an `Option`: a machine with only an
+    // Xbox pad plugged in is a perfectly good hyprpad session, and waiting
+    // forever for a Steam Controller that is not coming would be the wrong
+    // answer. `None` means "start with no puck", which is exactly the state the
+    // reconnect wait already handles — so the loop below begins in it and picks
+    // the puck up on its next scan if it ever arrives.
+    let source = {
+        let mut source = hidraw::PuckSource::acquire();
+        if source.is_none() {
+            // Distinguish the ways this can fail, because they need different
+            // things from the user. A puck that is *listed* in `/sys` but not
+            // obtainable is a half-finished host install — the udev rule took
+            // the nodes away and no broker is handing them back — and "waiting
+            // for a controller" would be a misleading thing to say about a
+            // controller that is plugged in.
+            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
+            if listed > 0 {
+                eprintln!(
+                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
+                     obtained — the udev rule is installed and the fd broker is not \
+                     reachable. Run `hyprpad setup --check`. Waiting…"
+                );
+            } else {
+                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
+            }
+            while source.is_none() && !gamepad_present(&config) {
+                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
+                source = hidraw::PuckSource::acquire();
+            }
+        }
+        match &source {
+            Some(s) => {
+                eprintln!("hyprpad: controller found ({} node(s), {})", s.len(), s.label())
+            }
+            None => eprintln!(
+                "hyprpad: starting on a gamepad instead; the puck will be picked up if it \
+                 turns up"
+            ),
+        }
+        source
+    };
+    let node_count = source.as_ref().map_or(0, hidraw::PuckSource::len);
+    if let Some(s) = &source {
+        status.set_source(status::Source::of(s));
+        status.set_connected(true);
+    }
 
     // Lizard-mode ownership (opt-in). Off by default so we never fight an
     // unmasked Steam that is managing lizard mode itself
@@ -310,7 +331,16 @@ pub fn run() -> std::io::Result<()> {
     // `hyprpad reload` works either way.
     install_reload_signal(&tx);
 
-    spawn_reader_pipeline(source, &tx);
+    // `None` means we started on a gamepad with no puck present. That is the
+    // reconnect wait's own state, so begin in it: the loop scans for the puck
+    // on its timer and arms a reader pipeline the moment it appears.
+    let mut waiting = match source {
+        Some(source) => {
+            spawn_reader_pipeline(source, &tx);
+            false
+        }
+        None => true,
+    };
 
     // The second backend: any ordinary Linux gamepad on `/dev/input/event*`
     // ([`crate::evdev`]). One thread owns discovery, adoption, the grab, the
@@ -468,8 +498,8 @@ pub fn run() -> std::io::Result<()> {
     // and, crucially, never returns. Hyprland IPC and the virtual pointer stay
     // alive across the gap; only the hidraw reader pipeline is torn down and
     // re-armed. `recv_timeout` with a shrinking deadline guarantees the scan
-    // still fires even if compositor events keep arriving.
-    let mut waiting = false;
+    // still fires even if compositor events keep arriving. `waiting` was
+    // decided above, when the reader pipeline was (or was not) armed.
     let mut next_scan = Instant::now();
     // What the loop knows about the focused window: which address it is (so a
     // `windowtitle` event can be attributed), which title form this compositor
@@ -1681,15 +1711,24 @@ fn drive_sticks(
         // `cursor L|R` wire the pads use, so the OSK child is untouched. The
         // commits are ordinary `[osk_buttons]` bindings — `a` and the triggers
         // rather than the pad clicks, which do not exist here.
-        let l = st.osk_left.step(st.sticks.left, &cfg.osk, now);
-        let r = st.osk_right.step(st.sticks.right, &cfg.osk, now);
         // The wire's `+ny` is up and the frame's `+y` is up too, so both axes
-        // pass straight through — the same no-flip the pad path relies on.
-        osk.cursor(OskPad::Left, round_wire(l.0), round_wire(l.1));
-        osk.cursor(OskPad::Right, round_wire(r.0), round_wire(r.1));
+        // pass straight through — the same no-flip the pad path relies on —
+        // and each is deduped at the wire's own precision, so a stick held
+        // hard against an edge stops re-sending.
+        let l = st.osk_left.step(st.sticks.left, &cfg.osk, now);
+        let l = (round_wire(l.0), round_wire(l.1));
+        if st.osk_left.should_send(l) {
+            osk.cursor(OskPad::Left, l.0, l.1);
+        }
+        let r = st.osk_right.step(st.sticks.right, &cfg.osk, now);
+        let r = (round_wire(r.0), round_wire(r.1));
+        if st.osk_right.should_send(r) {
+            osk.cursor(OskPad::Right, r.0, r.1);
+        }
         // Nothing else runs while the keyboard is up.
         st.cursor.reset();
         st.scroll.reset();
+        st.scroll_detent = 0.0;
         return;
     }
     st.osk_left.reset();
@@ -1752,6 +1791,17 @@ fn drive_sticks(
 /// scroll emits per detent (`sensitivity * circular_step_degrees` at the
 /// defaults), so the stick and the pad agree on what a notch is.
 const SCROLL_NOTCH: f64 = 15.0;
+
+/// Whether a gamepad the evdev backend would adopt is plugged in right now.
+///
+/// The startup wait's second exit. `false` whenever the backend is switched off
+/// in the config, because a pad nothing is going to read is not a controller
+/// being present — that would leave the daemon awake with no input at all,
+/// which is worse than waiting.
+fn gamepad_present(config: &Config) -> bool {
+    config.device().evdev
+        && crate::evdev::gamepad_nodes().is_ok_and(|nodes| !nodes.is_empty())
+}
 
 /// The `"sources"` list for `status.json`: every controller the daemon can hear
 /// right now, puck first.
@@ -4384,6 +4434,23 @@ mod tests {
         // takes both pads.
         let gates = StickGates { cursor: true, scroll: true, osk: true };
         assert!(gates.osk);
+    }
+
+    /// The startup wait's second exit. A machine with only an Xbox pad is a
+    /// perfectly good hyprpad session, so waiting forever for a puck that is
+    /// not coming would be the wrong answer — but a pad nothing is going to
+    /// read is not a controller being present, so the config knob wins.
+    #[test]
+    fn the_startup_wait_ends_on_a_gamepad_only_when_the_backend_is_armed() {
+        let off = Config::from_toml_str("[device]\nevdev = false\n").unwrap();
+        assert!(!gamepad_present(&off), "a backend that is off finds nothing");
+
+        // With the backend on the answer is whatever is actually plugged into
+        // the machine running the tests, which is not something to assert —
+        // but it must agree with the scan, and must never hang or panic.
+        let on = Config::from_toml_str("[device]\nevdev = true\n").unwrap();
+        let scanned = crate::evdev::gamepad_nodes().is_ok_and(|n| !n.is_empty());
+        assert_eq!(gamepad_present(&on), scanned);
     }
 
     /// The `"sources"` list, puck first, and only what is actually there.

@@ -245,6 +245,9 @@ impl StickIntegrator {
 pub struct StickCursor {
     integrator: StickIntegrator,
     pos: (f64, f64),
+    /// The last position actually put on the wire, at the wire's own
+    /// precision. See [`should_send`](Self::should_send).
+    last_sent: Option<(f32, f32)>,
 }
 
 impl Default for StickCursor {
@@ -256,7 +259,7 @@ impl Default for StickCursor {
 impl StickCursor {
     /// A cursor parked at the centre.
     pub fn new() -> StickCursor {
-        StickCursor { integrator: StickIntegrator::new(), pos: (0.0, 0.0) }
+        StickCursor { integrator: StickIntegrator::new(), pos: (0.0, 0.0), last_sent: None }
     }
 
     /// Recentre and forget the velocity — a fresh keyboard starts in the
@@ -264,6 +267,23 @@ impl StickCursor {
     pub fn reset(&mut self) {
         self.integrator.reset();
         self.pos = (0.0, 0.0);
+        self.last_sent = None;
+    }
+
+    /// Whether `rounded` is somewhere this cursor has not already been sent to,
+    /// remembering it if so.
+    ///
+    /// The OSK's `cursor` command serialises at four decimals, so a cursor
+    /// clamped against an edge — a stick held hard over — stops re-sending
+    /// instead of writing the same line into the child's stdin every step.
+    /// Exactly what the pad router's `last_sent` does, for exactly the same
+    /// reason.
+    pub fn should_send(&mut self, rounded: (f32, f32)) -> bool {
+        if self.last_sent == Some(rounded) {
+            return false;
+        }
+        self.last_sent = Some(rounded);
+        true
     }
 
     /// Integrate one step and return the new position, clamped to the
@@ -584,6 +604,31 @@ mod tests {
         assert_eq!(cur.position().1, 0.0);
         cur.reset();
         assert_eq!(cur.position(), (0.0, 0.0), "a fresh keyboard starts centred");
+    }
+
+    /// A cursor clamped against an edge stops re-sending: the deadline is
+    /// still armed (the stick is held over) but there is nothing new to say,
+    /// and writing the same line into the OSK child's stdin 250 times a second
+    /// would be a busy loop by another name.
+    #[test]
+    fn an_osk_cursor_stops_re_sending_once_it_stops_moving() {
+        let mut c = cfg();
+        c.osk.smoothing_ms = 0.0;
+        let mut cur = StickCursor::new();
+        let mut sent = 0;
+        for k in 0..500 {
+            let p = cur.step((1.0, 0.0), &c.osk, at(k * 4));
+            let rounded = (((p.0 * 10_000.0).round() / 10_000.0) as f32, p.1 as f32);
+            if cur.should_send(rounded) {
+                sent += 1;
+            }
+        }
+        assert!(sent > 10, "it moved, so it was sent while it moved ({sent})");
+        assert!(sent < 400, "and stopped once clamped at the edge ({sent})");
+        // A reset forgets where it was, so the next show re-sends the centre.
+        cur.reset();
+        assert!(cur.should_send((0.0, 0.0)));
+        assert!(!cur.should_send((0.0, 0.0)));
     }
 
     // --- the arm / disarm decision table -----------------------------------
