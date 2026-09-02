@@ -1599,20 +1599,72 @@ mod tests {
         assert_eq!(m.active(), "desktop");
     }
 
+    /// A spawned probe process tree, killed and reaped however the test leaves
+    /// the stack — a failing assert must not leak a `sleep` into the session.
+    ///
+    /// The child leads its own process group (`process_group(0)`, so its pgid
+    /// is its pid), because `Child::kill` signals only the process itself and
+    /// would orphan the descendants the shell started. One negative-pid signal
+    /// takes the whole tree. (The same guard as
+    /// `lua_config::tests::ProcessTree`, which this test's probe mirrors.)
+    struct ProcessTree(std::process::Child);
+
+    impl Drop for ProcessTree {
+        fn drop(&mut self) {
+            // SAFETY: a plain `kill(2)`; the pgid is this child's own, created
+            // by `process_group(0)` at spawn, so nothing else can be in it.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Poll `pred` on a 10 ms step until it holds or `budget` runs out.
+    ///
+    /// `/proc` is not a snapshot: a `/proc/<pid>/task` listing is not atomic
+    /// against libtest starting and joining threads around the walk, and a
+    /// grandchild is started by a shell with no handshake with us at all. Both
+    /// windows are transient, so wait for them rather than race them.
+    fn poll_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + budget;
+        loop {
+            if pred() {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The title-less case: a program that starts under the focused window
     /// without renaming it. The periodic sweep re-walks `/proc` and the rule
     /// flips — the same transition a focus change would have produced.
     #[test]
     fn the_periodic_rescan_sees_a_child_process_appear() {
-        let c = lua(
+        // The needle lives only in the probe's *command line*, never in its
+        // `comm` — which is precisely the window `/proc` leaves open. The
+        // kernel sets `comm` during `execve` but publishes `mm->arg_start`
+        // after the point `Command::spawn` returns from, so a walk landing in
+        // between reads the new name and an *empty* cmdline. The probe
+        // therefore announces itself and this test waits for that, rather than
+        // racing it — the same shape as
+        // `lua_config::tests::process_tree_has_finds_a_descendant_process`.
+        //
+        // The tag carries our pid, because the sibling tests spawn processes
+        // in parallel *under this same test binary* — inside the very tree
+        // being walked — and must not be able to satisfy the rule by accident.
+        let tag = format!("hyprpad-rescan-probe-{}", std::process::id());
+        let c = lua(&format!(
             r#"
             hyprpad.mode("claude").when(function(ctx)
-              return ctx.focus:process_tree_has("hyprpad-rescan-probe")
+              return ctx.focus:process_tree_has("{tag}")
             end)
             hyprpad.mode("desktop")
             hyprpad.default_mode "desktop"
-            "#,
-        );
+            "#
+        ));
         let mut m = ModeEngine::new(&c);
         // Pretend this test process is the focused window.
         let me = std::process::id() as i32;
@@ -1620,33 +1672,57 @@ mod tests {
         assert_eq!(m.active(), "desktop", "nothing is running under us yet");
         assert!(m.process_rescan_useful(&c), "the rule walks the tree, so the sweep is armed");
 
-        // The walk matches on `"<comm> <cmdline>"`, so a `sleep` wearing the
-        // probe's name as its `argv[0]` is a distinguishable stand-in for the
+        // The walk matches on `"<comm> <cmdline>"`, so a shell wearing the
+        // probe's name as its `$0` is a distinguishable stand-in for the
         // program the owner actually cares about — no such binary required.
-        use std::os::unix::process::CommandExt;
-        let mut child = std::process::Command::new("sleep")
-            .arg0("hyprpad-rescan-probe")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
+        //
+        // Three details keep it honest:
+        //
+        // * the script arrives on the outer shell's *stdin*, not in its argv,
+        //   so that shell's own `/proc/<pid>/cmdline` stays bare `/bin/sh` and
+        //   cannot carry the tag. Only the tagged inner shell can.
+        // * `/bin/echo` *inside* the tagged shell signals readiness: an
+        //   external command, so it runs only once that shell has exec'd and
+        //   published its command line, and it flushes by exiting. Reading the
+        //   token proves the tag is in `/proc`, not merely forked.
+        // * the tagged shell backgrounds its `sleep` and blocks in `wait`
+        //   rather than running the sleep last, because a shell whose final
+        //   command is a simple one exec's it in place — which would drop the
+        //   tag from the command line again.
+        let script = format!("/bin/sh -c '/bin/echo ready; sleep 300 & wait' {tag} &\nwait\n");
 
-        // `spawn` returns as soon as the fork happens; the child may not have
-        // exec'd yet, so give the rescan a few tries rather than racing it.
-        let mut flipped = false;
-        for _ in 0..50 {
-            flipped = m.rescan_processes(&c);
-            if flipped {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(flipped, "the rescan must see the new child");
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::process::CommandExt;
+        let mut spawned = std::process::Command::new("/bin/sh")
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+        spawned
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("feed the script");
+        let out = spawned.stdout.take().expect("piped stdout");
+        let _probe = ProcessTree(spawned);
+        let mut ready = String::new();
+        BufReader::new(out).read_line(&mut ready).expect("read the ready token");
+        assert_eq!(ready.trim(), "ready", "the probe shell never came up");
+
+        // The tag is published by now, so the sweep should flip on its first
+        // walk; the poll is there for the `/proc/<pid>/task` listing, which is
+        // still not atomic against libtest's threads.
+        assert!(
+            poll_until(Duration::from_secs(2), || m.rescan_processes(&c)),
+            "the rescan must see {tag} appear under {me}"
+        );
         assert_eq!(m.active(), "claude");
         // A second rescan with nothing new is not a transition.
         assert!(!m.rescan_processes(&c));
 
-        let _ = child.kill();
-        let _ = child.wait();
+        // `_probe` drops here, killing the whole probe group on every path.
     }
 
     #[test]
