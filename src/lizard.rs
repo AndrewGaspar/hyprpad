@@ -35,8 +35,29 @@
 //! the identical command/setting numbers (`ID_CLEAR_DIGITAL_MAPPINGS`,
 //! `ID_SET_SETTINGS_VALUES`, `SETTING_LIZARD_MODE`, `SETTING_STEAM_WATCHDOG_ENABLE`).
 //!
-//! Only these two documented, non-persistent reports are ever sent. No factory
-//! reset, no digital-mapping *writes*, nothing speculative.
+//! Only these two documented, non-persistent reports are ever sent by the
+//! ownership loop. No factory reset, no digital-mapping *writes*, nothing
+//! speculative.
+//!
+//! ## The firmware power knobs, and the deliberate power-off
+//!
+//! Three more commands live here, all from the same documented set and all
+//! opt-in (`docs/research/guide-hold-poweroff.md`):
+//!
+//! * [`PowerSettings`] — `SETTING_STEAMBUTTON_POWEROFF_TIME` (25) and
+//!   `SETTING_SLEEP_INACTIVITY_TIMEOUT` (50), appended to the *same* `0x87`
+//!   frame the disable sequence already re-sends every 30 s. Setting 25 is the
+//!   register behind "holding the Steam button while deliberating turns the
+//!   controller off": the firmware owns that timer, not Steam and not hyprpad.
+//!   Nothing is written unless the config asks.
+//! * [`read_settings`] / [`read_puck_settings`] — the `0x89`/`0x8B`/`0x8C`
+//!   round trip that asks the firmware what a setting currently is, what
+//!   maximum it accepts and what its factory default is. Read-only, and the
+//!   only way to learn the units the write above needs, since Valve publishes
+//!   no defaults table. `hyprpad puck-settings` is its front-end.
+//! * [`turn_off_controller`] — `0x9F ID_TURN_OFF_CONTROLLER`, the *deliberate*
+//!   power-off that replaces the accidental one, on a chord, `hyprpad off`, or
+//!   a right-click on the bar widget.
 //!
 //! ## Safety of concurrent access, and the sleeping controller
 //!
@@ -74,6 +95,50 @@ const SETTING_LIZARD_MODE: u8 = 9;
 /// otherwise reverts the controller to lizard mode (0 = off).
 const SETTING_STEAM_WATCHDOG_ENABLE: u8 = 71;
 
+// The power-related command and setting numbers are taken from
+// [`crate::uhid::settings`] rather than respelled here, so the two halves of
+// the project — the one that *writes* these to the real puck and the one that
+// *decodes* Steam writing them to the virtual one — cannot drift. Their
+// ultimate source is SDL's `controller_constants.h`, catalogued in
+// `docs/research/guide-hold-poweroff.md` §1.4.
+
+/// `SETTING_STEAMBUTTON_POWEROFF_TIME` (25 / `0x19`) — how long the Steam
+/// button must be held before the *firmware* powers the controller off. The
+/// knob this whole module-level feature exists for; see [`PowerSettings`] for
+/// what is and is not known about its units.
+const SETTING_STEAMBUTTON_POWEROFF_TIME: u8 =
+    crate::uhid::settings::setting::STEAMBUTTON_POWEROFF_TIME;
+/// `SETTING_SLEEP_INACTIVITY_TIMEOUT` (50 / `0x32`) — how long the controller
+/// sits idle before it sleeps on its own. A `u16` of **seconds** on the 2015
+/// firmware (sc-controller's `sc_dongle.py` writes it as one, default 600);
+/// UNVERIFIED on Triton.
+const SETTING_SLEEP_INACTIVITY_TIMEOUT: u8 =
+    crate::uhid::settings::setting::SLEEP_INACTIVITY_TIMEOUT;
+
+/// `ID_GET_SETTINGS_VALUES` — ask the firmware what a setting is *currently*
+/// set to.
+pub const ID_GET_SETTINGS_VALUES: u8 = 0x89;
+/// `ID_GET_SETTINGS_MAXS` — ask the firmware the maximum a setting accepts.
+pub const ID_GET_SETTINGS_MAXS: u8 = 0x8B;
+/// `ID_GET_SETTINGS_DEFAULTS` — ask the firmware a setting's factory default.
+pub const ID_GET_SETTINGS_DEFAULTS: u8 = 0x8C;
+
+/// `ID_TURN_OFF_CONTROLLER` — the deliberate power-off command.
+const ID_TURN_OFF_CONTROLLER: u8 = crate::uhid::settings::cmd::TURN_OFF_CONTROLLER;
+
+/// The payload sc-controller sends with [`ID_TURN_OFF_CONTROLLER`]: the four
+/// ASCII bytes `off!` (`scc/drivers/sc_dongle.py:368-371`, "Mercilessly stolen
+/// from scraw library"), making the frame `01 9f 04 6f 66 66 21` zero-padded to
+/// [`WIRE_LEN`]. Whether Triton actually requires the magic is **UNVERIFIED**
+/// (`docs/research/guide-hold-poweroff.md` §2, §6); a bare `01 9f 00` is the
+/// documented fallback to try if this is ignored.
+const TURN_OFF_MAGIC: &[u8; 4] = b"off!";
+
+/// The largest number of `(setting, u16)` pairs one [`settings_report`] frame
+/// can carry: the payload starts at byte 3 of a [`WIRE_LEN`] buffer and each
+/// pair is three bytes.
+const MAX_SETTINGS_PAIRS: usize = (WIRE_LEN - 3) / 3;
+
 /// Length of the controller feature-report body, excluding the leading report
 /// id. The puck's controller feature report (id 1) declares 63 payload bytes;
 /// with the report id that makes a 64-byte wire frame (confirmed from the live
@@ -102,6 +167,119 @@ const EPIPE_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// idempotent so the cost of re-sending is negligible.
 pub const RESEND_INTERVAL: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// The firmware power knobs
+// ---------------------------------------------------------------------------
+
+/// The value the config spelling `"off"` writes to either power setting.
+///
+/// **A guess, and deliberately the safe one of the two candidates.** Valve does
+/// not publish `g_DefaultSettingValues`, so neither the unit nor the "disabled"
+/// encoding of `SETTING_STEAMBUTTON_POWEROFF_TIME` is known
+/// (`docs/research/guide-hold-poweroff.md` §6 lists both as UNVERIFIED). Two
+/// readings of `0` are plausible and they are opposites:
+///
+/// * `0` means **never** — the usual convention for a timeout, and the reading
+///   §3.A assumes first ("*`0` is not 'never'.* Then write the maximum the
+///   firmware reports");
+/// * `0` means **no delay** — in which case writing it powers the controller
+///   off on *any* guide press, and the 30 s re-send puts that back after every
+///   wake.
+///
+/// So `"off"` writes `0xFFFF` instead: the largest value the `u16` field can
+/// carry — "as long as the firmware can express" — which is ~65 s under the
+/// shortest candidate unit (milliseconds), 18 hours under seconds, and is safe
+/// under *both* readings. §3.A's own fallback is the same idea, and
+/// `0x8B ID_GET_SETTINGS_MAXS` ([`read_settings`], `hyprpad puck-settings`) is
+/// how to learn what maximum the firmware will actually accept.
+///
+/// To test the "`0` = never" reading, write the integer explicitly:
+/// `steam_button_poweroff = 0`.
+pub const POWER_SETTING_OFF: u16 = u16::MAX;
+
+/// The two firmware power knobs hyprpad can write, as the config asked for
+/// them. `None` means "write nothing", which is the default and today's
+/// behaviour: a setting hyprpad does not mention keeps whatever the firmware
+/// has.
+///
+/// # What is known, and what is not
+///
+/// * **`steam_button_poweroff`** (`SETTING_STEAMBUTTON_POWEROFF_TIME`, 25) is
+///   the register behind the complaint this feature exists for: the firmware,
+///   not Steam and not hyprpad, powers the puck off on a long Steam-button hold
+///   (`docs/research/guide-hold-poweroff.md` §1). Its **units, default, maximum
+///   and whether `0` disables it are all UNVERIFIED**, as is whether Triton
+///   honours the setting at all — the name and number come from a shared enum
+///   that dates to the 2015 controller. Nothing public writes it.
+/// * **`sleep_inactivity_timeout`** (`SETTING_SLEEP_INACTIVITY_TIMEOUT`, 50) is
+///   the passive power-off — how long the controller sits idle before sleeping.
+///   sc-controller writes it as a `u16` of **seconds** (default 600) on the
+///   2015 firmware, which is the only third-party evidence for the unit of
+///   *any* setting in this frame; UNVERIFIED on Triton.
+///
+/// Both are therefore knobs the owner is expected to **test**: read them with
+/// `hyprpad puck-settings 25 50`, write a value, read it back, then time a hold
+/// with a stopwatch. See the verify recipe in `docs/design/puck-power.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerSettings {
+    /// `SETTING_STEAMBUTTON_POWEROFF_TIME` (25), raw as written to the wire.
+    pub steam_button_poweroff: Option<u16>,
+    /// `SETTING_SLEEP_INACTIVITY_TIMEOUT` (50), raw as written to the wire.
+    pub sleep_inactivity_timeout: Option<u16>,
+}
+
+impl PowerSettings {
+    /// The `(setting, value)` pairs to append to the lizard-disable frame — in
+    /// setting-number order, and empty when the config set neither knob (the
+    /// default, which keeps the frame byte-for-byte what it has always been).
+    pub fn pairs(&self) -> Vec<(u8, u16)> {
+        let mut pairs = Vec::new();
+        if let Some(v) = self.steam_button_poweroff {
+            pairs.push((SETTING_STEAMBUTTON_POWEROFF_TIME, v));
+        }
+        if let Some(v) = self.sleep_inactivity_timeout {
+            pairs.push((SETTING_SLEEP_INACTIVITY_TIMEOUT, v));
+        }
+        pairs
+    }
+
+    /// Whether the config asked for nothing, i.e. whether the settings write is
+    /// unchanged from the historical two-pair frame.
+    pub fn is_empty(&self) -> bool {
+        self.steam_button_poweroff.is_none() && self.sleep_inactivity_timeout.is_none()
+    }
+}
+
+/// The power settings the ownership loop currently writes.
+///
+/// A process-wide cell rather than an argument because [`disable_lizard_mode`]
+/// is called from four places in [`crate::run`] — startup, reconnect, reload and
+/// the ownership loop's own timer — none of which should have to thread a
+/// config value through, and because the loop runs on its own thread with no
+/// channel back to the daemon loop. [`crate::run`] pushes the config's value in
+/// at startup and again on every reload, so a `hyprpad reload` retunes the next
+/// re-send with nothing to restart.
+static POWER_SETTINGS: std::sync::RwLock<PowerSettings> =
+    std::sync::RwLock::new(PowerSettings {
+        steam_button_poweroff: None,
+        sleep_inactivity_timeout: None,
+    });
+
+/// Install the power settings the next lizard write will carry (from
+/// `h.daemon { steam_button_poweroff = …, sleep_inactivity_timeout = … }`).
+/// Called on startup and on every live reload.
+pub fn set_power_settings(power: PowerSettings) {
+    if let Ok(mut slot) = POWER_SETTINGS.write() {
+        *slot = power;
+    }
+}
+
+/// The power settings currently installed. A poisoned lock falls back to
+/// "write nothing", which is the historical frame — the safe direction.
+pub fn power_settings() -> PowerSettings {
+    POWER_SETTINGS.read().map(|p| *p).unwrap_or_default()
+}
+
 /// Build the `ID_CLEAR_DIGITAL_MAPPINGS` feature frame.
 fn clear_digital_mappings_report() -> [u8; WIRE_LEN] {
     let mut buf = [0u8; WIRE_LEN];
@@ -110,28 +288,53 @@ fn clear_digital_mappings_report() -> [u8; WIRE_LEN] {
     buf
 }
 
-/// Build the `ID_SET_SETTINGS_VALUES` feature frame that turns lizard mode and
-/// the revert-watchdog off (the IBEX/Deck disable path).
-fn disable_lizard_settings_report() -> [u8; WIRE_LEN] {
+/// Build an `ID_SET_SETTINGS_VALUES` feature frame carrying `pairs`.
+///
+/// `[report_id][0x87][3 * n][(setting, value_lo, value_hi) x n]`, zero-padded to
+/// [`WIRE_LEN`] — the frame SDL's `DisableSteamTritonLizardMode` and the
+/// kernel's `steam_write_settings` build, generalised from the fixed pair this
+/// module used to hardcode so extra settings can ride along in the same write.
+/// Pairs past [`MAX_SETTINGS_PAIRS`] would not fit in the report and are
+/// dropped; nothing in the daemon can produce that many.
+fn settings_report(pairs: &[(u8, u16)]) -> [u8; WIRE_LEN] {
     let mut buf = [0u8; WIRE_LEN];
     buf[0] = REPORT_ID_FEATURES_CONTROLLER;
     buf[1] = ID_SET_SETTINGS_VALUES;
-    buf[2] = 6; // payload length = 3 bytes * 2 settings
-    // SETTING_LIZARD_MODE = 0 (u16 little-endian)
-    buf[3] = SETTING_LIZARD_MODE;
-    buf[4] = 0x00;
-    buf[5] = 0x00;
-    // SETTING_STEAM_WATCHDOG_ENABLE = 0 (u16 little-endian)
-    buf[6] = SETTING_STEAM_WATCHDOG_ENABLE;
-    buf[7] = 0x00;
-    buf[8] = 0x00;
+    let n = pairs.len().min(MAX_SETTINGS_PAIRS);
+    buf[2] = (3 * n) as u8;
+    for (i, (id, value)) in pairs.iter().take(n).enumerate() {
+        let at = 3 + i * 3;
+        buf[at] = *id;
+        buf[at + 1] = (*value & 0x00FF) as u8;
+        buf[at + 2] = (*value >> 8) as u8;
+    }
     buf
+}
+
+/// The `(setting, value)` pairs of the disable-lizard write: the two settings
+/// this module has always written, plus whatever [`PowerSettings`] the config
+/// asked for — so the power knobs are carried by the *same* frame that already
+/// goes out every [`RESEND_INTERVAL`] and survives a reconnect for free.
+fn disable_lizard_pairs(power: PowerSettings) -> Vec<(u8, u16)> {
+    let mut pairs = vec![
+        (SETTING_LIZARD_MODE, 0),
+        (SETTING_STEAM_WATCHDOG_ENABLE, 0),
+    ];
+    pairs.extend(power.pairs());
+    pairs
+}
+
+/// Build the `ID_SET_SETTINGS_VALUES` feature frame that turns lizard mode and
+/// the revert-watchdog off (the IBEX/Deck disable path), plus any configured
+/// power settings.
+fn disable_lizard_settings_report(power: PowerSettings) -> [u8; WIRE_LEN] {
+    settings_report(&disable_lizard_pairs(power))
 }
 
 /// The full disable-lizard feature sequence, in send order: clear the digital
 /// mappings, then write the disabling settings.
-fn disable_sequence() -> [[u8; WIRE_LEN]; 2] {
-    [clear_digital_mappings_report(), disable_lizard_settings_report()]
+fn disable_sequence(power: PowerSettings) -> [[u8; WIRE_LEN]; 2] {
+    [clear_digital_mappings_report(), disable_lizard_settings_report(power)]
 }
 
 /// Build the `ID_SET_DEFAULT_DIGITAL_MAPPINGS` feature frame — restore the
@@ -150,20 +353,16 @@ fn set_default_digital_mappings_report() -> [u8; WIRE_LEN] {
 /// `SETTING_STEAM_WATCHDOG_ENABLE` matters: disable turned it off, and it is the
 /// switch that lets the firmware fall back to lizard mode on its own when no
 /// host heartbeat is seen.
+///
+/// It deliberately does **not** revert [`PowerSettings`]. There is nothing to
+/// revert them *to*: the firmware's defaults for settings 25 and 50 are not
+/// published (`docs/research/guide-hold-poweroff.md` §6), so restoring a guess
+/// would be worse than leaving the owner's chosen value in place — and a value
+/// the daemon wrote is in any case not known to survive a power cycle.
+/// `hyprpad puck-settings 25 50` reads the firmware's own defaults
+/// (`0x8C ID_GET_SETTINGS_DEFAULTS`) for anyone who wants to put them back.
 fn enable_lizard_settings_report() -> [u8; WIRE_LEN] {
-    let mut buf = [0u8; WIRE_LEN];
-    buf[0] = REPORT_ID_FEATURES_CONTROLLER;
-    buf[1] = ID_SET_SETTINGS_VALUES;
-    buf[2] = 6; // payload length = 3 bytes * 2 settings
-    // SETTING_LIZARD_MODE = 1 (u16 little-endian)
-    buf[3] = SETTING_LIZARD_MODE;
-    buf[4] = 0x01;
-    buf[5] = 0x00;
-    // SETTING_STEAM_WATCHDOG_ENABLE = 1 (u16 little-endian)
-    buf[6] = SETTING_STEAM_WATCHDOG_ENABLE;
-    buf[7] = 0x01;
-    buf[8] = 0x00;
-    buf
+    settings_report(&[(SETTING_LIZARD_MODE, 1), (SETTING_STEAM_WATCHDOG_ENABLE, 1)])
 }
 
 /// The full enable-lizard feature sequence, in send order: restore the default
@@ -186,9 +385,21 @@ const _IOC_READ: u32 = 2;
 
 /// The `HIDIOCSFEATURE` ioctl request code for a payload of `len` bytes.
 const fn hidiocsfeature(len: usize) -> libc::c_ulong {
+    feature_ioctl(0x06, len)
+}
+
+/// The `HIDIOCGFEATURE` ioctl request code for a buffer of `len` bytes —
+/// `_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, len)`, the read twin of
+/// [`hidiocsfeature`]. Byte 0 of the buffer selects the report id on the way in
+/// and comes back as part of the reply.
+const fn hidiocgfeature(len: usize) -> libc::c_ulong {
+    feature_ioctl(0x07, len)
+}
+
+/// The shared encoding behind both feature ioctls: only the `nr` differs.
+const fn feature_ioctl(nr: u32, len: usize) -> libc::c_ulong {
     let dir = _IOC_WRITE | _IOC_READ;
     let ty = b'H' as u32;
-    let nr = 0x06u32;
     ((dir << _IOC_DIRSHIFT)
         | (ty << _IOC_TYPESHIFT)
         | (nr << _IOC_NRSHIFT)
@@ -296,9 +507,48 @@ fn apply_to_puck(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
 }
 
 /// Disable lizard mode on the attached puck (clear the digital mappings, then
-/// turn `SETTING_LIZARD_MODE` and the revert-watchdog off).
+/// turn `SETTING_LIZARD_MODE` and the revert-watchdog off), carrying whatever
+/// [`PowerSettings`] the config installed in the same settings write.
 pub fn disable_lizard_mode() -> Result<(), String> {
-    apply_to_puck(&disable_sequence())
+    apply_to_puck(&disable_sequence(power_settings()))
+}
+
+/// Build the `ID_TURN_OFF_CONTROLLER` feature frame.
+///
+/// `01 9f 04 6f 66 66 21`, zero-padded to [`WIRE_LEN`] — command `0x9F` with the
+/// four-byte payload `"off!"`, exactly the bytes sc-controller sends
+/// (`scc/drivers/sc_dongle.py:368-371`) and the form
+/// `docs/research/guide-hold-poweroff.md` §2 prescribes. The framing is the
+/// same feature-report framing every other command in this module uses, so it
+/// goes out through the same `HIDIOCSFEATURE` path with the same STALL
+/// handling.
+fn turn_off_report() -> [u8; WIRE_LEN] {
+    let mut buf = [0u8; WIRE_LEN];
+    buf[0] = REPORT_ID_FEATURES_CONTROLLER;
+    buf[1] = ID_TURN_OFF_CONTROLLER;
+    buf[2] = TURN_OFF_MAGIC.len() as u8;
+    buf[3..3 + TURN_OFF_MAGIC.len()].copy_from_slice(TURN_OFF_MAGIC);
+    buf
+}
+
+/// Turn the controller off, deliberately — the `h.controller_off()` action, the
+/// `guide+quickaccess` chord, `hyprpad off`, and a right-click on the bar
+/// widget all end here.
+///
+/// This is the *replacement* for the firmware's guide-hold power-off, not an
+/// addition to it: the point of [`PowerSettings::steam_button_poweroff`] is to
+/// stop the hold from firing while deliberating, and the point of this is to
+/// still have a way to put the puck to sleep.
+///
+/// Best-effort against a possibly-absent controller, like every other write
+/// here: a puck whose controller is asleep STALLs every node and this returns
+/// `Err`, which for "turn it off" is a harmless no-op — it already is.
+///
+/// sc-controller refuses `0x9F` on a *wired* controller
+/// (`scc/drivers/sc_by_cable.py:102`); hyprpad does not special-case that
+/// because it only ever talks to the puck (`28de:1304`).
+pub fn turn_off_controller() -> Result<(), String> {
+    apply_to_puck(&[turn_off_report()])
 }
 
 /// Re-enable lizard mode on the attached puck — the inverse of
@@ -313,6 +563,272 @@ pub fn disable_lizard_mode() -> Result<(), String> {
 /// wake restores it anyway.
 pub fn enable_lizard_mode() -> Result<(), String> {
     apply_to_puck(&enable_sequence())
+}
+
+// ---------------------------------------------------------------------------
+// Reading settings back
+// ---------------------------------------------------------------------------
+//
+// Everything hyprpad writes above is a fire-and-forget `SET_FEATURE`. The
+// firmware will also *answer*, and it has to, because the units and defaults of
+// the power settings are not published anywhere: the only way to learn what
+// setting 25 means on this controller is to ask it
+// (`docs/research/guide-hold-poweroff.md` §2, §6).
+//
+// The round trip is the one the kernel driver uses. `hid-steam.c`'s
+// `steam_get_serial` (`drivers/hid/hid-steam.c:667-690`) documents it in a
+// comment — "Send: 0xae 0x15 0x01 / Recv: 0xae 0x15 0x01 serialnumber" — and
+// implements it as `steam_send_report` (a `SET_FEATURE` of the command frame)
+// followed by `steam_recv_report` (a `GET_FEATURE` on the same report id) whose
+// reply echoes `[cmd][len][payload…]`. `steam_recv_report_id`
+// (`hid-steam.c:433-500`) is the same shape.
+//
+// **UNVERIFIED, and the first thing to suspect if a read comes back empty:**
+// what the length byte of a *request* means. `steam_get_serial` sends
+// `0xae 0x15 0x01` — one payload byte behind a length of 21 — so on that
+// command the byte plainly describes the *reply*, not the request.
+// `docs/research/guide-hold-poweroff.md` §2/§4 prescribes `[01][89][n][ids…]`
+// for `GET_SETTINGS_VALUES`, i.e. the count of ids, and that is what
+// [`get_settings_request`] builds. If the firmware STALLs or answers with an
+// empty payload, the reply-length reading is the other thing to try.
+//
+// The split below is deliberate and is what makes this testable at all: the
+// request builder and the reply parser are **pure functions over bytes**, the
+// round trip is generic over a [`FeatureDevice`], and the only implementation
+// that touches a real descriptor is [`HidrawDevice`]. The unit tests drive a
+// fake device end to end, so the read path is covered without a controller
+// anywhere near it.
+
+/// Something that can exchange feature reports: a real hidraw descriptor, or a
+/// fake one in a test.
+///
+/// Both methods take the **whole wire frame including the leading report id**,
+/// which is what the `HIDIOCSFEATURE` / `HIDIOCGFEATURE` ioctls themselves
+/// take, so an implementation has nothing to reframe.
+pub trait FeatureDevice {
+    /// Send one feature report (`SET_FEATURE`).
+    fn write_feature(&mut self, report: &[u8]) -> Result<(), String>;
+    /// Read one feature report (`GET_FEATURE`) into `buf`, whose byte 0 selects
+    /// the report id. Returns how many bytes the device produced.
+    fn read_feature(&mut self, buf: &mut [u8]) -> Result<usize, String>;
+}
+
+/// Build a settings-query frame: `[report_id][command][n][id…]`, zero-padded to
+/// [`WIRE_LEN`].
+///
+/// `command` is one of [`ID_GET_SETTINGS_VALUES`], [`ID_GET_SETTINGS_MAXS`] or
+/// [`ID_GET_SETTINGS_DEFAULTS`] — the same frame shape answers all three, which
+/// is why the caller picks. Pure: no device, no I/O.
+pub fn get_settings_request(command: u8, ids: &[u8]) -> Result<[u8; WIRE_LEN], String> {
+    if ids.is_empty() {
+        return Err("a settings query needs at least one setting id".to_string());
+    }
+    if ids.len() > WIRE_LEN - 3 {
+        return Err(format!(
+            "too many setting ids ({}, max {}) for one {WIRE_LEN}-byte report",
+            ids.len(),
+            WIRE_LEN - 3
+        ));
+    }
+    let mut buf = [0u8; WIRE_LEN];
+    buf[0] = REPORT_ID_FEATURES_CONTROLLER;
+    buf[1] = command;
+    buf[2] = ids.len() as u8;
+    buf[3..3 + ids.len()].copy_from_slice(ids);
+    Ok(buf)
+}
+
+/// Parse a settings reply: `[report_id][command][len][id, value_lo, value_hi]…`,
+/// where `len` is `3 * pairs`.
+///
+/// Strict on purpose — this is the half that tells the owner what the firmware
+/// actually said, so "the reply was not an answer to this question" must not be
+/// reported as "the firmware returned nothing". Errors on a reply too short to
+/// hold a header, one whose command byte is not the one asked for (including
+/// the all-zero buffer a device that answered nothing leaves behind), one whose
+/// declared length runs past the bytes actually read, and one whose length is
+/// not a whole number of `(id, u16)` triples. Pure: no device, no I/O.
+pub fn parse_settings_reply(command: u8, reply: &[u8]) -> Result<Vec<(u8, u16)>, String> {
+    if reply.len() < 3 {
+        return Err(format!(
+            "settings reply truncated: {} byte(s), need at least 3",
+            reply.len()
+        ));
+    }
+    if reply[0] != REPORT_ID_FEATURES_CONTROLLER {
+        return Err(format!(
+            "settings reply has report id {:#04x}, expected {:#04x}",
+            reply[0], REPORT_ID_FEATURES_CONTROLLER
+        ));
+    }
+    if reply[1] != command {
+        return Err(format!(
+            "settings reply is for command {:#04x}, expected {command:#04x}",
+            reply[1]
+        ));
+    }
+    let declared = reply[2] as usize;
+    let available = reply.len() - 3;
+    if declared > available {
+        return Err(format!(
+            "settings reply claims {declared} payload byte(s) but only {available} were read"
+        ));
+    }
+    if !declared.is_multiple_of(3) {
+        return Err(format!(
+            "settings reply payload is {declared} byte(s), not a whole number of \
+             (id, u16) triples"
+        ));
+    }
+    Ok((0..declared / 3)
+        .map(|i| {
+            let at = 3 + i * 3;
+            (reply[at], u16::from_le_bytes([reply[at + 1], reply[at + 2]]))
+        })
+        .collect())
+}
+
+/// One settings query against one device: build the request, send it, read the
+/// answer, parse it.
+///
+/// Generic over [`FeatureDevice`] so the whole round trip — including the
+/// ordering of the two halves — is exercised against a fake in the tests and
+/// never needs the real controller.
+pub fn read_settings<D: FeatureDevice>(
+    dev: &mut D,
+    command: u8,
+    ids: &[u8],
+) -> Result<Vec<(u8, u16)>, String> {
+    let request = get_settings_request(command, ids)?;
+    dev.write_feature(&request)?;
+    let mut reply = [0u8; WIRE_LEN];
+    reply[0] = REPORT_ID_FEATURES_CONTROLLER;
+    let n = dev.read_feature(&mut reply)?;
+    parse_settings_reply(command, &reply[..n.min(WIRE_LEN)])
+}
+
+/// A real hidraw descriptor as a [`FeatureDevice`].
+///
+/// Borrows the fd rather than owning it: the descriptors come from
+/// [`crate::hidraw::PuckSource`], which owns them for the length of the query.
+pub struct HidrawDevice {
+    fd: RawFd,
+}
+
+impl HidrawDevice {
+    /// Wrap an open hidraw descriptor. The caller keeps it alive.
+    pub fn new(fd: RawFd) -> HidrawDevice {
+        HidrawDevice { fd }
+    }
+}
+
+impl FeatureDevice for HidrawDevice {
+    fn write_feature(&mut self, report: &[u8]) -> Result<(), String> {
+        match send_feature_report(self.fd, report) {
+            Ok(()) => Ok(()),
+            Err(SendErr::Stall) => Err("STALL (no controller attached to this slot)".to_string()),
+            Err(SendErr::Other(e)) => Err(e),
+        }
+    }
+
+    fn read_feature(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        let request = hidiocgfeature(buf.len());
+        // SAFETY: `self.fd` is a live hidraw fd for the duration of the call and
+        // `HIDIOCGFEATURE(len)` writes at most `buf.len()` bytes through the
+        // pointer, which is a unique mutable borrow of exactly that many bytes.
+        let ret = unsafe { libc::ioctl(self.fd, request, buf.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(format!("HIDIOCGFEATURE: {}", std::io::Error::last_os_error()));
+        }
+        Ok(ret as usize)
+    }
+}
+
+/// What the firmware says about one setting: its current value, and the maximum
+/// and factory default it reports for it.
+///
+/// A field is `None` when that query failed or the firmware left the setting out
+/// of its answer — which is itself the interesting result for setting 25, since
+/// "not stored at all" is one of the live hypotheses
+/// (`docs/research/guide-hold-poweroff.md` §3.A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingReport {
+    /// The `SETTING_*` number.
+    pub id: u8,
+    /// Its SDL name, for printing.
+    pub name: &'static str,
+    /// `0x89 ID_GET_SETTINGS_VALUES`.
+    pub current: Option<u16>,
+    /// `0x8B ID_GET_SETTINGS_MAXS`.
+    pub max: Option<u16>,
+    /// `0x8C ID_GET_SETTINGS_DEFAULTS`.
+    pub default: Option<u16>,
+}
+
+/// Assemble the current/max/default table for `ids` from three replies.
+///
+/// Pure, so the "the firmware left this one out" case is unit-tested without a
+/// device: each argument is whatever [`read_settings`] returned for that command
+/// (an empty slice for a query that failed outright).
+fn settings_table(
+    ids: &[u8],
+    current: &[(u8, u16)],
+    maxs: &[(u8, u16)],
+    defaults: &[(u8, u16)],
+) -> Vec<SettingReport> {
+    let find = |pairs: &[(u8, u16)], id: u8| pairs.iter().find(|(i, _)| *i == id).map(|(_, v)| *v);
+    ids.iter()
+        .map(|&id| SettingReport {
+            id,
+            name: crate::uhid::settings::setting_name(id),
+            current: find(current, id),
+            max: find(maxs, id),
+            default: find(defaults, id),
+        })
+        .collect()
+}
+
+/// Ask the attached puck for the current value, maximum and default of each
+/// setting in `ids`.
+///
+/// Goes through [`crate::hidraw::PuckSource::acquire`], exactly as the daemon
+/// and `hyprpad monitor` do, so it works whether the nodes are opened directly
+/// or handed over by the root broker. Only *one* of the puck's nodes has a
+/// controller behind it, so this tries each in turn and returns the first that
+/// answers the current-values query; the max and default queries then go to the
+/// same node, and a failure of either leaves those columns empty rather than
+/// failing the whole read.
+///
+/// Read-only: the only thing it sends is a query. Nothing here can change the
+/// controller's state.
+pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
+    if ids.is_empty() {
+        return Err("no setting ids given".to_string());
+    }
+    let opened = crate::hidraw::PuckSource::acquire()
+        .ok_or_else(|| "no Steam Controller puck found (28de:1304)".to_string())?
+        .into_open();
+    if opened.is_empty() {
+        return Err("no Steam Controller puck node could be opened".to_string());
+    }
+    let mut errors = Vec::new();
+    for (node, fd) in &opened {
+        let mut dev = HidrawDevice::new(fd.as_raw_fd());
+        match read_settings(&mut dev, ID_GET_SETTINGS_VALUES, ids) {
+            Ok(current) => {
+                let maxs = read_settings(&mut dev, ID_GET_SETTINGS_MAXS, ids).unwrap_or_default();
+                let defaults =
+                    read_settings(&mut dev, ID_GET_SETTINGS_DEFAULTS, ids).unwrap_or_default();
+                return Ok(settings_table(ids, &current, &maxs, &defaults));
+            }
+            Err(e) => errors.push(format!("{}: {e}", node.display())),
+        }
+    }
+    Err(format!(
+        "no puck node answered the settings query (the controller is probably asleep \
+         — press the Steam button and try again): {}",
+        errors.join("; ")
+    ))
 }
 
 /// Best-effort lizard restore for the exit paths: re-enable lizard mode and log
@@ -341,6 +857,24 @@ pub fn own_lizard_loop() {
             Ok(()) => {
                 if !last_ok {
                     eprintln!("hyprpad: lizard mode disabled on the puck (owning it)");
+                    let power = power_settings();
+                    if !power.is_empty() {
+                        // Name the values: they are guesses whose units are
+                        // unverified, so the log is where the owner checks that
+                        // what they meant is what went out.
+                        let pairs: Vec<String> = power
+                            .pairs()
+                            .iter()
+                            .map(|(id, v)| {
+                                format!("{}={v}", crate::uhid::settings::setting_name(*id))
+                            })
+                            .collect();
+                        eprintln!(
+                            "hyprpad: firmware power settings written with it: {} \
+                             (units UNVERIFIED — see `hyprpad puck-settings 25 50`)",
+                            pairs.join(", ")
+                        );
+                    }
                 }
                 last_ok = true;
                 warned = false;
@@ -460,7 +994,7 @@ mod tests {
 
     #[test]
     fn set_settings_report_bytes() {
-        let r = disable_lizard_settings_report();
+        let r = disable_lizard_settings_report(PowerSettings::default());
         assert_eq!(r.len(), 64);
         // 0x87 SET_SETTINGS_VALUES, len 6, (9,0,0) lizard off, (71,0,0) watchdog off.
         assert_eq!(
@@ -472,10 +1006,234 @@ mod tests {
 
     #[test]
     fn sequence_is_clear_then_settings() {
-        let seq = disable_sequence();
+        let seq = disable_sequence(PowerSettings::default());
         assert_eq!(seq.len(), 2);
         assert_eq!(seq[0][1], 0x81); // clear digital mappings first
         assert_eq!(seq[1][1], 0x87); // then set settings values
+    }
+
+    // --- the power settings ------------------------------------------------
+
+    #[test]
+    fn the_settings_frame_is_unchanged_when_no_power_knob_is_set() {
+        // The default must be *today's* behaviour, byte for byte: an owner who
+        // does not ask for the power knobs must not get a different write.
+        let plain = disable_lizard_settings_report(PowerSettings::default());
+        assert_eq!(plain[2], 6, "payload is still two pairs");
+        assert!(plain[9..].iter().all(|&b| b == 0));
+        assert!(PowerSettings::default().is_empty());
+        assert!(PowerSettings::default().pairs().is_empty());
+    }
+
+    #[test]
+    fn the_settings_frame_carries_setting_25_when_the_knob_is_set() {
+        let r = disable_lizard_settings_report(PowerSettings {
+            steam_button_poweroff: Some(0x1234),
+            sleep_inactivity_timeout: None,
+        });
+        // Three pairs now: lizard, watchdog, then 25 = 0x1234 little-endian.
+        assert_eq!(r[2], 9);
+        assert_eq!(&r[3..12], &[0x09, 0, 0, 0x47, 0, 0, 25, 0x34, 0x12]);
+        assert!(r[12..].iter().all(|&b| b == 0), "rest must be zero-padded");
+    }
+
+    #[test]
+    fn the_settings_frame_carries_both_power_settings_in_id_order() {
+        let r = disable_lizard_settings_report(PowerSettings {
+            steam_button_poweroff: Some(POWER_SETTING_OFF),
+            sleep_inactivity_timeout: Some(600),
+        });
+        assert_eq!(r[2], 12, "four pairs");
+        assert_eq!(
+            &r[3..15],
+            &[0x09, 0, 0, 0x47, 0, 0, 25, 0xFF, 0xFF, 50, 0x58, 0x02]
+        );
+        assert!(r[15..].iter().all(|&b| b == 0), "rest must be zero-padded");
+    }
+
+    #[test]
+    fn the_sleep_timeout_alone_is_the_only_extra_pair() {
+        let r = disable_lizard_settings_report(PowerSettings {
+            steam_button_poweroff: None,
+            sleep_inactivity_timeout: Some(1),
+        });
+        assert_eq!(r[2], 9);
+        assert_eq!(&r[9..12], &[50, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn off_writes_the_widest_value_the_field_can_hold_not_zero() {
+        // The documented reason: `0` might mean "no delay" rather than "never",
+        // and a poweroff time of zero would fire on every guide press.
+        assert_eq!(POWER_SETTING_OFF, 0xFFFF);
+    }
+
+    #[test]
+    fn the_power_setting_numbers_are_the_shared_ones() {
+        // Not respelled here: they come from the module that decodes Steam
+        // writing the same settings to the virtual controller.
+        assert_eq!(SETTING_STEAMBUTTON_POWEROFF_TIME, 25);
+        assert_eq!(SETTING_SLEEP_INACTIVITY_TIMEOUT, 50);
+        assert_eq!(ID_TURN_OFF_CONTROLLER, 0x9F);
+    }
+
+    #[test]
+    fn the_enable_frame_never_carries_power_settings() {
+        // Restore-on-exit must not write a guess at settings whose defaults we
+        // do not know: it is the two-pair frame it always was.
+        let en = enable_lizard_settings_report();
+        assert_eq!(&en[..9], &[0x01, 0x87, 0x06, 0x09, 0x01, 0x00, 0x47, 0x01, 0x00]);
+        assert!(en[9..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_settings_report_drops_pairs_that_would_not_fit() {
+        let many: Vec<(u8, u16)> = (0..40u8).map(|i| (i, u16::from(i))).collect();
+        let r = settings_report(&many);
+        assert_eq!(r[2] as usize, 3 * MAX_SETTINGS_PAIRS);
+        // The declared payload length is what the buffer actually holds, so a
+        // caller cannot make the frame lie about itself.
+        assert_eq!(3 + r[2] as usize, r.len() - (WIRE_LEN - 3 - 3 * MAX_SETTINGS_PAIRS));
+    }
+
+    // --- the power-off command ---------------------------------------------
+
+    #[test]
+    fn turn_off_report_bytes() {
+        let r = turn_off_report();
+        assert_eq!(r.len(), 64);
+        // sc-controller's `9f 04 6f 66 66 21`, behind the report id.
+        assert_eq!(&r[..7], &[0x01, 0x9F, 0x04, 0x6F, 0x66, 0x66, 0x21]);
+        assert_eq!(&r[3..7], b"off!");
+        assert!(r[7..].iter().all(|&b| b == 0), "rest must be zero-padded");
+    }
+
+    // --- the read round trip, against a fake device -------------------------
+
+    /// A [`FeatureDevice`] that records what was written and replays a canned
+    /// reply. No hidraw node is opened anywhere in these tests.
+    struct FakeDevice {
+        written: Vec<Vec<u8>>,
+        reply: Vec<u8>,
+        read_err: Option<String>,
+    }
+
+    impl FakeDevice {
+        fn answering(reply: Vec<u8>) -> FakeDevice {
+            FakeDevice { written: Vec::new(), reply, read_err: None }
+        }
+        /// A well-formed reply frame for `command` carrying `pairs`.
+        fn reply_frame(command: u8, pairs: &[(u8, u16)]) -> Vec<u8> {
+            let mut v = vec![REPORT_ID_FEATURES_CONTROLLER, command, (3 * pairs.len()) as u8];
+            for (id, value) in pairs {
+                v.push(*id);
+                v.extend_from_slice(&value.to_le_bytes());
+            }
+            v.resize(WIRE_LEN, 0);
+            v
+        }
+    }
+
+    impl FeatureDevice for FakeDevice {
+        fn write_feature(&mut self, report: &[u8]) -> Result<(), String> {
+            self.written.push(report.to_vec());
+            Ok(())
+        }
+        fn read_feature(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+            if let Some(e) = &self.read_err {
+                return Err(e.clone());
+            }
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_settings_query_is_report_id_command_count_then_ids() {
+        let r = get_settings_request(ID_GET_SETTINGS_VALUES, &[25, 50]).unwrap();
+        assert_eq!(r.len(), 64);
+        assert_eq!(&r[..5], &[0x01, 0x89, 0x02, 25, 50]);
+        assert!(r[5..].iter().all(|&b| b == 0), "rest must be zero-padded");
+        // The maxes and defaults queries are the same frame with another verb.
+        assert_eq!(get_settings_request(ID_GET_SETTINGS_MAXS, &[25]).unwrap()[1], 0x8B);
+        assert_eq!(get_settings_request(ID_GET_SETTINGS_DEFAULTS, &[25]).unwrap()[1], 0x8C);
+    }
+
+    #[test]
+    fn a_settings_query_needs_at_least_one_id_and_fits_the_report() {
+        assert!(get_settings_request(ID_GET_SETTINGS_VALUES, &[]).is_err());
+        let too_many: Vec<u8> = (0..=200u8).collect();
+        assert!(get_settings_request(ID_GET_SETTINGS_VALUES, &too_many).is_err());
+    }
+
+    #[test]
+    fn a_reply_parses_back_into_pairs() {
+        let frame = FakeDevice::reply_frame(ID_GET_SETTINGS_VALUES, &[(25, 300), (50, 600)]);
+        assert_eq!(
+            parse_settings_reply(ID_GET_SETTINGS_VALUES, &frame).unwrap(),
+            vec![(25, 300), (50, 600)]
+        );
+    }
+
+    #[test]
+    fn a_short_or_garbled_reply_is_an_error_not_an_empty_answer() {
+        // Too short to hold a header.
+        assert!(parse_settings_reply(ID_GET_SETTINGS_VALUES, &[0x01, 0x89]).is_err());
+        // The device answered nothing: an all-zero buffer is not an answer.
+        assert!(parse_settings_reply(ID_GET_SETTINGS_VALUES, &[0u8; WIRE_LEN]).is_err());
+        // An answer to a different question.
+        let other = FakeDevice::reply_frame(ID_GET_SETTINGS_MAXS, &[(25, 1)]);
+        let e = parse_settings_reply(ID_GET_SETTINGS_VALUES, &other).unwrap_err();
+        assert!(e.contains("0x8b"), "{e}");
+        // A wrong report id.
+        let mut wrong_id = FakeDevice::reply_frame(ID_GET_SETTINGS_VALUES, &[(25, 1)]);
+        wrong_id[0] = 0x02;
+        assert!(parse_settings_reply(ID_GET_SETTINGS_VALUES, &wrong_id).is_err());
+        // A length that runs past what was read.
+        let truncated = [0x01, 0x89, 6, 25, 0, 0];
+        let e = parse_settings_reply(ID_GET_SETTINGS_VALUES, &truncated).unwrap_err();
+        assert!(e.contains("only 3"), "{e}");
+        // A length that is not a whole number of triples.
+        let ragged = [0x01, 0x89, 4, 25, 0, 0, 50];
+        assert!(parse_settings_reply(ID_GET_SETTINGS_VALUES, &ragged).is_err());
+    }
+
+    #[test]
+    fn the_read_round_trip_sends_the_query_then_parses_the_answer() {
+        let mut dev =
+            FakeDevice::answering(FakeDevice::reply_frame(ID_GET_SETTINGS_VALUES, &[(25, 5000)]));
+        let got = read_settings(&mut dev, ID_GET_SETTINGS_VALUES, &[25]).unwrap();
+        assert_eq!(got, vec![(25, 5000)]);
+        assert_eq!(dev.written.len(), 1, "exactly one query went out");
+        assert_eq!(&dev.written[0][..4], &[0x01, 0x89, 0x01, 25]);
+        assert_eq!(dev.written[0].len(), WIRE_LEN);
+    }
+
+    #[test]
+    fn a_read_that_fails_propagates_rather_than_reporting_no_settings() {
+        let mut dev = FakeDevice::answering(Vec::new());
+        dev.read_err = Some("HIDIOCGFEATURE: Broken pipe".to_string());
+        let e = read_settings(&mut dev, ID_GET_SETTINGS_VALUES, &[25]).unwrap_err();
+        assert!(e.contains("Broken pipe"), "{e}");
+    }
+
+    #[test]
+    fn the_settings_table_leaves_a_missing_answer_empty() {
+        let t = settings_table(&[25, 50], &[(25, 300)], &[(25, 65535), (50, 65535)], &[]);
+        assert_eq!(t[0].id, 25);
+        assert_eq!(t[0].name, "SETTING_STEAMBUTTON_POWEROFF_TIME");
+        assert_eq!((t[0].current, t[0].max, t[0].default), (Some(300), Some(65535), None));
+        // 50 was not in the current-values answer at all: that is a real result,
+        // not a zero.
+        assert_eq!((t[1].current, t[1].max, t[1].default), (None, Some(65535), None));
+    }
+
+    #[test]
+    fn hidiocgfeature_encoding() {
+        // _IOC(WRITE|READ, 'H', 0x07, 64) — the read twin of HIDIOCSFEATURE.
+        assert_eq!(hidiocgfeature(WIRE_LEN), 0xC040_4807);
+        assert_ne!(hidiocgfeature(WIRE_LEN), hidiocsfeature(WIRE_LEN));
     }
 
     #[test]
@@ -510,7 +1268,7 @@ mod tests {
     #[test]
     fn enable_exactly_inverts_disable_settings() {
         // Same command, same settings, same order — only the values flip 0 <-> 1.
-        let dis = disable_lizard_settings_report();
+        let dis = disable_lizard_settings_report(PowerSettings::default());
         let en = enable_lizard_settings_report();
         assert_eq!(dis[1], en[1]); // ID_SET_SETTINGS_VALUES
         assert_eq!(dis[2], en[2]); // payload length

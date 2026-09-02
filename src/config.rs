@@ -29,7 +29,7 @@
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
 //! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
 //! | `[osk_buttons]` | what buttons do while the on-screen keyboard is up — a key typed through it, or one of its own actions (`osk commit\|shift\|dismiss`) — layered over the built-in Deck map ([`osk_builtins`]) |
-//! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
+//! | `[daemon]` | daemon-wide switches (`own_lizard`, `steam_button_poweroff`, `sleep_inactivity_timeout`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]); `guide_in = ["game"]` lists the modes where the pad drives the cursor *while the guide is held* |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
 //! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
@@ -279,6 +279,16 @@ pub enum Action {
     SetMode(String),
     /// Drop a manual override so the context rules decide again.
     ClearMode,
+    /// Turn the *controller* off — `0x9F ID_TURN_OFF_CONTROLLER` through
+    /// [`crate::lizard::turn_off_controller`], not a Hyprland dispatch and
+    /// nothing to do with the session.
+    ///
+    /// The deliberate counterpart to the firmware's guide-hold power-off, which
+    /// `[daemon] steam_button_poweroff` exists to lengthen or disable
+    /// (`docs/research/guide-hold-poweroff.md` §4). A one-shot: it means the
+    /// same on a guide chord as on a bare button, and there is no release edge
+    /// to pair it with — by the time one would arrive the controller is off.
+    ControllerOff,
     /// No action.
     None,
 }
@@ -376,6 +386,9 @@ impl Action {
                 }
             }
             "clear_mode" | "unset_mode" => Ok(Action::ClearMode),
+            // Turn the CONTROLLER off (not the session, not the machine). Takes
+            // no argument — a chord either means it or it does not.
+            "controller_off" => Ok(Action::ControllerOff),
             other => Err(format!("unknown action '{other}'")),
         }
     }
@@ -1315,6 +1328,23 @@ pub struct Config {
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
     pub(crate) own_lizard: bool,
+    /// `SETTING_STEAMBUTTON_POWEROFF_TIME` (25) — how long the firmware wants
+    /// the Steam button held before it powers the controller off. `None`, the
+    /// default, writes nothing at all and leaves the firmware exactly as it is.
+    ///
+    /// Spelled `steam_button_poweroff` in `[daemon]` / `h.daemon`, as either the
+    /// word `"off"` or a raw integer. **The units are UNVERIFIED** — see
+    /// [`crate::lizard::PowerSettings`] and
+    /// `docs/research/guide-hold-poweroff.md` §6 — so this is a knob the owner
+    /// is expected to test with `hyprpad puck-settings 25` and a stopwatch.
+    /// Written only when hyprpad owns lizard mode, since it rides in that frame.
+    pub(crate) steam_button_poweroff: Option<u16>,
+    /// `SETTING_SLEEP_INACTIVITY_TIMEOUT` (50) — how long the controller sits
+    /// idle before it sleeps by itself. Same treatment as
+    /// `steam_button_poweroff`: `None` writes nothing, `"off"` writes the widest
+    /// value the field holds, an integer writes it raw. A `u16` of seconds on
+    /// the 2015 firmware; UNVERIFIED on this one.
+    pub(crate) sleep_inactivity_timeout: Option<u16>,
     /// Whether a `windowtitle` event on the **focused** window re-resolves the
     /// modes (`rescan_on_title_change` in `[daemon]` / `h.daemon`). `None` is
     /// the default, which is *on*: it is the event-driven half of noticing a
@@ -1476,6 +1506,8 @@ impl Config {
         let mut buttons = HashMap::new();
         let mut osk_buttons = HashMap::new();
         let mut own_lizard = false;
+        let mut steam_button_poweroff = None;
+        let mut sleep_inactivity_timeout = None;
         let mut rescan_on_title_change = None;
         let mut process_rescan_ms = None;
         let mut cursor = CursorConfig::default();
@@ -1537,6 +1569,18 @@ impl Config {
                         "own_lizard" => {
                             own_lizard = parse_bool(&unquote(v))
                                 .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "steam_button_poweroff" => {
+                            steam_button_poweroff = Some(
+                                parse_power_setting(&unquote(v))
+                                    .map_err(|e| format!("line {lineno}: {e}"))?,
+                            );
+                        }
+                        "sleep_inactivity_timeout" => {
+                            sleep_inactivity_timeout = Some(
+                                parse_power_setting(&unquote(v))
+                                    .map_err(|e| format!("line {lineno}: {e}"))?,
+                            );
                         }
                         "rescan_on_title_change" => {
                             rescan_on_title_change = Some(
@@ -1706,6 +1750,8 @@ impl Config {
             buttons,
             osk_buttons,
             own_lizard,
+            steam_button_poweroff,
+            sleep_inactivity_timeout,
             rescan_on_title_change,
             process_rescan_ms,
             cursor,
@@ -1846,6 +1892,17 @@ impl Config {
     /// section; default `false`.
     pub fn own_lizard(&self) -> bool {
         self.own_lizard
+    }
+
+    /// The firmware power knobs to write alongside the lizard disable
+    /// (`steam_button_poweroff` / `sleep_inactivity_timeout` in `[daemon]` /
+    /// `h.daemon`). Both default to "write nothing", which is the behaviour
+    /// hyprpad has always had.
+    pub fn power_settings(&self) -> crate::lizard::PowerSettings {
+        crate::lizard::PowerSettings {
+            steam_button_poweroff: self.steam_button_poweroff,
+            sleep_inactivity_timeout: self.sleep_inactivity_timeout,
+        }
     }
 
     /// Whether a rename of the focused window re-resolves the modes
@@ -2095,6 +2152,34 @@ fn parse_millis(s: &str) -> Result<u64, String> {
     let t = s.trim();
     t.parse::<u64>()
         .map_err(|_| format!("expected a whole number of milliseconds (0 = off), got '{t}'"))
+}
+
+/// Parse one of the two `[daemon]` firmware power knobs
+/// (`steam_button_poweroff`, `sleep_inactivity_timeout`).
+///
+/// Two spellings, both landing on the raw `u16` the settings frame carries:
+///
+/// * `"off"` — [`crate::lizard::POWER_SETTING_OFF`], the widest value the field
+///   can hold. Deliberately **not** `0`: whether the firmware reads `0` as
+///   "never" or as "no delay at all" is unverified, and under the second
+///   reading `0` would power the controller off on any guide press.
+/// * an integer `0..=65535` — written raw, so the owner can test any reading
+///   including `0`.
+///
+/// The units are the firmware's and are unverified in both cases
+/// (`docs/research/guide-hold-poweroff.md` §6); this only decides the number.
+fn parse_power_setting(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(crate::lizard::POWER_SETTING_OFF);
+    }
+    s.parse::<u16>().map_err(|_| {
+        format!(
+            "'{s}' is not a firmware power setting: write \"off\" or a whole number \
+             0-65535 (the units are the firmware's and are unverified - read them \
+             back with `hyprpad puck-settings 25 50`)"
+        )
+    })
 }
 
 /// Parse a boolean config value: `true`/`false`, `1`/`0`, `yes`/`no`,
@@ -3386,6 +3471,70 @@ rumble_intensity = 0.25
         assert_eq!(Action::parse("mode desktop"), Ok(Action::SetMode("desktop".into())));
         assert_eq!(Action::parse("clear_mode"), Ok(Action::ClearMode));
         assert!(Action::parse("set_mode").is_err());
+    }
+
+    #[test]
+    fn controller_off_parses_from_the_toml_grammar() {
+        assert_eq!(Action::parse("controller_off"), Ok(Action::ControllerOff));
+        // It takes no argument, and is not a Hyprland verb: a typo must not
+        // silently become an exec.
+        assert!(Action::parse("controller off").is_err());
+        assert!(Action::parse("controlleroff").is_err());
+        // A one-shot on a bare button as well as on a chord.
+        assert_eq!(
+            ButtonAction::classify(Action::ControllerOff),
+            Ok(ButtonAction::Fire(Action::ControllerOff))
+        );
+        // And it round-trips through a real config file, on both kinds of
+        // binding.
+        let c = Config::from_toml_str(
+            "[bindings]\n\"guide+quickaccess\" = \"controller_off\"\n\
+             [buttons]\nl4 = \"controller_off\"\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            c.resolve(&crate::gesture::GestureEvent::GuideChord(Button::QuickAccess)),
+            Action::ControllerOff
+        );
+        assert_eq!(
+            c.buttons().get(&Button::GripL4),
+            Some(&ButtonAction::Fire(Action::ControllerOff))
+        );
+    }
+
+    #[test]
+    fn the_firmware_power_knobs_default_to_writing_nothing() {
+        // The whole feature is opt-in: an existing config must produce exactly
+        // the settings frame hyprpad has always sent.
+        assert_eq!(Config::load_default().power_settings(), crate::lizard::PowerSettings::default());
+        assert!(Config::load_default().power_settings().is_empty());
+    }
+
+    #[test]
+    fn the_firmware_power_knobs_parse_off_and_an_integer() {
+        let off = Config::from_toml_str(
+            "[daemon]\nsteam_button_poweroff = \"off\"\nsleep_inactivity_timeout = 600\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            off.power_settings(),
+            crate::lizard::PowerSettings {
+                steam_button_poweroff: Some(crate::lizard::POWER_SETTING_OFF),
+                sleep_inactivity_timeout: Some(600),
+            }
+        );
+        // An explicit 0 is written raw, so the "0 = never" reading is testable.
+        let zero = Config::from_toml_str("[daemon]\nsteam_button_poweroff = 0\n").expect("parse");
+        assert_eq!(zero.power_settings().steam_button_poweroff, Some(0));
+        // "OFF" is the same word.
+        let upper =
+            Config::from_toml_str("[daemon]\nsteam_button_poweroff = \"OFF\"\n").expect("parse");
+        assert_eq!(upper.power_settings().steam_button_poweroff, Some(u16::MAX));
+        // Anything else is an error naming the line and the two spellings.
+        let e = Config::from_toml_str("[daemon]\nsteam_button_poweroff = \"long\"\n").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("off"), "{e}");
+        assert!(Config::from_toml_str("[daemon]\nsleep_inactivity_timeout = 70000\n").is_err());
+        assert!(Config::from_toml_str("[daemon]\nsleep_inactivity_timeout = -1\n").is_err());
     }
 
     #[test]

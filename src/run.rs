@@ -149,6 +149,12 @@ enum Input {
     /// [`install_reload_signal`]) so the async-signal-safe handler only ever
     /// `write`s, and the actual reload runs in the loop's ordinary context.
     Reload,
+    /// SIGUSR1 (or `hyprpad off`) asked us to turn the *controller* off. Rides
+    /// the same self-pipe as [`Input::Reload`], for the same reason: the
+    /// `0x9F` write opens descriptors and logs, neither of which is
+    /// async-signal-safe. The same one-shot [`Action::ControllerOff`] performs
+    /// from a chord.
+    ControllerOff,
 }
 
 pub fn run() -> std::io::Result<()> {
@@ -233,6 +239,11 @@ pub fn run() -> std::io::Result<()> {
     // as it stands *now*; reload only does a best-effort one-shot, and a full
     // ownership change wants a restart.
     let mut own_lizard = lizard_ownership_enabled(&config);
+
+    // The firmware power knobs ride in the lizard-disable frame, so hand them to
+    // the module that builds it rather than threading them through the four
+    // places that ask for a disable. Re-installed on every reload, below.
+    crate::lizard::set_power_settings(config.power_settings());
 
     // When we own lizard we must give it back on the way out, or the firmware
     // keyboard/mouse stays dead and the user has no pointer until a power-cycle.
@@ -593,6 +604,15 @@ pub fn run() -> std::io::Result<()> {
                 gamepad.release(&mut haptics);
                 waiting = true;
                 next_scan = Instant::now() + RECONNECT_SCAN_INTERVAL;
+            }
+            Input::ControllerOff => {
+                // The same thing the `guide+quickaccess` chord does, reached
+                // from `hyprpad off` (or the bar widget's right-click) instead.
+                // Deliberately not a shutdown of anything else: the daemon
+                // stays up and sits in its reconnect wait, exactly as it does
+                // when the controller sleeps on its own.
+                eprintln!("hyprpad: turning the controller off (SIGUSR1)");
+                controller_off();
             }
             Input::Reload => {
                 apply_reload(
@@ -2107,27 +2127,65 @@ fn lizard_ownership_enabled(config: &Config) -> bool {
     }
 }
 
-/// Write end of the self-pipe the SIGHUP handler pokes to request a config
-/// reload. `-1` until [`install_reload_signal`] runs. Separate from the
-/// lizard restore-on-signal pipe in [`crate::lizard`]: that one drives an exit,
-/// this one drives a reload, and SIGHUP must never exit.
+/// Write end of the self-pipe the SIGHUP/SIGUSR1 handler pokes. `-1` until
+/// [`install_reload_signal`] runs. Separate from the lizard restore-on-signal
+/// pipe in [`crate::lizard`]: that one drives an exit, this one drives work the
+/// loop does and keeps running afterwards.
 static RELOAD_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// The SIGHUP handler. Async-signal-safe by construction: it does nothing but
-/// `write` a single byte to the self-pipe so the waiter thread can run the real
-/// reload in ordinary thread context. Mirrors [`crate::lizard`]'s
-/// `on_exit_signal`, but this pipe feeds a reload, not a process exit.
-extern "C" fn on_reload_signal(_sig: libc::c_int) {
+/// The SIGHUP/SIGUSR1 handler. Async-signal-safe by construction: it does
+/// nothing but `write` the signal number to the self-pipe so the waiter thread
+/// can run the real work in ordinary thread context. Mirrors
+/// [`crate::lizard`]'s `on_exit_signal`, but this pipe feeds the loop, not a
+/// process exit.
+///
+/// The signal *number* is what goes on the wire (both fit in a `u8`), so one
+/// pipe carries both requests and [`signal_to_input`] is the only place that
+/// decides which is which.
+extern "C" fn on_reload_signal(sig: libc::c_int) {
     let fd = RELOAD_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
-        let byte = 1u8;
+        let byte = sig as u8;
         // `write` is on POSIX's async-signal-safe list; best-effort, ignore the
-        // result — a full pipe just means a reload is already pending.
+        // result — a full pipe just means a request is already pending.
         let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
     }
 }
 
-/// Install SIGHUP handling that asks the main loop to reload its config.
+/// Which loop input a caught signal asks for. The pure half of the waiter
+/// thread, so the mapping is unit-tested without signals, pipes or a daemon.
+///
+/// * `SIGHUP` — re-read the config (`hyprpad reload`).
+/// * `SIGUSR1` — turn the controller off (`hyprpad off`).
+///
+/// Anything else is ignored: only those two handlers are installed, so a third
+/// number arriving on the pipe means the byte was corrupt, and dropping it is
+/// safer than guessing which of the two was meant — one of them powers the
+/// controller off.
+fn signal_to_input(sig: libc::c_int) -> Option<Input> {
+    match sig {
+        libc::SIGHUP => Some(Input::Reload),
+        libc::SIGUSR1 => Some(Input::ControllerOff),
+        _ => None,
+    }
+}
+
+/// Turn the controller off, and say what happened.
+///
+/// The single place [`Action::ControllerOff`] and [`Input::ControllerOff`] both
+/// land, so a chord and `hyprpad off` cannot drift. An `Err` here is almost
+/// always "every puck node STALLed", i.e. the controller is already asleep —
+/// which is the outcome that was asked for — so it is reported at a low key and
+/// never propagated.
+fn controller_off() {
+    match crate::lizard::turn_off_controller() {
+        Ok(()) => eprintln!("hyprpad: controller off (0x9F sent)"),
+        Err(e) => eprintln!("hyprpad: controller off not delivered: {e}"),
+    }
+}
+
+/// Install SIGHUP handling that asks the main loop to reload its config, and
+/// SIGUSR1 handling that asks it to turn the controller off.
 ///
 /// This reuses the same self-pipe pattern as the lizard restore-on-signal
 /// handler ([`crate::lizard::install_signal_restore`]) rather than adding a
@@ -2139,16 +2197,20 @@ extern "C" fn on_reload_signal(_sig: libc::c_int) {
 /// keeps a reload request from killing the daemon.
 ///
 /// SIGINT/SIGTERM stay entirely with [`crate::lizard`] (whose waiter restores
-/// lizard mode and exits); SIGHUP is a distinct signal handled here, so the two
-/// never contend. `SA_RESTART` keeps a SIGHUP mid-read from erroring out the
-/// hidraw reader threads. Best-effort: if the pipe can't be created we log and
-/// leave SIGHUP at its default.
+/// lizard mode and exits); SIGHUP and SIGUSR1 are distinct signals handled here,
+/// so the two never contend. Those two share one pipe and one waiter — the
+/// handler writes the signal number and [`signal_to_input`] decides — which
+/// keeps the async-signal-safe surface at exactly one `write`. `SA_RESTART`
+/// keeps a signal mid-read from erroring out the hidraw reader threads.
+/// Best-effort: if the pipe can't be created we log and leave both at their
+/// defaults. SIGUSR1's default action is also to *terminate*, so installing this
+/// is what keeps `hyprpad off` from killing the daemon it is talking to.
 fn install_reload_signal(tx: &mpsc::Sender<Input>) {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid 2-element buffer for `pipe`.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         eprintln!(
-            "warning: config reload-on-SIGHUP not installed (pipe: {})",
+            "warning: reload-on-SIGHUP / controller-off-on-SIGUSR1 not installed (pipe: {})",
             std::io::Error::last_os_error()
         );
         return;
@@ -2165,6 +2227,7 @@ fn install_reload_signal(tx: &mpsc::Sender<Input>) {
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = libc::SA_RESTART;
         libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut());
     }
 
     let tx = tx.clone();
@@ -2183,9 +2246,13 @@ fn install_reload_signal(tx: &mpsc::Sender<Input>) {
             if n == 0 {
                 return; // write end closed (only at shutdown).
             }
-            // Ordinary thread context now: nudge the loop to reload. If the loop
-            // is gone the channel is closed and we stop.
-            if tx.send(Input::Reload).is_err() {
+            // Ordinary thread context now: nudge the loop with whatever the
+            // signal asked for. If the loop is gone the channel is closed and
+            // we stop.
+            let Some(input) = signal_to_input(libc::c_int::from(byte[0])) else {
+                continue; // not one of ours; nothing to do.
+            };
+            if tx.send(input).is_err() {
                 return;
             }
         }
@@ -2255,6 +2322,11 @@ fn apply_reload(
     // tuning change reaches the on-screen cursors. Reset (fresh dampers) is fine
     // whether or not the keyboard is currently up.
     *osk_route = OskRoute::new(config.cursor());
+
+    // The power knobs are read out of this cell by the next settings write, so a
+    // reload retunes them with nothing to restart — within one `RESEND_INTERVAL`
+    // if ownership was already on, and immediately if it just came on.
+    crate::lizard::set_power_settings(config.power_settings());
 
     let new_own = lizard_ownership_enabled(config);
     if new_own != *own_lizard {
@@ -2348,6 +2420,36 @@ impl Drop for PidFile {
 /// live daemon can be found, so a stale or missing pidfile is not mistaken for
 /// success. (`kill -HUP <pid>` by hand does the same thing for power users.)
 pub fn reload() -> Result<(), String> {
+    let pid = signal_daemon(libc::SIGHUP)?;
+    eprintln!("hyprpad: sent SIGHUP to daemon (pid {pid}); it will re-read its config");
+    Ok(())
+}
+
+/// The `hyprpad off` subcommand: find the running daemon via its pidfile and
+/// send it SIGUSR1, which makes it turn the **controller** off (see
+/// [`install_reload_signal`] and [`Input::ControllerOff`]) — the CLI spelling of
+/// the same one-shot the `guide+quickaccess` chord fires, and what the bar
+/// widget runs on a right-click.
+///
+/// It goes through the daemon rather than sending `0x9F` itself for two
+/// reasons: the daemon already holds the puck's descriptors (which, once
+/// `packaging/udev/72-hyprpad-puck.rules` is installed, is the only process
+/// that can without the broker), and one writer to the device is the invariant
+/// the whole design rests on. So this reports "no daemon" rather than falling
+/// back to opening the controller behind its back.
+pub fn controller_off_command() -> Result<(), String> {
+    let pid = signal_daemon(libc::SIGUSR1)?;
+    eprintln!("hyprpad: sent SIGUSR1 to daemon (pid {pid}); turning the controller off");
+    Ok(())
+}
+
+/// Find the running daemon through its pidfile and send it `sig`, returning the
+/// pid it went to.
+///
+/// Shared by [`reload`] and [`controller_off_command`], so "which daemon" is
+/// answered once: a missing pidfile, a corrupt one and a stale one each get
+/// their own message rather than a confusing failure at `kill` time.
+fn signal_daemon(sig: libc::c_int) -> Result<i32, String> {
     let Some(path) = pid_file_path() else {
         return Err("cannot locate pidfile (XDG_RUNTIME_DIR is unset)".to_string());
     };
@@ -2380,15 +2482,14 @@ pub fn reload() -> Result<(), String> {
         return Err(format!("cannot signal daemon pid {pid}: {err}"));
     }
 
-    // SAFETY: sending SIGHUP to the daemon pid.
-    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+    // SAFETY: sending a signal to the daemon pid.
+    if unsafe { libc::kill(pid, sig) } != 0 {
         return Err(format!(
-            "sending SIGHUP to pid {pid}: {}",
+            "sending signal {sig} to pid {pid}: {}",
             std::io::Error::last_os_error()
         ));
     }
-    eprintln!("hyprpad: sent SIGHUP to daemon (pid {pid}); it will re-read its config");
-    Ok(())
+    Ok(pid)
 }
 
 /// What the loop remembers about the focused window between compositor events,
@@ -2960,6 +3061,15 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
         Action::Key(_) => Ok(()),
         // Handled in `perform_action` against the mode engine, never here.
         Action::SetMode(_) | Action::ClearMode => Ok(()),
+        // Turn the controller off: `0x9F` through the same feature-report path
+        // lizard mode uses. A failure here is almost always "the controller is
+        // already asleep" (every puck node STALLs), which for this action is
+        // the outcome asked for — so it is logged, not propagated as an IPC
+        // error, and never takes the daemon down.
+        Action::ControllerOff => {
+            controller_off();
+            Ok(())
+        }
         Action::None => Ok(()),
     }
 }
@@ -3888,6 +3998,21 @@ mod tests {
             cfg.resolve(&GestureEvent::GuideChord(report::Button::BumperR1)),
             Action::None
         );
+    }
+
+    #[test]
+    fn the_two_handled_signals_map_to_their_own_loop_inputs() {
+        // One pipe, one waiter, two meanings — and getting them the wrong way
+        // round would turn a config reload into a power-off, so the mapping is
+        // pinned here rather than only in the waiter thread.
+        assert!(matches!(signal_to_input(libc::SIGHUP), Some(Input::Reload)));
+        assert!(matches!(signal_to_input(libc::SIGUSR1), Some(Input::ControllerOff)));
+        // Nothing else is handled: a corrupt byte must be dropped, not guessed
+        // at. SIGTERM in particular belongs to the lizard restore path, and
+        // must never be answered here.
+        for other in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR2, 0] {
+            assert!(signal_to_input(other).is_none(), "signal {other} should not be ours");
+        }
     }
 
     #[test]

@@ -735,6 +735,7 @@ pub fn action_string(a: &Action) -> String {
         },
         Action::SetMode(m) => format!("set_mode {m}"),
         Action::ClearMode => "clear_mode".to_string(),
+        Action::ControllerOff => "controller_off".to_string(),
         Action::None => "none".to_string(),
     }
 }
@@ -752,6 +753,9 @@ pub fn action_kind(a: &Action) -> &'static str {
         Action::Key(_) => "key",
         Action::SetMode(_) => "set_mode",
         Action::ClearMode => "clear_mode",
+        // Its own kind, not `exec`: nothing else on the sheet acts on the
+        // hardware in the reader's hand, and the widget colours by this.
+        Action::ControllerOff => "controller",
         Action::None => "none",
     }
 }
@@ -983,6 +987,7 @@ pub fn derive_label(a: &Action) -> String {
         },
         Action::SetMode(m) => format!("Force {m} mode"),
         Action::ClearMode => "Back to automatic mode".to_string(),
+        Action::ControllerOff => "Turn the controller off".to_string(),
         Action::None => "Unbound".to_string(),
     }
 }
@@ -2015,6 +2020,41 @@ mod tests {
         );
         assert_eq!(find(&t, "guide+rpad").guard, Guard::OnlyIn(vec!["game".into()]));
         assert_eq!(find(&t, "guide+rpad_click").action_kind, "mouse");
+    }
+
+    #[test]
+    fn controller_off_gets_its_own_words_and_its_own_kind() {
+        // The label the sheet draws when a binding gives no description of its
+        // own, the spelling a config would write back, and a kind of its own so
+        // the widget does not colour it like an `exec`.
+        assert_eq!(derive_label(&Action::ControllerOff), "Turn the controller off");
+        assert_eq!(action_string(&Action::ControllerOff), "controller_off");
+        assert_eq!(action_kind(&Action::ControllerOff), "controller");
+        // Round trip: what the sheet prints is what the parser reads back.
+        assert_eq!(
+            Action::parse(&action_string(&Action::ControllerOff)),
+            Ok(Action::ControllerOff)
+        );
+
+        // And on a real sheet, from both front-ends.
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.bind("guide+quickaccess", "Controller off", h.controller_off())
+            h.button("l4", h.controller_off())
+            "#,
+        );
+        let chord = find(&s, "guide+quickaccess");
+        assert_eq!(
+            (chord.label.as_str(), chord.action.as_str(), chord.action_kind),
+            ("Controller off", "controller_off", "controller")
+        );
+        // No description: the derived words stand in.
+        assert_eq!(find(&s, "l4").label, "Turn the controller off");
+        let t = sheet_from_toml("[bindings]\n\"guide+quickaccess\" = \"controller_off\"\n");
+        assert_eq!(find(&t, "guide+quickaccess").action_kind, "controller");
     }
 
     // --- JSON shape --------------------------------------------------------

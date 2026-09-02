@@ -419,6 +419,17 @@ already-mapped one asks for it back, and `Exclusive` routes every pointer event
 compositor-wide to the surface for as long as it lasts (omacom/omarchy#9029) —
 so the prime has to be brief, and its timing is not a number to guess at.
 
+**Right-click turns the controller off** (`hyprpad off`). `WidgetButton` emits
+`pressed(int button)` and its `MouseArea` already accepts all three buttons, so
+the second gesture costs one branch: `Qt.RightButton` runs `hyprpad off`,
+anything else opens the sheet. That is the *deliberate* power-off which replaces
+the firmware's guide-hold one (README, "Powering the controller off") — and
+choosing the other mouse button is the whole confirmation, on purpose: the owner
+asked for no menu. `hyprpad off` signals the running daemon rather than touching
+the puck, so the widget needs no access to the device; the widget then vanishes
+by itself, because the daemon publishes `connected: false` as soon as the stream
+stops. The tooltip says both.
+
 ## Theme
 
 `bar.barForeground` and `bar.fontFamily` rather than the `Color`/`Style`

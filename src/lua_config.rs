@@ -23,7 +23,7 @@
 //! local h = hyprpad
 //!
 //! -- Settings: one call per section, taking the same keys the TOML has.
-//! h.daemon  { own_lizard = true, rescan_on_title_change = true, process_rescan_ms = 500 }
+//! h.daemon  { own_lizard = true, steam_button_poweroff = "off", process_rescan_ms = 500 }
 //! h.cursor  { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
 //! h.haptics { cursor_spacing_px = 96 }
@@ -625,6 +625,8 @@ fn finish(
         buttons: b.buttons,
         osk_buttons: b.osk_buttons,
         own_lizard: b.own_lizard,
+        steam_button_poweroff: b.steam_button_poweroff,
+        sleep_inactivity_timeout: b.sleep_inactivity_timeout,
         rescan_on_title_change: b.rescan_on_title_change,
         process_rescan_ms: b.process_rescan_ms,
         cursor: b.cursor,
@@ -703,6 +705,8 @@ struct Build {
     button_descs: HashMap<crate::report::Button, String>,
     osk_button_descs: HashMap<crate::report::Button, String>,
     own_lizard: bool,
+    steam_button_poweroff: Option<u16>,
+    sleep_inactivity_timeout: Option<u16>,
     rescan_on_title_change: Option<bool>,
     process_rescan_ms: Option<u64>,
     cursor: CursorConfig,
@@ -866,6 +870,7 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("set_mode", action_ctor(lua, "set_mode", "name")?)?;
     h.set("fullscreen", action_nullary(lua, "fullscreen")?)?;
     h.set("clear_mode", action_nullary(lua, "clear_mode")?)?;
+    h.set("controller_off", action_nullary(lua, "controller_off")?)?;
     h.set("none", action_nullary(lua, "none")?)?;
     h.set("keyboard", keyboard_ctor(lua)?)?;
     // The on-screen keyboard's own actions — `h.osk "commit"|"shift"|"dismiss"`
@@ -1194,7 +1199,8 @@ fn default_mode_fn(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
 
 // --- settings sections -----------------------------------------------------
 
-/// `h.daemon { own_lizard = true, rescan_on_title_change = true,
+/// `h.daemon { own_lizard = true, steam_button_poweroff = "off",
+/// sleep_inactivity_timeout = 600, rescan_on_title_change = true,
 /// process_rescan_ms = 500 }`.
 fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
@@ -1204,6 +1210,12 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
             let (k, v) = pair?;
             match k.as_str() {
                 "own_lizard" => b.own_lizard = as_bool(&v, &k)?,
+                "steam_button_poweroff" => {
+                    b.steam_button_poweroff = Some(as_power_setting(&v, &k)?)
+                }
+                "sleep_inactivity_timeout" => {
+                    b.sleep_inactivity_timeout = Some(as_power_setting(&v, &k)?)
+                }
                 "rescan_on_title_change" => {
                     b.rescan_on_title_change = Some(as_bool(&v, &k)?)
                 }
@@ -1212,7 +1224,13 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
                     return Err(unknown_key(
                         "h.daemon",
                         other,
-                        &["own_lizard", "rescan_on_title_change", "process_rescan_ms"],
+                        &[
+                            "own_lizard",
+                            "steam_button_poweroff",
+                            "sleep_inactivity_timeout",
+                            "rescan_on_title_change",
+                            "process_rescan_ms",
+                        ],
                     ))
                 }
             }
@@ -1527,13 +1545,15 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
             let Some(verb) = verb else {
                 return Err(err(
                     "that table is not an action — use one of h.workspace/h.exec/h.dispatch/\
-                     h.keyboard/h.key/h.mouse/h.fullscreen/h.set_mode/h.clear_mode/h.none",
+                     h.keyboard/h.key/h.mouse/h.fullscreen/h.set_mode/h.clear_mode/\
+                     h.controller_off/h.none",
                 ));
             };
             let arg: String = t.get::<Option<String>>("arg")?.unwrap_or_default();
             match verb.as_str() {
                 "fullscreen" => Ok(Action::ToggleFullscreen),
                 "clear_mode" => Ok(Action::ClearMode),
+                "controller_off" => Ok(Action::ControllerOff),
                 "none" => Ok(Action::None),
                 "key" => KeyChord::parse(&arg).map(Action::Key).map_err(err),
                 // A mouse button is a key in evdev's code space; the daemon
@@ -1662,6 +1682,37 @@ fn as_f64(v: &Value, key: &str) -> mlua::Result<f64> {
         return Err(err(format!("'{key}' must be a finite number")));
     }
     Ok(n)
+}
+
+/// One of the two `h.daemon` firmware power knobs: the string `"off"`, or a
+/// whole number in `0..=65535` written to the setting raw.
+///
+/// The same grammar the TOML front-end's `parse_power_setting` reads, so the
+/// two files spell the knob identically. The units are the firmware's and are
+/// UNVERIFIED (`docs/research/guide-hold-poweroff.md` §6).
+fn as_power_setting(v: &Value, key: &str) -> mlua::Result<u16> {
+    match v {
+        Value::String(s) => {
+            let s = s.to_str()?;
+            let s = s.trim();
+            if s.eq_ignore_ascii_case("off") {
+                Ok(crate::lizard::POWER_SETTING_OFF)
+            } else {
+                Err(err(format!(
+                    "'{key}' takes \"off\" or a number, got the string {s:?}"
+                )))
+            }
+        }
+        other => {
+            let n = as_f64(other, key)?;
+            if n < 0.0 || n > f64::from(u16::MAX) || n.fract() != 0.0 {
+                return Err(err(format!(
+                    "'{key}' must be \"off\" or a whole number 0-65535, got {n}"
+                )));
+            }
+            Ok(n as u16)
+        }
+    }
 }
 
 fn as_bool(v: &Value, key: &str) -> mlua::Result<bool> {
@@ -2072,6 +2123,70 @@ mod tests {
 
         let e = load_str(r#"hyprpad.bind("guide+nope", hyprpad.exec "x")"#, "t.lua").unwrap_err();
         assert!(e.contains("unknown button 'nope'"), "{e}");
+    }
+
+    #[test]
+    fn h_controller_off_is_an_action_on_a_chord_and_on_a_button() {
+        let c = load(
+            r#"
+            hyprpad.bind("guide+quickaccess", "Controller off", hyprpad.controller_off())
+            hyprpad.button("l4", hyprpad.controller_off())
+            "#,
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::QuickAccess)),
+            Action::ControllerOff
+        );
+        assert_eq!(
+            c.buttons_in(&desktop()).get(&Button::GripL4),
+            Some(&crate::config::ButtonAction::Fire(Action::ControllerOff))
+        );
+        // The string spelling is the TOML one, so a config can be ported a line
+        // at a time.
+        let s = load(r#"hyprpad.bind("guide+l5", "controller_off")"#);
+        assert_eq!(s.resolve(&GestureEvent::GuideChord(Button::GripL5)), Action::ControllerOff);
+    }
+
+    #[test]
+    fn the_firmware_power_knobs_parse_off_and_a_number() {
+        // Untouched by the file: nothing is written, which is the historical
+        // settings frame.
+        assert!(load(r#"hyprpad.daemon { own_lizard = true }"#).power_settings().is_empty());
+
+        let c = load(
+            r#"hyprpad.daemon {
+                 steam_button_poweroff = "off",
+                 sleep_inactivity_timeout = 600,
+               }"#,
+        );
+        assert_eq!(
+            c.power_settings(),
+            crate::lizard::PowerSettings {
+                steam_button_poweroff: Some(crate::lizard::POWER_SETTING_OFF),
+                sleep_inactivity_timeout: Some(600),
+            }
+        );
+        // An explicit 0 is written raw, so the "0 = never" reading is testable.
+        assert_eq!(
+            load(r#"hyprpad.daemon { steam_button_poweroff = 0 }"#)
+                .power_settings()
+                .steam_button_poweroff,
+            Some(0)
+        );
+        // A string that is not "off", a fraction, and a value past the u16 the
+        // wire carries are all load errors naming the key.
+        for bad in [
+            r#"hyprpad.daemon { steam_button_poweroff = "long" }"#,
+            r#"hyprpad.daemon { steam_button_poweroff = 1.5 }"#,
+            r#"hyprpad.daemon { steam_button_poweroff = 70000 }"#,
+            r#"hyprpad.daemon { sleep_inactivity_timeout = -1 }"#,
+        ] {
+            let e = load_str(bad, "t.lua").unwrap_err();
+            assert!(e.contains("poweroff") || e.contains("inactivity"), "{bad}: {e}");
+        }
+        // And the typo message lists the new keys.
+        let e = load_str(r#"hyprpad.daemon { steam_button_power = "off" }"#, "t.lua").unwrap_err();
+        assert!(e.contains("steam_button_poweroff"), "{e}");
     }
 
     #[test]
@@ -2805,6 +2920,10 @@ mod tests {
         let toml = Config::from_toml_str(SAMPLE_TOML).expect("sample toml");
 
         assert_eq!(lua.own_lizard(), toml.own_lizard());
+        // The firmware power knobs are `[daemon]` settings like `own_lizard`,
+        // and both front-ends can spell them: commented out in the sample, so
+        // this pins "neither file writes setting 25 or 50 by default".
+        assert_eq!(lua.power_settings(), toml.power_settings());
         assert_eq!(lua.cursor(), toml.cursor());
         // `guide_in` is a guard, not a `CursorConfig` field, so `cursor()`
         // above would not notice it drifting. Both front-ends can spell it.
@@ -2921,5 +3040,6 @@ l2 = "osk shift"
 "guide+y" = "keyboard split"
 "guide+rpad_click" = "mouse left"
 "guide+view" = "exec hyprpad-cheatsheet toggle"
+"guide+quickaccess" = "controller_off"
 "#;
 }

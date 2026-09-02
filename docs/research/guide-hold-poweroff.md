@@ -370,6 +370,22 @@ Test protocol (owner not using the controller): read 25/50 → write → read ba
 → stopwatch hold → power-cycle → read back (persistence) → `hyprpad off` →
 press Steam to wake → confirm lizard re-disabled within 30 s.
 
+### Built, and where the recipe lives now
+
+A+B are implemented; **[docs/design/puck-power.md](../design/puck-power.md)** is
+the design note and carries the step-by-step verify recipe (the test protocol
+above, expanded with what each outcome means). Two deltas from the plan:
+
+* the read subcommand is spelled **`hyprpad puck-settings [id…]`**, not
+  `hyprpad settings get`, and defaults to `25 50`;
+* the config knobs are `steam_button_poweroff` and `sleep_inactivity_timeout`,
+  taking `"off"` or an integer. `"off"` writes `0xFFFF`, **not** `0` — under the
+  "`0` = no delay" reading of §3.A a zero would power the pad off on any guide
+  press, and `0xFFFF` is safe under both readings. An explicit integer `0` is
+  still available for testing that reading.
+
+Everything in §6 remains unverified; nothing here was tested against the device.
+
 ## 5. Sources
 
 Local (this machine, read-only):
