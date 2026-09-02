@@ -100,8 +100,8 @@
 //! own — it wants a fresh press.
 
 use crate::config::{
-    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, KeyChord, OskAction,
-    RumbleMode, ScrollConfig, ScrollMode,
+    Action, ButtonAction, Config, CursorConfig, GamepadConfig, GamepadKind, HapticsConfig,
+    KeyChord, OskAction, RumbleMode, ScrollConfig, ScrollMode,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gamepad::{self, VirtualGamepad};
@@ -114,8 +114,11 @@ use crate::keyboard::VirtualKeyboard;
 use crate::mode::ModeEngine;
 use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
-use crate::status::StatusWriter;
-use crate::{hidraw, report, status};
+use crate::status::{RelayKind, StatusWriter};
+use crate::uhid::settings::Action as RelayAction;
+use crate::uhid::translate::StripMask;
+use crate::uhid::SteamRelay;
+use crate::{hidraw, report, status, uhid};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -311,6 +314,7 @@ pub fn run() -> std::io::Result<()> {
     // machine with no `/dev/uinput` warns once and carries on with the whole
     // desktop layer intact.
     let mut gamepad = GamepadState::new();
+    gamepad.relay = start_relay(config.gamepad());
     if config.gamepad().enabled {
         eprintln!("hyprpad: virtual gamepad armed (created on first game focus)");
     } else {
@@ -326,6 +330,7 @@ pub fn run() -> std::io::Result<()> {
     let mut modes = ModeEngine::new(&config);
     status.set_modes(status::mode_names(&config));
     status.set_mode(modes.active());
+    status.set_relay(relay_kind(config.gamepad(), gamepad.relay.is_some()));
     if !config.modes().is_empty() {
         eprintln!(
             "hyprpad: {} mode(s) declared, starting in '{}'",
@@ -717,10 +722,12 @@ pub fn run() -> std::io::Result<()> {
                 drive_gamepad(
                     &mut gamepad,
                     &frame,
+                    &data,
                     config.gamepad(),
                     forwarding,
                     hx.dev,
                     now,
+                    debug,
                 );
                 prev_frame = frame;
             }
@@ -1588,13 +1595,93 @@ fn gamepad_forwarding(
     enabled && game_focused && desktop_suppressed && !guide_active && !osk_active
 }
 
+/// Create the virtual Steam Controller, if the config asks for one *and* a
+/// `/dev/uhid` descriptor can be had.
+///
+/// Called once, at startup. Unlike the Xbox pad — which is made lazily, on the
+/// first frame a game actually holds focus — the relay is created eagerly and
+/// kept for the daemon's whole life, because Steam adopts a controller when its
+/// hidraw node appears and re-adopts it every time it reappears. Creating it on
+/// a focus change would make Steam re-detect and re-apply configs each time a
+/// game came forward.
+///
+/// **Every failure is non-fatal and logged exactly once.** On an ordinary
+/// desktop `acquire_uhid` fails with `EACCES` — `/dev/uhid` is `crw------- root
+/// root` and no shipped rule opens it — which is the expected outcome until the
+/// host-integration half lands. The daemon carries on with no game sink at all
+/// rather than quietly substituting the Xbox pad, which would be a different
+/// controller than the config asked for.
+fn start_relay(cfg: &GamepadConfig) -> Option<SteamRelay> {
+    if !cfg.enabled || cfg.kind != GamepadKind::Steam {
+        return None;
+    }
+    let profile = cfg.identity.profile();
+    let fd = match uhid::acquire_uhid() {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!(
+                "hyprpad: [gamepad] kind = \"steam\" but /dev/uhid is unavailable ({e}); \
+                 games get no input. Grant access with a udev rule:\n  \
+                 KERNEL==\"uhid\", SUBSYSTEM==\"misc\", MODE=\"0660\", TAG+=\"uaccess\", \
+                 OPTIONS+=\"static_node=uhid\""
+            );
+            return None;
+        }
+    };
+    match SteamRelay::start(fd, profile) {
+        Ok(relay) => {
+            eprintln!(
+                "hyprpad: virtual Steam Controller created ({}, identity '{}'); \
+                 streaming at 250 Hz, forwarding under game focus",
+                profile.vid_pid(),
+                profile.identity.as_str()
+            );
+            Some(relay)
+        }
+        Err(e) => {
+            eprintln!("warning: could not create the virtual Steam Controller ({e}); \
+                       games get no input");
+            None
+        }
+    }
+}
+
+/// Which sink `status.json` should report.
+///
+/// Deliberately reports what a game would *actually* receive, not what the
+/// config asked for: `kind = "steam"` with no usable `/dev/uhid` is
+/// [`RelayKind::None`]. Pure, so the whole mapping is unit-testable.
+fn relay_kind(cfg: &GamepadConfig, relay_live: bool) -> RelayKind {
+    if !cfg.enabled {
+        return RelayKind::None;
+    }
+    match cfg.kind {
+        GamepadKind::Xbox => RelayKind::Xbox,
+        GamepadKind::Steam if relay_live => RelayKind::Steam,
+        GamepadKind::Steam => RelayKind::None,
+    }
+}
+
 /// Cross-frame state for the virtual gamepad: the lazily-created device, the
 /// edge-detection flag behind the neutral-on-transition guarantee, and the
 /// rumble command last written to the puck.
 struct GamepadState {
     /// The uinput device. `None` until the first frame that actually wants to
-    /// forward — or forever, if creation failed.
+    /// forward — or forever, if creation failed. Always `None` under
+    /// `[gamepad] kind = "steam"`: only ever one sink (see [`start_relay`]).
     pad: Option<VirtualGamepad>,
+    /// The virtual Valve controller, when `[gamepad] kind = "steam"` and a
+    /// `/dev/uhid` descriptor could be had. Unlike the uinput pad this is
+    /// created **once, at startup**, and never torn down on a focus change: a
+    /// create/destroy cycle makes Steam re-detect the controller, re-apply its
+    /// configs and toast about it (research doc §5.3).
+    relay: Option<SteamRelay>,
+    /// The `(strong, weak)` magnitudes Steam last asked the relay for.
+    ///
+    /// Kept as *state* rather than acted on where it arrives, so the relay's
+    /// rumble goes through exactly the same 20 Hz coalescing clock as the Xbox
+    /// pad's: [`drive_rumble`] reads it once a frame.
+    relay_rumble: (u16, u16),
     /// Whether creation has been attempted, so a failure warns exactly once
     /// instead of on every frame of every game.
     tried: bool,
@@ -1615,6 +1702,8 @@ impl GamepadState {
     fn new() -> GamepadState {
         GamepadState {
             pad: None,
+            relay: None,
+            relay_rumble: (0, 0),
             tried: false,
             forwarding: false,
             rumble: (0, 0),
@@ -1633,6 +1722,12 @@ impl GamepadState {
         if let Some(pad) = self.pad.as_mut() {
             pad.neutral();
         }
+        // The relay is never destroyed here — only fed neutral. Steam must not
+        // see the controller disappear when the puck naps or a game loses focus.
+        if let Some(relay) = self.relay.as_ref() {
+            relay.release();
+        }
+        self.relay_rumble = (0, 0);
         self.forwarding = false;
         self.stop_rumble(haptics);
     }
@@ -1658,39 +1753,118 @@ impl GamepadState {
 /// The device is created here rather than at startup, on the first frame that
 /// wants it, so a session that never focuses a game never creates one. Games
 /// discover it through the usual udev hotplug path.
+#[allow(clippy::too_many_arguments)]
 fn drive_gamepad(
     st: &mut GamepadState,
     frame: &report::Frame,
+    raw: &[u8],
     cfg: &GamepadConfig,
     forwarding: bool,
     haptics: &mut Haptics,
     now: Instant,
+    debug: bool,
 ) {
+    // Whatever Steam has written to the relay since the last frame, first: a
+    // rumble it asked for should not wait a frame behind the one it is
+    // reacting to. Reads nothing when there is no relay.
+    absorb_relay_writes(st, cfg, forwarding, haptics, debug);
+
     if forwarding {
-        if st.pad.is_none() && !st.tried {
-            st.tried = true;
-            match VirtualGamepad::new() {
-                Ok(pad) => {
-                    eprintln!(
-                        "hyprpad: virtual gamepad created (045e:028e); forwarding under game focus"
-                    );
-                    st.pad = Some(pad);
+        if let Some(relay) = st.relay.as_ref() {
+            // The Steam sink. `raw` goes in unprocessed: the triton profile
+            // relays the puck's own bytes, so anything re-encoded on the way
+            // would be a loss.
+            relay.forward(raw, frame, strip_mask(cfg));
+        } else {
+            if st.pad.is_none() && !st.tried && cfg.kind == GamepadKind::Xbox {
+                st.tried = true;
+                match VirtualGamepad::new() {
+                    Ok(pad) => {
+                        eprintln!(
+                            "hyprpad: virtual gamepad created (045e:028e); \
+                             forwarding under game focus"
+                        );
+                        st.pad = Some(pad);
+                    }
+                    Err(e) => eprintln!("warning: no virtual gamepad ({e}); games get no input"),
                 }
-                Err(e) => eprintln!("warning: no virtual gamepad ({e}); games get no input"),
             }
-        }
-        if let Some(pad) = st.pad.as_mut() {
-            pad.apply(frame, cfg.forward_guide);
+            if let Some(pad) = st.pad.as_mut() {
+                pad.apply(frame, cfg.forward_guide);
+            }
         }
         st.forwarding = true;
     } else if st.forwarding {
-        // The falling edge, and the only place it is handled.
+        // The falling edge, and the only place it is handled. Both sinks make
+        // the same promise here: neutral, so no game is left holding a stick.
         if let Some(pad) = st.pad.as_mut() {
             pad.neutral();
+        }
+        if let Some(relay) = st.relay.as_ref() {
+            relay.release();
         }
         st.forwarding = false;
     }
     drive_rumble(st, cfg, forwarding, haptics, now);
+}
+
+/// Which buttons the relay withholds from Steam.
+///
+/// The guide is hyprpad's global chord modifier, so it is stripped unless
+/// `forward_guide` hands it back — the same knob, and the same meaning, as on
+/// the Xbox pad, where it gates `BTN_MODE`. Read per frame, so a reload
+/// retunes it on the next report.
+///
+/// Quick Access is not stripped yet. §4.4 of the research doc suggests deriving
+/// the whole mask from the live binding table so any button the owner has bound
+/// is withheld; that is a follow-on, and it is recorded in
+/// `docs/design/uhid-relay.md`.
+fn strip_mask(cfg: &GamepadConfig) -> StripMask {
+    StripMask { guide: !cfg.forward_guide, quick_access: false }
+}
+
+/// Drain and act on everything Steam wrote to the relay.
+///
+/// Steam drives a Valve controller it has adopted: the proven run took 39
+/// `SetSettingsValues` writes inside two minutes. Rumble and haptics become
+/// real pulses on the puck through `haptics.rs`'s single writer thread — §5.2
+/// is explicit that the relay must never open a second writable fd on the
+/// device. Everything else is logged under `HYPRSC_DEBUG` and dropped.
+///
+/// **The queue is drained whether or not a game is forwarding, and its
+/// actuator commands are then dropped unless one is.** Both halves matter. The
+/// draining keeps the relay's bounded queue from filling and stalling, and
+/// keeps the debug log honest about what Steam is doing. The dropping is §5.2's
+/// arbitration: while hyprpad owns the controller — the desktop, the OSK, a
+/// held guide — hyprpad owns the actuators too, so a backgrounded game cannot
+/// buzz the on-screen keyboard.
+fn absorb_relay_writes(
+    st: &mut GamepadState,
+    cfg: &GamepadConfig,
+    forwarding: bool,
+    haptics: &mut Haptics,
+    debug: bool,
+) {
+    let Some(relay) = st.relay.as_ref() else { return };
+    let ours = forwarding && cfg.rumble;
+    for action in relay.drain_actions() {
+        if debug {
+            eprintln!("[relay] {}", action.describe());
+        }
+        match action {
+            // Held, not fired: `drive_rumble` applies it on the shared 20 Hz
+            // clock, the same one the Xbox pad's force feedback runs on.
+            RelayAction::Rumble { strong, weak } if ours => st.relay_rumble = (strong, weak),
+            RelayAction::Haptic { pad, on_us, off_us, count } if ours => {
+                let on_us = gamepad::scale_magnitude(on_us, cfg.rumble_intensity);
+                haptics.pulse(pad, on_us, off_us, count);
+            }
+            // Settings, drops, malformed frames, and every actuator command
+            // that arrived while hyprpad owns the pads: logged above, and
+            // deliberately not acted on. See `uhid::settings` for the policy.
+            _ => {}
+        }
+    }
 }
 
 /// Carry the game's force feedback back to the real controller for one frame.
@@ -1717,16 +1891,24 @@ fn drive_rumble(
 
     // Not forwarding, or rumble switched off: the target is silence. Reading the
     // knobs per frame is what makes `hyprpad reload` take effect on the next one.
-    let want = match st.pad.as_ref() {
-        Some(pad) if forwarding && cfg.rumble => {
-            let (strong, weak) = pad.rumble().magnitudes();
-            (
-                gamepad::scale_magnitude(strong, cfg.rumble_intensity),
-                gamepad::scale_magnitude(weak, cfg.rumble_intensity),
-            )
+    // Where the magnitudes come from is the one difference between the two
+    // sinks: the Xbox pad's force-feedback reader thread publishes what a game
+    // uploaded, while the relay carries what Steam wrote to the virtual
+    // controller. Both are then scaled, clocked and emitted identically.
+    let raw = if !(forwarding && cfg.rumble) {
+        (0, 0)
+    } else if st.relay.is_some() {
+        st.relay_rumble
+    } else {
+        match st.pad.as_ref() {
+            Some(pad) => pad.rumble().magnitudes(),
+            None => (0, 0),
         }
-        _ => (0, 0),
     };
+    let want = (
+        gamepad::scale_magnitude(raw.0, cfg.rumble_intensity),
+        gamepad::scale_magnitude(raw.1, cfg.rumble_intensity),
+    );
     if !rumble_due(want, st.rumble, st.rumble_sent, now) {
         return;
     }
@@ -3737,11 +3919,58 @@ mod tests {
         drive_gamepad(
             st,
             &report::Frame::default(),
+            &[],
             &GamepadConfig::default(),
             forwarding,
             hap,
             now,
+            false,
         );
+    }
+
+    /// What `status.json` reports is what a game would actually receive —
+    /// which is not the same as what the config asked for.
+    #[test]
+    fn the_published_relay_is_the_sink_that_really_exists() {
+        let xbox = GamepadConfig::default();
+        assert_eq!(xbox.kind, GamepadKind::Xbox);
+        assert_eq!(relay_kind(&xbox, false), RelayKind::Xbox);
+
+        let steam = GamepadConfig { kind: GamepadKind::Steam, ..GamepadConfig::default() };
+        assert_eq!(relay_kind(&steam, true), RelayKind::Steam);
+        // The case on this machine today: /dev/uhid is root-only, so the relay
+        // never came up. Report "none" — never silently fall back to the Xbox
+        // pad, which is a different controller than the config asked for.
+        assert_eq!(relay_kind(&steam, false), RelayKind::None);
+
+        // The master switch wins over both.
+        let off = GamepadConfig { enabled: false, ..GamepadConfig::default() };
+        assert_eq!(relay_kind(&off, false), RelayKind::None);
+        let off_steam =
+            GamepadConfig { enabled: false, kind: GamepadKind::Steam, ..GamepadConfig::default() };
+        assert_eq!(relay_kind(&off_steam, true), RelayKind::None);
+    }
+
+    /// The relay is never even attempted unless the config asks for it, so a
+    /// default install never touches `/dev/uhid`.
+    #[test]
+    fn no_relay_is_started_unless_the_config_asks_for_one() {
+        assert!(start_relay(&GamepadConfig::default()).is_none(), "kind = xbox");
+        let off =
+            GamepadConfig { enabled: false, kind: GamepadKind::Steam, ..GamepadConfig::default() };
+        assert!(start_relay(&off).is_none(), "the master switch is off");
+    }
+
+    /// The guide is hyprpad's chord modifier, so the relay withholds it unless
+    /// the owner hands it back — the same rule, and the same knob, as the Xbox
+    /// pad's `BTN_MODE`.
+    #[test]
+    fn the_strip_mask_follows_the_forward_guide_knob() {
+        let d = GamepadConfig::default();
+        assert!(!d.forward_guide);
+        assert_eq!(strip_mask(&d), StripMask { guide: true, quick_access: false });
+        let fwd = GamepadConfig { forward_guide: true, ..GamepadConfig::default() };
+        assert_eq!(strip_mask(&fwd), StripMask { guide: false, quick_access: false });
     }
 
     #[test]

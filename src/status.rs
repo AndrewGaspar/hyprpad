@@ -6,7 +6,8 @@
 //!
 //! ```json
 //! {"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
-//!  "pid": 12345, "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
+//!  "relay": "xbox", "pid": 12345,
+//!  "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
 //!  "updated": 1725230000}
 //! ```
 //!
@@ -47,6 +48,35 @@ pub fn status_file_path() -> Option<PathBuf> {
     Some(status_dir()?.join("status.json"))
 }
 
+/// Which game sink is live — the `"relay"` field of `status.json`.
+///
+/// A widget uses it to say what a game would actually receive, which is not the
+/// same question as which one the config asked for: `[gamepad] kind = "steam"`
+/// with no writable `/dev/uhid` yields [`RelayKind::None`], not
+/// [`RelayKind::Steam`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RelayKind {
+    /// No game sink at all: `[gamepad] enabled = false`, or `kind = "steam"`
+    /// with no `/dev/uhid` the daemon may open.
+    #[default]
+    None,
+    /// The uinput Xbox-360 pad ([`crate::gamepad`]).
+    Xbox,
+    /// The virtual Valve controller on `/dev/uhid` ([`crate::uhid`]).
+    Steam,
+}
+
+impl RelayKind {
+    /// The wire spelling, which is also the `[gamepad] kind` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayKind::None => "none",
+            RelayKind::Xbox => "xbox",
+            RelayKind::Steam => "steam",
+        }
+    }
+}
+
 /// The published state. One value, so a publish is always a whole consistent
 /// object rather than a field at a time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +90,8 @@ pub struct Status {
     pub mode: String,
     /// A human name for the controller, from the hidraw node's `HID_NAME`.
     pub controller: String,
+    /// Which virtual controller a focused game is actually being given.
+    pub relay: RelayKind,
     /// The daemon's pid, so a reader can tell a live file from one a killed
     /// daemon left behind.
     pub pid: u32,
@@ -78,6 +110,8 @@ impl Status {
         push_str(&mut o, &self.mode);
         o.push_str(", \"controller\": ");
         push_str(&mut o, &self.controller);
+        o.push_str(", \"relay\": ");
+        push_str(&mut o, self.relay.as_str());
         let _ = write!(o, ", \"pid\": {}, \"modes\": ", self.pid);
         push_strs(&mut o, &self.modes);
         let _ = write!(o, ", \"updated\": {}}}", self.updated);
@@ -160,6 +194,7 @@ impl StatusWriter {
                 connected: false,
                 mode: BUILTIN_DESKTOP.to_string(),
                 controller: DEFAULT_CONTROLLER.to_string(),
+                relay: RelayKind::None,
                 pid: std::process::id(),
                 modes: Vec::new(),
                 updated: now_secs(),
@@ -227,6 +262,21 @@ impl StatusWriter {
             return;
         }
         self.status.mode = effective.to_string();
+        self.publish();
+    }
+
+    /// Record which game sink is live.
+    ///
+    /// Set once at startup, when the daemon has learned whether the configured
+    /// sink could actually be created — for the Steam relay that means "was
+    /// `/dev/uhid` openable", which is not knowable from the config alone — and
+    /// again on a reload that turns the whole forwarding path off. Publishes
+    /// only on a real change.
+    pub fn set_relay(&mut self, relay: RelayKind) {
+        if self.status.relay == relay {
+            return;
+        }
+        self.status.relay = relay;
         self.publish();
     }
 
@@ -384,6 +434,7 @@ mod tests {
             connected: true,
             mode: "desktop".to_string(),
             controller: "Steam Controller Puck".to_string(),
+            relay: RelayKind::Xbox,
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
             updated: 1_725_230_000,
@@ -395,10 +446,47 @@ mod tests {
         assert_eq!(
             sample().to_json(),
             "{\"connected\": true, \"mode\": \"desktop\", \
-             \"controller\": \"Steam Controller Puck\", \"pid\": 12345, \
+             \"controller\": \"Steam Controller Puck\", \"relay\": \"xbox\", \
+             \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
              \"updated\": 1725230000}\n"
         );
+    }
+
+    /// The `"relay"` field: which sink a focused game is actually given.
+    #[test]
+    fn json_carries_the_live_relay() {
+        let mut s = sample();
+        assert!(s.to_json().contains(r#""relay": "xbox""#), "{}", s.to_json());
+        s.relay = RelayKind::Steam;
+        assert!(s.to_json().contains(r#""relay": "steam""#), "{}", s.to_json());
+        s.relay = RelayKind::None;
+        assert!(s.to_json().contains(r#""relay": "none""#), "{}", s.to_json());
+        assert_eq!(RelayKind::default(), RelayKind::None);
+        assert_eq!(
+            (RelayKind::None.as_str(), RelayKind::Xbox.as_str(), RelayKind::Steam.as_str()),
+            ("none", "xbox", "steam")
+        );
+    }
+
+    #[test]
+    fn set_relay_publishes_once_per_real_change() {
+        let dir = TempDir::new("relay");
+        let file = dir.path().join("status.json");
+        let mut w = StatusWriter::in_dir(dir.path());
+        assert_eq!(w.status().relay, RelayKind::None, "nothing live until told");
+
+        w.set_relay(RelayKind::Steam);
+        let json = std::fs::read_to_string(&file).unwrap();
+        assert!(json.contains(r#""relay": "steam""#), "{json}");
+
+        // Idempotent: setting the same value again publishes nothing new.
+        let before = std::fs::read_to_string(&file).unwrap();
+        w.set_relay(RelayKind::Steam);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+        w.set_relay(RelayKind::None);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""relay": "none""#));
     }
 
     #[test]

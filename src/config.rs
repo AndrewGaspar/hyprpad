@@ -47,6 +47,7 @@
 use crate::gesture::{self, Stick, StickDir};
 use crate::output::{PointerButton, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use crate::report;
+use crate::uhid::Identity;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1052,12 +1053,58 @@ impl RumbleMode {
     }
 }
 
+/// Which virtual controller games and Steam are given (`[gamepad] kind`).
+///
+/// Exactly one is ever created. Running both would put two pads in front of
+/// Steam and make every press count twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GamepadKind {
+    /// The synthesized Xbox-360-class uinput pad ([`crate::gamepad`]).
+    ///
+    /// **The default**, and it stays the default: it needs no privilege beyond
+    /// `/dev/uinput`, which the daemon already has, and it is what every
+    /// existing config gets. Nothing changes until the owner opts in.
+    #[default]
+    Xbox,
+    /// A virtual **Valve** controller on `/dev/uhid` ([`crate::uhid`]), which
+    /// Steam adopts as the real thing — trackpads as trackpads, gyro, per-game
+    /// Steam Input configs, back grips.
+    ///
+    /// Opt-in, because it needs a writable `/dev/uhid`. Where that is not
+    /// available the daemon logs once and runs with no game sink at all rather
+    /// than silently falling back to the Xbox pad, which would put a different
+    /// controller in front of the game than the config asked for.
+    Steam,
+}
+
+impl GamepadKind {
+    /// Parse the `kind = …` config value.
+    pub fn parse(s: &str) -> Result<GamepadKind, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "xbox" | "x360" | "xinput" | "uinput" => Ok(GamepadKind::Xbox),
+            "steam" | "valve" | "uhid" => Ok(GamepadKind::Steam),
+            other => Err(format!("unknown gamepad kind '{other}' (xbox|steam)")),
+        }
+    }
+
+    /// The name this kind is written as in a config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GamepadKind::Xbox => "xbox",
+            GamepadKind::Steam => "steam",
+        }
+    }
+}
+
 /// Virtual-gamepad knobs (the `[gamepad]` config section).
 ///
 /// The Tier-1 keystone: hyprpad owns the real puck, so Steam and games are fed a
-/// synthesized Xbox-360-class pad ([`crate::gamepad`]) whenever a game holds
-/// focus. All of these are read *per frame* by the daemon, so `hyprpad reload`
-/// takes effect on the next report with nothing to rebuild.
+/// synthesized pad whenever a game holds focus — an Xbox-360-class one
+/// ([`crate::gamepad`]) by default, or a virtual Steam Controller
+/// ([`crate::uhid`]) with `kind = "steam"`. All of these are read *per frame* by
+/// the daemon, so `hyprpad reload` takes effect on the next report with nothing
+/// to rebuild — except `kind` and `identity`, which choose a device created once
+/// at startup.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GamepadConfig {
     /// Master switch. Default **`true`** — this is the point of the project. It
@@ -1079,6 +1126,12 @@ pub struct GamepadConfig {
     /// `hid-steam` does); `0` or below silences rumble — use `rumble = false` to
     /// switch it off properly. Default `1.0`.
     pub rumble_intensity: f64,
+    /// Which virtual controller to create. Default [`GamepadKind::Xbox`], so an
+    /// existing config behaves exactly as it did.
+    pub kind: GamepadKind,
+    /// With `kind = "steam"`, which Valve identity to present. Default
+    /// [`Identity::Triton`]; ignored entirely under `kind = "xbox"`.
+    pub identity: Identity,
 }
 
 impl Default for GamepadConfig {
@@ -1089,6 +1142,8 @@ impl Default for GamepadConfig {
             rumble: true,
             rumble_mode: RumbleMode::Native,
             rumble_intensity: 1.0,
+            kind: GamepadKind::Xbox,
+            identity: Identity::Triton,
         }
     }
 }
@@ -1406,6 +1461,8 @@ intensity = 1.0             # pulse-width scale; 1.0 = the kernel's calibrated w
 # such frame, so a session that never plays a game never creates one.
 [gamepad]
 enabled = true              # master switch for the whole forwarding path
+kind = xbox                 # xbox (a uinput Xbox-360 pad) | steam (a virtual Valve controller on /dev/uhid)
+identity = triton           # with kind = steam: triton (28de:1302, least translation) | deck (28de:12f0, proven)
 forward_guide = false       # send the guide button to the game as BTN_MODE (it is hyprpad's modifier)
 rumble = true               # forward a game's force feedback to the puck's actuators
 rumble_mode = native        # native (the puck's 0x80 rumble report) | pulse (approximate with 0x81 trains)
@@ -1624,6 +1681,14 @@ impl Config {
                         }
                         "rumble_intensity" | "rumble_strength" | "rumble_gain" => {
                             gamepad.rumble_intensity = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "kind" | "pad" | "device" => {
+                            gamepad.kind = GamepadKind::parse(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "identity" | "profile" => {
+                            gamepad.identity = Identity::parse(&val)
                                 .map_err(|e| format!("line {lineno}: {e}"))?;
                         }
                         other => {
@@ -3109,6 +3174,51 @@ intensity = 0.5
         assert!(Config::from_toml_str("[haptics]\nwiggle = true\n")
             .unwrap_err()
             .contains("unknown [haptics] setting"));
+    }
+
+    /// The `kind`/`identity` pair: the one config line that swaps the game
+    /// sink from the Xbox pad to a virtual Steam Controller.
+    #[test]
+    fn gamepad_kind_and_identity_parse_and_default_to_the_unchanged_behaviour() {
+        // The default is unchanged behaviour: an existing config keeps its
+        // Xbox pad and never touches /dev/uhid.
+        let d = GamepadConfig::default();
+        assert_eq!(d.kind, GamepadKind::Xbox);
+        assert_eq!(d.identity, Identity::Triton, "unused under kind = xbox");
+
+        let c = Config::from_toml_str("[gamepad]\nkind = steam\n").unwrap();
+        assert_eq!(c.gamepad().kind, GamepadKind::Steam);
+        assert_eq!(c.gamepad().identity, Identity::Triton, "triton is the default identity");
+        assert!(c.gamepad().enabled, "untouched knobs keep their defaults");
+
+        let c = Config::from_toml_str("[gamepad]\nkind = steam\nidentity = deck\n").unwrap();
+        assert_eq!(c.gamepad().kind, GamepadKind::Steam);
+        assert_eq!(c.gamepad().identity, Identity::Deck);
+
+        // Quoted values and the accepted aliases.
+        let c = Config::from_toml_str("[gamepad]\nkind = \"uhid\"\nidentity = \"1302\"\n")
+            .unwrap();
+        assert_eq!((c.gamepad().kind, c.gamepad().identity), (GamepadKind::Steam, Identity::Triton));
+        let c = Config::from_toml_str("[gamepad]\npad = xinput\n").unwrap();
+        assert_eq!(c.gamepad().kind, GamepadKind::Xbox);
+
+        // The sample config is living documentation of the defaults, so it must
+        // parse and must not change them.
+        let sample = Config::load_default();
+        assert_eq!(sample.gamepad().kind, GamepadKind::Xbox);
+        assert_eq!(sample.gamepad().identity, Identity::Triton);
+    }
+
+    #[test]
+    fn a_misspelt_kind_or_identity_fails_the_whole_parse() {
+        // Never half-configured: a typo must not leave the daemon presenting a
+        // controller the owner did not ask for.
+        let e = Config::from_toml_str("[gamepad]\nkind = playstation\n").unwrap_err();
+        assert!(e.contains("xbox|steam"), "{e}");
+        let e = Config::from_toml_str("[gamepad]\nidentity = 1304\n").unwrap_err();
+        assert!(e.contains("triton|deck"), "{e}");
+        assert_eq!(GamepadKind::Xbox.as_str(), "xbox");
+        assert_eq!(GamepadKind::Steam.as_str(), "steam");
     }
 
     #[test]

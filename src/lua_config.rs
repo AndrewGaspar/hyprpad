@@ -27,7 +27,7 @@
 //! h.cursor  { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
 //! h.haptics { cursor_spacing_px = 96 }
-//! h.gamepad { enabled = true }
+//! h.gamepad { enabled = true, kind = "xbox", identity = "triton" }
 //!
 //! -- Bindings. The optional middle string is a description, exactly as
 //! -- `o.bind(keys, desc, action)` reads in the Hyprland config.
@@ -1359,12 +1359,24 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                 "rumble_intensity" | "rumble_gain" => {
                     b.gamepad.rumble_intensity = as_f64(&v, &k)?
                 }
+                // Which virtual controller games see, and — for the Steam one —
+                // which Valve identity it presents. See `crate::uhid::profile`.
+                "kind" => {
+                    b.gamepad.kind =
+                        crate::config::GamepadKind::parse(&as_string(&v, &k)?).map_err(err)?;
+                }
+                "identity" => {
+                    b.gamepad.identity =
+                        crate::uhid::Identity::parse(&as_string(&v, &k)?).map_err(err)?;
+                }
                 other => {
                     return Err(unknown_key(
                         "h.gamepad",
                         other,
                         &[
                             "enabled",
+                            "kind",
+                            "identity",
                             "forward_guide",
                             "rumble",
                             "rumble_mode",
@@ -1682,7 +1694,7 @@ mod tests {
             h.cursor { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
             h.scroll { mode = "circular", sensitivity = 1.0, circular_step_degrees = 15.0 }
             h.haptics { cursor_spacing_px = 96 }
-            h.gamepad { enabled = true, rumble_mode = "pulse" }
+            h.gamepad { enabled = true, rumble_mode = "pulse", kind = "steam", identity = "deck" }
             "#,
         );
         assert!(c.own_lizard());
@@ -1692,6 +1704,8 @@ mod tests {
         assert_eq!(c.scroll().mode, ScrollMode::Circular);
         assert_eq!(c.haptics().cursor_spacing_px, 96.0);
         assert_eq!(c.gamepad().rumble_mode, crate::config::RumbleMode::Pulse);
+        assert_eq!(c.gamepad().kind, crate::config::GamepadKind::Steam);
+        assert_eq!(c.gamepad().identity, crate::uhid::Identity::Deck);
         // Untouched knobs keep their built-in defaults, exactly as in TOML.
         assert_eq!(c.cursor().one_euro_beta, CursorConfig::default().one_euro_beta);
     }
