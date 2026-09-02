@@ -3791,6 +3791,9 @@ deadzone = 0.001
         assert_eq!(d.scroll().circular_step_degrees, 15.0);
         assert_eq!(d.scroll().circular_min_radius, 0.35);
 
+        // See `the_stick_and_device_sections_parse_in_both_dialects` below for
+        // `[sticks]` and `[device]`.
+
         // A `[scroll]` section overrides individual knobs; bindings still parse.
         let c = Config::from_toml_str(
             r#"
@@ -4392,6 +4395,92 @@ rumble_intensity = 0.25
         assert!(!t.exits_on_button(Button::A));
         for what in [TransientExit::Focus, TransientExit::Title, TransientExit::Click] {
             assert!(t.exits_on(what));
+        }
+    }
+
+    /// The two sections the second input backend adds, in both front-ends —
+    /// and the point of the exercise: the flat TOML spelling and the nested
+    /// Lua one land on exactly the same value, because both go through
+    /// `set_stick_axis_knob`.
+    #[test]
+    fn the_stick_and_device_sections_parse_in_both_dialects() {
+        let d = Config::load_default();
+        assert!(d.sticks().enabled, "a padless pad with no stick cursor has no pointer");
+        assert_eq!(d.sticks().tick_ms, 4);
+        assert_eq!(d.sticks().cursor.deadzone, 0.12);
+        assert_eq!(d.sticks().cursor.curve, 2.0);
+        assert_eq!(d.sticks().cursor.max, 1500.0);
+        assert_eq!(d.sticks().scroll.max, 180.0);
+        assert_eq!(d.sticks().osk.max, 2.4);
+        assert!(d.device().evdev && d.device().grab);
+
+        let toml = Config::from_toml_str(
+            r#"
+[sticks]
+tick_ms = 8
+cursor_deadzone = 0.2
+cursor_curve = 1.0
+cursor_max_px_s = 900
+cursor_smoothing_ms = 0
+scroll_max_units_s = 240
+osk_max_units_s = 3
+
+[device]
+grab = false
+
+[bindings]
+"guide+a" = "fullscreen"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(toml.sticks().tick_ms, 8);
+        assert_eq!(toml.sticks().cursor.deadzone, 0.2);
+        assert_eq!(toml.sticks().cursor.curve, 1.0);
+        assert_eq!(toml.sticks().cursor.max, 900.0);
+        assert_eq!(toml.sticks().cursor.smoothing_ms, 0.0);
+        assert_eq!(toml.sticks().scroll.max, 240.0);
+        assert_eq!(toml.sticks().osk.max, 3.0);
+        assert_eq!(toml.sticks().cursor.outer, 0.95, "unmentioned knobs keep their defaults");
+        assert!(!toml.device().grab);
+        assert!(toml.device().evdev);
+        assert_eq!(
+            toml.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen,
+            "bindings still parse beside the new sections"
+        );
+
+        let lua = crate::lua_config::load_str(
+            r#"
+local h = hyprpad
+h.sticks {
+  tick_ms = 8,
+  cursor = { deadzone = 0.2, curve = 1.0, max_px_s = 900, smoothing_ms = 0 },
+  scroll = { max_units_s = 240 },
+  osk    = { max_units_s = 3 },
+}
+h.device { grab = false }
+h.bind("guide+a", h.fullscreen())
+"#,
+            "test.lua",
+        )
+        .expect("lua parses");
+        assert_eq!(lua.sticks(), toml.sticks(), "the two dialects agree exactly");
+        assert_eq!(lua.device(), toml.device());
+
+        // The flat `<group>_<knob>` spelling works in Lua too, and an unknown
+        // knob or group is an error rather than a silent no-op.
+        let flat = crate::lua_config::load_str(
+            "local h = hyprpad\nh.sticks { cursor_max_px_s = 900 }\n",
+            "test.lua",
+        )
+        .expect("flat spelling");
+        assert_eq!(flat.sticks().cursor.max, 900.0);
+        for bad in [
+            "[sticks]\ncursor_nope = 1\n",
+            "[sticks]\nnope_deadzone = 1\n",
+            "[device]\nnope = true\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad} should not parse");
         }
     }
 
