@@ -93,9 +93,10 @@ h.bind("guide+stick_down", "Previous workspace", h.dispatch 'hl.dsp.focus({ work
 h.bind("guide+dpad_down",  "Window to new workspace", h.dispatch 'hl.dsp.window.move({ workspace = "emptyn", follow = true })')
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
-h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button
+h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button, held with it
 h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
-h.osk_button("y",   h.key "space")                       -- only while the OSK is up
+h.button("l5",      h.exec "voxtype record toggle")      -- any other action fires once, on press
+h.osk_button("y",   h.key "space")                       -- only while the OSK is up; keys only
 ```
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
@@ -112,6 +113,20 @@ in `[buttons]`); a config that declares its own buttons lists the ones it wants,
 so a mode can take a click away like anything else, and each shows on the cheat
 sheet with its guard. They obey the same gates as every bare button: off while
 the guide button is held or the on-screen keyboard is up.
+
+A bare button takes any action a guide chord takes. What differs is that a
+button is *held*: a key or mouse button (`h.key`, `h.mouse`) is pressed on the
+down edge and released on the up edge, so a held arrow auto-repeats and a held
+click drags; every other action — `h.exec`, `h.dispatch`, `h.workspace`,
+`h.keyboard`, `h.fullscreen`, `h.set_mode`, `h.clear_mode` — fires **once** on
+the press edge and never repeats while the button stays down. Both kinds go
+through the same gates and guards, and a fired action does exactly what it
+would do on a chord (`h.exec` gets `HYPRPAD_MODE`, `h.set_mode` runs the mode
+handoff). `h.button("l5", h.exec "voxtype record toggle")` is a push-to-talk
+toggle on a grip; `h.button("r4", h.keyboard { mode = "split" })` raises the
+keyboard without the modifier. `h.none` is not something a button can do —
+remove the line instead. `h.osk_button` stays keys-only: it types through the
+on-screen keyboard's own virtual keyboard.
 
 ### Modes and guards
 

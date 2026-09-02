@@ -43,7 +43,7 @@
 
 use std::fmt::Write as _;
 
-use crate::config::{Action, Config, ConfigFormat, Guard, ModeState, WorkspaceTarget};
+use crate::config::{Action, ButtonAction, Config, ConfigFormat, Guard, ModeState, WorkspaceTarget};
 use crate::gesture::{Stick, StickDir};
 use crate::report::Button;
 
@@ -184,23 +184,25 @@ impl Sheet {
             ));
         }
 
-        for (section, map, descs, guards) in [
-            (Section::Button, &c.buttons, &c.button_descs, &c.button_guards),
-            (Section::OskButton, &c.osk_buttons, &c.osk_button_descs, &c.osk_button_guards),
-        ] {
-            for (btn, code) in map {
-                entries.push(entry(
-                    section,
-                    button_name(*btn).to_string(),
-                    button_name(*btn).to_string(),
-                    button_label(*btn),
-                    None,
-                    button_rank(*btn),
-                    &Action::Key(*code),
-                    descs.get(btn),
-                    guards.get(btn),
-                ));
-            }
+        // A bare button's row reads exactly like a chord's: a held key or
+        // click spells back as `key up` / `mouse left`, and a fired action as
+        // whatever it is (`exec …`, `keyboard split`), label and kind alike.
+        let button_entry = |btn: Button, what: &ButtonAction, desc, guard| {
+            entry(
+                Section::Button,
+                button_name(btn).to_string(),
+                button_name(btn).to_string(),
+                button_label(btn),
+                None,
+                button_rank(btn),
+                &what.to_action(),
+                desc,
+                guard,
+            )
+        };
+        for (btn, what) in &c.buttons {
+            let (desc, guard) = (c.button_descs.get(btn), c.button_guards.get(btn));
+            entries.push(button_entry(*btn, what, desc, guard));
         }
 
         // A button bound once per mode contributes one row per binding, each
@@ -208,16 +210,21 @@ impl Sheet {
         // "Close cheat sheet" under the sheet, and the mode rows below sort the
         // two into the modes they are live in.
         for alt in &c.button_alts {
+            let (desc, guard) = (alt.desc.as_ref(), Some(&alt.guard));
+            entries.push(button_entry(alt.button, &alt.action, desc, guard));
+        }
+
+        for (btn, code) in &c.osk_buttons {
             entries.push(entry(
-                Section::Button,
-                button_name(alt.button).to_string(),
-                button_name(alt.button).to_string(),
-                button_label(alt.button),
+                Section::OskButton,
+                button_name(*btn).to_string(),
+                button_name(*btn).to_string(),
+                button_label(*btn),
                 None,
-                button_rank(alt.button),
-                &Action::Key(alt.code),
-                alt.desc.as_ref(),
-                Some(&alt.guard),
+                button_rank(*btn),
+                &Action::Key(*code),
+                c.osk_button_descs.get(btn),
+                c.osk_button_guards.get(btn),
             ));
         }
 
@@ -1234,6 +1241,68 @@ mod tests {
     }
 
     // --- the TOML front-end ------------------------------------------------
+
+    #[test]
+    fn a_fired_button_row_reads_exactly_like_a_chords() {
+        // A bare button bound to something other than a key or click fires on
+        // its press edge; on the sheet that is an ordinary action row — label,
+        // spelling and kind all derived the way a chord's are — in the
+        // bare-button section, with its guard.
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true }).when(function(ctx) return false end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.bind("guide+r5", h.exec "voxtype record toggle")
+            h.button("l5", h.exec "voxtype record toggle"):only_in("desktop")
+            h.button("r4", h.keyboard { mode = "split" })
+            h.button("l4", "Pause the game", h.set_mode "game")
+            h.button("dpad_up", h.key "up")
+            h.button("r2", h.mouse "left")
+            "#,
+        );
+        let l5 = find(&s, "l5");
+        let chord = find(&s, "guide+r5");
+        assert_eq!(l5.section, Section::Button);
+        assert_eq!(l5.action_kind, "exec");
+        assert_eq!(l5.action, "exec voxtype record toggle");
+        assert_eq!(l5.label, "Voxtype record toggle");
+        assert!(!l5.described);
+        assert_eq!(l5.guard, Guard::OnlyIn(vec!["desktop".into()]));
+        // Same action, same row apart from the control it sits on.
+        assert_eq!(
+            (l5.label.as_str(), l5.action.as_str(), l5.action_kind),
+            (chord.label.as_str(), chord.action.as_str(), chord.action_kind)
+        );
+
+        let r4 = find(&s, "r4");
+        assert_eq!(r4.action_kind, "keyboard");
+        assert_eq!(r4.action, "keyboard split");
+        assert_eq!(r4.label, "On-screen keyboard (split)");
+        let l4 = find(&s, "l4");
+        assert_eq!(l4.action_kind, "set_mode");
+        assert_eq!(l4.label, "Pause the game");
+        assert!(l4.described);
+        // The held rows are untouched by any of this.
+        assert_eq!(find(&s, "dpad_up").action_kind, "key");
+        assert_eq!(find(&s, "dpad_up").label, "Up");
+        assert_eq!(find(&s, "r2").action_kind, "mouse");
+        assert_eq!(find(&s, "r2").label, "Left click");
+
+        // The text form prints the fired row in the bare-button table.
+        let text = s.to_text();
+        let table = text.split("Bare buttons (no modifier)").nth(1).expect("section");
+        let table = table.split("OSK helpers").next().expect("section end");
+        assert!(table.contains("l5") && table.contains("exec voxtype record toggle"), "{table}");
+        assert!(table.contains("only in desktop"), "{table}");
+
+        // And the TOML front-end lands in the same place.
+        let t = sheet_from_toml("[buttons]\nl5 = \"exec foo\"\ndpad_up = \"key up\"\n");
+        assert_eq!(find(&t, "l5").action_kind, "exec");
+        assert_eq!(find(&t, "l5").label, "Foo");
+        assert_eq!(find(&t, "l5").section, Section::Button);
+    }
 
     #[test]
     fn a_toml_config_gets_derived_labels() {
