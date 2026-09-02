@@ -138,6 +138,18 @@ pub struct Status {
     /// Every mode that can become active, in resolution order — for a widget
     /// that wants to show more than the current one.
     pub modes: Vec<String>,
+    /// Every controller the daemon can hear right now, in preference order:
+    /// `"puck"` for the Steam Controller, and the evdev backend's own label
+    /// (`"elite"`, else `"gamepad"`) for a pad it has adopted
+    /// ([`crate::evdev::Node::label`]). Both can be present at once; which one
+    /// is *driving* is the last-active-source rule in [`crate::run`], and it is
+    /// `layout` that says which won.
+    pub sources: Vec<String>,
+    /// The cheat-sheet layout id for the **active** source —
+    /// `"steam-controller-2026"` or `"xbox-elite-2"`. The sheet's widget names
+    /// no controller anywhere; it loads `layouts/<id>.json`, so this one string
+    /// is the whole of "which drawing should I show".
+    pub layout: String,
     /// Seconds since the epoch at the last publish.
     pub updated: u64,
 }
@@ -154,8 +166,12 @@ impl Status {
         push_str(&mut o, self.relay.as_str());
         o.push_str(", \"source\": ");
         push_str(&mut o, self.source.as_str());
+        o.push_str(", \"layout\": ");
+        push_str(&mut o, &self.layout);
         let _ = write!(o, ", \"pid\": {}, \"modes\": ", self.pid);
         push_strs(&mut o, &self.modes);
+        o.push_str(", \"sources\": ");
+        push_strs(&mut o, &self.sources);
         let _ = write!(o, ", \"updated\": {}}}", self.updated);
         o.push('\n');
         o
@@ -240,6 +256,8 @@ impl StatusWriter {
                 source: Source::default(),
                 pid: std::process::id(),
                 modes: Vec::new(),
+                sources: Vec::new(),
+                layout: crate::evdev::LAYOUT_PUCK.to_string(),
                 updated: now_secs(),
             },
             base_mode: BUILTIN_DESKTOP.to_string(),
@@ -344,6 +362,29 @@ impl StatusWriter {
             return;
         }
         self.status.modes = modes;
+        self.publish();
+    }
+
+    /// Record which controllers the daemon can hear. Called whenever either
+    /// backend gains or loses a device; publishes only on a real change.
+    pub fn set_sources(&mut self, sources: Vec<String>) {
+        if self.status.sources == sources {
+            return;
+        }
+        self.status.sources = sources;
+        self.publish();
+    }
+
+    /// Record the cheat-sheet layout id of the **active** source.
+    ///
+    /// Written by the daemon and only by the daemon: `hyprpad bindings --json`
+    /// deliberately never touches the device, so the one process that knows
+    /// which controller is in the user's hands is the one that publishes it.
+    pub fn set_layout(&mut self, layout: &str) {
+        if self.status.layout == layout {
+            return;
+        }
+        self.status.layout = layout.to_string();
         self.publish();
     }
 
@@ -495,6 +536,8 @@ mod tests {
             source: Source::Direct,
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
+            sources: vec!["puck".to_string()],
+            layout: "steam-controller-2026".to_string(),
             updated: 1_725_230_000,
         }
     }
@@ -505,8 +548,10 @@ mod tests {
             sample().to_json(),
             "{\"connected\": true, \"mode\": \"desktop\", \
              \"controller\": \"Steam Controller Puck\", \"relay\": \"xbox\", \
-             \"source\": \"direct\", \"pid\": 12345, \
+             \"source\": \"direct\", \"layout\": \"steam-controller-2026\", \
+             \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
+             \"sources\": [\"puck\"], \
              \"updated\": 1725230000}\n"
         );
     }

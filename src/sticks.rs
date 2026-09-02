@@ -484,7 +484,8 @@ mod tests {
         let s = Shape { deadzone: 0.12, outer: 0.95, curve: 2.0 };
         // Full deflection on the diagonal: the magnitude is the max, split
         // along the unit vector — not `max` on each axis.
-        let (vx, vy) = s.velocity((0.7071, 0.7071), 1500.0);
+        let d = std::f64::consts::FRAC_1_SQRT_2;
+        let (vx, vy) = s.velocity((d, d), 1500.0);
         assert!((vx.hypot(vy) - 1500.0).abs() < 1.0, "got {}", vx.hypot(vy));
         assert!((vx - vy).abs() < 1e-6, "the diagonal stays a diagonal");
         // Inside the deadzone is exactly zero, both axes.
