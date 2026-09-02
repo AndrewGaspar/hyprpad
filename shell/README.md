@@ -270,7 +270,10 @@ Presence in a bar section *is* "enabled" — there is no second list — so a ba
 widget must **not** also be added to `plugins[]`, where it would do nothing.
 Per-widget settings are inline sibling keys on that entry, read through
 `BarWidget`'s `setting()`: `{"id": "hyprpad.status", "showMode": false}` gives
-a glyph with no word beside it.
+a glyph with no word beside it. The other two are `livenessSec` (how often the
+daemon's pid is re-probed, default 5) and `navIdleSec` (how long the bar focus
+ring may sit untouched before it lets go, default 12; see "The ring lets go of
+itself").
 
 As with the cheat sheet, `scripts/hyprpad-statusbar install` copies the plugin
 and then *prints* the placement line rather than editing `shell.json` — where a
@@ -408,12 +411,43 @@ the same ring:
 | `omarchy-shell -q hyprpad.status navNext` / `navPrev` | step along the bar |
 | `omarchy-shell -q hyprpad.status navActivate` | left-click the focused widget |
 | `omarchy-shell -q hyprpad.status navSecondary` | right-click it |
-| `omarchy-shell -q hyprpad.status navIsActive` | whether the ring is up |
+| `omarchy-shell hyprpad.status navIsActive` | whether the ring is up — prints `true`/`false` |
+
+Note the missing `-q` on the last row. `omarchy-shell`'s quiet mode is
+best-effort *and silent*: it suppresses stdout and exits 0 whatever happened
+(`bin/omarchy-shell`, `if (( !QUIET )) && [[ -n $output ]]`). That is exactly
+right for the fire-and-forget verbs `config/hyprpad.lua` binds, and exactly
+wrong for a question — `omarchy-shell -q … navIsActive` prints nothing no
+matter what the widget returns, which is why the ring once looked like it could
+not answer for itself.
 
 Every verb is broadcast to all live copies of the widget, because one bar
 surface exists per monitor while an IPC target routes to a single handler. Each
 copy then decides whether *it* is the one on the focused output; only that one
 maps the nav surface.
+
+### The ring lets go of itself
+
+The nav surface is not a decoration: hyprpad keys its modes on layer
+namespaces, so while `omarchy-bar-nav` is mapped the daemon is *pinned* in
+`omarchy-ui`. A ring nobody dismissed therefore keeps `game` from ever winning
+(no controller forwarding into a game), leaves B meaning Back instead of
+Backspace on the desktop, and quietly keeps the keyboard on a 1×1 surface. This
+was observed for real — the ring survived a session lock and was still mapped
+hours later, and only an explicit `navLeave` cleared it.
+
+So bar mode expires. Five things end it with nobody asking:
+
+| exit | how |
+| --- | --- |
+| **idle** | `navIdleSec` seconds (default 12, plugin setting, 3–60) with no key and no verb; every step, activate, verb and key press restarts the clock. With a panel open the window stretches ×5 rather than stopping — the panel owns the keyboard so the ring sees no keys, but an exit that depends on the bar's `activePopout` clearing is exactly the exit that can get stuck |
+| **focus loss** | the surface stops being the compositor's keyboard focus and it is not a panel it deliberately yielded to. Read from QtQuick's attached `Window.active` on the item inside the layer surface — on Wayland a window is active exactly while it holds the keyboard — after a 750 ms grace, sized for the slowest handback because the idle timeout is what really backs it up |
+| **session lock** | `omarchy.lock`'s `locked`, the same fact `omarchy-shell lock isLocked` prints, reached through the bar's injected `shell` via `serviceFor("omarchy.lock")`. Focus loss would catch the lock too; the binding makes it immediate |
+| **nothing to focus** | the target list goes empty. `clickTargetsChanged` catches registration, but a widget that merely hides itself changes `moduleTargetClickable` without touching the registry, so the ring re-checks its own stops once a second while it is up |
+| **teardown** | `Component.onDestruction` unmaps the surface and destroys the ring, so a plugin hot-reload cannot strand a layer behind it |
+
+Everything is defensive: a bar that injects no `shell`, or a shell with the lock
+plugin disabled, costs a `null` and falls back on the idle timeout.
 
 ### Two details worth keeping
 
@@ -461,5 +495,5 @@ a glyph and a word, which no stock button shape covers.
 | file | what it is |
 | --- | --- |
 | `manifest.json` | the Omarchy plugin manifest (schemaVersion 1, kind `bar-widget`) |
-| `Widget.qml` | the whole widget: two `FileView`s, three timers, one button, and the bar-mode focus ring |
+| `Widget.qml` | the whole widget: two `FileView`s, six timers, one button, and the bar-mode focus ring that lets go of itself |
 | `art/` | Kenney's CC0 controller glyph, and `LICENSES.md` for its provenance |

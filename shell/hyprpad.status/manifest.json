@@ -20,7 +20,8 @@
     "defaultSection": "right",
     "defaults": {
       "showMode": true,
-      "livenessSec": 5
+      "livenessSec": 5,
+      "navIdleSec": 12
     },
     "schema": [
       {
@@ -37,6 +38,15 @@
         "max": 60,
         "step": 1,
         "defaultValue": 5
+      },
+      {
+        "key": "navIdleSec",
+        "type": "integer",
+        "label": "Leave the bar focus ring after this many idle seconds",
+        "min": 3,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 12
       }
     ]
   }

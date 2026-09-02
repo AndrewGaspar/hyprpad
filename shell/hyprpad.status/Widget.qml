@@ -31,6 +31,39 @@
 // the watcher carries every update, including the file being removed and
 // coming back. The second timer re-runs the liveness probe, and runs only
 // while there is a status file to distrust.
+//
+// ## Why the ring lets go of itself
+//
+// The widget also hosts bar mode (the focus ring, far below), and bar mode
+// maps a keyboard-focused layer surface whose namespace is `omarchy-bar-nav`.
+// hyprpad keys its MODES on layer namespaces, so that surface is not a hint
+// about bar mode — it *is* bar mode: while it is mapped, `config/hyprpad.lua`
+// puts the daemon in `omarchy-ui` and holds it there. A ring left up
+// unattended is therefore never merely a rectangle nobody noticed:
+//
+//   * `omarchy-ui` outranks `game`, so a game gets no controller forwarding
+//     for as long as the surface lives;
+//   * B is bound to Back in `omarchy-ui` and to Backspace on the desktop, so
+//     typing quietly acquires the wrong Back key;
+//   * the 1x1 surface still owns the keyboard, so keys land on a ring that is
+//     drawn on nothing the user is looking at.
+//
+// This is not hypothetical. The ring was once observed still mapped after a
+// session lock and for hours afterwards, pinning `omarchy-ui` the whole time;
+// only an explicit `navLeave` cleared it. So bar mode is built to expire, not
+// to persist. Five things end it without being asked:
+//
+//   1. an idle timeout (`navIdleSec`, default 12 s) that every step, every
+//      activate and every verb restarts;
+//   2. losing the keyboard to anything that is not a bar panel it deliberately
+//      yielded to;
+//   3. the session lock;
+//   4. the bar reporting nothing left to focus;
+//   5. this widget being destroyed — a plugin hot-reload must not be able to
+//      strand the surface behind it.
+//
+// The ring is allowed to be forgotten. It is not allowed to outlive the
+// attention that raised it.
 
 import QtQuick
 import Quickshell
@@ -204,8 +237,16 @@ BarWidget {
       root.broadcast("navSecondaryLocal")
     }
 
-    // A string, not a bool: every IPC verb this shell ships returns one, and
-    // `qs ipc` prints whatever comes back — `[[ $(...) == true ]]` in a script.
+    // A string, not a bool: every IPC verb this shell ships returns one — the
+    // lock service's own `isLocked` is this exact line — and `qs ipc` prints
+    // whatever comes back, so `[[ $(...) == true ]]` works in a script.
+    //
+    // Ask for it WITHOUT `-q`. `omarchy-shell`'s quiet mode is "best effort,
+    // say nothing, always exit 0": it drops the answer on the floor
+    // (`bin/omarchy-shell`, `if (( !QUIET )) && [[ -n $output ]]`). `-q` is
+    // right for the fire-and-forget verbs that `config/hyprpad.lua` binds and
+    // wrong for every question, which is why asking the ring whether it was up
+    // once looked like a widget that could not answer.
     function navIsActive(): string {
       return root.navAnyActive() ? "true" : "false"
     }
@@ -288,6 +329,61 @@ BarWidget {
   // panel's own PanelKeyCatcher gets the D-pad and B.
   readonly property bool navYielded:
     root.navActive && !!(root.bar && root.bar.activePopout)
+
+  // --- letting go ----------------------------------------------------------
+  //
+  // See "Why the ring lets go of itself" at the top of this file: while the
+  // nav surface is mapped, hyprpad is pinned in `omarchy-ui`. So each of the
+  // five exits below is a safety property, not a nicety.
+
+  // The idle window. Clamped to the manifest's own range, because the setting
+  // reaches us straight out of shell.json and a hand-edited 0 must not buy a
+  // ring that never expires.
+  readonly property int navIdleSec: {
+    var raw = Math.round(Number(root.setting("navIdleSec", 12)))
+    if (!(raw > 0)) raw = 12
+    return Math.max(3, Math.min(60, raw))
+  }
+
+  // Does the compositor still send this surface keys? On Wayland, window
+  // activation IS keyboard focus (`wl_keyboard.enter`), so QtQuick's attached
+  // `Window.active` on an item inside the layer surface answers exactly the
+  // question the ring needs to ask, with no Quickshell-private API: there is
+  // no "do I have focus" property on `PanelWindow`/`WlrLayershell`, only the
+  // `keyboardFocus` we ask *for*, and upstream's `Ui/KeyboardPanel.qml` never
+  // needed the answer because it dismisses on an outside click instead.
+  readonly property bool navSurfaceFocused: navLayer.visible && navKeys.windowActive
+
+  // Focus arrives a commit or two after the map, so "not focused" only means
+  // something once it has been focused at least once. Until then the idle
+  // timeout is the backstop — a ring the compositor never fed is still a ring
+  // that expires.
+  property bool navFocusSeen: false
+
+  // The session lock. `omarchy.lock` is a first-party service plugin
+  // (`shell/plugins/lock/Service.qml`) whose `locked` is the same fact
+  // `omarchy-shell lock isLocked` prints, and the host injects itself into the
+  // bar as `shell`, which hands out services by id.
+  //
+  // Losing the keyboard to the lock surface would catch this on its own; the
+  // binding is what makes it immediate, and what still holds if the compositor
+  // turns out to be stingier with focus events than expected. Both, because
+  // this is the case that actually happened.
+  readonly property var navLockService: root.navLockFrom(root.bar)
+  readonly property bool navSessionLocked:
+    !!(root.navLockService && root.navLockService.locked === true)
+
+  // The bar arrives as an untyped argument, which is the honest shape as well
+  // as the quiet one: `BarWidget` types `bar` as `QtObject`, so nothing about
+  // the host is known here at compile time anyway. Every hop is optional, so a
+  // bar that injects no `shell`, or a shell with the lock plugin disabled,
+  // costs a null rather than an error — and the ring falls back on its idle
+  // timeout, which is why this may be a best-effort lookup at all.
+  function navLockFrom(host) {
+    var shellRoot = host ? host.shell : null
+    if (!shellRoot || typeof shellRoot.serviceFor !== "function") return null
+    return shellRoot.serviceFor("omarchy.lock")
+  }
 
   // The arrow that steps off the bar. Always perpendicular to the axis the
   // ring walks, so it can never be a move.
@@ -399,6 +495,7 @@ BarWidget {
 
   function navStep(delta) {
     if (!root.navActive) return
+    root.navPoke()
     var list = root.navTargets()
     if (list.length === 0) {
       root.navLeaveLocal()
@@ -414,6 +511,10 @@ BarWidget {
   function navEnterLocal() {
     if (!root.bar) return
     if (root.bar.barHidden === true) return
+    // Refusing is the same rule as leaving: `onNavSessionLockedChanged` only
+    // fires on an edge, so a lock that was already up when the verb arrived
+    // has to be caught here.
+    if (root.navSessionLocked) return
     if (root.navOwner() !== root) {
       root.navLeaveLocal()
       return
@@ -424,12 +525,16 @@ BarWidget {
       ? root.navLastTarget : root.navStartTarget(list)
     root.navActive = true
     root.navSetTarget(resume)
+    root.navPoke()
   }
 
   function navLeaveLocal() {
     if (!root.navActive && !root.navRing) return
     root.navActive = false
     root.navSetTarget(null)
+    navIdleTimer.stop()
+    navFocusLossTimer.stop()
+    root.navFocusSeen = false
   }
 
   function navNextLocal() { root.navStep(1) }
@@ -441,6 +546,7 @@ BarWidget {
   function navPress(button) {
     if (!root.navActive || !root.navTarget) return
     if (typeof root.navTarget.triggerPress !== "function") return
+    root.navPoke()
     root.navTarget.triggerPress(button)
   }
 
@@ -485,6 +591,49 @@ BarWidget {
     if (list.indexOf(root.navTarget) === -1) root.navSetTarget(root.navStartTarget(list))
   }
 
+  // Attention. Every step, activate, verb and key press lands here, and the
+  // idle clock starts over.
+  function navPoke() {
+    if (root.navActive) navIdleTimer.restart()
+    else navIdleTimer.stop()
+  }
+
+  // Losing the keyboard to anything that is not a panel we yielded to means the
+  // user is elsewhere — another window, a menu, the lock screen — and the ring
+  // has no business holding a mode open on their behalf. The grace is because
+  // focus legitimately blinks off for a frame or two: the Exclusive -> OnDemand
+  // prime recommits keyboard interactivity, and a closing panel hands focus
+  // back through the compositor rather than directly.
+  function navFocusWatch() {
+    if (root.navSurfaceFocused) {
+      root.navFocusSeen = true
+      navFocusLossTimer.stop()
+      return
+    }
+    if (!root.navActive || root.navYielded || !root.navFocusSeen) {
+      navFocusLossTimer.stop()
+      return
+    }
+    if (!navFocusLossTimer.running) navFocusLossTimer.start()
+  }
+
+  // Tear the surface down for good: called when this widget is destroyed, which
+  // on a plugin hot-reload is the only thing standing between a reload and a
+  // stranded `omarchy-bar-nav` layer pinning `omarchy-ui` forever. Guarded
+  // throughout, because children may already be going away underneath us.
+  function navShutdown() {
+    try {
+      root.navActive = false
+      if (root.navRing) {
+        root.navRing.destroy()
+        root.navRing = null
+      }
+      root.navTarget = null
+    } catch (e) {
+      // Nothing useful to do while the object graph is being dismantled.
+    }
+  }
+
   function navBeginPrime() {
     if (root.navActive && !root.navYielded && navLayer.backingWindowVisible) navPrimeTimer.restart()
   }
@@ -502,6 +651,10 @@ BarWidget {
   // mapped; a keyboard user gets the identical behaviour by construction.
   function navKey(event) {
     if (!root.navActive) return
+    // Any key that reaches the ring is attention: the surface is only fed keys
+    // while it holds focus, so this covers the pad, the keyboard and the ones
+    // the ring does not itself act on.
+    root.navPoke()
     var key = event.key
     if (key === Qt.Key_Escape || key === Qt.Key_Back) {
       root.navLeaveLocal(); event.accepted = true; return
@@ -521,15 +674,36 @@ BarWidget {
   }
 
   onNavActiveChanged: {
-    if (root.navActive) root.navTakeFocus()
-    else {
+    if (root.navActive) {
+      root.navFocusSeen = false
+      root.navPoke()
+      root.navTakeFocus()
+    } else {
       navPrimeTimer.stop()
+      navIdleTimer.stop()
+      navFocusLossTimer.stop()
       root.navPrimed = false
+      root.navFocusSeen = false
     }
   }
 
-  // A panel closed and handed the keyboard back.
-  onNavYieldedChanged: if (root.navActive && !root.navYielded) root.navTakeFocus()
+  // A panel closed and handed the keyboard back — or opened and took it. Both
+  // edges move the idle clock and re-arm the focus watch.
+  onNavYieldedChanged: {
+    if (root.navActive && !root.navYielded) root.navTakeFocus()
+    root.navPoke()
+    root.navFocusWatch()
+  }
+
+  onNavSurfaceFocusedChanged: root.navFocusWatch()
+
+  // The lock is the case that produced this whole section: the ring outlived
+  // one, and hyprpad sat in `omarchy-ui` for hours behind it.
+  onNavSessionLockedChanged: if (root.navSessionLocked) root.navLeaveLocal()
+
+  // A hot-reloaded plugin is a new widget object; the old one must not leave
+  // its layer surface — and therefore hyprpad's mode — behind it.
+  Component.onDestruction: root.navShutdown()
 
   Timer {
     id: navPrimeTimer
@@ -538,6 +712,47 @@ BarWidget {
     // number, on purpose — this is the same hazard (omacom/omarchy#9029).
     interval: 75
     onTriggered: if (root.navActive) root.navPrimed = true
+  }
+
+  // Exit 1: the idle timeout. Single-shot and restarted by `navPoke`, so the
+  // ring lives exactly as long as the user keeps touching it.
+  //
+  // While a panel is open the window stretches rather than stopping. It has to
+  // stretch — the panel owns the keyboard, so the ring sees no keys, and
+  // somebody reading a network list is not idle — and it must not stop, because
+  // `activePopout` is the bar's flag, not ours, and a ring whose only exit is
+  // somebody else's flag clearing is precisely the ring that got stuck. A
+  // minute of nothing at all with a panel up is abandoned by any reading.
+  Timer {
+    id: navIdleTimer
+    interval: root.navIdleSec * (root.navYielded ? 5 : 1) * 1000
+    onTriggered: if (root.navActive) root.navLeaveLocal()
+  }
+
+  // Exit 2: the grace on losing the keyboard. It only has to be shorter than
+  // the idle timeout that backs it up, so it is sized for the slowest handback
+  // rather than the fastest: a panel closing gives its focus back through the
+  // compositor, and the ring then re-primes Exclusive -> OnDemand to take it.
+  // Three quarters of a second of extra life for an abandoned ring costs
+  // nothing next to stealing the ring back from someone who just pressed B.
+  Timer {
+    id: navFocusLossTimer
+    interval: 750
+    onTriggered:
+      if (root.navActive && !root.navYielded && !root.navSurfaceFocused) root.navLeaveLocal()
+  }
+
+  // Exit 4: nothing left to focus. `onClickTargetsChanged` catches a target
+  // registering or going away, but a widget that merely hides itself changes
+  // `moduleTargetClickable` without touching the registry — so the ring
+  // re-checks its own stops while it is up. One pass over a handful of bar
+  // items, once a second, and only during bar mode.
+  Timer {
+    id: navGuardTimer
+    interval: 1000
+    repeat: true
+    running: root.navActive
+    onTriggered: root.navRevalidateNow()
   }
 
   Connections {
@@ -610,6 +825,12 @@ BarWidget {
       id: navKeys
       anchors.fill: parent
       focus: true
+
+      // Whether the compositor is feeding this surface keys. The attached
+      // `Window.active` resolves to the layer surface's backing window, and on
+      // Wayland a window is active exactly while it holds the keyboard.
+      readonly property bool windowActive: Window.active
+
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) { root.navKey(event) }
     }
