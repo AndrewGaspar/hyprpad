@@ -96,7 +96,8 @@ h.bind("guide+y",  h.keyboard { mode = "split" })
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button, held with it
 h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
 h.button("l5",      h.exec "voxtype record toggle")      -- any other action fires once, on press
-h.osk_button("y",   h.key "space")                       -- only while the OSK is up; keys only
+h.osk_button("y",   h.key "space")                       -- only while the OSK is up
+h.osk_button("l2",  h.osk "shift")                       -- the keyboard's own actions, not just keys
 ```
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,

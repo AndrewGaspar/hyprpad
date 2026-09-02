@@ -2488,6 +2488,14 @@ mod tests {
 
         assert_eq!(lua.own_lizard(), toml.own_lizard());
         assert_eq!(lua.cursor(), toml.cursor());
+        // `guide_in` is a guard, not a `CursorConfig` field, so `cursor()`
+        // above would not notice it drifting. Both front-ends can spell it.
+        let in_game = crate::config::ModeState::new("game", Vec::new());
+        assert_eq!(
+            lua.cursor_guide_enabled_in(&in_game),
+            toml.cursor_guide_enabled_in(&in_game),
+            "the guide-held cursor differs between config.lua and config.toml"
+        );
         assert_eq!(lua.scroll(), toml.scroll());
         assert_eq!(lua.haptics(), toml.haptics());
         // A TOML config has no modes, so a Lua binding guarded INTO one has no
@@ -2496,6 +2504,11 @@ mod tests {
         // `omarchy-ui` — modes a TOML user never enters. What must still agree
         // binding for binding is the pad a TOML user actually gets — the
         // default mode.
+        //
+        // Guide CHORDS are the exception to that exception: `resolve` is
+        // guard-blind (`resolve_in` is the one that applies a guard), so a
+        // chord guarded into a mode — `guide+rpad_click`, live only in `game`
+        // — still needs its row in the fixture below.
         let st = crate::config::ModeState::new(lua.default_mode(), Vec::new());
         assert_eq!(&lua.buttons_in(&st), toml.buttons());
         assert_eq!(lua.osk_buttons(), toml.osk_buttons());
@@ -2545,6 +2558,7 @@ one_euro_min_cutoff = 0.3
 one_euro_beta = 1.0
 one_euro_d_cutoff = 1.0
 hysteresis = 0.0008
+guide_in = ["game"]
 
 [haptics]
 cursor_spacing_px = 96
@@ -2568,6 +2582,7 @@ l2 = "mouse right"
 [osk_buttons]
 y = "key space"
 x = "key backspace"
+l2 = "osk shift"
 
 [bindings]
 "guide+r1" = "workspace +1"
@@ -2586,6 +2601,7 @@ x = "key backspace"
 "guide+l2" = "dispatch hl.dsp.group.prev()"
 "guide+r2" = "dispatch hl.dsp.group.next()"
 "guide+y" = "keyboard split"
+"guide+rpad_click" = "mouse left"
 "guide+view" = "exec hyprpad-cheatsheet toggle"
 "#;
 }
