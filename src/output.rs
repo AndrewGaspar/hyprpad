@@ -35,8 +35,18 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 // Virtual pointer (zwlr_virtual_pointer_v1)
 // ---------------------------------------------------------------------------
 
+/// The Linux evdev codes for the three mouse buttons (`input-event-codes.h`).
+///
+/// They share one code space with the `KEY_*` keyboard codes, which is what
+/// lets a bare-button binding carry a click as an ordinary [`crate::config::
+/// Action::Key`]: the daemon looks at the code and routes a `BTN_*` one to the
+/// virtual pointer instead of the virtual keyboard.
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
+
 /// A mouse button, mapped to its Linux evdev button code on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PointerButton {
     Left,
     Right,
@@ -46,10 +56,28 @@ pub enum PointerButton {
 impl PointerButton {
     /// The `BTN_*` evdev code the protocol expects.
     fn code(self) -> u32 {
+        u32::from(self.evdev())
+    }
+
+    /// The button's evdev code: [`BTN_LEFT`], [`BTN_RIGHT`] or [`BTN_MIDDLE`].
+    pub fn evdev(self) -> u16 {
         match self {
-            PointerButton::Left => 0x110,   // BTN_LEFT
-            PointerButton::Right => 0x111,  // BTN_RIGHT
-            PointerButton::Middle => 0x112, // BTN_MIDDLE
+            PointerButton::Left => BTN_LEFT,
+            PointerButton::Right => BTN_RIGHT,
+            PointerButton::Middle => BTN_MIDDLE,
+        }
+    }
+
+    /// The button an evdev code names, or `None` for anything that is not one
+    /// of the three mouse buttons — a `KEY_*` keyboard code in particular. This
+    /// is the routing decision for a bare-button binding: `Some` goes to the
+    /// virtual pointer, `None` to the virtual keyboard.
+    pub fn from_evdev(code: u16) -> Option<PointerButton> {
+        match code {
+            BTN_LEFT => Some(PointerButton::Left),
+            BTN_RIGHT => Some(PointerButton::Right),
+            BTN_MIDDLE => Some(PointerButton::Middle),
+            _ => None,
         }
     }
 }
@@ -447,5 +475,20 @@ mod tests {
         assert_eq!(PointerButton::Left.code(), 0x110);
         assert_eq!(PointerButton::Right.code(), 0x111);
         assert_eq!(PointerButton::Middle.code(), 0x112);
+    }
+
+    #[test]
+    fn pointer_buttons_round_trip_through_their_evdev_codes() {
+        for b in [PointerButton::Left, PointerButton::Right, PointerButton::Middle] {
+            assert_eq!(PointerButton::from_evdev(b.evdev()), Some(b));
+        }
+        assert_eq!(PointerButton::from_evdev(BTN_LEFT), Some(PointerButton::Left));
+        assert_eq!(PointerButton::from_evdev(BTN_RIGHT), Some(PointerButton::Right));
+        assert_eq!(PointerButton::from_evdev(BTN_MIDDLE), Some(PointerButton::Middle));
+        // A keyboard code is not a mouse button, and neither are the codes on
+        // either side of the three (BTN_MOUSE's neighbours BTN_SIDE/BTN_EXTRA).
+        for code in [0u16, 1, 103, 255, 0x10f, 0x113, 0x114, u16::MAX] {
+            assert_eq!(PointerButton::from_evdev(code), None, "code {code:#x}");
+        }
     }
 }

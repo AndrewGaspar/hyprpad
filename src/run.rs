@@ -430,17 +430,19 @@ pub fn run() -> std::io::Result<()> {
             Input::ReadersEnded => {
                 eprintln!("hyprpad: controller disconnected, waiting for it to return…");
                 status.set_connected(false);
-                // Release everything held for the vanished controller — a
-                // synthetic click and all smoothing/gesture state — so nothing is
-                // stuck down and a stale `prev` cannot jump the cursor on return.
+                // Release everything held for the vanished controller — every
+                // bare-button key and click, and all smoothing/gesture state —
+                // so nothing is stuck down and a stale `prev` cannot jump the
+                // cursor on return. No report will arrive to `reconcile` the
+                // held set against, so it is released here, explicitly.
                 reset_frame_state(
                     &mut engine,
                     &mut cursor,
                     &mut scroll,
                     &mut osk_route,
                     &mut prev_frame,
-                    pointer.as_mut(),
                 );
+                button_keys.release_all(&mut keyboard, pointer.as_mut());
                 // Same contract for the game: a vanished controller must not
                 // leave the virtual pad holding its last frame, or a rumble
                 // running with nothing left to stop it.
@@ -454,7 +456,6 @@ pub fn run() -> std::io::Result<()> {
                     &mut cursor,
                     &mut scroll,
                     &mut osk_route,
-                    pointer.as_mut(),
                     &mut own_lizard,
                     &mut modes,
                 );
@@ -574,15 +575,19 @@ pub fn run() -> std::io::Result<()> {
                         now,
                     );
                 }
-                // Bare-button bindings (D-pad -> arrows by default). Gated OFF on
-                // the guide layer (so guide+dpad stays a chord) and while the OSK
-                // owns the pads. The per-mode gate is in the *map*: `modes
-                // .buttons()` already carries only the bindings whose guard
-                // passes, so a game mode that guards them out yields an empty
-                // map and `reconcile` releases anything held.
+                // Bare-button bindings (D-pad -> arrows, pad click / triggers ->
+                // mouse clicks by default; each code goes to the device it
+                // belongs to). Gated OFF on the guide layer (so guide+dpad and
+                // guide+l2/r2 stay chords) and while the OSK owns the pads (it
+                // takes the pad clicks as key commits itself, via `route_osk`).
+                // The per-mode gate is in the *map*: `modes.buttons()` already
+                // carries only the bindings whose guard passes, so a game mode
+                // that guards them out yields an empty map and `reconcile`
+                // releases anything held.
                 let buttons_active = !engine.guide_active() && !osk.is_active();
                 drive_buttons(
                     &mut keyboard,
+                    pointer.as_mut(),
                     &frame,
                     modes.buttons(),
                     &mut button_keys,
@@ -738,19 +743,20 @@ fn button_pad(b: report::Button) -> HapticPad {
 }
 
 /// Forget all per-frame state on disconnect (equivalently, before a reconnect —
-/// no reports flow in between): drop any held synthetic click, then reset the
-/// gesture engine, the cursor/scroll dampers, and the OSK router, and clear the
-/// previous frame. Without this a stale `prev` (position or timestamp) would
-/// jump the cursor or misfire a gesture on the first frame after the gap.
+/// no reports flow in between): reset the gesture engine, the cursor/scroll
+/// dampers, and the OSK router, and clear the previous frame. Without this a
+/// stale `prev` (position or timestamp) would jump the cursor or misfire a
+/// gesture on the first frame after the gap. Held bare-button output (keys and
+/// clicks alike) is [`ButtonKeys`]'s to release; the caller does that beside
+/// this.
 fn reset_frame_state(
     engine: &mut GestureEngine,
     cursor: &mut CursorState,
     scroll: &mut ScrollState,
     osk_route: &mut OskRoute,
     prev_frame: &mut report::Frame,
-    pointer: Option<&mut VirtualPointer>,
 ) {
-    release_outputs(cursor, scroll, osk_route, pointer);
+    release_outputs(cursor, scroll, osk_route);
     // Forgetting held buttons is right ONLY here: the device went away, so
     // whatever was held is gone too. A mode transition must never do this
     // (see `mode_handoff`).
@@ -758,26 +764,12 @@ fn reset_frame_state(
     *prev_frame = report::Frame::default();
 }
 
-/// Release everything the desktop layer is *outputting* — held synthetic mouse
-/// buttons, and the cursor/scroll/OSK smoothing state (so nothing differences
-/// across a gap) — WITHOUT touching gesture edge state. This is the safe half of
-/// a reset: it changes what we emit, not what we think is pressed.
-fn release_outputs(
-    cursor: &mut CursorState,
-    scroll: &mut ScrollState,
-    osk_route: &mut OskRoute,
-    pointer: Option<&mut VirtualPointer>,
-) {
-    if let Some(ptr) = pointer {
-        if cursor.left_down {
-            ptr.button(PointerButton::Left, false);
-            cursor.left_down = false;
-        }
-        if cursor.right_down {
-            ptr.button(PointerButton::Right, false);
-            cursor.right_down = false;
-        }
-    }
+/// Drop the desktop layer's *continuous* output state — the cursor/scroll/OSK
+/// smoothing state, so nothing differences across a gap — WITHOUT touching
+/// gesture edge state. This is the safe half of a reset: it changes what we
+/// emit, not what we think is pressed. Pressed output (a held key or mouse
+/// button) is a bare-button binding, released by [`ButtonKeys::release_all`].
+fn release_outputs(cursor: &mut CursorState, scroll: &mut ScrollState, osk_route: &mut OskRoute) {
     cursor.damper.reset();
     scroll.reset();
     osk_route.reset();
@@ -787,7 +779,7 @@ fn release_outputs(
 /// — a focus change, a rename of the focused window, the periodic process
 /// rescan, a manual override from a binding, or a reload.
 ///
-/// Whatever the outgoing mode was holding — a synthetic click, a held key, the
+/// Whatever the outgoing mode was holding — a held key or mouse button, the
 /// virtual pad's last stick values, a mid-flight gesture — is let go before the
 /// incoming mode's gates apply. One function, so a new way of *noticing* a
 /// transition can never come with a subtly different way of *making* one.
@@ -808,8 +800,8 @@ fn mode_handoff(
     // held. Resetting edge state would make it look freshly pressed on the next
     // frame -> fire again -> toggle the overlay closed -> flip back -> reset ->
     // ... an open/close loop for as long as the chord is held (observed live).
-    release_outputs(cursor, scroll, osk_route, pointer);
-    button_keys.release_all(keyboard);
+    release_outputs(cursor, scroll, osk_route);
+    button_keys.release_all(keyboard, pointer);
     gamepad.release(haptics);
 }
 
@@ -835,11 +827,6 @@ struct CursorState {
     damper: PadDamper,
     /// Desktop-cursor gain (px per pad count), from `[cursor] sens`.
     sens: f64,
-    /// Whether the synthetic left mouse button is currently held.
-    left_down: bool,
-    /// Whether the synthetic right mouse button is currently held (full left
-    /// trigger pull → right click on the desktop).
-    right_down: bool,
     /// Pixels of cursor travel accumulated toward the next haptic texture tick
     /// (`[haptics] cursor` / `cursor_spacing_px`). Reset on lift so a re-touch
     /// starts a fresh spacing.
@@ -851,8 +838,6 @@ impl CursorState {
         CursorState {
             damper: damper_from(cfg),
             sens: cfg.sens,
-            left_down: false,
-            right_down: false,
             travel_px: 0.0,
         }
     }
@@ -868,11 +853,14 @@ impl CursorState {
     }
 }
 
-/// Drive the pointer from the right trackpad for a single frame.
+/// Drive the pointer's *motion* from the right trackpad for a single frame.
 ///
 /// Active only on the ambient (non-guide) layer and when the arbiter is not
 /// suppressing desktop control: the guide layer owns the pad for workspace
-/// gestures, and a focused game owns it for itself.
+/// gestures, and a focused game owns it for itself. Mouse *buttons* are not
+/// this function's business: a pad click or trigger pull is a bare-button
+/// binding (`rpad_click = "mouse left"` by default), pressed and released by
+/// [`drive_buttons`] under its own gate.
 fn drive_cursor(
     ptr: &mut VirtualPointer,
     frame: &report::Frame,
@@ -883,16 +871,8 @@ fn drive_cursor(
     now: Instant,
 ) {
     if guide_active || suppressed {
-        // Release the desktop's claim: drop any held click and forget the
-        // tracking origin (all filter state) so re-entry starts clean.
-        if st.left_down {
-            ptr.button(PointerButton::Left, false);
-            st.left_down = false;
-        }
-        if st.right_down {
-            ptr.button(PointerButton::Right, false);
-            st.right_down = false;
-        }
+        // Release the desktop's claim: forget the tracking origin (all filter
+        // state) so re-entry starts clean.
         st.damper.reset();
         st.travel_px = 0.0;
         return;
@@ -923,21 +903,6 @@ fn drive_cursor(
     } else {
         st.damper.reset();
         st.travel_px = 0.0;
-    }
-
-    // A hard pad click (or a full right-trigger pull) is a left click.
-    let want_down = frame.pressed(report::Button::PadRightClick)
-        || frame.pressed(report::Button::TriggerR2Full);
-    if want_down != st.left_down {
-        ptr.button(PointerButton::Left, want_down);
-        st.left_down = want_down;
-    }
-
-    // A full left-trigger pull is a right click.
-    let want_right = frame.pressed(report::Button::TriggerL2Full);
-    if want_right != st.right_down {
-        ptr.button(PointerButton::Right, want_right);
-        st.right_down = want_right;
     }
 }
 
@@ -1157,39 +1122,88 @@ impl ButtonKeys {
         events
     }
 
-    /// Release every held key immediately, outside the per-frame reconcile.
+    /// Release every held key and mouse button immediately, outside the
+    /// per-frame reconcile.
     ///
-    /// Used by the mode-transition handoff: `reconcile` would get there on the
-    /// next report anyway, but "no key is stranded across a mode switch" should
-    /// not depend on another report arriving.
-    fn release_all(&mut self, kbd: &mut Option<VirtualKeyboard>) {
+    /// Used by the mode-transition handoff and the disconnect path: `reconcile`
+    /// would get there on the next report anyway, but "no key is stranded
+    /// across a mode switch" should not depend on another report arriving —
+    /// and after a disconnect none will.
+    fn release_all(
+        &mut self,
+        kbd: &mut Option<VirtualKeyboard>,
+        mut pointer: Option<&mut VirtualPointer>,
+    ) {
         for (_, code) in self.held.drain() {
+            emit_button_code(kbd, pointer.as_deref_mut(), code, false);
+        }
+    }
+}
+
+/// Which virtual device a bare-button binding's evdev code is emitted on.
+///
+/// The `[buttons]` map holds one code space — evdev's — and this is the single
+/// place it is split: a `BTN_*` mouse code (`mouse left`, 0x110..=0x112) is
+/// clicked through the virtual pointer, everything else is a `KEY_*` typed
+/// through the virtual keyboard. Pure, so the decision is unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Keyboard,
+    Pointer(PointerButton),
+}
+
+fn route(code: u16) -> Route {
+    match PointerButton::from_evdev(code) {
+        Some(b) => Route::Pointer(b),
+        None => Route::Keyboard,
+    }
+}
+
+/// Emit one bare-button edge on the device its code belongs to. A missing
+/// device (uinput or the virtual-pointer protocol unavailable) makes the edge a
+/// no-op for that code only; the other device keeps working, and the held set
+/// is updated regardless so nothing is remembered as down that was never sent.
+fn emit_button_code(
+    kbd: &mut Option<VirtualKeyboard>,
+    pointer: Option<&mut VirtualPointer>,
+    code: u16,
+    pressed: bool,
+) {
+    match route(code) {
+        Route::Pointer(mb) => {
+            if let Some(ptr) = pointer {
+                ptr.button(mb, pressed);
+            }
+        }
+        Route::Keyboard => {
             if let Some(kbd) = kbd.as_mut() {
-                kbd.key(code, false);
+                kbd.key(code, pressed);
             }
         }
     }
 }
 
-/// Drive the bare-button keyboard for a single frame: press each bound button's
-/// key on its down edge and release it on its up edge, subject to `active` (the
-/// guide/OSK/suppressed gate, mirroring [`drive_cursor`]). A missing keyboard
-/// (uinput unavailable) makes this a no-op.
+/// Drive the bare-button bindings for a single frame: press each bound button's
+/// key or mouse button on its down edge and release it on its up edge, subject
+/// to `active` (the guide/OSK/suppressed gate, mirroring [`drive_cursor`]).
+/// Each code is routed to the device it belongs to ([`route`]); a missing
+/// keyboard or pointer silences the codes that would have gone to it and
+/// nothing else, so the pad click still clicks on a box with no uinput.
 ///
 /// Feedback fires on the **press edge only** ([`Haptic::Button`], off by
 /// default): a held D-pad auto-repeats in the kernel — which produces no further
 /// events here, so a repeat never buzzes — and a release is not a keystroke.
 fn drive_buttons(
     kbd: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
     frame: &report::Frame,
     bindings: &HashMap<report::Button, u16>,
     st: &mut ButtonKeys,
     active: bool,
     hx: &mut HapticCtx,
 ) {
-    let Some(kbd) = kbd.as_mut() else { return };
     for (btn, code, pressed) in st.reconcile(bindings, |b| frame.pressed(b), active) {
-        kbd.key(code, pressed);
+        emit_button_code(kbd, pointer.as_deref_mut(), code, pressed);
         if pressed {
             hx.fire(Haptic::Button, button_pad(btn));
         }
@@ -1605,7 +1619,6 @@ fn apply_reload(
     cursor: &mut CursorState,
     scroll: &mut ScrollState,
     osk_route: &mut OskRoute,
-    pointer: Option<&mut VirtualPointer>,
     own_lizard: &mut bool,
     modes: &mut ModeEngine,
 ) {
@@ -1620,16 +1633,10 @@ fn apply_reload(
         return;
     }
 
-    // Release any held synthetic left click before rebuilding the cursor damper,
-    // so a reload mid-drag never strands the button down (the rebuilt state
-    // starts with `left_down = false`).
-    if let Some(ptr) = pointer {
-        if cursor.left_down {
-            ptr.button(PointerButton::Left, false);
-            cursor.left_down = false;
-        }
-    }
-
+    // A held key or mouse button is a bare-button binding, and the next frame's
+    // `reconcile` settles it against the NEW map: a binding that survived the
+    // reload stays held (a reload mid-drag keeps the drag), one that changed or
+    // vanished is released. Nothing to do here.
     cursor.reconfigure(config.cursor());
     scroll.reconfigure(config.scroll(), config.cursor());
     // The OSK router shares the `[cursor]` smoothing knobs; rebuild it too so a
@@ -1645,7 +1652,8 @@ fn apply_reload(
 
     // Modes and guards came from the new file: re-resolve immediately against
     // the *unchanged* context, so the reload takes effect without waiting for
-    // the next focus change. A held click/key was already released above.
+    // the next focus change. A held key or click settles on the next frame's
+    // `reconcile` against the re-resolved map.
     if modes.reconfigure(config) {
         eprintln!("hyprpad: mode -> {} (reload)", modes.active());
     }
@@ -2613,16 +2621,31 @@ mod tests {
     }
 
     #[test]
-    fn cursor_reconfigure_applies_sens_and_keeps_held_click() {
+    fn cursor_reconfigure_applies_sens() {
         // A live reload rebuilds the damper (fresh filter state, no jump) and
-        // applies the new gain, but must not clear a held click — the reload path
-        // releases that itself before calling this.
+        // applies the new gain. There is no held-click state here to preserve
+        // any more: a click is a bare-button binding, `ButtonKeys`'s to hold.
         let mut st = CursorState::new(&CursorConfig::default());
-        st.left_down = true;
         let cfg = CursorConfig { sens: 0.2, ..CursorConfig::default() };
         st.reconfigure(&cfg);
         assert_eq!(st.sens, 0.2);
-        assert!(st.left_down, "reconfigure must not clear a held click");
+    }
+
+    #[test]
+    fn bare_button_codes_route_by_the_evdev_code_space() {
+        // The whole design in one decision: the three BTN_MOUSE codes go to the
+        // pointer, every KEY_* code (and anything else) to the keyboard.
+        assert_eq!(route(0x110), Route::Pointer(PointerButton::Left));
+        assert_eq!(route(0x111), Route::Pointer(PointerButton::Right));
+        assert_eq!(route(0x112), Route::Pointer(PointerButton::Middle));
+        for code in [1u16, 14, 28, 103, 158, 255, 0x10f, 0x113] {
+            assert_eq!(route(code), Route::Keyboard, "code {code:#x}");
+        }
+        // And the config agrees on what a mouse binding parses to.
+        assert_eq!(
+            Action::parse("mouse left"),
+            Ok(Action::Key(PointerButton::Left.evdev()))
+        );
     }
 
     #[test]
@@ -2687,13 +2710,42 @@ mod tests {
 
     #[test]
     fn release_all_drops_every_held_key_with_no_keyboard() {
-        // `release_all` runs on the transition path, where the uinput keyboard
-        // may legitimately be absent; it must still clear the held set.
+        // `release_all` runs on the transition and disconnect paths, where the
+        // uinput keyboard and the virtual pointer may legitimately be absent;
+        // it must still clear the held set — mouse codes included, with no
+        // pointer to send their release to.
         let mut keys = ButtonKeys::new();
-        let map = HashMap::from([(report::Button::DpadUp, 103u16), (report::Button::A, 28)]);
+        let map = HashMap::from([
+            (report::Button::DpadUp, 103u16),
+            (report::Button::A, 28),
+            (report::Button::TriggerR2Full, PointerButton::Left.evdev()),
+            (report::Button::TriggerL2Full, PointerButton::Right.evdev()),
+        ]);
         keys.reconcile(&map, |_| true, true);
+        assert_eq!(keys.held.len(), 4);
+        keys.release_all(&mut None, None);
+        assert!(keys.held.is_empty());
+
+        // The same with no devices on the per-frame path: `drive_buttons` must
+        // not bail out when the keyboard is missing, because the pointer may
+        // still be there (and vice versa) — the held set tracks either way.
+        let mut keys = ButtonKeys::new();
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let bit = |b: report::Button| -> u32 {
+            (0..32)
+                .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
+                .expect("button has a bit")
+        };
+        let frame = report::Frame {
+            buttons: (1 << bit(report::Button::TriggerR2Full)) | (1 << bit(report::Button::DpadUp)),
+            ..report::Frame::default()
+        };
+        drive_buttons(&mut kbd, None, &frame, &map, &mut keys, true, &mut hx);
         assert_eq!(keys.held.len(), 2);
-        keys.release_all(&mut None);
+        drive_buttons(&mut kbd, None, &report::Frame::default(), &map, &mut keys, true, &mut hx);
         assert!(keys.held.is_empty());
     }
 

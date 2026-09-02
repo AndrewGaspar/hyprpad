@@ -36,6 +36,7 @@
 //! h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 //! h.bind("guide+y",  h.keyboard { mode = "split" })
 //! h.button("dpad_up", h.key "up")       -- bare button, no guide modifier
+//! h.button("r2",      h.mouse "left")   -- a mouse button, through the pointer
 //! h.osk_button("y",   h.key "space")    -- only while the OSK is up
 //!
 //! -- Modes: a mode is a NAMED CONTEXT selected by a predicate. Rules run in
@@ -92,7 +93,7 @@ use crate::config::{
     Action, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig, ModeDef,
     ScrollConfig, ScrollMode,
 };
-use crate::config::{key_code, parse_button, GestureKey};
+use crate::config::{is_mouse_code, key_code, mouse_code, parse_button, GestureKey};
 use crate::mode::Context;
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value, VmState};
 use std::cell::{Cell, RefCell};
@@ -793,6 +794,7 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("exec", action_ctor(lua, "exec", "cmd")?)?;
     h.set("dispatch", action_ctor(lua, "dispatch", "expr")?)?;
     h.set("key", action_ctor(lua, "key", "name")?)?;
+    h.set("mouse", action_ctor(lua, "mouse", "button")?)?;
     h.set("set_mode", action_ctor(lua, "set_mode", "name")?)?;
     h.set("fullscreen", action_nullary(lua, "fullscreen")?)?;
     h.set("clear_mode", action_nullary(lua, "clear_mode")?)?;
@@ -1027,6 +1029,15 @@ fn bind_fn(
                          (got {action:?} for '{key}')"
                     )));
                 };
+                // The OSK types a key by name through its own virtual keyboard;
+                // a mouse button has no meaning there (and the OSK already owns
+                // the pad clicks as key commits). Same rule as the TOML parser.
+                if matches!(kind, BindKind::OskButton) && is_mouse_code(code) {
+                    return Err(err(format!(
+                        "h.osk_button sends keys through the on-screen keyboard; a mouse \
+                         button makes no sense there — bind '{key}' with h.button instead"
+                    )));
+                }
                 match kind {
                     // A button bound a *second* time is the same button meaning
                     // something else in another mode — `b` is backspace on the
@@ -1423,7 +1434,7 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
             let Some(verb) = verb else {
                 return Err(err(
                     "that table is not an action — use one of h.workspace/h.exec/h.dispatch/\
-                     h.keyboard/h.key/h.fullscreen/h.set_mode/h.clear_mode/h.none",
+                     h.keyboard/h.key/h.mouse/h.fullscreen/h.set_mode/h.clear_mode/h.none",
                 ));
             };
             let arg: String = t.get::<Option<String>>("arg")?.unwrap_or_default();
@@ -1432,6 +1443,9 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
                 "clear_mode" => Ok(Action::ClearMode),
                 "none" => Ok(Action::None),
                 "key" => key_code(&arg).map(Action::Key).map_err(err),
+                // A mouse button is a key in evdev's code space; the daemon
+                // routes it to the virtual pointer by its code.
+                "mouse" => mouse_code(&arg).map(Action::Key).map_err(err),
                 "set_mode" => {
                     if arg.is_empty() {
                         Err(err("h.set_mode needs a mode name"))
@@ -1684,6 +1698,65 @@ mod tests {
     fn a_button_bound_to_a_non_key_action_is_an_error() {
         let e = load_str(r#"hyprpad.button("a", hyprpad.exec "walker")"#, "t.lua").unwrap_err();
         assert!(e.contains("must be a key"), "{e}");
+    }
+
+    #[test]
+    fn h_mouse_binds_a_mouse_button_as_a_bare_button() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.button("r2", h.mouse "left")
+            h.button("l2", h.mouse "right")
+            h.button("rpad_click", h.mouse "LMB")
+            h.button("r3", "mouse middle")   -- the TOML grammar, as a plain string
+            h.button("l3", h.key "btn_left") -- the evdev spelling through h.key
+            "#,
+        );
+        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&272));
+        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&273));
+        assert_eq!(c.buttons().get(&Button::PadRightClick), Some(&272));
+        assert_eq!(c.buttons().get(&Button::R3), Some(&274));
+        assert_eq!(c.buttons().get(&Button::L3), Some(&272));
+
+        let e = load_str(r#"hyprpad.button("r2", hyprpad.mouse "side")"#, "t.lua").unwrap_err();
+        assert!(e.contains("unknown mouse button 'side'"), "{e}");
+        let e = load_str(r#"hyprpad.button("r2", hyprpad.mouse {})"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.mouse needs a button"), "{e}");
+    }
+
+    #[test]
+    fn an_osk_button_cannot_be_a_mouse_button() {
+        for action in [r#"hyprpad.mouse "left""#, r#"hyprpad.key "btn_right""#, r#""click 3""#] {
+            let src = format!(r#"hyprpad.osk_button("y", {action})"#);
+            let e = load_str(&src, "t.lua").unwrap_err();
+            assert!(e.contains("mouse button makes no sense there"), "{e}");
+            assert!(e.contains("h.button"), "should suggest h.button: {e}");
+            assert!(e.contains("'y'"), "should name the button: {e}");
+        }
+    }
+
+    #[test]
+    fn a_mouse_binding_is_guarded_like_a_key_binding() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.button("r2", h.mouse "left"):only_in("desktop")
+            h.button("l2", h.mouse "right"):not_in("game")
+            h.button("dpad_up", h.key "up"):only_in("desktop")
+            "#,
+        );
+        let game = ModeState::new("game", vec![]);
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerR2Full), Some(&272));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerL2Full), Some(&273));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::DpadUp), Some(&103));
+        // In the game the clicks are gone with the arrows: the map is what a
+        // mode takes away, and a click is just another entry in it.
+        assert!(c.buttons_in(&game).is_empty());
+        assert_eq!(c.button_guards.get(&Button::TriggerR2Full), c.button_guards.get(&Button::DpadUp));
     }
 
     #[test]
@@ -2266,6 +2339,9 @@ dpad_left = "key left"
 dpad_right = "key right"
 a = "key enter"
 b = "key backspace"
+rpad_click = "mouse left"
+r2 = "mouse left"
+l2 = "mouse right"
 
 [osk_buttons]
 y = "key space"
@@ -2276,7 +2352,6 @@ x = "key backspace"
 "guide+l1" = "workspace -1"
 "guide+stick_right" = "workspace +1"
 "guide+stick_left"  = "workspace -1"
-"guide+x" = "exec omarchy-menu"
 "guide+a" = "exec voxtype record toggle"
 "guide+b" = "dispatch hl.dsp.window.close()"
 "guide+r5" = "exec playerctl play-pause"
