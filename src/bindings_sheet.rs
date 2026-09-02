@@ -57,8 +57,8 @@
 use std::fmt::Write as _;
 
 use crate::config::{
-    osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, ModeState, OskAction,
-    WorkspaceTarget,
+    osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, KeyChord, ModeState,
+    OskAction, WorkspaceTarget,
 };
 use crate::gesture::{Stick, StickDir};
 use crate::report::Button;
@@ -726,9 +726,12 @@ pub fn action_string(a: &Action) -> String {
         }
         // A mouse button is a `Key` in evdev's code space; spell it back the
         // way a config would write it, so the round trip lands on `mouse`.
-        Action::Key(code) => match mouse_name(*code) {
+        // Only a *bare* one, though: `shift+btn_left` has modifiers to name and
+        // there is no `mouse` spelling that carries them, so it prints as the
+        // key combo it parsed from.
+        Action::Key(chord) => match bare_mouse_name(chord) {
             Some(button) => format!("mouse {button}"),
-            None => format!("key {}", key_name(*code)),
+            None => format!("key {}", chord_name(chord)),
         },
         Action::SetMode(m) => format!("set_mode {m}"),
         Action::ClearMode => "clear_mode".to_string(),
@@ -745,7 +748,7 @@ pub fn action_kind(a: &Action) -> &'static str {
         Action::Exec(_) => "exec",
         Action::Dispatch(_) => "dispatch",
         Action::ToggleKeyboard { .. } => "keyboard",
-        Action::Key(code) if mouse_name(*code).is_some() => "mouse",
+        Action::Key(chord) if bare_mouse_name(chord).is_some() => "mouse",
         Action::Key(_) => "key",
         Action::SetMode(_) => "set_mode",
         Action::ClearMode => "clear_mode",
@@ -757,7 +760,7 @@ pub fn action_kind(a: &Action) -> &'static str {
 /// `osk shift` — what [`OskAction::parse`] reads back.
 pub fn osk_action_string(a: OskAction) -> String {
     match a {
-        OskAction::Key(code) => action_string(&Action::Key(code)),
+        OskAction::Key(chord) => action_string(&Action::Key(chord)),
         OskAction::Commit => "osk commit".to_string(),
         OskAction::Shift => "osk shift".to_string(),
         OskAction::Dismiss => "osk dismiss".to_string(),
@@ -780,7 +783,7 @@ pub fn osk_action_kind(a: OskAction) -> &'static str {
 /// moves `osk shift` to another button reads the same as the default.
 pub fn derive_osk_label(a: OskAction) -> String {
     match a {
-        OskAction::Key(code) => derive_label(&Action::Key(code)),
+        OskAction::Key(chord) => derive_label(&Action::Key(chord)),
         OskAction::Commit => "Type the key under the cursor".to_string(),
         OskAction::Shift => "Shift (hold)".to_string(),
         OskAction::Dismiss => "Close the keyboard".to_string(),
@@ -800,6 +803,11 @@ fn target(t: &WorkspaceTarget) -> String {
 /// [`crate::config::key_code`]. Unknown codes print numerically rather than
 /// panicking, so a future key added to one table cannot break the sheet.
 pub fn key_name(code: u16) -> String {
+    // The letter and digit rows are computed from the same table `key_code`
+    // parses them with, so the two directions cannot drift.
+    if let Some(c) = crate::config::row_name(code) {
+        return c.to_string();
+    }
     match code {
         103 => "up",
         108 => "down",
@@ -824,6 +832,31 @@ pub fn key_name(code: u16) -> String {
         100 => "rightalt",
         125 => "leftmeta",
         126 => "rightmeta",
+        58 => "capslock",
+        110 => "insert",
+        59 => "f1",
+        60 => "f2",
+        61 => "f3",
+        62 => "f4",
+        63 => "f5",
+        64 => "f6",
+        65 => "f7",
+        66 => "f8",
+        67 => "f9",
+        68 => "f10",
+        87 => "f11",
+        88 => "f12",
+        12 => "minus",
+        13 => "equal",
+        26 => "leftbrace",
+        27 => "rightbrace",
+        39 => "semicolon",
+        40 => "apostrophe",
+        41 => "grave",
+        43 => "backslash",
+        51 => "comma",
+        52 => "dot",
+        53 => "slash",
         // The mouse buttons under their evdev names (`key btn_left` parses).
         // `action_string` prefers the `mouse left` spelling; this is the
         // fallback for anything that prints a code as a key name.
@@ -831,6 +864,76 @@ pub fn key_name(code: u16) -> String {
         0x111 => "btn_right",
         0x112 => "btn_middle",
         _ => return format!("keycode {code}"),
+    }
+    .to_string()
+}
+
+/// A whole [`KeyChord`] in canonical config spelling — `tab`, `shift+tab`,
+/// `ctrl+shift+tab` — the inverse of [`crate::config::KeyChord::parse`].
+pub fn chord_name(chord: &KeyChord) -> String {
+    if chord.is_plain() {
+        return key_name(chord.code());
+    }
+    let mut out = String::new();
+    for &m in chord.mods() {
+        match mod_name(m) {
+            "" => out.push_str(&key_name(m)),
+            short => out.push_str(short),
+        }
+        out.push('+');
+    }
+    out.push_str(&key_name(chord.code()));
+    out
+}
+
+/// The modifier's *config* name in the prefix of a combo: the short, unqualified
+/// spelling (`shift`, `ctrl`, `alt`, `super`) for the left-hand keys people mean
+/// when they do not say, and the explicit `right*` name for the others.
+///
+/// Both parse back to the same code ([`crate::config::modifier_code`]), so the
+/// round trip holds either way; the short one is what a config writes and what
+/// the cheat sheet should show. A modifier bound *alone* is still printed by
+/// [`key_name`] as the exact key it is — there the left/right distinction is the
+/// whole content of the binding.
+fn mod_name(code: u16) -> &'static str {
+    match code {
+        42 => "shift",
+        29 => "ctrl",
+        56 => "alt",
+        125 => "super",
+        54 => "rightshift",
+        97 => "rightctrl",
+        100 => "rightalt",
+        126 => "rightmeta",
+        // Not a modifier at all; unreachable through parsing, and printing the
+        // key's own name is the honest answer if it ever happens.
+        _ => "",
+    }
+}
+
+/// The mouse-button name of a chord that is *only* a mouse button — no
+/// modifiers to lose. `mouse left` is the config spelling for exactly that, and
+/// nothing else, so a chord with modifiers deliberately answers `None` and gets
+/// printed as a key combo instead.
+fn bare_mouse_name(chord: &KeyChord) -> Option<&'static str> {
+    chord.is_plain().then(|| mouse_name(chord.code())).flatten()
+}
+
+/// The modifier's label in the *prefix* of a combo: the short, unqualified word
+/// a person reads in "Shift+Tab". A modifier bound on its own is still labelled
+/// by its full key name ("Leftshift"), because there the exact key is the whole
+/// point; in front of a `+` it never is.
+fn mod_label(code: u16) -> String {
+    match code {
+        42 => "Shift",
+        54 => "Right Shift",
+        29 => "Ctrl",
+        97 => "Right Ctrl",
+        56 => "Alt",
+        100 => "Right Alt",
+        125 => "Super",
+        126 => "Right Super",
+        other => return capitalize(&key_name(other)),
     }
     .to_string()
 }
@@ -872,14 +975,34 @@ pub fn derive_label(a: &Action) -> String {
                 format!("On-screen keyboard ({m})")
             }
         }
-        Action::Key(code) => match mouse_name(*code) {
+        Action::Key(chord) => match bare_mouse_name(chord) {
             Some(button) => format!("{} click", capitalize(button)),
-            None => capitalize(&key_name(*code).replace("page", "page ")),
+            None => chord_label(chord),
         },
         Action::SetMode(m) => format!("Force {m} mode"),
         Action::ClearMode => "Back to automatic mode".to_string(),
         Action::None => "Unbound".to_string(),
     }
+}
+
+/// A combo in words: the modifiers by their short names, then the key, joined
+/// the way the config joins them — "Shift+Tab", "Ctrl+Left", "Shift+F". A lone
+/// key is just its own label, exactly as before combos existed.
+fn chord_label(chord: &KeyChord) -> String {
+    let key = match bare_mouse_name(&KeyChord::plain(chord.code())) {
+        Some(button) => format!("{} click", capitalize(button)),
+        None => capitalize(&key_name(chord.code()).replace("page", "page ")),
+    };
+    if chord.is_plain() {
+        return key;
+    }
+    let mut out = String::new();
+    for &m in chord.mods() {
+        out.push_str(&mod_label(m));
+        out.push('+');
+    }
+    out.push_str(&key);
+    out
 }
 
 /// "next"/"previous" for the ±1 steps that make up almost every real config,
@@ -1270,14 +1393,90 @@ mod tests {
     }
 
     #[test]
+    fn a_combo_reads_back_as_the_config_wrote_it_and_labels_in_words() {
+        use crate::config::KeyChord;
+        let k = |s: &str| KeyChord::parse(s).expect(s);
+
+        // The config spelling, both ways: what a `config.toml` would say, and
+        // what `Action::parse` reads back from it.
+        for spelling in ["shift+tab", "ctrl+left", "ctrl+shift+tab", "super+1", "shift+f"] {
+            let action = Action::Key(k(spelling));
+            assert_eq!(action_string(&action), format!("key {spelling}"));
+            assert_eq!(Action::parse(&action_string(&action)), Ok(action.clone()), "{spelling}");
+            assert_eq!(action_kind(&action), "key");
+        }
+        assert_eq!(chord_name(&k("shift+tab")), "shift+tab");
+        assert_eq!(chord_name(&k("leftshift+tab")), "shift+tab", "the short form is canonical");
+        assert_eq!(chord_name(&k("rightshift+tab")), "rightshift+tab", "but not for the right one");
+        assert_eq!(chord_name(&k("tab")), "tab", "a lone key keeps its bare name");
+        // A lone modifier is still the exact key it was bound as.
+        assert_eq!(action_string(&Action::Key(k("leftshift"))), "key leftshift");
+
+        // The derived labels: modifiers by their short names, the key by its own.
+        assert_eq!(derive_label(&Action::Key(k("shift+tab"))), "Shift+Tab");
+        assert_eq!(derive_label(&Action::Key(k("ctrl+left"))), "Ctrl+Left");
+        assert_eq!(derive_label(&Action::Key(k("shift+f"))), "Shift+F");
+        assert_eq!(derive_label(&Action::Key(k("ctrl+shift+tab"))), "Ctrl+Shift+Tab");
+        assert_eq!(derive_label(&Action::Key(k("super+1"))), "Super+1");
+        assert_eq!(derive_label(&Action::Key(k("rightalt+home"))), "Right Alt+Home");
+        // A modifier bound alone still names the exact key it is — there the
+        // left/right distinction is the point.
+        assert_eq!(derive_label(&Action::Key(k("leftshift"))), "Leftshift");
+
+        // A combo whose key is a mouse button has modifiers to name, so it
+        // prints as a key combo rather than losing them to the `mouse`
+        // spelling — and its kind follows the spelling.
+        let shift_click = Action::Key(k("shift+btn_left"));
+        assert_eq!(action_string(&shift_click), "key shift+btn_left");
+        assert_eq!(action_kind(&shift_click), "key");
+        assert_eq!(derive_label(&shift_click), "Shift+Left click");
+        assert_eq!(Action::parse("key shift+btn_left"), Ok(shift_click));
+        // A bare one is still `mouse left`.
+        assert_eq!(action_string(&Action::Key(k("btn_left"))), "mouse left");
+        assert_eq!(action_kind(&Action::Key(k("btn_left"))), "mouse");
+
+        // The OSK table renders a combo the same way.
+        let osk = OskAction::Key(k("ctrl+backspace"));
+        assert_eq!(osk_action_string(osk), "key ctrl+backspace");
+        assert_eq!(osk_action_kind(osk), "key");
+        assert_eq!(derive_osk_label(osk), "Ctrl+Backspace");
+    }
+
+    #[test]
+    fn every_name_the_sheet_prints_is_a_name_the_config_parses() {
+        // `key_name` is `key_code`'s inverse, and the letter/digit rows are
+        // computed from one table on both sides. Walk the whole keyboard range
+        // and pin the round trip, so a key added to one direction can never
+        // print as something the other cannot read back.
+        for code in 1u16..=255 {
+            let name = key_name(code);
+            if name.starts_with("keycode ") {
+                continue; // not in the table at all — printed numerically
+            }
+            assert_eq!(
+                Action::parse(&format!("key {name}")),
+                Ok(Action::Key(KeyChord::plain(code))),
+                "{code} printed as {name:?}"
+            );
+        }
+        // The letters and digits, specifically.
+        assert_eq!(key_name(30), "a");
+        assert_eq!(key_name(50), "m");
+        assert_eq!(key_name(2), "1");
+        assert_eq!(key_name(11), "0");
+        assert_eq!(key_name(88), "f12");
+        assert_eq!(key_name(52), "dot");
+    }
+
+    #[test]
     fn key_and_mode_labels() {
-        assert_eq!(derive_label(&Action::Key(103)), "Up");
-        assert_eq!(derive_label(&Action::Key(14)), "Backspace");
-        assert_eq!(derive_label(&Action::Key(104)), "Page up");
+        assert_eq!(derive_label(&Action::Key(103.into())), "Up");
+        assert_eq!(derive_label(&Action::Key(14.into())), "Backspace");
+        assert_eq!(derive_label(&Action::Key(104.into())), "Page up");
         // The modifiers print under the name they were bound by, and parse back.
-        assert_eq!(derive_label(&Action::Key(42)), "Leftshift");
-        assert_eq!(action_string(&Action::Key(125)), "key leftmeta");
-        assert_eq!(Action::parse("key leftmeta"), Ok(Action::Key(125)));
+        assert_eq!(derive_label(&Action::Key(42.into())), "Leftshift");
+        assert_eq!(action_string(&Action::Key(125.into())), "key leftmeta");
+        assert_eq!(Action::parse("key leftmeta"), Ok(Action::Key(125.into())));
         assert_eq!(derive_label(&Action::SetMode("desktop".into())), "Force desktop mode");
         assert_eq!(derive_label(&Action::ClearMode), "Back to automatic mode");
     }
@@ -1286,16 +1485,16 @@ mod tests {
     fn mouse_bindings_read_as_clicks() {
         // A mouse button is a `Key` in evdev's code space; the sheet tells it
         // apart by the code, exactly as the daemon does when routing it.
-        assert_eq!(derive_label(&Action::Key(0x110)), "Left click");
-        assert_eq!(derive_label(&Action::Key(0x111)), "Right click");
-        assert_eq!(derive_label(&Action::Key(0x112)), "Middle click");
-        assert_eq!(action_string(&Action::Key(0x110)), "mouse left");
-        assert_eq!(action_string(&Action::Key(0x111)), "mouse right");
-        assert_eq!(action_kind(&Action::Key(0x110)), "mouse");
-        assert_eq!(action_kind(&Action::Key(0x112)), "mouse");
+        assert_eq!(derive_label(&Action::Key(0x110.into())), "Left click");
+        assert_eq!(derive_label(&Action::Key(0x111.into())), "Right click");
+        assert_eq!(derive_label(&Action::Key(0x112.into())), "Middle click");
+        assert_eq!(action_string(&Action::Key(0x110.into())), "mouse left");
+        assert_eq!(action_string(&Action::Key(0x111.into())), "mouse right");
+        assert_eq!(action_kind(&Action::Key(0x110.into())), "mouse");
+        assert_eq!(action_kind(&Action::Key(0x112.into())), "mouse");
         // A keyboard code is untouched by this.
-        assert_eq!(action_kind(&Action::Key(103)), "key");
-        assert_eq!(action_string(&Action::Key(103)), "key up");
+        assert_eq!(action_kind(&Action::Key(103.into())), "key");
+        assert_eq!(action_string(&Action::Key(103.into())), "key up");
         assert_eq!(key_name(0x110), "btn_left");
         assert_eq!(key_name(0x112), "btn_middle");
         assert_eq!(mouse_name(103), None);
@@ -1332,9 +1531,9 @@ mod tests {
             Action::Dispatch("hl.dsp.window.close()".into()),
             Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false },
             Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true },
-            Action::Key(103),
-            Action::Key(0x110),
-            Action::Key(0x112),
+            Action::Key(103.into()),
+            Action::Key(0x110.into()),
+            Action::Key(0x112.into()),
             Action::SetMode("game".into()),
             Action::ClearMode,
             Action::None,
@@ -1344,7 +1543,7 @@ mod tests {
         }
         // The keyboard's own table, through its own parser.
         for a in [
-            OskAction::Key(57),
+            OskAction::Key(57.into()),
             OskAction::Commit,
             OskAction::Shift,
             OskAction::Dismiss,
@@ -1353,9 +1552,9 @@ mod tests {
             let s = osk_action_string(a);
             assert_eq!(OskAction::parse(&s), Ok(a), "round trip of {s:?}");
         }
-        assert_eq!(osk_action_kind(OskAction::Key(57)), "key");
+        assert_eq!(osk_action_kind(OskAction::Key(57.into())), "key");
         assert_eq!(osk_action_kind(OskAction::Shift), "osk");
-        assert_eq!(derive_osk_label(OskAction::Key(57)), "Space");
+        assert_eq!(derive_osk_label(OskAction::Key(57.into())), "Space");
         assert_eq!(derive_osk_label(OskAction::Shift), "Shift (hold)");
         assert_eq!(derive_osk_label(OskAction::Commit), "Type the key under the cursor");
         assert_eq!(derive_osk_label(OskAction::Dismiss), "Close the keyboard");

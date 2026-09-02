@@ -105,6 +105,17 @@ Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
 (`"workspace +1"`) works too — it is parsed by the same grammar the TOML file
 uses.
 
+`h.key` takes a **combo**: modifier names joined to the key with `+`, as in
+`h.key "shift+tab"`, `h.key "ctrl+left"`, `h.key "ctrl+shift+tab"` or
+`h.key "super+1"` (`"key shift+tab"` in TOML) — a modifier is
+`shift|ctrl|control|alt|super|meta|win` or an explicit `leftshift`/`rightctrl`/…
+form, and the key is any name the table knows: the letters, the digits, the
+arrows and editing keys, `f1`–`f12` and the US punctuation. The modifiers go
+down before the key and come up after it wherever it is pressed — a bare button,
+a guide chord, or an `h.osk_button` typed through the on-screen keyboard — so a
+held `h.key "ctrl+left"` auto-repeats as a unit, and an unknown token, a
+repeated modifier or a combo with nothing after its `+` is a reported error.
+
 The mouse buttons are bare-button bindings like any other. `h.mouse "left"`
 (`left|right|middle`; `"mouse left"` or `"click left"` in TOML) is a `h.key`
 whose evdev code names a mouse button, and the daemon clicks it through the

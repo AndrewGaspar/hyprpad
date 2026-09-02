@@ -100,7 +100,7 @@
 //! own — it wants a fresh press.
 
 use crate::config::{
-    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, OskAction,
+    Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, KeyChord, OskAction,
     RumbleMode, ScrollConfig, ScrollMode, WorkspaceTarget,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
@@ -1216,7 +1216,7 @@ fn circular_scroll(ticks: i32, sensitivity: f64, step_degrees: f64, natural: boo
 /// ([`ButtonAction::Fire`]) has no state here: it is over the moment its press
 /// edge is.
 struct ButtonKeys {
-    held: HashMap<report::Button, u16>,
+    held: HashMap<report::Button, KeyChord>,
     /// Whether the bare-button layer was live at the end of the last
     /// [`reconcile`](Self::reconcile), with no transition since. A press is
     /// honoured only when this was already true: the frame the gate opens on
@@ -1233,7 +1233,10 @@ impl ButtonKeys {
     }
 
     /// Reconcile the desired key state against what is held, returning the
-    /// `(button, code, pressed)` events to emit and updating the held set. Pure
+    /// `(button, chord, pressed)` events to emit and updating the held set. A
+    /// chord is one event, not one per code: the expansion into modifier and
+    /// key edges is [`chord_edges`]'s, so this stays about *which* binding is
+    /// down and never about the order its codes go down in. Pure
     /// (no I/O), so the gating and release-on-state-change logic is
     /// unit-testable. The originating button rides along so the caller can fire
     /// feedback on the side of the controller it sits on.
@@ -1255,15 +1258,15 @@ impl ButtonKeys {
         pressed: F,
         was_pressed: G,
         active: bool,
-    ) -> Vec<(report::Button, u16, bool)> {
+    ) -> Vec<(report::Button, KeyChord, bool)> {
         let mut events = Vec::new();
         // Release anything that should no longer be held: the gate closed, the
         // button lifted, or the binding is no longer live in this mode.
-        self.held.retain(|&btn, &mut code| {
+        self.held.retain(|&btn, &mut chord| {
             let keep =
-                active && pressed(btn) && bindings.get(&btn) == Some(&ButtonAction::Hold(code));
+                active && pressed(btn) && bindings.get(&btn) == Some(&ButtonAction::Hold(chord));
             if !keep {
-                events.push((btn, code, false));
+                events.push((btn, chord, false));
             }
             keep
         });
@@ -1274,10 +1277,10 @@ impl ButtonKeys {
         self.open = active;
         if settled {
             for (&btn, what) in bindings {
-                let ButtonAction::Hold(code) = *what else { continue };
+                let ButtonAction::Hold(chord) = *what else { continue };
                 if pressed(btn) && !was_pressed(btn) && !self.held.contains_key(&btn) {
-                    events.push((btn, code, true));
-                    self.held.insert(btn, code);
+                    events.push((btn, chord, true));
+                    self.held.insert(btn, chord);
                 }
             }
         }
@@ -1300,8 +1303,8 @@ impl ButtonKeys {
         kbd: &mut Option<VirtualKeyboard>,
         mut pointer: Option<&mut VirtualPointer>,
     ) {
-        for (_, code) in self.held.drain() {
-            emit_button_code(kbd, pointer.as_deref_mut(), code, false);
+        for (_, chord) in self.held.drain() {
+            emit_chord(kbd, pointer.as_deref_mut(), &chord, false);
         }
         self.open = false;
     }
@@ -1319,7 +1322,7 @@ impl ButtonKeys {
 /// Released beside [`ButtonKeys`] on the mode handoff and the disconnect path,
 /// so a click held under the guide-mouse is never stranded across either.
 struct ChordKeys {
-    held: HashMap<report::Button, u16>,
+    held: HashMap<report::Button, KeyChord>,
 }
 
 impl ChordKeys {
@@ -1327,29 +1330,29 @@ impl ChordKeys {
         ChordKeys { held: HashMap::new() }
     }
 
-    /// A chord on `btn` resolved to a held `code`: the `(code, pressed)` edges
-    /// to emit. Normally one press. Should the button already be holding an
-    /// output — its release was never seen, which a fresh gesture engine can
+    /// A chord on `btn` resolved to a held `chord`: the `(chord, pressed)`
+    /// edges to emit. Normally one press. Should the button already be holding
+    /// an output — its release was never seen, which a fresh gesture engine can
     /// do — that one is let go first, so no code is ever pressed twice. Pure.
-    fn press(&mut self, btn: report::Button, code: u16) -> Vec<(u16, bool)> {
+    fn press(&mut self, btn: report::Button, chord: KeyChord) -> Vec<(KeyChord, bool)> {
         let mut events = Vec::with_capacity(2);
-        if let Some(old) = self.held.insert(btn, code) {
+        if let Some(old) = self.held.insert(btn, chord) {
             events.push((old, false));
         }
-        events.push((code, true));
+        events.push((chord, true));
         events
     }
 
-    /// The chord button lifted under the guide: the code to release, if it
+    /// The chord button lifted under the guide: the chord to release, if it
     /// was holding one. A button holding nothing (its chord was not a key, or
     /// the handoff already let it go) is `None`. Pure.
-    fn release(&mut self, btn: report::Button) -> Option<u16> {
+    fn release(&mut self, btn: report::Button) -> Option<KeyChord> {
         self.held.remove(&btn)
     }
 
-    /// Forget everything held, returning the codes to release. Pure.
-    fn drain(&mut self) -> Vec<u16> {
-        self.held.drain().map(|(_, code)| code).collect()
+    /// Forget everything held, returning the chords to release. Pure.
+    fn drain(&mut self) -> Vec<KeyChord> {
+        self.held.drain().map(|(_, chord)| chord).collect()
     }
 
     /// Release every held output now: on the guide's release, the mode
@@ -1361,8 +1364,8 @@ impl ChordKeys {
         kbd: &mut Option<VirtualKeyboard>,
         mut pointer: Option<&mut VirtualPointer>,
     ) {
-        for code in self.drain() {
-            emit_button_code(kbd, pointer.as_deref_mut(), code, false);
+        for chord in self.drain() {
+            emit_chord(kbd, pointer.as_deref_mut(), &chord, false);
         }
     }
 }
@@ -1383,6 +1386,43 @@ fn route(code: u16) -> Route {
     match PointerButton::from_evdev(code) {
         Some(b) => Route::Pointer(b),
         None => Route::Keyboard,
+    }
+}
+
+/// The `(code, pressed)` edges one edge of a held [`KeyChord`] expands to.
+///
+/// Pressing runs the modifiers in order and then the key; releasing runs the
+/// key and then the modifiers in reverse, so the combo brackets its key the way
+/// a real keyboard does and nothing is left down out of order. A chord with no
+/// modifiers is the single edge it always was.
+///
+/// Pure, and the *only* place the order lives: [`ButtonKeys`] and
+/// [`ChordKeys`] both hand their edges through here, so a bare button and a
+/// guide chord can never press a combo differently.
+fn chord_edges(chord: &KeyChord, pressed: bool) -> Vec<(u16, bool)> {
+    let mut edges = Vec::with_capacity(chord.mods().len() + 1);
+    if pressed {
+        edges.extend(chord.mods().iter().map(|&m| (m, true)));
+        edges.push((chord.code(), true));
+    } else {
+        edges.push((chord.code(), false));
+        edges.extend(chord.mods().iter().rev().map(|&m| (m, false)));
+    }
+    edges
+}
+
+/// Emit one edge of a held chord, code by code ([`chord_edges`]), each on the
+/// device it belongs to ([`emit_button_code`]). The modifiers are always
+/// `KEY_*` and so always the keyboard's; only the key itself can be a mouse
+/// button, which is what makes `shift+btn_left` a coherent binding.
+fn emit_chord(
+    kbd: &mut Option<VirtualKeyboard>,
+    mut pointer: Option<&mut VirtualPointer>,
+    chord: &KeyChord,
+    pressed: bool,
+) {
+    for (code, down) in chord_edges(chord, pressed) {
+        emit_button_code(kbd, pointer.as_deref_mut(), code, down);
     }
 }
 
@@ -1434,8 +1474,8 @@ fn drive_buttons(
     hx: &mut HapticCtx,
 ) {
     let events = st.reconcile(bindings, |b| frame.pressed(b), |b| prev.pressed(b), active);
-    for (btn, code, pressed) in events {
-        emit_button_code(kbd, pointer.as_deref_mut(), code, pressed);
+    for (btn, chord, pressed) in events {
+        emit_chord(kbd, pointer.as_deref_mut(), &chord, pressed);
         if pressed {
             hx.fire(Haptic::Button, button_pad(btn));
         }
@@ -2249,8 +2289,8 @@ fn handle_gesture(
         // The other edge of a held chord output. Not a binding: nothing
         // resolves against it, and a button holding nothing is nothing.
         GestureEvent::GuideChordRelease(b) => {
-            if let Some(code) = chords.release(b) {
-                emit_button_code(keyboard, pointer, code, false);
+            if let Some(chord) = chords.release(b) {
+                emit_chord(keyboard, pointer, &chord, false);
             }
             return false;
         }
@@ -2292,10 +2332,10 @@ fn handle_gesture(
     // because to the hand this is a button going down, and the pad click that
     // is its usual home already has its own. On a flick or the guide hold a
     // key still does nothing: there is no release edge to pair it with.
-    if let (GestureEvent::GuideChord(b), Action::Key(code)) = (ge, &action) {
+    if let (GestureEvent::GuideChord(b), Action::Key(chord)) = (ge, &action) {
         hx.fire(Haptic::Button, button_pad(b));
-        for (code, pressed) in chords.press(b, *code) {
-            emit_button_code(keyboard, pointer.as_deref_mut(), code, pressed);
+        for (chord, pressed) in chords.press(b, *chord) {
+            emit_chord(keyboard, pointer.as_deref_mut(), &chord, pressed);
         }
         return false;
     }
@@ -2386,9 +2426,9 @@ struct OskPadState {
 /// hold logic is unit-testable without a keyboard child or a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OskOp {
-    /// Tap a raw key through the keyboard, with the hand the button is under
-    /// (for the commit click).
-    Key(u16, HapticPad),
+    /// Tap a key — with any modifiers held around it — through the keyboard,
+    /// with the hand the button is under (for the commit click).
+    Key(KeyChord, HapticPad),
     /// Type the key under this pad's cursor.
     Commit(OskPad),
     /// The first Shift-bound button went down.
@@ -2461,7 +2501,7 @@ impl OskRoute {
 
         for b in frame.edges_down(prev) {
             match bindings.get(&b) {
-                Some(OskAction::Key(code)) => ops.push(OskOp::Key(*code, button_pad(b))),
+                Some(OskAction::Key(chord)) => ops.push(OskOp::Key(*chord, button_pad(b))),
                 Some(OskAction::Commit) => ops.push(OskOp::Commit(commit_pad(b))),
                 Some(OskAction::Shift) => {
                     if self.shift_holders.is_empty() {
@@ -2537,8 +2577,8 @@ fn route_osk(
     // Commit on click-down (the Deck commits on click, not release).
     for op in st.step(frame, prev, osk_buttons) {
         match op {
-            OskOp::Key(code, hand) => {
-                osk.key(code);
+            OskOp::Key(chord, hand) => {
+                osk.key(&chord);
                 hx.fire(Haptic::Commit, hand);
             }
             OskOp::Commit(pad) => {
@@ -2883,34 +2923,183 @@ mod tests {
     }
 
     #[test]
+    fn a_combo_presses_its_modifiers_first_and_releases_them_last() {
+        use crate::config::KeyChord;
+        // Shift+Tab: the modifier goes down before the key and comes up after
+        // it, which is the whole reason a chord is one binding and not two.
+        let shift_tab = KeyChord::parse("shift+tab").unwrap();
+        assert_eq!(chord_edges(&shift_tab, true), vec![(42, true), (15, true)]);
+        assert_eq!(chord_edges(&shift_tab, false), vec![(15, false), (42, false)]);
+        // Several modifiers nest: pressed left to right, released right to
+        // left, so nothing is ever left down out of order.
+        let csa = KeyChord::parse("ctrl+shift+alt+left").unwrap();
+        assert_eq!(
+            chord_edges(&csa, true),
+            vec![(29, true), (42, true), (56, true), (105, true)]
+        );
+        assert_eq!(
+            chord_edges(&csa, false),
+            vec![(105, false), (56, false), (42, false), (29, false)]
+        );
+        // A lone key is the single edge it always was.
+        assert_eq!(chord_edges(&KeyChord::plain(103), true), vec![(103, true)]);
+        assert_eq!(chord_edges(&KeyChord::plain(103), false), vec![(103, false)]);
+        // A combo whose key is a mouse button splits across the two devices —
+        // the modifier is a KEY_*, the button a BTN_*, and `route` sorts them.
+        let shift_click = KeyChord::parse("shift+btn_left").unwrap();
+        assert_eq!(chord_edges(&shift_click, true), vec![(42, true), (0x110, true)]);
+        assert_eq!(route(42), Route::Keyboard);
+        assert_eq!(route(0x110), Route::Pointer(PointerButton::Left));
+    }
+
+    #[test]
+    fn a_bare_combo_binding_behaves_like_a_single_key_through_the_latch() {
+        // The combo is one held output: pressed on the down edge, released on
+        // the up edge, silent while held (the kernel repeats the key with the
+        // modifiers still down), and subject to the same stale-press latch a
+        // single key is — the rule that keeps a button held across a gate
+        // change from pressing again on its own.
+        use report::Button::*;
+        use crate::config::KeyChord;
+        let shift_tab = KeyChord::parse("shift+tab").unwrap();
+        let bindings = HashMap::from([(BumperL1, ButtonAction::Hold(shift_tab))]);
+        let mut st = live();
+        let l1 = |b: report::Button| b == BumperL1;
+        assert_eq!(
+            st.reconcile(&bindings, l1, none, true),
+            vec![(BumperL1, shift_tab, true)]
+        );
+        assert!(st.reconcile(&bindings, l1, l1, true).is_empty(), "held: no repeat of ours");
+        assert_eq!(
+            st.reconcile(&bindings, none, l1, true),
+            vec![(BumperL1, shift_tab, false)]
+        );
+        assert!(st.held.is_empty());
+
+        // Gate closes mid-hold: the whole combo is released, once.
+        assert_eq!(st.reconcile(&bindings, l1, none, true).len(), 1);
+        assert_eq!(
+            st.reconcile(&bindings, l1, l1, false),
+            vec![(BumperL1, shift_tab, false)]
+        );
+        // Still down when the gate reopens: nothing, until a fresh press.
+        assert!(st.reconcile(&bindings, l1, l1, true).is_empty());
+        assert!(st.reconcile(&bindings, l1, l1, true).is_empty());
+        assert!(st.reconcile(&bindings, none, l1, true).is_empty());
+        assert_eq!(st.reconcile(&bindings, l1, none, true).len(), 1);
+
+        // And rebinding the same button to a *different* combo releases the
+        // old one: the held set compares whole chords, not bare keycodes.
+        let ctrl_tab = KeyChord::parse("ctrl+tab").unwrap();
+        let rebound = HashMap::from([(BumperL1, ButtonAction::Hold(ctrl_tab))]);
+        assert_eq!(
+            st.reconcile(&rebound, l1, l1, true),
+            vec![(BumperL1, shift_tab, false)],
+            "the old combo lets go; the new one waits for a fresh press"
+        );
+    }
+
+    #[test]
+    fn release_all_lets_a_held_combo_go_whole_and_in_order() {
+        use crate::config::KeyChord;
+        // The handoff and disconnect paths must not strand a modifier down —
+        // a stuck Ctrl is worse than a stuck arrow, because every later key
+        // means something different.
+        let ctrl_left = KeyChord::parse("ctrl+left").unwrap();
+        let mut keys = live();
+        let map = HashMap::from([(report::Button::DpadLeft, ButtonAction::Hold(ctrl_left))]);
+        keys.reconcile(&map, |_| true, none, true);
+        assert_eq!(keys.held.len(), 1);
+        keys.release_all(&mut None, None);
+        assert!(keys.held.is_empty());
+        // The order the release would have gone out in: key first, modifier
+        // after, so nothing outlives the key it was holding.
+        assert_eq!(chord_edges(&ctrl_left, false), vec![(105, false), (29, false)]);
+
+        // The chord-side twin, on the guide layer.
+        let mut chords = ChordKeys::new();
+        chords.press(report::Button::A, ctrl_left);
+        assert_eq!(chords.drain(), vec![ctrl_left]);
+        chords.press(report::Button::A, ctrl_left);
+        chords.release_all(&mut None, None);
+        assert!(chords.held.is_empty());
+    }
+
+    #[test]
+    fn a_combo_on_a_guide_chord_is_held_whole() {
+        // `h.bind("guide+a", h.key "ctrl+c")`: a Key on a chord is a held
+        // output, so a short press is the copy and a long one is a held
+        // Ctrl+C. Through the real dispatch, gates and all.
+        use report::Button::*;
+        use crate::config::KeyChord;
+        let cfg = Config::from_toml_str(
+            "[bindings]\n\"guide+a\" = \"key ctrl+c\"\n",
+        )
+        .expect("parse");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&cfg);
+        let mut osk = OskHandle::new();
+        let mut hap = Haptics::new();
+        let hcfg = HapticsConfig::default();
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg };
+        let mut chords = ChordKeys::new();
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let ctrl_c = KeyChord::parse("ctrl+c").unwrap();
+
+        macro_rules! gesture {
+            ($ge:expr) => {
+                handle_gesture(
+                    &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, $ge,
+                )
+            };
+        }
+
+        // Recognition holds the whole combo; nothing is performed.
+        assert!(!gesture!(GestureEvent::GuideChord(A)));
+        assert_eq!(chords.held.get(&A), Some(&ctrl_c));
+        // The button lifting under the guide releases it — key then modifier.
+        assert!(!gesture!(GestureEvent::GuideChordRelease(A)));
+        assert!(chords.held.is_empty());
+        // And the guide letting go first does the same.
+        assert!(!gesture!(GestureEvent::GuideChord(A)));
+        assert_eq!(chords.held.len(), 1);
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true }));
+        assert!(chords.held.is_empty());
+    }
+
+    #[test]
     fn bare_button_presses_on_down_and_releases_on_up() {
         use report::Button::*;
         use ButtonAction::Hold;
-        let bindings = HashMap::from([(DpadUp, Hold(103)), (DpadDown, Hold(108))]);
+        let bindings = HashMap::from([(DpadUp, Hold(103.into())), (DpadDown, Hold(108.into()))]);
         let mut st = live();
         let up = |b: report::Button| b == DpadUp;
         // DpadUp goes down while active: press KEY_UP, nothing for the unpressed
         // DpadDown. The originating button rides along for the haptic side.
-        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
+        let up_down = vec![(DpadUp, KeyChord::plain(103), true)];
+        assert_eq!(st.reconcile(&bindings, up, none, true), up_down);
         // Held and still down next frame: no repeated event (the kernel repeats)
         // — which is also why a held arrow cannot buzz per repeat.
         assert!(st.reconcile(&bindings, up, up, true).is_empty());
         // Lifts: release KEY_UP, held set empties.
-        assert_eq!(st.reconcile(&bindings, none, up, true), vec![(DpadUp, 103, false)]);
+        let up_up = vec![(DpadUp, KeyChord::plain(103), false)];
+        assert_eq!(st.reconcile(&bindings, none, up, true), up_up);
         assert!(st.held.is_empty());
     }
 
     #[test]
     fn bare_button_gate_off_releases_and_suppresses() {
         use report::Button::*;
-        let bindings = HashMap::from([(DpadUp, ButtonAction::Hold(103))]);
+        let bindings = HashMap::from([(DpadUp, ButtonAction::Hold(103.into()))]);
         let mut st = live();
         let up = |b: report::Button| b == DpadUp;
         // Press while active.
-        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
+        let up_down = vec![(DpadUp, KeyChord::plain(103), true)];
+        assert_eq!(st.reconcile(&bindings, up, none, true), up_down);
         // The gate closes (guide/OSK/game) while the D-pad is still held: the key
         // is released cleanly rather than left stuck down.
-        assert_eq!(st.reconcile(&bindings, up, up, false), vec![(DpadUp, 103, false)]);
+        let up_up = vec![(DpadUp, KeyChord::plain(103), false)];
+        assert_eq!(st.reconcile(&bindings, up, up, false), up_up);
         assert!(st.held.is_empty());
         // Still held but gated off: no new press (the chord/game gets it instead).
         assert!(st.reconcile(&bindings, up, up, false).is_empty());
@@ -2923,7 +3112,8 @@ mod tests {
         assert!(st.held.is_empty());
         // Release and press again: the arrow is back.
         assert!(st.reconcile(&bindings, none, up, true).is_empty());
-        assert_eq!(st.reconcile(&bindings, up, none, true), vec![(DpadUp, 103, true)]);
+        let up_down = vec![(DpadUp, KeyChord::plain(103), true)];
+        assert_eq!(st.reconcile(&bindings, up, none, true), up_down);
     }
 
     #[test]
@@ -2931,8 +3121,8 @@ mod tests {
         use report::Button::*;
         use ButtonAction::{Fire, Hold};
         let bindings = HashMap::from([
-            (DpadUp, Hold(103)),
-            (DpadLeft, Hold(105)),
+            (DpadUp, Hold(103.into())),
+            (DpadLeft, Hold(105.into())),
             (GripL5, Fire(Action::Exec("true".into()))),
         ]);
         let mut st = live();
@@ -2944,8 +3134,11 @@ mod tests {
         assert!(st.held.is_empty());
         // Two bound buttons down at once: both press (HashMap order is arbitrary).
         let mut ev = st.reconcile(&bindings, |b| b == DpadUp || b == DpadLeft, none, true);
-        ev.sort_by_key(|&(_, code, _)| code);
-        assert_eq!(ev, vec![(DpadUp, 103, true), (DpadLeft, 105, true)]);
+        ev.sort_by_key(|&(_, chord, _)| chord.code());
+        assert_eq!(
+            ev,
+            vec![(DpadUp, KeyChord::plain(103), true), (DpadLeft, KeyChord::plain(105), true)]
+        );
         assert_eq!(st.held.len(), 2);
     }
 
@@ -2957,7 +3150,7 @@ mod tests {
         // down this frame, under the keyboard, and `route_osk` closed the
         // keyboard before the bare layer ran), nor while B stays down.
         use report::Button::*;
-        let bindings = HashMap::from([(B, ButtonAction::Hold(14))]);
+        let bindings = HashMap::from([(B, ButtonAction::Hold(14.into()))]);
         let mut st = live();
         let b = |x: report::Button| x == B;
         // Keyboard up: the layer is gated.
@@ -2971,8 +3164,8 @@ mod tests {
         assert!(st.held.is_empty());
         // Released, then a fresh press: Backspace works again.
         assert!(st.reconcile(&bindings, none, b, true).is_empty());
-        assert_eq!(st.reconcile(&bindings, b, none, true), vec![(B, 14, true)]);
-        assert_eq!(st.reconcile(&bindings, none, b, true), vec![(B, 14, false)]);
+        assert_eq!(st.reconcile(&bindings, b, none, true), vec![(B, KeyChord::plain(14), true)]);
+        assert_eq!(st.reconcile(&bindings, none, b, true), vec![(B, KeyChord::plain(14), false)]);
         // And the daemon starts gated, so a button held while it comes up
         // (or while the controller reconnects) is not a keystroke either.
         let mut fresh = ButtonKeys::new();
@@ -2986,7 +3179,7 @@ mod tests {
         // The bare layer's gate opens on a button already down: no Enter until
         // A is released and pressed again. Same for a fired binding.
         use report::Button::*;
-        let held = HashMap::from([(A, ButtonAction::Hold(28))]);
+        let held = HashMap::from([(A, ButtonAction::Hold(28.into()))]);
         let mut st = live();
         let a = |x: report::Button| x == A;
         // Guide held: the layer is gated; A goes down under it (the chord).
@@ -2997,7 +3190,7 @@ mod tests {
         assert!(st.reconcile(&held, a, a, true).is_empty());
         // Fresh press: Enter.
         assert!(st.reconcile(&held, none, a, true).is_empty());
-        assert_eq!(st.reconcile(&held, a, none, true), vec![(A, 28, true)]);
+        assert_eq!(st.reconcile(&held, a, none, true), vec![(A, KeyChord::plain(28), true)]);
 
         // The fired kind: under the guide the press is swallowed rather than
         // deferred, and once the gate opens A is down on both frames — not
@@ -3021,12 +3214,12 @@ mod tests {
         // used to see "bound, down, not held" and press Tab again: one tap
         // became two or three.
         use report::Button::*;
-        let ui = HashMap::from([(BumperR1, ButtonAction::Hold(15))]);
+        let ui = HashMap::from([(BumperR1, ButtonAction::Hold(15.into()))]);
         let desktop: HashMap<report::Button, ButtonAction> = HashMap::new();
         let mut st = live();
         let r1 = |x: report::Button| x == BumperR1;
         // The tap: a press edge in omarchy-ui. The ONE press of this test.
-        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, 15, true)]);
+        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, KeyChord::plain(15), true)]);
         // Tab reaches the bar; the panel layer closes: handoff to the desktop,
         // where R1 is unbound. The handoff releases Tab (no device here, so
         // the held set just empties) and marks the transition.
@@ -3045,7 +3238,7 @@ mod tests {
         assert!(st.held.is_empty());
         // Release, press again: the second tap is a second Tab.
         assert!(st.reconcile(&ui, none, r1, true).is_empty());
-        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, 15, true)]);
+        assert_eq!(st.reconcile(&ui, r1, none, true), vec![(BumperR1, KeyChord::plain(15), true)]);
 
         // A fired binding across the same handoff: the press edge fired once,
         // and after the flip R1 is down on both frames — not an edge.
@@ -3082,7 +3275,8 @@ mod tests {
         let idle = report::Frame::default();
         assert!(st.step(&idle, &y, &bindings).is_empty());
         // A fresh press: Space, clicked under the right hand.
-        assert_eq!(st.step(&y, &idle, &bindings), vec![OskOp::Key(57, HapticPad::Right)]);
+        let space = vec![OskOp::Key(KeyChord::plain(57), HapticPad::Right)];
+        assert_eq!(st.step(&y, &idle, &bindings), space);
         assert!(st.step(&y, &y, &bindings).is_empty(), "held: no repeat");
     }
 
@@ -3100,10 +3294,11 @@ mod tests {
         let rclick = frame_of(&[PadRightClick]);
         assert_eq!(st.step(&lclick, &idle, &bindings), vec![OskOp::Commit(OskPad::Left)]);
         assert_eq!(st.step(&rclick, &lclick, &bindings), vec![OskOp::Commit(OskPad::Right)]);
-        assert_eq!(st.step(&frame_of(&[X]), &rclick, &bindings), vec![OskOp::Key(14, HapticPad::Right)]);
+        let backspace = vec![OskOp::Key(KeyChord::plain(14), HapticPad::Right)];
+        assert_eq!(st.step(&frame_of(&[X]), &rclick, &bindings), backspace);
         assert_eq!(
             st.step(&frame_of(&[TriggerR2Full]), &idle, &bindings),
-            vec![OskOp::Key(28, HapticPad::Right)]
+            vec![OskOp::Key(KeyChord::plain(28), HapticPad::Right)]
         );
 
         // L2 holds Shift: down with the pull, nothing while held, up with the
@@ -3196,7 +3391,7 @@ mod tests {
         use report::Button::*;
         use ButtonAction::{Fire, Hold};
         let go = Action::Exec("true".into());
-        let bindings = HashMap::from([(GripL5, Fire(go.clone())), (DpadUp, Hold(103))]);
+        let bindings = HashMap::from([(GripL5, Fire(go.clone())), (DpadUp, Hold(103.into()))]);
         let idle = report::Frame::default();
         let down = frame_of(&[GripL5, DpadUp]);
 
@@ -3435,7 +3630,7 @@ mod tests {
         // And the config agrees on what a mouse binding parses to.
         assert_eq!(
             Action::parse("mouse left"),
-            Ok(Action::Key(PointerButton::Left.evdev()))
+            Ok(Action::Key(PointerButton::Left.evdev().into()))
         );
     }
 
@@ -3490,13 +3685,13 @@ mod tests {
 
         // Desktop: D-pad up is bound, press it.
         let down = keys.reconcile(m.buttons(), up, none, true);
-        assert_eq!(down, vec![(report::Button::DpadUp, 103, true)]);
+        assert_eq!(down, vec![(report::Button::DpadUp, KeyChord::plain(103), true)]);
 
         // A game takes focus. The map goes empty, so the held key releases even
         // though the button is still physically down.
         m.focus_changed(&cfg, "steam_app_413080", "", None);
         let released = keys.reconcile(m.buttons(), up, up, true);
-        assert_eq!(released, vec![(report::Button::DpadUp, 103, false)]);
+        assert_eq!(released, vec![(report::Button::DpadUp, KeyChord::plain(103), false)]);
         assert!(keys.held.is_empty());
     }
 
@@ -3509,10 +3704,10 @@ mod tests {
         use ButtonAction::Hold;
         let mut keys = live();
         let map = HashMap::from([
-            (report::Button::DpadUp, Hold(103)),
-            (report::Button::A, Hold(28)),
-            (report::Button::TriggerR2Full, Hold(PointerButton::Left.evdev())),
-            (report::Button::TriggerL2Full, Hold(PointerButton::Right.evdev())),
+            (report::Button::DpadUp, Hold(103.into())),
+            (report::Button::A, Hold(28.into())),
+            (report::Button::TriggerR2Full, Hold(PointerButton::Left.evdev().into())),
+            (report::Button::TriggerL2Full, Hold(PointerButton::Right.evdev().into())),
         ]);
         keys.reconcile(&map, |_| true, none, true);
         assert_eq!(keys.held.len(), 4);
@@ -3768,27 +3963,31 @@ mod tests {
         use report::Button::*;
         let mut chords = ChordKeys::new();
         // Recognition presses.
-        assert_eq!(chords.press(PadRightClick, 0x110), vec![(0x110, true)]);
-        assert_eq!(chords.held.get(&PadRightClick), Some(&0x110));
+        let click = KeyChord::plain(0x110);
+        assert_eq!(chords.press(PadRightClick, click), vec![(click, true)]);
+        assert_eq!(chords.held.get(&PadRightClick), Some(&click));
         // The button lifting under the guide releases exactly that output,
         // once; a button holding nothing is nothing.
-        assert_eq!(chords.release(PadRightClick), Some(0x110));
+        assert_eq!(chords.release(PadRightClick), Some(click));
         assert_eq!(chords.release(PadRightClick), None);
         assert_eq!(chords.release(BumperR1), None);
         assert!(chords.held.is_empty());
 
         // Two chords held at once; the guide releasing ends both.
-        chords.press(PadRightClick, 0x110);
-        chords.press(GripL5, 42);
-        let mut all = chords.drain();
+        chords.press(PadRightClick, click);
+        chords.press(GripL5, KeyChord::plain(42));
+        let mut all: Vec<u16> = chords.drain().iter().map(KeyChord::code).collect();
         all.sort_unstable();
         assert_eq!(all, vec![42, 0x110]);
         assert!(chords.held.is_empty());
 
         // A press with no release ever seen for that button (a fresh gesture
         // engine after a reconnect) lets the old output go first.
-        chords.press(GripL5, 42);
-        assert_eq!(chords.press(GripL5, 54), vec![(42, false), (54, true)]);
+        chords.press(GripL5, KeyChord::plain(42));
+        assert_eq!(
+            chords.press(GripL5, KeyChord::plain(54)),
+            vec![(KeyChord::plain(42), false), (KeyChord::plain(54), true)]
+        );
         assert_eq!(chords.held.len(), 1);
 
         // The mode handoff releases it like a bare button's, with no devices
@@ -3813,7 +4012,7 @@ mod tests {
             &mut haptics,
         );
         assert!(chords.held.is_empty(), "the handoff strands nothing");
-        chords.press(PadRightClick, 0x110);
+        chords.press(PadRightClick, click);
         chords.release_all(&mut None, None);
         assert!(chords.held.is_empty(), "nor does a disconnect");
     }
@@ -3857,7 +4056,10 @@ mod tests {
 
         // Recognition presses and holds; nothing is performed, no mode moves.
         assert!(!gesture!(GestureEvent::GuideChord(PadRightClick)));
-        assert_eq!(chords.held.get(&PadRightClick), Some(&PointerButton::Left.evdev()));
+        assert_eq!(
+            chords.held.get(&PadRightClick),
+            Some(&KeyChord::plain(PointerButton::Left.evdev()))
+        );
         // A second chord holds beside it — a modifier on a grip.
         assert!(!gesture!(GestureEvent::GuideChord(GripL5)));
         assert_eq!(chords.held.len(), 2);

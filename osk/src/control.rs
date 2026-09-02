@@ -22,7 +22,8 @@
 //! shift <down|up>                  # hold / release a physical Shift (momentary; the latch is untouched)
 //! layer <base|symbols|toggle>      # switch the base QWERTY ↔ numeric/symbols page
 //! reflow <on|off>                  # displace (on) vs overlay/float (off); recreates surfaces
-//! key <keycode>                    # commit a raw evdev keycode directly (test/daemon)
+//! key <keycode> [mod…]             # commit a raw evdev keycode directly (test/daemon),
+//!                                  # optionally with modifier keycodes held around it
 //! type <text…>                     # type an ASCII string (test helper)
 //! quit                             # exit the process
 //! ```
@@ -61,8 +62,11 @@ pub enum Command {
     /// Switch the surface policy: `true` = displace (exclusive zone), `false` =
     /// overlay/float. Recreates the live surface(s) with the flipped policy.
     Reflow { on: bool },
-    /// Commit a raw evdev keycode directly.
-    Key { keycode: u16 },
+    /// Commit a raw evdev keycode directly, with `mods` (themselves raw
+    /// keycodes) held around it — pressed before it in the order given and
+    /// released after it in reverse, so `key 14 29` is Ctrl+Backspace. An empty
+    /// `mods` is the one-code form the wire has always had.
+    Key { keycode: u16, mods: Vec<u16> },
     /// Type an ASCII string.
     Type { text: String },
     /// Exit the process.
@@ -137,8 +141,14 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Reflow { on })
         }
         "key" => {
-            let kc: u16 = rest.parse().map_err(|_| format!("bad keycode '{rest}'"))?;
-            Ok(Command::Key { keycode: kc })
+            let mut it = rest.split_whitespace();
+            let head = it.next().unwrap_or("");
+            let keycode: u16 = head.parse().map_err(|_| format!("bad keycode '{head}'"))?;
+            let mut mods = Vec::new();
+            for tok in it {
+                mods.push(tok.parse::<u16>().map_err(|_| format!("bad modifier '{tok}'"))?);
+            }
+            Ok(Command::Key { keycode, mods })
         }
         "type" => Ok(Command::Type { text: rest.to_string() }),
         "" => Err("empty line".into()),
@@ -401,7 +411,25 @@ mod tests {
 
     #[test]
     fn parses_key_type_hide_quit() {
-        assert_eq!(parse("key 30"), Ok(Command::Key { keycode: 30 }));
+        assert_eq!(parse("key 30"), Ok(Command::Key { keycode: 30, mods: vec![] }));
+        // The extended form: modifiers follow the keycode, in press order.
+        assert_eq!(
+            parse("key 14 29"),
+            Ok(Command::Key { keycode: 14, mods: vec![29] }),
+            "ctrl+backspace"
+        );
+        assert_eq!(
+            parse("key 15 29 42"),
+            Ok(Command::Key { keycode: 15, mods: vec![29, 42] }),
+            "ctrl+shift+tab"
+        );
+        // Extra whitespace is the splitter's problem, not the grammar's.
+        assert_eq!(parse("key  14   29 "), Ok(Command::Key { keycode: 14, mods: vec![29] }));
+        // A junk modifier is reported, not silently dropped: a keystroke that
+        // half-lands is worse than one that does not.
+        assert!(parse("key 14 nope").unwrap_err().contains("bad modifier"));
+        assert!(parse("key nope").unwrap_err().contains("bad keycode"));
+        assert!(parse("key").unwrap_err().contains("bad keycode"));
         assert_eq!(parse("type hello world"), Ok(Command::Type { text: "hello world".into() }));
         assert_eq!(parse("hide"), Ok(Command::Hide));
         assert_eq!(parse("quit"), Ok(Command::Quit));

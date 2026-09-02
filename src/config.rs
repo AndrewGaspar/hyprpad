@@ -91,6 +91,123 @@ impl WorkspaceTarget {
     }
 }
 
+/// The most modifiers one [`KeyChord`] can carry.
+///
+/// There are only eight modifier codes in the key table (`left`/`right` ×
+/// shift/ctrl/alt/meta) and [`KeyChord::parse`] rejects a repeat, so a chord
+/// can never legitimately want a ninth: this is a defensive bound, not a limit
+/// a config meets.
+const MAX_CHORD_MODS: usize = 8;
+
+/// A key with the modifiers held around it — `shift+tab`, `ctrl+left`,
+/// `ctrl+shift+tab`.
+///
+/// Wherever the daemon presses the key it presses `mods` first, **in order**;
+/// wherever it releases the key it releases them afterwards, **in reverse**, so
+/// the combo brackets its key the way a real keyboard does. A chord with no
+/// modifiers is exactly the lone keycode [`Action::Key`] carried before combos
+/// existed and behaves identically — held with the button, auto-repeated by the
+/// kernel, released on the up edge.
+///
+/// The modifiers are always `KEY_*` codes ([`modifier_code`] rejects anything
+/// else before the final `+`), but the key itself is the same open evdev space
+/// [`Action::Key`] has always used: `shift+btn_left` is a legal chord whose
+/// modifier is typed on the virtual keyboard while its button is clicked on the
+/// virtual pointer.
+///
+/// The modifiers live in an inline array rather than a `Vec` so the type stays
+/// `Copy`, which is what lets [`OskAction`] — copied out of the layered map
+/// every frame — stay `Copy` too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyChord {
+    mods: [u16; MAX_CHORD_MODS],
+    n_mods: u8,
+    code: u16,
+}
+
+impl KeyChord {
+    /// A bare key with no modifiers — what every `Action::Key` was before
+    /// combos, and what `h.key "tab"` still parses to.
+    pub const fn plain(code: u16) -> KeyChord {
+        KeyChord { mods: [0; MAX_CHORD_MODS], n_mods: 0, code }
+    }
+
+    /// A key with `mods` held around it, in press order. Errors rather than
+    /// truncating if handed more modifiers than the table can name — which
+    /// parsing cannot produce, since a repeat is already an error.
+    pub fn new(mods: &[u16], code: u16) -> Result<KeyChord, String> {
+        if mods.len() > MAX_CHORD_MODS {
+            return Err(format!("too many modifiers ({}, max {MAX_CHORD_MODS})", mods.len()));
+        }
+        let mut chord = KeyChord::plain(code);
+        chord.mods[..mods.len()].copy_from_slice(mods);
+        chord.n_mods = mods.len() as u8;
+        Ok(chord)
+    }
+
+    /// The modifiers, in press order (release order is this reversed).
+    pub fn mods(&self) -> &[u16] {
+        &self.mods[..usize::from(self.n_mods)]
+    }
+
+    /// The key the modifiers bracket.
+    pub fn code(&self) -> u16 {
+        self.code
+    }
+
+    /// Whether this is a lone key — no modifiers to press around it.
+    pub fn is_plain(&self) -> bool {
+        self.n_mods == 0
+    }
+
+    /// Parse a key name, optionally preceded by modifiers joined with `+`:
+    /// `"tab"`, `"shift+tab"`, `"ctrl+shift+tab"`, `"ctrl+left"`, `"shift+f"`,
+    /// `"super+1"`. Every name is [`key_code`]'s, so a key is spelled the same
+    /// alone as it is in a combo; every token before the last must name a
+    /// modifier ([`modifier_code`]).
+    ///
+    /// Whitespace around a token is allowed (`"ctrl + left"`). Errors: an
+    /// unknown token, a non-modifier before a `+`, a repeated modifier, and a
+    /// combo that stops at a modifier with no key after it.
+    pub fn parse(s: &str) -> Result<KeyChord, String> {
+        let s = s.trim();
+        // The common case, and the only spelling that existed before combos:
+        // no `+`, so the whole string is one key name.
+        if !s.contains('+') {
+            return Ok(KeyChord::plain(key_code(s)?));
+        }
+        let mut parts: Vec<&str> = s.split('+').map(str::trim).collect();
+        // `split` always yields at least one part, so the pop cannot fail.
+        let last = parts.pop().unwrap_or_default();
+        if last.is_empty() {
+            return Err(format!(
+                "'{s}' stops at a modifier: a combo needs the key it holds, \
+                 e.g. 'shift+tab'"
+            ));
+        }
+        let mut mods: Vec<u16> = Vec::with_capacity(parts.len());
+        for tok in parts {
+            if tok.is_empty() {
+                return Err(format!("empty modifier in '{s}'"));
+            }
+            let code = modifier_code(tok)?;
+            if mods.contains(&code) {
+                return Err(format!("modifier '{tok}' is repeated in '{s}'"));
+            }
+            mods.push(code);
+        }
+        KeyChord::new(&mods, key_code(last)?)
+    }
+}
+
+/// A lone keycode is a chord with no modifiers, so a call site that already has
+/// the code — a built-in, a test — can keep saying just that.
+impl From<u16> for KeyChord {
+    fn from(code: u16) -> KeyChord {
+        KeyChord::plain(code)
+    }
+}
+
 /// An action the integration layer can carry out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -127,7 +244,13 @@ pub enum Action {
     /// ([`crate::output::VirtualPointer`]) instead. The daemon decides by the
     /// code ([`PointerButton::from_evdev`]); the binding tables, guards and
     /// mode engine never need to tell the two apart. Not a Hyprland dispatch.
-    Key(u16),
+    ///
+    /// The payload is a whole [`KeyChord`], so the key may carry modifiers
+    /// (`key shift+tab`, `h.key "ctrl+left"`). They are pressed before it and
+    /// released after it wherever it is pressed and released — a bare button, a
+    /// guide chord, or the on-screen keyboard's helper table — and a chord with
+    /// no modifiers is the plain keycode this always was.
+    Key(KeyChord),
     /// Force the named mode, overriding whatever the context rules resolve to
     /// ([`crate::mode::ModeEngine`]'s manual override — the top of the
     /// precedence, docs/13). Applied by the daemon loop, not dispatched.
@@ -207,7 +330,7 @@ impl Action {
                 if rest.is_empty() {
                     Err("key needs a name".to_string())
                 } else {
-                    Ok(Action::Key(key_code(rest)?))
+                    Ok(Action::Key(KeyChord::parse(rest)?))
                 }
             }
             // A mouse button is a key in evdev's code space (`BTN_LEFT` sits a
@@ -217,7 +340,7 @@ impl Action {
                 if rest.is_empty() {
                     Err("mouse needs a button: left|right|middle".to_string())
                 } else {
-                    Ok(Action::Key(mouse_code(rest)?))
+                    Ok(Action::Key(mouse_code(rest)?.into()))
                 }
             }
             // The manual mode override (docs/13 "Owner decisions" #4). Spelled
@@ -246,7 +369,10 @@ impl Action {
 /// * [`Hold`](Self::Hold) — a `KEY_*` or `BTN_*` evdev code ([`Action::Key`],
 ///   spelled `key up` / `mouse left`). Pressed on the down edge and released
 ///   on the up edge, so the kernel auto-repeats a held arrow and a held mouse
-///   button drags. Today's behaviour for every bare button.
+///   button drags. Today's behaviour for every bare button. A combo
+///   ([`KeyChord`], `key ctrl+left`) is held the same way, whole: its
+///   modifiers go down before the key and come up after it, and the kernel
+///   auto-repeats the key with them still down.
 /// * [`Fire`](Self::Fire) — everything else (`exec`, `dispatch`, `workspace`,
 ///   `keyboard`, `fullscreen`, `set_mode`, `clear_mode`). Performed **once**
 ///   on the press edge, through the same path a guide chord takes after it
@@ -256,8 +382,9 @@ impl Action {
 /// error — remove the line instead ([`ButtonAction::classify`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ButtonAction {
-    /// An evdev code held down with the button.
-    Hold(u16),
+    /// An evdev code — with any modifiers around it — held down with the
+    /// button.
+    Hold(KeyChord),
     /// An action fired once on the press edge.
     Fire(Action),
 }
@@ -266,7 +393,7 @@ impl ButtonAction {
     /// Sort a parsed action into what a bare button does with it.
     pub fn classify(action: Action) -> Result<ButtonAction, String> {
         match action {
-            Action::Key(code) => Ok(ButtonAction::Hold(code)),
+            Action::Key(chord) => Ok(ButtonAction::Hold(chord)),
             Action::None => Err("a bare button needs an action; to leave a button unbound, \
                                  remove its line instead of binding it to none"
                 .to_string()),
@@ -278,7 +405,7 @@ impl ButtonAction {
     /// [`classify`](Self::classify), for the cheat sheet.
     pub fn to_action(&self) -> Action {
         match self {
-            ButtonAction::Hold(code) => Action::Key(*code),
+            ButtonAction::Hold(chord) => Action::Key(*chord),
             ButtonAction::Fire(a) => a.clone(),
         }
     }
@@ -298,7 +425,11 @@ pub enum OskAction {
     /// Tap this raw evdev key through the keyboard's own virtual keyboard
     /// (`key space`, `h.key "space"`): the Deck's Y = Space, X = Backspace,
     /// R2 = Enter. Never a mouse button — there is no pointer in a keyboard.
-    Key(u16),
+    ///
+    /// A [`KeyChord`] like any other `Action::Key`, so `h.key "ctrl+backspace"`
+    /// works here too: the modifiers ride the wire to the keyboard child, which
+    /// holds them around the tap on its own uinput device.
+    Key(KeyChord),
     /// Type the key under the cursor of the pad on this button's side of the
     /// puck (`osk commit`, `h.osk "commit"`): the pad clicks.
     Commit,
@@ -338,8 +469,8 @@ impl OskAction {
                 format!("unknown on-screen keyboard action '{rest}' (want osk commit|shift|dismiss)")
             }),
             "key" | "mouse" | "click" => match Action::parse(s)? {
-                Action::Key(code) if is_mouse_code(code) => Err(OSK_MOUSE_ERR.to_string()),
-                Action::Key(code) => Ok(OskAction::Key(code)),
+                Action::Key(c) if is_mouse_code(c.code()) => Err(OSK_MOUSE_ERR.to_string()),
+                Action::Key(chord) => Ok(OskAction::Key(chord)),
                 other => Err(format!("'{s}' is not a key ({other:?})")),
             },
             _ => Err("osk_buttons values must be a 'key <name>', one of the keyboard's own \
@@ -384,9 +515,9 @@ pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'stat
         (PadLeftClick, OskAction::Commit, "Type the key under the cursor"),
         (PadRightClick, OskAction::Commit, "Type the key under the cursor"),
         (TriggerL2Full, OskAction::Shift, "Shift (hold)"),
-        (TriggerR2Full, OskAction::Key(28), "Enter"),
-        (Y, OskAction::Key(57), "Space"),
-        (X, OskAction::Key(14), "Backspace"),
+        (TriggerR2Full, OskAction::Key(KeyChord::plain(28)), "Enter"),
+        (Y, OskAction::Key(KeyChord::plain(57)), "Space"),
+        (X, OskAction::Key(KeyChord::plain(14)), "Backspace"),
         (B, OskAction::Dismiss, "Close the keyboard"),
         (Menu, OskAction::Dismiss, "Close the keyboard"),
     ]
@@ -498,11 +629,20 @@ pub(crate) fn parse_button(s: &str) -> Result<report::Button, String> {
 /// its raw evdev keycode (`input-event-codes.h`, the `KEY_*` constants).
 ///
 /// Covers the arrow keys (the D-pad-to-arrows default) plus the common editing
-/// and navigation keys, so bare buttons can be bound to more than the arrows
-/// without extending this table. An unknown name is a reported error, never a
-/// silent no-op. Names are matched case-insensitively by the caller.
+/// and navigation keys, the letter and digit rows, the function keys and the
+/// US punctuation, so a binding — or a leg of a [`KeyChord`] — can name any
+/// key a combo realistically wants. An unknown name is a reported error, never
+/// a silent no-op. Names are matched case-insensitively.
+///
+/// The letters and digits are not listed: they are contiguous runs in evdev's
+/// table, so [`row_code`] computes them and [`row_name`] inverts them from the
+/// same rows, which is what keeps the two directions from drifting.
 pub(crate) fn key_code(name: &str) -> Result<u16, String> {
-    let code = match name.trim().to_ascii_lowercase().as_str() {
+    let name = name.trim().to_ascii_lowercase();
+    if let Some(code) = row_code(&name) {
+        return Ok(code);
+    }
+    let code = match name.as_str() {
         "up" => 103,        // KEY_UP
         "down" => 108,      // KEY_DOWN
         "left" => 105,      // KEY_LEFT
@@ -527,8 +667,39 @@ pub(crate) fn key_code(name: &str) -> Result<u16, String> {
         "rightctrl" => 97,           // KEY_RIGHTCTRL
         "leftalt" | "alt" => 56,     // KEY_LEFTALT
         "rightalt" | "altgr" => 100, // KEY_RIGHTALT
-        "leftmeta" | "meta" | "super" => 125, // KEY_LEFTMETA
+        "leftmeta" | "meta" | "super" | "win" => 125, // KEY_LEFTMETA
         "rightmeta" => 126,          // KEY_RIGHTMETA
+        // The function keys. F1..F10 are contiguous; F11/F12 sit apart, as
+        // they do in `input-event-codes.h`. Nothing past F12: a controller
+        // binding for F13 is far likelier a typo than an intent.
+        "f1" => 59,
+        "f2" => 60,
+        "f3" => 61,
+        "f4" => 62,
+        "f5" => 63,
+        "f6" => 64,
+        "f7" => 65,
+        "f8" => 66,
+        "f9" => 67,
+        "f10" => 68,
+        "f11" => 87,
+        "f12" => 88,
+        "insert" | "ins" => 110, // KEY_INSERT
+        "capslock" | "caps" => 58,
+        // US punctuation, under evdev's own `KEY_*` names plus the spellings a
+        // person reaches for first. None of them contains a `+`, so splitting a
+        // combo on `+` stays unambiguous.
+        "minus" | "dash" => 12,
+        "equal" | "equals" => 13,
+        "leftbrace" | "lbracket" => 26,
+        "rightbrace" | "rbracket" => 27,
+        "semicolon" => 39,
+        "apostrophe" | "quote" => 40,
+        "grave" | "backtick" | "tilde" => 41,
+        "backslash" => 43,
+        "comma" => 51,
+        "dot" | "period" => 52,
+        "slash" => 53,
         // The mouse buttons, under their evdev names: `key btn_left` is the
         // same binding `mouse left` is. Routed to the pointer by the daemon.
         "btn_left" => BTN_LEFT,
@@ -536,6 +707,74 @@ pub(crate) fn key_code(name: &str) -> Result<u16, String> {
         "btn_middle" => BTN_MIDDLE,
         other => return Err(format!("unknown key '{other}'")),
     };
+    Ok(code)
+}
+
+/// The QWERTY letter and digit rows as evdev lays them out: each entry is the
+/// keycode of the row's first key and the characters that follow it, in order.
+///
+/// `KEY_1`..`KEY_9` are 2..=10 with `KEY_0` closing the row at 11, and the
+/// three letter rows start at `KEY_Q` = 16, `KEY_A` = 30 and `KEY_Z` = 44. One
+/// table serves both directions ([`row_code`], [`row_name`]) so a letter can
+/// never parse to a code the cheat sheet spells back differently.
+const KEY_ROWS: [(u16, &str); 4] =
+    [(2, "1234567890"), (16, "qwertyuiop"), (30, "asdfghjkl"), (44, "zxcvbnm")];
+
+/// The keycode of a single-character key name (`"a"`, `"7"`), or `None` for
+/// anything else — including a name that is one character but not on a row.
+pub(crate) fn row_code(name: &str) -> Option<u16> {
+    let mut chars = name.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    for (base, row) in KEY_ROWS {
+        if let Some(i) = row.find(c) {
+            return Some(base + i as u16);
+        }
+    }
+    None
+}
+
+/// The single-character name of a letter or digit keycode — the inverse of
+/// [`row_code`], for the cheat sheet.
+pub(crate) fn row_name(code: u16) -> Option<char> {
+    for (base, row) in KEY_ROWS {
+        if code >= base {
+            if let Some(c) = row.as_bytes().get(usize::from(code - base)) {
+                return Some(*c as char);
+            }
+        }
+    }
+    None
+}
+
+/// Whether an evdev code is one of the eight modifier keys a [`KeyChord`] may
+/// hold around its key.
+pub(crate) fn is_modifier_code(code: u16) -> bool {
+    matches!(code, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126)
+}
+
+/// Resolve one modifier token of a combo — everything before the last `+`.
+///
+/// Every [`key_code`] spelling of a modifier works, so `shift`, `ctrl`,
+/// `control`, `alt`, `super`, `meta`, `win` and the explicit `leftshift` /
+/// `rightctrl` / … forms all land here. A name that resolves to an ordinary key
+/// is rejected *as a modifier*, with the reason said plainly: only the last
+/// token of a combo may be one.
+pub(crate) fn modifier_code(name: &str) -> Result<u16, String> {
+    let code = key_code(name).map_err(|_| {
+        format!(
+            "unknown modifier '{name}' (want shift|ctrl|alt|super, or an \
+             explicit leftshift|rightctrl|… form)"
+        )
+    })?;
+    if !is_modifier_code(code) {
+        return Err(format!(
+            "'{name}' is not a modifier: only shift|ctrl|alt|super can come \
+             before a '+' in a key combo"
+        ));
+    }
     Ok(code)
 }
 
@@ -2140,9 +2379,123 @@ mod tests {
     }
 
     #[test]
+    fn the_key_table_covers_the_letters_digits_punctuation_and_function_keys() {
+        // The rows are computed, so spot-check each one's ends and one middle.
+        assert_eq!(key_code("a"), Ok(30));
+        assert_eq!(key_code("l"), Ok(38));
+        assert_eq!(key_code("q"), Ok(16));
+        assert_eq!(key_code("p"), Ok(25));
+        assert_eq!(key_code("z"), Ok(44));
+        assert_eq!(key_code("m"), Ok(50));
+        assert_eq!(key_code("F"), Ok(33), "matched case-insensitively");
+        assert_eq!(key_code("1"), Ok(2));
+        assert_eq!(key_code("9"), Ok(10));
+        assert_eq!(key_code("0"), Ok(11), "KEY_0 closes the row, it does not open it");
+        // Function keys, with F11/F12 out of line exactly as evdev has them.
+        assert_eq!(key_code("f1"), Ok(59));
+        assert_eq!(key_code("f10"), Ok(68));
+        assert_eq!(key_code("f11"), Ok(87));
+        assert_eq!(key_code("f12"), Ok(88));
+        assert!(key_code("f13").unwrap_err().contains("unknown key"), "still stops at F12");
+        // Punctuation, under evdev's names and the everyday ones.
+        assert_eq!(key_code("minus"), Ok(12));
+        assert_eq!(key_code("equal"), Ok(13));
+        assert_eq!(key_code("comma"), Ok(51));
+        assert_eq!(key_code("dot"), key_code("period"));
+        assert_eq!(key_code("slash"), Ok(53));
+        assert_eq!(key_code("grave"), key_code("backtick"));
+        assert_eq!(key_code("insert"), Ok(110));
+        assert_eq!(key_code("win"), key_code("super"));
+        // Every name the table can produce stays inside the range the uinput
+        // keyboards register (1..=255) — the mouse buttons excepted, which go
+        // to the pointer instead.
+        for name in ["a", "z", "0", "9", "f12", "slash", "insert", "capslock", "grave"] {
+            let code = key_code(name).unwrap();
+            assert!((1..=255).contains(&code), "{name} -> {code}");
+        }
+    }
+
+    #[test]
+    fn key_chords_parse_modifiers_before_the_key() {
+        use KeyChord as K;
+        // A lone key is a chord with nothing around it — byte for byte the
+        // binding that existed before combos.
+        let tab = K::parse("tab").unwrap();
+        assert!(tab.is_plain());
+        assert_eq!(tab.code(), 15);
+        assert_eq!(tab.mods(), &[] as &[u16]);
+        assert_eq!(tab, K::plain(15));
+
+        // The forms the designs asked for.
+        let shift_tab = K::parse("shift+tab").unwrap();
+        assert_eq!(shift_tab.mods(), &[42]);
+        assert_eq!(shift_tab.code(), 15);
+        let ctrl_shift_tab = K::parse("ctrl+shift+tab").unwrap();
+        assert_eq!(ctrl_shift_tab.mods(), &[29, 42], "in the order written");
+        assert_eq!(ctrl_shift_tab.code(), 15);
+        assert_eq!(K::parse("ctrl+left").unwrap(), K::new(&[29], 105).unwrap());
+        assert_eq!(K::parse("shift+f").unwrap(), K::new(&[42], 33).unwrap());
+        assert_eq!(K::parse("super+1").unwrap(), K::new(&[125], 2).unwrap());
+
+        // Modifier aliases, and the explicit left/right forms.
+        for name in ["shift", "leftshift", "SHIFT"] {
+            assert_eq!(K::parse(&format!("{name}+tab")).unwrap().mods(), &[42], "{name}");
+        }
+        for (name, code) in [("ctrl", 29), ("control", 29), ("alt", 56), ("super", 125),
+                             ("meta", 125), ("win", 125), ("rightshift", 54),
+                             ("rightctrl", 97), ("rightalt", 100), ("rightmeta", 126)] {
+            assert_eq!(K::parse(&format!("{name}+a")).unwrap().mods(), &[code], "{name}");
+        }
+        // Whitespace around a token is the writer's business, not the grammar's.
+        assert_eq!(K::parse(" ctrl + left ").unwrap(), K::parse("ctrl+left").unwrap());
+
+        // A mouse button may be the key of a combo: the modifier goes to the
+        // keyboard, the button to the pointer.
+        let shift_click = K::parse("shift+btn_left").unwrap();
+        assert_eq!(shift_click.mods(), &[42]);
+        assert_eq!(shift_click.code(), BTN_LEFT);
+
+        // The three errors.
+        assert!(K::parse("shift+nope").unwrap_err().contains("unknown key"));
+        assert!(K::parse("nope+tab").unwrap_err().contains("unknown modifier"));
+        assert!(K::parse("shift+").unwrap_err().contains("stops at a modifier"));
+        assert!(K::parse("shift+shift+tab").unwrap_err().contains("repeated"));
+        assert!(K::parse("ctrl+ctrl+a").unwrap_err().contains("repeated"));
+        // A non-modifier before the `+` is rejected where it stands, and says why.
+        let e = K::parse("a+b").unwrap_err();
+        assert!(e.contains("is not a modifier"), "{e}");
+        // leftshift and rightshift are different keys, so both may be held.
+        assert_eq!(K::parse("leftshift+rightshift+a").unwrap().mods(), &[42, 54]);
+    }
+
+    #[test]
+    fn combo_actions_parse_and_classify_like_any_other_key() {
+        assert_eq!(
+            Action::parse("key shift+tab"),
+            Ok(Action::Key(KeyChord::parse("shift+tab").unwrap()))
+        );
+        // A bare button holds the whole combo; it is not a fired action.
+        assert_eq!(
+            ButtonAction::classify(Action::parse("key ctrl+left").unwrap()),
+            Ok(ButtonAction::Hold(KeyChord::parse("ctrl+left").unwrap()))
+        );
+        // And `to_action` puts it back exactly, so the cheat sheet round-trips.
+        let hold = ButtonAction::Hold(KeyChord::parse("ctrl+shift+tab").unwrap());
+        assert_eq!(hold.to_action(), Action::parse("key ctrl+shift+tab").unwrap());
+        // The OSK's table takes a combo too — but still not a mouse button.
+        assert_eq!(
+            OskAction::parse("key ctrl+backspace"),
+            Ok(OskAction::Key(KeyChord::parse("ctrl+backspace").unwrap()))
+        );
+        assert!(OskAction::parse("key shift+btn_left").unwrap_err().contains("mouse button"));
+        // The error text still names the bad token, whichever half it is in.
+        assert!(Action::parse("key ctrl+nope").unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
     fn key_action_parses_and_reports_unknown() {
-        assert_eq!(Action::parse("key up").unwrap(), Action::Key(103));
-        assert_eq!(Action::parse("key ESC").unwrap(), Action::Key(1));
+        assert_eq!(Action::parse("key up").unwrap(), Action::Key(103.into()));
+        assert_eq!(Action::parse("key ESC").unwrap(), Action::Key(1.into()));
         assert!(Action::parse("key").unwrap_err().contains("key needs a name"));
         assert!(Action::parse("key nope").unwrap_err().contains("unknown key"));
     }
@@ -2152,15 +2505,15 @@ mod tests {
         let c = Config::load_default();
         let b = c.buttons();
         use ButtonAction::Hold;
-        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
-        assert_eq!(b.get(&Button::DpadDown), Some(&Hold(108)));
-        assert_eq!(b.get(&Button::DpadLeft), Some(&Hold(105)));
-        assert_eq!(b.get(&Button::DpadRight), Some(&Hold(106)));
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103.into())));
+        assert_eq!(b.get(&Button::DpadDown), Some(&Hold(108.into())));
+        assert_eq!(b.get(&Button::DpadLeft), Some(&Hold(105.into())));
+        assert_eq!(b.get(&Button::DpadRight), Some(&Hold(106.into())));
         // The mouse clicks that used to be hardwired in the cursor driver: pad
         // click and a full R2 pull are a left click, a full L2 pull a right one.
-        assert_eq!(b.get(&Button::PadRightClick), Some(&Hold(BTN_LEFT)));
-        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(BTN_LEFT)));
-        assert_eq!(b.get(&Button::TriggerL2Full), Some(&Hold(BTN_RIGHT)));
+        assert_eq!(b.get(&Button::PadRightClick), Some(&Hold(BTN_LEFT.into())));
+        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(BTN_LEFT.into())));
+        assert_eq!(b.get(&Button::TriggerL2Full), Some(&Hold(BTN_RIGHT.into())));
         // Four arrows and three clicks, and nothing else, by default — and
         // every one of them is held with its button, not fired.
         assert_eq!(b.len(), 7);
@@ -2179,11 +2532,11 @@ mod tests {
 
     #[test]
     fn mouse_actions_parse_to_key_actions_in_the_btn_code_space() {
-        assert_eq!(Action::parse("mouse left"), Ok(Action::Key(272)));
-        assert_eq!(Action::parse("click right"), Ok(Action::Key(273)));
-        assert_eq!(Action::parse("MOUSE Middle"), Ok(Action::Key(274)));
+        assert_eq!(Action::parse("mouse left"), Ok(Action::Key(272.into())));
+        assert_eq!(Action::parse("click right"), Ok(Action::Key(273.into())));
+        assert_eq!(Action::parse("MOUSE Middle"), Ok(Action::Key(274.into())));
         // The evdev spelling works through `key` too: same code, same action.
-        assert_eq!(Action::parse("key btn_left"), Ok(Action::Key(272)));
+        assert_eq!(Action::parse("key btn_left"), Ok(Action::Key(272.into())));
         assert_eq!(Action::parse("key btn_left"), Action::parse("mouse left"));
         assert!(Action::parse("mouse").unwrap_err().contains("mouse needs a button"));
         let e = Action::parse("mouse side").unwrap_err();
@@ -2212,8 +2565,10 @@ mod tests {
     fn buttons_accept_a_mouse_button_but_osk_buttons_reject_it() {
         let c = Config::from_toml_str("[buttons]\nr2 = \"mouse left\"\nl2 = \"click rmb\"\n")
             .expect("parse");
-        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&ButtonAction::Hold(BTN_LEFT)));
-        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&ButtonAction::Hold(BTN_RIGHT)));
+        let r2 = c.buttons().get(&Button::TriggerR2Full);
+        assert_eq!(r2, Some(&ButtonAction::Hold(BTN_LEFT.into())));
+        let l2 = c.buttons().get(&Button::TriggerL2Full);
+        assert_eq!(l2, Some(&ButtonAction::Hold(BTN_RIGHT.into())));
 
         for value in ["mouse left", "key btn_right", "click 3"] {
             let e = Config::from_toml_str(&format!("[osk_buttons]\ny = \"{value}\"\n"))
@@ -2235,8 +2590,8 @@ mod tests {
         assert_eq!(OskAction::parse("osk dismiss"), Ok(Dismiss));
         assert_eq!(OskAction::parse("osk close"), Ok(Dismiss));
         assert_eq!(OskAction::parse("osk hide"), Ok(Dismiss));
-        assert_eq!(OskAction::parse("key space"), Ok(Key(57)));
-        assert_eq!(OskAction::parse("  key enter "), Ok(Key(28)));
+        assert_eq!(OskAction::parse("key space"), Ok(Key(57.into())));
+        assert_eq!(OskAction::parse("  key enter "), Ok(Key(28.into())));
         assert_eq!(OskAction::parse("none"), Ok(None));
         assert_eq!(OskAction::parse(""), Ok(None));
 
@@ -2278,9 +2633,9 @@ mod tests {
         // Names and codes agree with the key table the config grammar uses.
         for (b, what, _) in osk_builtins() {
             match (b, what) {
-                (Button::TriggerR2Full, Key(c)) => assert_eq!(c, key_code("enter").unwrap()),
-                (Button::Y, Key(c)) => assert_eq!(c, key_code("space").unwrap()),
-                (Button::X, Key(c)) => assert_eq!(c, key_code("backspace").unwrap()),
+                (Button::TriggerR2Full, Key(c)) => assert_eq!(c.code(), key_code("enter").unwrap()),
+                (Button::Y, Key(c)) => assert_eq!(c.code(), key_code("space").unwrap()),
+                (Button::X, Key(c)) => assert_eq!(c.code(), key_code("backspace").unwrap()),
                 (Button::PadLeftClick | Button::PadRightClick, Commit) => {}
                 (Button::TriggerL2Full, Shift) => {}
                 (Button::B | Button::Menu, Dismiss) => {}
@@ -2294,7 +2649,7 @@ mod tests {
         assert!(bare.osk_buttons().is_empty());
         let live = bare.osk_buttons_in(&anywhere);
         assert_eq!(live.get(&Button::TriggerL2Full), Some(&Shift));
-        assert_eq!(live.get(&Button::TriggerR2Full), Some(&Key(28)));
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&Key(28.into())));
         assert_eq!(live.get(&Button::PadLeftClick), Some(&Commit));
         assert_eq!(live.get(&Button::B), Some(&Dismiss));
         assert_eq!(live.len(), 8);
@@ -2313,7 +2668,7 @@ mod tests {
         assert_eq!(c.osk_buttons().get(&Button::Menu), Some(&None), "the raw table keeps `none`");
         let live = c.osk_buttons_in(&anywhere);
         assert_eq!(live.get(&Button::TriggerR2Full), Some(&Commit), "rebound over the built-in");
-        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15)), "added");
+        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15.into())), "added");
         assert_eq!(live.get(&Button::Menu), Option::None, "taken away, nothing in its place");
         assert_eq!(live.get(&Button::B), Some(&Dismiss), "the other built-ins survive");
         assert_eq!(live.get(&Button::TriggerL2Full), Some(&Shift));
@@ -2331,9 +2686,9 @@ a = "key enter"
 r1 = "key pageup"
 "#;
         let c = Config::from_toml_str(toml).expect("parse");
-        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&ButtonAction::Hold(103)));
-        assert_eq!(c.buttons().get(&Button::A), Some(&ButtonAction::Hold(28)));
-        assert_eq!(c.buttons().get(&Button::BumperR1), Some(&ButtonAction::Hold(104)));
+        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&ButtonAction::Hold(103.into())));
+        assert_eq!(c.buttons().get(&Button::A), Some(&ButtonAction::Hold(28.into())));
+        assert_eq!(c.buttons().get(&Button::BumperR1), Some(&ButtonAction::Hold(104.into())));
         // Bindings and buttons are independent sections.
         assert!(c.is_empty());
 
@@ -2370,8 +2725,8 @@ r5 = "dispatch hl.dsp.window.close()"
         let c = Config::from_toml_str(toml).expect("parse");
         let b = c.buttons();
         assert_eq!(b.get(&Button::A), Some(&Fire(Action::Exec("foo".into()))));
-        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
-        assert_eq!(b.get(&Button::X), Some(&Hold(BTN_LEFT)));
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103.into())));
+        assert_eq!(b.get(&Button::X), Some(&Hold(BTN_LEFT.into())));
         assert_eq!(
             b.get(&Button::B),
             Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false }))
@@ -2404,8 +2759,9 @@ r5 = "dispatch hl.dsp.window.close()"
     #[test]
     fn button_action_classifies_keys_as_held_and_the_rest_as_fired() {
         use ButtonAction::{Fire, Hold};
-        assert_eq!(ButtonAction::classify(Action::Key(103)), Ok(Hold(103)));
-        assert_eq!(ButtonAction::classify(Action::Key(BTN_RIGHT)), Ok(Hold(BTN_RIGHT)));
+        assert_eq!(ButtonAction::classify(Action::Key(103.into())), Ok(Hold(103.into())));
+        let rmb = ButtonAction::classify(Action::Key(BTN_RIGHT.into()));
+        assert_eq!(rmb, Ok(Hold(BTN_RIGHT.into())));
         for a in [
             Action::Exec("x".into()),
             Action::Dispatch("y".into()),
@@ -2420,7 +2776,7 @@ r5 = "dispatch hl.dsp.window.close()"
         }
         assert!(ButtonAction::classify(Action::None).is_err());
         // And back: what the sheet prints is what the config said.
-        assert_eq!(Hold(103).to_action(), Action::Key(103));
+        assert_eq!(Hold(103.into()).to_action(), Action::Key(103.into()));
         assert_eq!(Fire(Action::ClearMode).to_action(), Action::ClearMode);
     }
 

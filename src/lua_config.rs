@@ -36,6 +36,7 @@
 //! h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 //! h.bind("guide+y",  h.keyboard { mode = "split" })
 //! h.button("dpad_up", h.key "up")       -- bare button, no guide modifier; held with it
+//! h.button("l1",      h.key "shift+tab") -- a combo: modifiers held around the key
 //! h.button("r2",      h.mouse "left")   -- a mouse button, through the pointer
 //! h.button("l5",      h.exec "voxtype record toggle") -- any other action fires once, on press
 //! h.osk_button("y",   h.key "space")    -- only while the OSK is up: a key typed through it…
@@ -56,6 +57,17 @@
 //! h.bind("guide+l1", h.workspace "-1"):not_in("game")
 //! h.bind("guide+i", h.exec "…"):when(function(ctx) return ctx.focus.pid ~= nil end)
 //! ```
+//!
+//! `h.key` takes a **combo** as readily as a key: modifier names joined to the
+//! key with `+` — `h.key "shift+tab"`, `h.key "ctrl+left"`, `h.key "ctrl+shift+tab"`,
+//! `h.key "super+1"` — where a modifier is `shift|ctrl|control|alt|super|meta|win`
+//! or an explicit `leftshift`/`rightctrl`/… form, and the key is any name the
+//! table knows (the letters, the digits, the arrows and editing keys, `f1`–`f12`,
+//! the US punctuation). The modifiers are pressed before the key and released
+//! after it wherever it goes down — a bare button, a guide chord, or an
+//! `h.osk_button` typed through the on-screen keyboard — so a held `ctrl+left`
+//! auto-repeats as one, and an unknown token, a repeated modifier or a combo
+//! with no key after its `+` is a reported error.
 //!
 //! `ctx` carries `ctx.focus.class`, `.title`, `.pid`, `.fullscreen`, and the
 //! method `ctx.focus:process_tree_has("claude")`, which walks the focused
@@ -96,7 +108,7 @@ use crate::config::{
     Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
     ModeDef, OskAction, ScrollConfig, ScrollMode,
 };
-use crate::config::{key_code, mouse_code, parse_button, GestureKey};
+use crate::config::{mouse_code, parse_button, GestureKey, KeyChord};
 use crate::mode::Context;
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value, VmState};
 use std::cell::{Cell, RefCell};
@@ -1468,10 +1480,10 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
                 "fullscreen" => Ok(Action::ToggleFullscreen),
                 "clear_mode" => Ok(Action::ClearMode),
                 "none" => Ok(Action::None),
-                "key" => key_code(&arg).map(Action::Key).map_err(err),
+                "key" => KeyChord::parse(&arg).map(Action::Key).map_err(err),
                 // A mouse button is a key in evdev's code space; the daemon
                 // routes it to the virtual pointer by its code.
-                "mouse" => mouse_code(&arg).map(Action::Key).map_err(err),
+                "mouse" => mouse_code(&arg).map(|c| Action::Key(c.into())).map_err(err),
                 "set_mode" => {
                     if arg.is_empty() {
                         Err(err("h.set_mode needs a mode name"))
@@ -1759,9 +1771,9 @@ mod tests {
             h.osk_button("y", h.key "space")
             "#,
         );
-        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&Hold(103)));
-        assert_eq!(c.buttons().get(&Button::A), Some(&Hold(28)));
-        assert_eq!(c.osk_buttons().get(&Button::Y), Some(&OskAction::Key(57)));
+        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&Hold(103.into())));
+        assert_eq!(c.buttons().get(&Button::A), Some(&Hold(28.into())));
+        assert_eq!(c.osk_buttons().get(&Button::Y), Some(&OskAction::Key(57.into())));
         assert!(c.buttons().get(&Button::Y).is_none());
     }
 
@@ -1783,7 +1795,7 @@ mod tests {
         assert_eq!(raw.get(&Button::TriggerR2Full), Some(&Commit));
         assert_eq!(raw.get(&Button::B), Some(&Dismiss));
         assert_eq!(raw.get(&Button::Menu), Some(&OskAction::None));
-        assert_eq!(raw.get(&Button::BumperL1), Some(&Key(15)));
+        assert_eq!(raw.get(&Button::BumperL1), Some(&Key(15.into())));
         assert_eq!(c.osk_button_descs.get(&Button::B).map(String::as_str), Some("Put it away"));
 
         // Layered over the built-ins: Menu is gone, R2 is a commit now, and
@@ -1793,8 +1805,8 @@ mod tests {
         assert_eq!(live.get(&Button::Menu), None);
         assert_eq!(live.get(&Button::TriggerR2Full), Some(&Commit));
         assert_eq!(live.get(&Button::PadRightClick), Some(&Commit));
-        assert_eq!(live.get(&Button::Y), Some(&Key(57)));
-        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15)));
+        assert_eq!(live.get(&Button::Y), Some(&Key(57.into())));
+        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15.into())));
 
         // The keyboard's verbs mean nothing on a chord or a bare button.
         let e = load_str(r#"hyprpad.bind("guide+a", hyprpad.osk "commit")"#, "t.lua").unwrap_err();
@@ -1840,8 +1852,8 @@ mod tests {
         assert_eq!(b.get(&Button::BumperL1), Some(&Fire(Action::ToggleFullscreen)));
         assert_eq!(b.get(&Button::GripR4), Some(&Fire(Action::SetMode("desktop".into()))));
         assert_eq!(b.get(&Button::GripL4), Some(&Fire(Action::ClearMode)));
-        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
-        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(272)));
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103.into())));
+        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(272.into())));
 
         // `h.none` binds nothing, and a button is not where to say so.
         let e = load_str(r#"hyprpad.button("b", hyprpad.none())"#, "t.lua").unwrap_err();
@@ -1882,7 +1894,7 @@ mod tests {
         assert_eq!(c.button_alts[0].desc.as_deref(), Some("Pause"));
         // ...and it is what `b` does in the game, while the desktop keeps the key.
         assert_eq!(c.buttons_in(&game).get(&Button::B), Some(&Fire(Action::Exec("x".into()))));
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14.into())));
     }
 
     #[test]
@@ -1897,11 +1909,11 @@ mod tests {
             h.button("l3", h.key "btn_left") -- the evdev spelling through h.key
             "#,
         );
-        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&Hold(272)));
-        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&Hold(273)));
-        assert_eq!(c.buttons().get(&Button::PadRightClick), Some(&Hold(272)));
-        assert_eq!(c.buttons().get(&Button::R3), Some(&Hold(274)));
-        assert_eq!(c.buttons().get(&Button::L3), Some(&Hold(272)));
+        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&Hold(272.into())));
+        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&Hold(273.into())));
+        assert_eq!(c.buttons().get(&Button::PadRightClick), Some(&Hold(272.into())));
+        assert_eq!(c.buttons().get(&Button::R3), Some(&Hold(274.into())));
+        assert_eq!(c.buttons().get(&Button::L3), Some(&Hold(272.into())));
 
         let e = load_str(r#"hyprpad.button("r2", hyprpad.mouse "side")"#, "t.lua").unwrap_err();
         assert!(e.contains("unknown mouse button 'side'"), "{e}");
@@ -1935,9 +1947,9 @@ mod tests {
             "#,
         );
         let game = ModeState::new("game", vec![]);
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerR2Full), Some(&Hold(272)));
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerL2Full), Some(&Hold(273)));
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::DpadUp), Some(&Hold(103)));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerR2Full), Some(&Hold(272.into())));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::TriggerL2Full), Some(&Hold(273.into())));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::DpadUp), Some(&Hold(103.into())));
         // In the game the clicks are gone with the arrows: the map is what a
         // mode takes away, and a click is just another entry in it.
         assert!(c.buttons_in(&game).is_empty());
@@ -2337,8 +2349,8 @@ mod tests {
             "#,
         );
         let sheet = ModeState::new("cheatsheet", vec![]);
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)), "Backspace");
-        assert_eq!(c.buttons_in(&sheet).get(&Button::B), Some(&Hold(1)), "Escape");
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14.into())), "Backspace");
+        assert_eq!(c.buttons_in(&sheet).get(&Button::B), Some(&Hold(1.into())), "Escape");
         assert_eq!(c.buttons_in(&sheet).len(), 1, "and nothing else is live there");
 
         // The alternate is a binding in its own right, description and all, so
@@ -2347,7 +2359,7 @@ mod tests {
         assert_eq!(c.button_alts[0].desc.as_deref(), Some("Close cheat sheet"));
         // The base map — the unguarded view the no-modes path uses — keeps the
         // binding that was declared first.
-        assert_eq!(c.buttons().get(&Button::B), Some(&Hold(14)));
+        assert_eq!(c.buttons().get(&Button::B), Some(&Hold(14.into())));
     }
 
     #[test]
@@ -2362,7 +2374,7 @@ mod tests {
             h.button("b", h.key "escape")
             "#,
         );
-        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14)));
+        assert_eq!(c.buttons_in(&desktop()).get(&Button::B), Some(&Hold(14.into())));
     }
 
     #[test]

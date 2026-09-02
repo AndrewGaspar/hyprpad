@@ -69,6 +69,22 @@ struct InputEvent {
     value: i32,
 }
 
+/// The modifier keycodes actually held around a tap: the caller's `mods`, in
+/// order, plus the keyboard's own Shift appended when `shift` is set and the
+/// caller has not already asked for it.
+///
+/// One list means one press/release order for both kinds of modifier, so a
+/// `key 33 29` (Ctrl+F) typed while the OSK's Shift latch is on holds Ctrl and
+/// Shift together rather than nesting them inconsistently. Pure, and the whole
+/// of the ordering decision — [`VirtualKeyboard::tap_with_mods`] just walks it.
+pub fn effective_mods(shift: bool, mods: &[u16]) -> Vec<u16> {
+    let mut held = mods.to_vec();
+    if shift && !held.contains(&KEY_LEFTSHIFT) {
+        held.push(KEY_LEFTSHIFT);
+    }
+    held
+}
+
 /// A kernel-level virtual keyboard created through `/dev/uinput`.
 ///
 /// It emits **real evdev keycodes** (`KEY_H`, `KEY_LEFTSHIFT`, …), so the
@@ -134,17 +150,29 @@ impl VirtualKeyboard {
     /// the bridge from the layout model: a [`crate::layout::Key`]'s `keycode`
     /// goes straight in here, with `shift` from the active shift state.
     pub fn tap(&mut self, code: u16, shift: bool) {
+        self.tap_with_mods(code, shift, &[]);
+    }
+
+    /// Tap one keycode with `mods` — raw modifier keycodes — held around it,
+    /// plus the keyboard's own Shift when `shift` is set ([`effective_mods`]).
+    /// The modifiers go down in order before the key and come up in reverse
+    /// after it, so a `key 14 29` from the daemon lands as Ctrl+Backspace.
+    ///
+    /// With no modifiers and `shift` set this is byte-for-byte the sequence
+    /// [`tap`](Self::tap) always emitted, timing included.
+    pub fn tap_with_mods(&mut self, code: u16, shift: bool, mods: &[u16]) {
         if code == 0 {
             return; // meta key with no direct keycode
         }
-        if shift {
-            self.emit_key(KEY_LEFTSHIFT, true);
+        let held = effective_mods(shift, mods);
+        for &m in &held {
+            self.emit_key(m, true);
         }
         self.emit_key(code, true);
         std::thread::sleep(Duration::from_millis(6));
         self.emit_key(code, false);
-        if shift {
-            self.emit_key(KEY_LEFTSHIFT, false);
+        for &m in held.iter().rev() {
+            self.emit_key(m, false);
         }
         std::thread::sleep(Duration::from_millis(6));
     }
@@ -254,6 +282,25 @@ pub fn key_for(c: char) -> Option<(u16, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_mods_folds_the_keyboards_own_shift_in_beside_the_daemons() {
+        // No modifiers and no shift: nothing is held, which is the plain tap
+        // the keyboard has always done for a letter.
+        assert_eq!(effective_mods(false, &[]), Vec::<u16>::new());
+        // The shift latch (or a held L2) alone is the old `tap(code, true)`.
+        assert_eq!(effective_mods(true, &[]), vec![KEY_LEFTSHIFT]);
+        // A daemon combo alone: exactly what it asked for, in its order.
+        assert_eq!(effective_mods(false, &[29]), vec![29]);
+        assert_eq!(effective_mods(false, &[29, 42]), vec![29, 42]);
+        // Both: Shift joins the end of the list rather than nesting around it,
+        // so `ctrl+backspace` typed with Shift latched holds Ctrl and Shift
+        // together.
+        assert_eq!(effective_mods(true, &[29]), vec![29, KEY_LEFTSHIFT]);
+        // And a combo that already says shift does not get a second one.
+        assert_eq!(effective_mods(true, &[KEY_LEFTSHIFT]), vec![KEY_LEFTSHIFT]);
+        assert_eq!(effective_mods(true, &[29, KEY_LEFTSHIFT]), vec![29, KEY_LEFTSHIFT]);
+    }
 
     #[test]
     fn ascii_map_covers_letters_digits_and_shift() {
