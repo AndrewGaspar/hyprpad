@@ -67,6 +67,18 @@ h.mode("game", { forward = true }).when(function(ctx)
       or c == "steamwebhelper"
 end)
 
+-- A browser: Google Chrome, and Omarchy's web apps (Chrome in `--app` mode,
+-- class `chrome-<host>__-Default`). Class-keyed like `game`, so it sits below
+-- the layer-keyed modes — an open menu or the cheat sheet still wins — and
+-- above `desktop`, the fallback. Every desktop guard below lists it too, so
+-- a browser behaves exactly like the desktop except where a binding says
+-- otherwise — today the bumpers, which switch tabs
+-- (docs/research/browser-hints.md).
+h.mode("browser").when(function(ctx)
+  local c = ctx.focus.class:lower()
+  return c == "google-chrome" or c:match("^chrome%-") ~= nil
+end)
+
 -- A terminal running Claude Code. Same window class as any other terminal, so
 -- the rule has to look INSIDE the window: `process_tree_has` walks the focused
 -- window's /proc descendants (once per focused pid, cached). Finnicky by
@@ -105,14 +117,14 @@ h.cursor {
   one_euro_beta = 1.0,
   one_euro_d_cutoff = 1.0,
   hysteresis = 0.0008,
-  only_in = { "desktop", "omarchy-ui" },
+  only_in = { "desktop", "omarchy-ui", "browser" },
 }
 
 h.scroll {
   mode = "circular",
   sensitivity = 1.0,
   circular_step_degrees = 15.0,
-  only_in = { "desktop", "omarchy-ui" },
+  only_in = { "desktop", "omarchy-ui", "browser" },
 }
 
 h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
@@ -124,19 +136,19 @@ h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
 -- is what hands them to the game under a game-classed window.
 -- ---------------------------------------------------------------------------
 
-h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui")
-h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui")
-h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui")
-h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui")
-h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui")     -- A = Enter/confirm
-h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
+h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui", "browser")
+h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui", "browser")
+h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui", "browser")
+h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui", "browser")
+h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui", "browser")     -- A = Enter/confirm
+h.button("b", h.key "backspace"):only_in("desktop", "browser") -- B = Backspace
 
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
 -- exactly like the cursor above: where the pad moves the pointer, it clicks.
-h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui")
-h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui")
-h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui")
+h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser")
+h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser")
+h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui", "browser")
 
 -- The same button, a different meaning in a different mode. The cheat sheet has
 -- keyboard focus and closes on Escape, so B dismisses it — and the two never
@@ -151,6 +163,23 @@ h.button("b", "Back (closes at top level)", h.key "back"):only_in("omarchy-ui")
 -- mode is exclusive: `guide+l1`/`guide+r1` still change workspace.
 h.button("l1", "Previous sheet tab", h.key "left"):only_in("cheatsheet")
 h.button("r1", "Next sheet tab", h.key "right"):only_in("cheatsheet")
+
+-- Bar panels (docs/research/bar-navigation.md, phase 0). Every panel the bar
+-- opens shares the `omarchy-keyboard-panel` layer — already in the `omarchy-ui`
+-- allowlist above — and Tab inside one closes it and opens its neighbour, so
+-- R1 walks the ring that `guide+dpad_up` (below) opens: Agents, Bluetooth,
+-- Network, Audio, Display, Power. R1's second alternate, and as exclusive as
+-- the first: under a panel we are in `omarchy-ui`, never in `cheatsheet`.
+h.button("r1", "Next panel", h.key "tab"):only_in("omarchy-ui")
+
+-- Browser tabs on the bumpers (docs/research/browser-hints.md §6): Chrome's
+-- own Ctrl+Shift+Tab / Ctrl+Tab, sent by the compositor to the focused
+-- window — a bare button carrying a dispatch fires once, on the press edge.
+-- Guarded into `browser`, so the bumpers still page the cheat sheet and walk
+-- the bar's panels elsewhere, and `guide+l1`/`guide+r1` still change
+-- workspace everywhere.
+h.button("l1", "Previous browser tab", h.dispatch 'hl.dsp.send_shortcut({ mods = "CTRL SHIFT", key = "Tab" })'):only_in("browser")
+h.button("r1", "Next browser tab",     h.dispatch 'hl.dsp.send_shortcut({ mods = "CTRL", key = "Tab" })'):only_in("browser")
 
 -- While the on-screen keyboard is up, these tap keys THROUGH the OSK
 -- (Deck-style helpers) so you never hunt for them with a cursor. Unguarded on
@@ -171,6 +200,8 @@ h.bind("guide+r1",          "Workspace right",     h.workspace "+1")
 h.bind("guide+l1",          "Workspace left",      h.workspace "-1")
 h.bind("guide+stick_right", "Workspace right",     h.workspace "+1")
 h.bind("guide+stick_left",  "Workspace left",      h.workspace "-1")
+h.bind("guide+x",           "New workspace",       h.dispatch 'hl.dsp.focus({ workspace = "emptyn" })')
+h.bind("guide+stick_down",  "Previous workspace",  h.dispatch 'hl.dsp.focus({ workspace = "previous" })')
 h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle")
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")
@@ -178,6 +209,20 @@ h.bind("guide+menu",        "Omarchy menu",        h.exec "omarchy-menu")
 h.bind("guide+l2",          "Previous tab",        h.dispatch "hl.dsp.group.prev()")
 h.bind("guide+r2",          "Next tab",            h.dispatch "hl.dsp.group.next()")
 h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" })
+
+-- `guide+x` and the stick's down flick above are HypXRland workspace
+-- selectors (docs/research/empty-workspace.md): `emptyn` is the first empty
+-- workspace to the RIGHT of this one, created at the end if none is free, and
+-- `previous` is where you were before it. They go through `h.dispatch` until
+-- `h.workspace` learns them. "B closes, X opens", the right stick is a whole
+-- family (left/right = ±1, down = back), and D-pad down takes the focused
+-- window along to the new one.
+h.bind("guide+dpad_down",   "Window to new workspace", h.dispatch 'hl.dsp.window.move({ workspace = "emptyn", follow = true })')
+
+-- Up to the bar (docs/research/bar-navigation.md, phase 0): opens the first
+-- panel of the bar's right section; R1 then walks the rest, the D-pad and A
+-- drive the panel, B closes it.
+h.bind("guide+dpad_up",     "Bar panels",          h.exec "omarchy-shell -q shell togglePanelAt right 1")
 
 -- View is the "show me the map" key: it raises the cheat sheet — this very
 -- file, drawn onto a controller diagram. The descriptions above are what it

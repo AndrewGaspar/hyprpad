@@ -2356,9 +2356,10 @@ mod tests {
         assert_eq!(lua.haptics(), toml.haptics());
         // A TOML config has no modes, so a Lua binding guarded INTO one has no
         // TOML counterpart to compare against: the cheat sheet's own Left/Right
-        // paging exists only under `cheatsheet`, a mode a TOML user never
-        // enters. What must still agree binding for binding is the pad a TOML
-        // user actually gets — the default mode.
+        // paging exists only under `cheatsheet`, and R1's Tab only under
+        // `omarchy-ui` — modes a TOML user never enters. What must still agree
+        // binding for binding is the pad a TOML user actually gets — the
+        // default mode.
         let st = crate::config::ModeState::new(lua.default_mode(), Vec::new());
         assert_eq!(&lua.buttons_in(&st), toml.buttons());
         assert_eq!(lua.osk_buttons(), toml.osk_buttons());
@@ -2437,6 +2438,10 @@ x = "key backspace"
 "guide+l1" = "workspace -1"
 "guide+stick_right" = "workspace +1"
 "guide+stick_left"  = "workspace -1"
+"guide+x" = 'dispatch hl.dsp.focus({ workspace = "emptyn" })'
+"guide+stick_down" = 'dispatch hl.dsp.focus({ workspace = "previous" })'
+"guide+dpad_down" = 'dispatch hl.dsp.window.move({ workspace = "emptyn", follow = true })'
+"guide+dpad_up" = "exec omarchy-shell -q shell togglePanelAt right 1"
 "guide+a" = "exec voxtype record toggle"
 "guide+b" = "dispatch hl.dsp.window.close()"
 "guide+r5" = "exec playerctl play-pause"
