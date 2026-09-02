@@ -68,6 +68,14 @@ tag. **VERIFIED(xpadneo/xone/SDL/systemd)** = read from those projects'
   owner installs `udev-hid-bpf` (one package) *or* plugs in USB-C; the hidraw
   sidecar decoder that removes even that dependency is phase 2.
 
+  > **Correction (owner review, 2026-09-02):** not a free-running tick. The loop already
+  > blocks on its input channel with a *deadline* (reconnect scan, rumble re-send); the
+  > stick integrators arm a 4 ms deadline **only while a stick is outside its deadzone or a
+  > scroll rate is non-zero**, and drop it the moment everything is centred. Idle, the loop
+  > blocks indefinitely, as it does today with the puck asleep. No busy poll, nothing runs
+  > while nothing moves; per-wakeup cost is microseconds of arithmetic. Read every
+  > `Input::Tick` below as this conditional deadline.
+
 ---
 
 ## 1. How the Elite Series 2 appears on Linux
