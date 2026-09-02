@@ -17,10 +17,12 @@
 -- reload — never per input frame.
 --
 -- A rule sees `ctx.focus` (the focused window: `.class`, `.title`, `.pid`,
--- `.fullscreen`, `:process_tree_has("claude")`) and `ctx.layers` (the
--- layer-shell overlays on screen: `:has("hyprpad-cheatsheet")`, `:list()`,
--- and `ipairs`-able). Overlays are how hyprpad's own windowless UI — the cheat
--- sheet, the on-screen keyboard — becomes something a rule can select on.
+-- `.fullscreen`, `:process_tree_has("claude")`), `ctx.layers` (the layer-shell
+-- overlays on screen: `:has("hyprpad-cheatsheet")`, `:list()`, and
+-- `ipairs`-able) and `ctx.locked` (whether the session is locked). Overlays are
+-- how hyprpad's own windowless UI — the cheat sheet, the on-screen keyboard —
+-- becomes something a rule can select on; `ctx.locked` is how the lock screen
+-- does, since it is neither a window nor a layer.
 
 local h = hyprpad
 
@@ -30,6 +32,28 @@ local h = hyprpad
 -- A mode carries nothing but its name, its rule, and whether it forwards raw
 -- input to the game. What is LIVE in a mode is decided per binding, below.
 -- ---------------------------------------------------------------------------
+
+-- The session lock, FIRST — above even the cheat sheet, because the lock is
+-- drawn over everything and owns the keyboard outright.
+--
+-- Omarchy's lock screen is an `ext-session-lock-v1` surface, which is neither a
+-- window nor a layer: no `activewindow`, nothing in `ctx.layers`, so without
+-- `ctx.locked` a locked session looks exactly like the desktop and the bare
+-- buttons below type into the password field — D-pad arrows, A as Enter, B as
+-- Backspace, the pads as a mouse.
+--
+-- The mode has NO bindings guarded into it, and that is the whole point: every
+-- bare button, both mouse clicks, the cursor and the scroll are `:only_in`
+-- other modes, so declaring `locked` and mentioning it nowhere else takes all
+-- of them away here. Nothing is forwarded either — no `forward = true`.
+--
+-- The guide chords stay live, deliberately. They are unguarded (see the bottom
+-- of this file), so they survive every mode including this one; a chord cannot
+-- reach the password field, and `guide+r5` (play/pause) is a reasonable thing
+-- to want from a locked screen. The one exception to "nothing is live here" is
+-- the on-screen keyboard, which `guide+y` can still raise on purpose — it is
+-- the only deliberate way to type at a lock screen from the controller.
+h.mode("locked").when(function(ctx) return ctx.locked end)
 
 -- The cheat sheet is modal while it's up: B closes it (it listens for Escape).
 --

@@ -70,6 +70,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 /// A handle to the running compositor's command socket.
 ///
@@ -192,6 +193,26 @@ impl Hypr {
     /// level 3 alongside `omarchy-bar` and `omarchy-background`.
     pub fn open_layers(&self) -> io::Result<BTreeSet<String>> {
         Ok(parse_layer_namespaces(&self.query("layers")?))
+    }
+
+    /// Whether the session is locked, from `j/locked`.
+    ///
+    /// The compositor answers `{"locked": true}` off
+    /// `g_pSessionLockManager->isSessionLocked()`, which is a one-word
+    /// delegation to the session-lock protocol's own flag — no walk, no
+    /// allocation. Verified against the live compositor, *while locked*: both
+    /// this socket and `hyprctl` answer normally under an
+    /// `ext-session-lock-v1` grab, which is the fact the whole design rests on
+    /// (docs/research/session-lifecycle.md §1).
+    ///
+    /// `locked` is registered but missing from `hyprctl --help`; it reaches the
+    /// server through the generic passthrough. That is a documentation gap, not
+    /// an instability — the command has been in Hyprland since PR #6042.
+    pub fn locked(&self) -> io::Result<bool> {
+        let json = self.query("locked")?;
+        parse_locked(&json).ok_or_else(|| {
+            io::Error::other(format!("j/locked: no 'locked' field in {json:?}"))
+        })
     }
 
     /// Fire-and-forget exec of a shell command, detached from our stdio. A
@@ -339,6 +360,27 @@ pub(crate) fn parse_layer_namespaces(json: &str) -> BTreeSet<String> {
     out
 }
 
+/// The `locked` field of a `j/locked` reply — the one boolean this crate reads
+/// out of Hyprland's JSON.
+///
+/// Same four-line-scanner ethos as [`json_number`], which cannot serve here
+/// because it reads digits and the reply spells the value `true`/`false`.
+/// Anything that is neither word is `None`, so a reply from a compositor that
+/// does not know the command reads as "could not tell" rather than "unlocked".
+///
+/// Crate-visible so the parse can be tested against the captured reply.
+pub(crate) fn parse_locked(json: &str) -> Option<bool> {
+    const NEEDLE: &str = "\"locked\":";
+    let rest = json[json.find(NEEDLE)? + NEEDLE.len()..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// A parsed line from the `.socket2.sock` event stream.
 ///
 /// Addresses are normalized to the `0x…` form used by the JSON queries and by
@@ -405,6 +447,25 @@ pub enum HyprEvent {
     /// modal, and swallowing the keyboard, and nothing else on the event stream
     /// says so.
     Layer { namespace: String, open: bool },
+    /// The session locked or unlocked.
+    ///
+    /// **Not on the wire today.** The compositor emits no socket2 event for
+    /// `ext-session-lock-v1` — the whole `postEvent` table was read, and the
+    /// nearest names (`lockgroups`, the *window group* lock; `screencast`) are
+    /// something else. So this variant is synthesized by [`watch_locked`],
+    /// which polls the state the compositor *will* answer for
+    /// ([`Hypr::locked`]), and reaches the daemon on the same channel as a real
+    /// event so nothing downstream can tell the difference.
+    ///
+    /// The parse arm below is there for the day it *is* on the wire. The fork
+    /// already turns the manager's `lock`/`unlock` signals into a watchdog
+    /// write in `Compositor.cpp`; a `postEvent(SHyprIPCEvent{"lockscreen",
+    /// "1"|"0"})` beside it is a two-line change, and the spelling here matches
+    /// upstream's convention for a boolean-state event (`fullscreen>>1`,
+    /// `lockgroups>>0`). If both ever arrive the duplicate is free: the engine
+    /// answers a report of the state it already holds with "no change"
+    /// ([`crate::mode::ModeEngine::lock_changed`]).
+    Locked(bool),
     /// Any event not modelled above, passed through verbatim.
     Other { name: String, data: String },
 }
@@ -426,6 +487,75 @@ pub fn subscribe() -> io::Result<mpsc::Receiver<HyprEvent>> {
             if let Some(event) = parse_event(&line) {
                 if tx.send(event).is_err() {
                     break; // receiver gone
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// How often [`watch_locked`] asks the compositor whether the session is
+/// locked.
+///
+/// One `j/locked` round trip on the command socket, measured at **0.2 ms**
+/// against the live compositor — a 0.02% duty cycle, with the thread asleep for
+/// the rest of it. A second is well inside "the buttons went dead the moment
+/// the screen did" for a human, and the poll only runs at all for a config that
+/// mentions the lock ([`crate::lua_config::LuaRuntime::reads_locked`]).
+pub const LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Watch the session lock, reporting every change as a [`HyprEvent::Locked`].
+///
+/// **This is a poll, and it is a poll on purpose.** The compositor has no
+/// socket2 event for `ext-session-lock-v1` (see [`HyprEvent::Locked`]), and the
+/// lock is invisible to both feeds the daemon already has: it is not a window
+/// (no `activewindow`) and not layer-shell (it never appears in `j/layers`).
+/// Three alternatives were weighed:
+///
+/// * **A fork-side `lockscreen>>1` event** — the right answer, and a small one:
+///   `Compositor.cpp` already listens for the session-lock manager's
+///   `lock`/`unlock` signals. Out of this crate's hands; the parse arm above is
+///   in place for the day it lands.
+/// * **`hyprland-lock-notify-v1`**, the compositor's real lock-state *push*
+///   channel. The daemon already holds a Wayland connection (the virtual
+///   pointer), so this is the event-driven fix that needs no fork change — but
+///   it means binding another protocol for a state that changes twice a day.
+/// * **`omarchy-shell lock isLocked`** — the obvious shell one-liner, and the
+///   one to avoid: it spawns a Quickshell IPC client and costs **~80 ms** per
+///   sample, 400x this, and it ties hyprpad to Omarchy's shell for a fact the
+///   compositor already knows.
+///
+/// `initial` is the state the caller already seeded the engine with, so the
+/// first send is a real change and not a restatement. The thread carries its
+/// own connection — a [`Hypr`] is a path, not a socket, and every request dials
+/// afresh — so it cannot contend with the daemon's. It ends when the receiver
+/// is dropped. A failed query is reported once and then retried quietly: a
+/// compositor that is restarting must not print a line a second.
+pub fn watch_locked(initial: bool, interval: Duration) -> io::Result<mpsc::Receiver<HyprEvent>> {
+    let hypr = Hypr::connect()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut last = initial;
+        let mut complained = false;
+        loop {
+            thread::sleep(interval);
+            match hypr.locked() {
+                Ok(now) => {
+                    complained = false;
+                    if now != last {
+                        last = now;
+                        if tx.send(HyprEvent::Locked(now)).is_err() {
+                            return; // receiver gone
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !complained {
+                        eprintln!(
+                            "warning: could not read the session lock state ({e}); retrying"
+                        );
+                        complained = true;
+                    }
                 }
             }
         }
@@ -490,6 +620,10 @@ fn parse_event(line: &str) -> Option<HyprEvent> {
             namespace: data.to_string(),
             open: false,
         },
+        // Nothing emits this yet; see `HyprEvent::Locked`. Read like
+        // `fullscreen`, the other boolean-state event, so a fork that adds it
+        // needs no change here.
+        "lockscreen" => HyprEvent::Locked(data.trim() != "0"),
         _ => HyprEvent::Other {
             name: name.to_string(),
             data: data.to_string(),
@@ -878,6 +1012,44 @@ mod tests {
         );
     }
 
+
+    /// `j/locked`, captured verbatim from the live compositor *while the
+    /// session was locked* — leading newline and all, which is what the
+    /// compositor's format string produces and what a scanner that assumed a
+    /// reply starts with `{` would trip on.
+    const LOCKED_JSON: &str = "\n{\n    \"locked\": true\n}\n";
+
+    #[test]
+    fn reads_the_session_lock_out_of_a_locked_reply() {
+        assert_eq!(parse_locked(LOCKED_JSON), Some(true));
+        assert_eq!(parse_locked(&LOCKED_JSON.replace("true", "false")), Some(false));
+        // Bare `hyprctl locked` (no `-j`) answers one word; we always ask for
+        // JSON, and a reply with no field is "could not tell", never "unlocked".
+        assert_eq!(parse_locked("true"), None);
+        assert_eq!(parse_locked(""), None);
+        assert_eq!(parse_locked("{}"), None);
+        // `binds` carries a `"locked"` of its own (a keybind flag, an integer).
+        // It is not a reply we ever pass here, but reading a number as `false`
+        // would be a silent wrong answer, so it is a `None` too.
+        assert_eq!(parse_locked(r#"{"locked": 0}"#), None);
+    }
+
+    /// Nothing emits `lockscreen` today — the fallback poll synthesizes
+    /// [`HyprEvent::Locked`] instead — but the arm is what makes a fork-side
+    /// event a compositor change and nothing more, so it is tested like one.
+    #[test]
+    fn parses_a_lockscreen_event_if_one_ever_arrives() {
+        assert_eq!(parse_event("lockscreen>>1"), Some(HyprEvent::Locked(true)));
+        assert_eq!(parse_event("lockscreen>>0"), Some(HyprEvent::Locked(false)));
+        // Read exactly like `fullscreen`, the other boolean-state event.
+        assert_eq!(parse_event("lockscreen>>1\n"), Some(HyprEvent::Locked(true)));
+        // The window-*group* lock is a different event and must not be mistaken
+        // for this one.
+        assert_eq!(
+            parse_event("lockgroups>>1"),
+            Some(HyprEvent::Other { name: "lockgroups".into(), data: "1".into() })
+        );
+    }
 
     #[test]
     fn reads_every_open_namespace_out_of_a_layers_reply() {

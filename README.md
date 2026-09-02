@@ -212,8 +212,8 @@ of the device, not something this binding can switch off.
 
 A **mode** is a named context chosen by a predicate. Rules run in definition
 order, first match wins, and **only on a context change** — a focus change, a
-fullscreen change, an overlay opening or closing, a manual override, a reload.
-Never per input frame.
+fullscreen change, an overlay opening or closing, the session locking or
+unlocking, a manual override, a reload. Never per input frame.
 
 ```lua
 h.mode("game", { forward = true }).when(function(ctx)
@@ -239,6 +239,32 @@ the layer-shell overlays on screen — hyprpad's own (`hyprpad-cheatsheet`,
 `hyprpad-osk`) and everyone else's — as an array of namespaces with `:has(name)`
 and `:list()` on it. It is seeded from the compositor at startup, so a daemon
 restarted under the cheat sheet knows it is there.
+
+#### `ctx.locked` and the `locked` mode
+
+`ctx.locked` is the third context source: true while the session is locked.
+It exists because the other two are blind to the lock screen — Omarchy's is an
+`ext-session-lock-v1` surface, so it is neither a window (no `activewindow`) nor
+a layer (nothing in `ctx.layers`), and to an engine watching only those a locked
+session and an idle desktop look identical. They are not: on a locked session
+every bare button is typing into a password field. The sample config therefore
+declares `h.mode("locked").when(function(ctx) return ctx.locked end)` **first**,
+above even the cheat sheet, and guards nothing into it — which is enough, because
+the D-pad, A, B, both mouse clicks, the cursor and the scroll are all `:only_in`
+*other* modes and so vanish here. The guide chords are unguarded and stay live
+on purpose (a chord cannot reach the field, and `guide+r5` for play/pause is a
+reasonable thing to want from a lock screen), as does `guide+y` — raising the
+on-screen keyboard is the one deliberate way to type at a lock screen from the
+controller. `ctx.locked` reads the same in a `:when` guard, if you would rather
+silence one binding than declare a mode:
+`h.button("a", h.key "enter"):when(function(ctx) return not ctx.locked end)`.
+
+The compositor emits no event for this — there is no `lockscreen>>1` on the
+event socket — so the daemon seeds the state from `j/locked` at startup and then
+polls the same query once a second (0.2 ms on the socket it already holds; the
+`omarchy-shell lock isLocked` alternative is a subprocess at ~80 ms). Both are
+opt-in: a config that never mentions `locked` is never polled, and a TOML config
+never is at all.
 
 A button can be bound once per mode, which is how one control means two things:
 
