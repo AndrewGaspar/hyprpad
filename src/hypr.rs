@@ -88,6 +88,15 @@ impl Hypr {
         Ok(Hypr { dir })
     }
 
+    /// A handle that points at no compositor, for tests of code that carries a
+    /// `Hypr` but takes a path that never talks to it (a mode override, say).
+    /// Any request through it fails with a socket error rather than reaching a
+    /// live session.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Hypr {
+        Hypr { dir: PathBuf::from("/nonexistent/hyprpad-detached") }
+    }
+
     /// Switch to the workspace `n` steps away on the active monitor
     /// (`+1` next, `-1` previous). Wraps `hl.dsp.focus({ workspace = "e±n" })`.
     pub fn workspace_relative(&self, n: i32) -> io::Result<()> {

@@ -38,7 +38,7 @@
 //! once for the file, once for the modes.
 
 use crate::arbitrate::Arbiter;
-use crate::config::{Config, ModeState};
+use crate::config::{ButtonAction, Config, ModeState};
 use crate::gesture::GestureEvent;
 use crate::report;
 use std::collections::{BTreeSet, HashMap};
@@ -119,7 +119,7 @@ pub struct ModeEngine {
     forwards: bool,
     cursor: bool,
     scroll: bool,
-    buttons: HashMap<report::Button, u16>,
+    buttons: HashMap<report::Button, ButtonAction>,
     osk_buttons: HashMap<report::Button, u16>,
 }
 
@@ -388,8 +388,9 @@ impl ModeEngine {
         self.scroll
     }
 
-    /// The bare-button bindings live in this mode.
-    pub fn buttons(&self) -> &HashMap<report::Button, u16> {
+    /// The bare-button bindings live in this mode: what each button does
+    /// ([`ButtonAction`]), held with it or fired on its press edge.
+    pub fn buttons(&self) -> &HashMap<report::Button, ButtonAction> {
         &self.buttons
     }
 
@@ -502,6 +503,7 @@ impl ModeEngine {
 mod tests {
     use super::*;
     use crate::config::Action;
+    use crate::config::ButtonAction::Hold;
     use crate::lua_config::load_str;
     use crate::report::Button;
 
@@ -647,7 +649,7 @@ mod tests {
 
         // Desktop: everything live.
         assert!(m.cursor_enabled() && m.scroll_enabled());
-        assert_eq!(m.buttons().get(&Button::DpadUp), Some(&103));
+        assert_eq!(m.buttons().get(&Button::DpadUp), Some(&Hold(103)));
         assert!(m.allows_gesture(&c, &GestureEvent::GuideChord(Button::BumperL1), true));
 
         m.focus_changed(&c, "steam_app_1", "", None);
@@ -800,9 +802,9 @@ mod tests {
         assert_eq!(m.buttons().len(), 9, "d-pad + A + B + the three mouse clicks");
         // The clicks are bindings now, and on the desktop they are live: pad
         // click and R2 are a left click, L2 a right click.
-        assert_eq!(m.buttons().get(&report::Button::PadRightClick), Some(&0x110));
-        assert_eq!(m.buttons().get(&report::Button::TriggerR2Full), Some(&0x110));
-        assert_eq!(m.buttons().get(&report::Button::TriggerL2Full), Some(&0x111));
+        assert_eq!(m.buttons().get(&report::Button::PadRightClick), Some(&Hold(0x110)));
+        assert_eq!(m.buttons().get(&report::Button::TriggerR2Full), Some(&Hold(0x110)));
+        assert_eq!(m.buttons().get(&report::Button::TriggerL2Full), Some(&Hold(0x111)));
 
         for class in [
             "steam_app_413080",
@@ -845,18 +847,18 @@ mod tests {
         let mut m = ModeEngine::new(&c);
         m.focus_changed(&c, "foot", "ajg@framework", None);
         assert_eq!(m.active(), "desktop");
-        assert_eq!(m.buttons().get(&Button::B), Some(&14), "B is Backspace here");
+        assert_eq!(m.buttons().get(&Button::B), Some(&Hold(14)), "B is Backspace here");
 
         // The sheet comes up. No focus event fires for a layer surface, so this
         // is the only thing that says so — and it is one transition.
         assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
         assert_eq!(m.active(), "cheatsheet");
-        assert_eq!(m.buttons().get(&Button::B), Some(&1), "B is Escape under the sheet");
+        assert_eq!(m.buttons().get(&Button::B), Some(&Hold(1)), "B is Escape under the sheet");
         // The sheet's own controls, and nothing else: B closes it, and the
         // bumpers page its tabs (Left/Right, which is what the widget listens
         // for). The desktop's arrows and Enter are gone, as they must be.
-        assert_eq!(m.buttons().get(&Button::BumperL1), Some(&105), "L1 pages back");
-        assert_eq!(m.buttons().get(&Button::BumperR1), Some(&106), "R1 pages on");
+        assert_eq!(m.buttons().get(&Button::BumperL1), Some(&Hold(105)), "L1 pages back");
+        assert_eq!(m.buttons().get(&Button::BumperR1), Some(&Hold(106)), "R1 pages on");
         assert_eq!(m.buttons().len(), 3, "nothing else is guarded into cheatsheet");
 
         // A repeat `openlayer` is not a context change: no re-resolve, and the
@@ -871,7 +873,7 @@ mod tests {
         // Escape lands, the sheet closes, and the desktop takes B back.
         assert!(m.layer_changed(&c, "hyprpad-cheatsheet", false));
         assert_eq!(m.active(), "desktop");
-        assert_eq!(m.buttons().get(&Button::B), Some(&14));
+        assert_eq!(m.buttons().get(&Button::B), Some(&Hold(14)));
         // Closing what is not open re-resolves nothing.
         assert!(!m.layer_changed(&c, "hyprpad-cheatsheet", false));
     }
@@ -889,7 +891,7 @@ mod tests {
         assert!(m.layer_changed(&c, "hyprpad-cheatsheet", true));
         assert_eq!(m.active(), "cheatsheet");
         assert!(!m.forwards(), "the sheet has the keyboard, not the game");
-        assert_eq!(m.buttons().get(&Button::B), Some(&1));
+        assert_eq!(m.buttons().get(&Button::B), Some(&Hold(1)));
 
         // ...and the game gets everything back when the sheet goes away. The
         // focused window never moved.
@@ -942,7 +944,7 @@ mod tests {
         let open = crate::hypr::parse_layer_namespaces(crate::hypr::CAPTURED_LAYERS_JSON);
         assert!(m.seed_layers(&c, open.clone()));
         assert_eq!(m.active(), "cheatsheet");
-        assert_eq!(m.buttons().get(&Button::B), Some(&1));
+        assert_eq!(m.buttons().get(&Button::B), Some(&Hold(1)));
         // Everyone else's overlays came along and changed nothing.
         assert!(m.layers().contains("omarchy-bar"));
         // Seeding the same set again is not a context change.

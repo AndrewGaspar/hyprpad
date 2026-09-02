@@ -27,7 +27,7 @@
 //! | Section | What it configures |
 //! |---|---|
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
-//! | `[buttons]` | bare buttons -> raw keys or mouse buttons (D-pad = arrows, pad click / triggers = clicks by default) |
+//! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
 //! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
 //! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
@@ -215,6 +215,54 @@ impl Action {
             }
             "clear_mode" | "unset_mode" => Ok(Action::ClearMode),
             other => Err(format!("unknown action '{other}'")),
+        }
+    }
+}
+
+/// What a bare button does: a held output that follows the button, or a
+/// one-shot action on its press edge.
+///
+/// A bare button (`[buttons]` / `h.button`) takes any action a guide chord
+/// takes, but a button is *held*, and only some actions mean something for as
+/// long as it is:
+///
+/// * [`Hold`](Self::Hold) — a `KEY_*` or `BTN_*` evdev code ([`Action::Key`],
+///   spelled `key up` / `mouse left`). Pressed on the down edge and released
+///   on the up edge, so the kernel auto-repeats a held arrow and a held mouse
+///   button drags. Today's behaviour for every bare button.
+/// * [`Fire`](Self::Fire) — everything else (`exec`, `dispatch`, `workspace`,
+///   `keyboard`, `fullscreen`, `set_mode`, `clear_mode`). Performed **once**
+///   on the press edge, through the same path a guide chord takes after it
+///   resolves, and never again while the button stays down.
+///
+/// [`Action::None`] is neither: a bare button with no action is a config
+/// error — remove the line instead ([`ButtonAction::classify`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ButtonAction {
+    /// An evdev code held down with the button.
+    Hold(u16),
+    /// An action fired once on the press edge.
+    Fire(Action),
+}
+
+impl ButtonAction {
+    /// Sort a parsed action into what a bare button does with it.
+    pub fn classify(action: Action) -> Result<ButtonAction, String> {
+        match action {
+            Action::Key(code) => Ok(ButtonAction::Hold(code)),
+            Action::None => Err("a bare button needs an action; to leave a button unbound, \
+                                 remove its line instead of binding it to none"
+                .to_string()),
+            other => Ok(ButtonAction::Fire(other)),
+        }
+    }
+
+    /// The action as a config would spell it — the inverse of
+    /// [`classify`](Self::classify), for the cheat sheet.
+    pub fn to_action(&self) -> Action {
+        match self {
+            ButtonAction::Hold(code) => Action::Key(*code),
+            ButtonAction::Fire(a) => a.clone(),
         }
     }
 }
@@ -690,8 +738,8 @@ pub struct ModeDef {
 pub struct ButtonAlt {
     /// The button being bound again.
     pub button: report::Button,
-    /// The `KEY_*` code it emits where this binding is live.
-    pub code: u16,
+    /// What it does where this binding is live.
+    pub action: ButtonAction,
     /// Where it is live. Practically always a mode guard: an unguarded
     /// re-binding of an already-bound button can never win.
     pub guard: Guard,
@@ -793,11 +841,12 @@ pub const DEFAULT_PROCESS_RESCAN_MS: u64 = 500;
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub(crate) bindings: HashMap<GestureKey, Action>,
-    /// Bare-button bindings (the `[buttons]` section): a controller button
-    /// pressed *without* the guide modifier emits a raw evdev keycode. Distinct
-    /// from `bindings`, which are guide chords. Maps the button to its `KEY_*`
-    /// code; the default maps the D-pad to the arrow keys.
-    pub(crate) buttons: HashMap<report::Button, u16>,
+    /// Bare-button bindings (the `[buttons]` section): what a controller button
+    /// pressed *without* the guide modifier does — an evdev code held with it,
+    /// or any other action fired on its press edge ([`ButtonAction`]). Distinct
+    /// from `bindings`, which are guide chords. The default maps the D-pad to
+    /// the arrow keys and the pad click / triggers to mouse clicks.
+    pub(crate) buttons: HashMap<report::Button, ButtonAction>,
     /// OSK-helper buttons (the `[osk_buttons]` section): while the on-screen
     /// keyboard is up, these buttons send a raw key THROUGH the OSK (its uinput
     /// types it), Deck-style. Default: `Y` = Space, `X` = Backspace. Distinct
@@ -883,13 +932,15 @@ pub const DEFAULT_TOML: &str = r#"
 "guide+x" = "exec walker"            # launcher
 "guide+y" = "keyboard"               # toggle the on-screen keyboard (bottom deck; configurable)
 
-# Bare buttons: pressed WITHOUT the guide modifier, they emit a raw key or a
-# mouse button. The D-pad acts as the arrow keys on the desktop (holding
+# Bare buttons: pressed WITHOUT the guide modifier. A key or mouse button is
+# held with the button: the D-pad acts as the arrow keys on the desktop (holding
 # repeats, like a real keyboard); a hard right-pad click or a full right-trigger
-# pull is a left click, a full left-trigger pull a right click. These are
-# suppressed while the guide layer or on-screen keyboard is up, and in a focused
-# game — there the D-pad reaches the game as a controller. A config that lists
-# its own [buttons] replaces this whole table, clicks included.
+# pull is a left click, a full left-trigger pull a right click. Any other action
+# from the [bindings] grammar works here too (`l5 = "exec …"`, `r4 = "keyboard
+# split"`) and fires once, on the press. These are suppressed while the guide
+# layer or on-screen keyboard is up, and in a focused game — there the D-pad
+# reaches the game as a controller. A config that lists its own [buttons]
+# replaces this whole table, clicks included.
 [buttons]
 dpad_up = "key up"
 dpad_down = "key down"
@@ -981,24 +1032,17 @@ impl Config {
                     bindings.insert(key, action);
                 }
                 // Bare-button bindings: a button pressed WITHOUT the guide
-                // modifier emits a raw key. The key uses the same button-name
-                // aliases as the guide chords (`dpad_up`, `a`, `r1`, ...); the
-                // value must be a `key <name>` action.
+                // modifier. The key uses the same button-name aliases as the
+                // guide chords (`dpad_up`, `a`, `r1`, ...); the value is any
+                // action in the `[bindings]` grammar, sorted into held-with-
+                // the-button or fired-on-press by `ButtonAction::classify`.
                 "buttons" => {
                     let button = parse_button(&unquote(k).trim().to_ascii_lowercase())
                         .map_err(|e| format!("line {lineno}: {e}"))?;
                     let action = Action::parse(&unquote(v))
+                        .and_then(ButtonAction::classify)
                         .map_err(|e| format!("line {lineno}: {e}"))?;
-                    match action {
-                        Action::Key(code) => {
-                            buttons.insert(button, code);
-                        }
-                        _ => {
-                            return Err(format!(
-                                "line {lineno}: [buttons] values must be a 'key <name>' action"
-                            ));
-                        }
-                    }
+                    buttons.insert(button, action);
                 }
                 // OSK helper buttons: while the on-screen keyboard is up, the
                 // button sends its key THROUGH the OSK (Deck-style Y=Space,
@@ -1298,10 +1342,11 @@ impl Config {
         self.bindings.is_empty()
     }
 
-    /// The bare-button bindings (`[buttons]` section): each controller button
-    /// pressed *without* the guide modifier maps to a raw evdev keycode. The
-    /// default maps the D-pad to the arrow keys.
-    pub fn buttons(&self) -> &HashMap<report::Button, u16> {
+    /// The bare-button bindings (`[buttons]` section): what each controller
+    /// button pressed *without* the guide modifier does ([`ButtonAction`]). The
+    /// default maps the D-pad to the arrow keys and the pad click / triggers to
+    /// mouse clicks.
+    pub fn buttons(&self) -> &HashMap<report::Button, ButtonAction> {
         &self.buttons
     }
 
@@ -1415,11 +1460,11 @@ impl Config {
     /// that passes wins. Since modes are exclusive there is normally no
     /// competition — `b` is backspace on the desktop and escape under the cheat
     /// sheet, and never both.
-    pub fn buttons_in(&self, st: &ModeState) -> HashMap<report::Button, u16> {
+    pub fn buttons_in(&self, st: &ModeState) -> HashMap<report::Button, ButtonAction> {
         let mut live = filter_buttons(&self.buttons, &self.button_guards, st);
         for alt in &self.button_alts {
             if alt.guard.allows(st) {
-                live.entry(alt.button).or_insert(alt.code);
+                live.entry(alt.button).or_insert_with(|| alt.action.clone());
             }
         }
         live
@@ -1498,15 +1543,17 @@ fn pick_front_end(root: &std::path::Path) -> Option<(std::path::PathBuf, ConfigF
     candidates.into_iter().find(|(p, _)| p.exists())
 }
 
-/// Drop the button bindings whose guard does not pass in `st`.
-fn filter_buttons(
-    map: &HashMap<report::Button, u16>,
+/// Drop the button bindings whose guard does not pass in `st`. Generic over the
+/// binding — a bare button's [`ButtonAction`], an OSK helper's keycode — since
+/// the guard is keyed by the button either way.
+fn filter_buttons<V: Clone>(
+    map: &HashMap<report::Button, V>,
     guards: &HashMap<report::Button, Guard>,
     st: &ModeState,
-) -> HashMap<report::Button, u16> {
+) -> HashMap<report::Button, V> {
     map.iter()
         .filter(|(b, _)| guards.get(b).unwrap_or(&ALWAYS).allows(st))
-        .map(|(b, c)| (*b, *c))
+        .map(|(b, v)| (*b, v.clone()))
         .collect()
 }
 
@@ -1895,17 +1942,20 @@ mod tests {
     fn default_buttons_map_dpad_to_arrows() {
         let c = Config::load_default();
         let b = c.buttons();
-        assert_eq!(b.get(&Button::DpadUp), Some(&103));
-        assert_eq!(b.get(&Button::DpadDown), Some(&108));
-        assert_eq!(b.get(&Button::DpadLeft), Some(&105));
-        assert_eq!(b.get(&Button::DpadRight), Some(&106));
+        use ButtonAction::Hold;
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
+        assert_eq!(b.get(&Button::DpadDown), Some(&Hold(108)));
+        assert_eq!(b.get(&Button::DpadLeft), Some(&Hold(105)));
+        assert_eq!(b.get(&Button::DpadRight), Some(&Hold(106)));
         // The mouse clicks that used to be hardwired in the cursor driver: pad
         // click and a full R2 pull are a left click, a full L2 pull a right one.
-        assert_eq!(b.get(&Button::PadRightClick), Some(&BTN_LEFT));
-        assert_eq!(b.get(&Button::TriggerR2Full), Some(&BTN_LEFT));
-        assert_eq!(b.get(&Button::TriggerL2Full), Some(&BTN_RIGHT));
-        // Four arrows and three clicks, and nothing else, by default.
+        assert_eq!(b.get(&Button::PadRightClick), Some(&Hold(BTN_LEFT)));
+        assert_eq!(b.get(&Button::TriggerR2Full), Some(&Hold(BTN_LEFT)));
+        assert_eq!(b.get(&Button::TriggerL2Full), Some(&Hold(BTN_RIGHT)));
+        // Four arrows and three clicks, and nothing else, by default — and
+        // every one of them is held with its button, not fired.
         assert_eq!(b.len(), 7);
+        assert!(b.values().all(|a| matches!(a, Hold(_))));
     }
 
     #[test]
@@ -1953,8 +2003,8 @@ mod tests {
     fn buttons_accept_a_mouse_button_but_osk_buttons_reject_it() {
         let c = Config::from_toml_str("[buttons]\nr2 = \"mouse left\"\nl2 = \"click rmb\"\n")
             .expect("parse");
-        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&BTN_LEFT));
-        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&BTN_RIGHT));
+        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&ButtonAction::Hold(BTN_LEFT)));
+        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&ButtonAction::Hold(BTN_RIGHT)));
 
         for value in ["mouse left", "key btn_right", "click 3"] {
             let e = Config::from_toml_str(&format!("[osk_buttons]\ny = \"{value}\"\n"))
@@ -1970,7 +2020,7 @@ mod tests {
     #[test]
     fn buttons_section_parses_aliases_and_reports_errors() {
         // Uses the same button-name aliases as the guide chords, plus a
-        // non-D-pad button, and the value must be a `key <name>` action.
+        // non-D-pad button; a `key <name>` value is held with the button.
         let toml = r#"
 [buttons]
 dpad_up = "key up"
@@ -1978,9 +2028,9 @@ a = "key enter"
 r1 = "key pageup"
 "#;
         let c = Config::from_toml_str(toml).expect("parse");
-        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&103));
-        assert_eq!(c.buttons().get(&Button::A), Some(&28));
-        assert_eq!(c.buttons().get(&Button::BumperR1), Some(&104));
+        assert_eq!(c.buttons().get(&Button::DpadUp), Some(&ButtonAction::Hold(103)));
+        assert_eq!(c.buttons().get(&Button::A), Some(&ButtonAction::Hold(28)));
+        assert_eq!(c.buttons().get(&Button::BumperR1), Some(&ButtonAction::Hold(104)));
         // Bindings and buttons are independent sections.
         assert!(c.is_empty());
 
@@ -1992,10 +2042,83 @@ r1 = "key pageup"
         assert!(Config::from_toml_str("[buttons]\ndpad_up = \"key sideways\"\n")
             .unwrap_err()
             .contains("unknown key"));
-        // A non-key action in [buttons] is rejected.
-        assert!(Config::from_toml_str("[buttons]\ndpad_up = \"fullscreen\"\n")
-            .unwrap_err()
-            .contains("must be a 'key <name>' action"));
+        // An unknown action is reported with the same message a chord gets.
+        let e = Config::from_toml_str("[buttons]\ndpad_up = \"teleport home\"\n").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("unknown action 'teleport'"), "{e}");
+    }
+
+    #[test]
+    fn buttons_take_any_action_held_or_fired() {
+        use ButtonAction::{Fire, Hold};
+        // The same grammar as [bindings]: a key or mouse button is held with
+        // the button, everything else fires once on the press edge.
+        let toml = r#"
+[buttons]
+a = "exec foo"
+dpad_up = "key up"
+x = "mouse left"
+b = "keyboard split"
+r1 = "workspace +1"
+l1 = "fullscreen"
+r4 = "set_mode edit"
+l4 = "clear_mode"
+r5 = "dispatch hl.dsp.window.close()"
+"#;
+        let c = Config::from_toml_str(toml).expect("parse");
+        let b = c.buttons();
+        assert_eq!(b.get(&Button::A), Some(&Fire(Action::Exec("foo".into()))));
+        assert_eq!(b.get(&Button::DpadUp), Some(&Hold(103)));
+        assert_eq!(b.get(&Button::X), Some(&Hold(BTN_LEFT)));
+        assert_eq!(
+            b.get(&Button::B),
+            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false }))
+        );
+        assert_eq!(
+            b.get(&Button::BumperR1),
+            Some(&Fire(Action::Workspace(WorkspaceTarget::Relative(1))))
+        );
+        assert_eq!(b.get(&Button::BumperL1), Some(&Fire(Action::ToggleFullscreen)));
+        assert_eq!(b.get(&Button::GripR4), Some(&Fire(Action::SetMode("edit".into()))));
+        assert_eq!(b.get(&Button::GripL4), Some(&Fire(Action::ClearMode)));
+        assert_eq!(
+            b.get(&Button::GripR5),
+            Some(&Fire(Action::Dispatch("hl.dsp.window.close()".into())))
+        );
+
+        // `none` is not something a button can do: say so, at the line.
+        let e = Config::from_toml_str("[buttons]\ny = \"none\"\n").unwrap_err();
+        assert!(e.contains("line 2"), "{e}");
+        assert!(e.contains("a bare button needs an action"), "{e}");
+        assert!(e.contains("remove its line"), "{e}");
+        let e = Config::from_toml_str("[buttons]\ny = \"\"\n").unwrap_err();
+        assert!(e.contains("a bare button needs an action"), "{e}");
+
+        // The guard filter carries a fired action through unchanged.
+        let anywhere = ModeState::new("whatever", vec![]);
+        assert_eq!(c.buttons_in(&anywhere), *c.buttons());
+    }
+
+    #[test]
+    fn button_action_classifies_keys_as_held_and_the_rest_as_fired() {
+        use ButtonAction::{Fire, Hold};
+        assert_eq!(ButtonAction::classify(Action::Key(103)), Ok(Hold(103)));
+        assert_eq!(ButtonAction::classify(Action::Key(BTN_RIGHT)), Ok(Hold(BTN_RIGHT)));
+        for a in [
+            Action::Exec("x".into()),
+            Action::Dispatch("y".into()),
+            Action::Workspace(WorkspaceTarget::Number(3)),
+            Action::MoveWindowToWorkspace(WorkspaceTarget::Relative(-1)),
+            Action::ToggleFullscreen,
+            Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true },
+            Action::SetMode("game".into()),
+            Action::ClearMode,
+        ] {
+            assert_eq!(ButtonAction::classify(a.clone()), Ok(Fire(a)));
+        }
+        assert!(ButtonAction::classify(Action::None).is_err());
+        // And back: what the sheet prints is what the config said.
+        assert_eq!(Hold(103).to_action(), Action::Key(103));
+        assert_eq!(Fire(Action::ClearMode).to_action(), Action::ClearMode);
     }
 
     #[test]
