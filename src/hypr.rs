@@ -25,7 +25,7 @@
 //!     | intent                        | dispatcher                                        |
 //!     |-------------------------------|---------------------------------------------------|
 //!     | workspace, relative (+1/-1)   | `hl.dsp.focus({ workspace = "e+1" })`             |
-//!     | workspace, by name            | `hl.dsp.focus({ workspace = "name:foo" })`        |
+//!     | workspace, by selector        | `hl.dsp.focus({ workspace = "emptyn" })`          |
 //!     | move active window to ws      | `hl.dsp.window.move({ workspace = "e+1" })`       |
 //!     | toggle fullscreen             | `hl.dsp.window.fullscreen({ mode = "fullscreen" })` |
 //!     | focus a window by address     | `hl.dsp.focus({ window = "address:0x..." })`      |
@@ -34,6 +34,13 @@
 //!     `workspace` one), and `hl.dsp.window.*` operations accept an optional
 //!     `window = "address:0x..."` selector to target a specific window instead
 //!     of the active one (proven by fullscreening a non-active window).
+//!
+//!     The `workspace = …` field is *not* validated at config time: the string
+//!     reaches `getWorkspaceIDNameFromString` when the dispatcher fires, so
+//!     the whole selector grammar (`empty`, `emptyn`, `previous`, `r+1`,
+//!     `special:foo`, `name:foo`, a bare id, …) is legal there. hyprpad
+//!     therefore hands selectors over untouched — see
+//!     [`crate::config::WorkspaceTarget`].
 //!
 //! The command socket is one-shot: connect, write the request, read the whole
 //! reply, the server closes the connection. A dispatch that lands replies the
@@ -55,6 +62,7 @@
 //! itself is sound; only the focus outcome could not be demonstrated in that
 //! environment.
 
+use crate::config::WorkspaceTarget;
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -97,37 +105,15 @@ impl Hypr {
         Hypr { dir: PathBuf::from("/nonexistent/hyprpad-detached") }
     }
 
-    /// Switch to the workspace `n` steps away on the active monitor
-    /// (`+1` next, `-1` previous). Wraps `hl.dsp.focus({ workspace = "e±n" })`.
-    pub fn workspace_relative(&self, n: i32) -> io::Result<()> {
-        self.dispatch_ok(&format!(
-            "hl.dsp.focus({{ workspace = \"{}\" }})",
-            rel_arg(n)
-        ))
+    /// Switch to the workspace `t` points at.
+    pub fn workspace(&self, t: &WorkspaceTarget) -> io::Result<()> {
+        self.dispatch_ok(&focus_workspace_expr(t))
     }
 
-    /// Switch to a workspace by name. A bare `name` (no `:` selector) is taken
-    /// as a named workspace and sent as `name:<name>`; an already-qualified
-    /// selector such as `special:magic` is passed through unchanged.
-    pub fn workspace_named(&self, name: &str) -> io::Result<()> {
-        let selector = if name.contains(':') {
-            name.to_string()
-        } else {
-            format!("name:{name}")
-        };
-        self.dispatch_ok(&format!(
-            "hl.dsp.focus({{ workspace = \"{}\" }})",
-            lua_escape(&selector)
-        ))
-    }
-
-    /// Move the active window `n` workspaces away (it follows, as with the
-    /// classic `movetoworkspace e±n`).
-    pub fn move_window_to_workspace_relative(&self, n: i32) -> io::Result<()> {
-        self.dispatch_ok(&format!(
-            "hl.dsp.window.move({{ workspace = \"{}\" }})",
-            rel_arg(n)
-        ))
+    /// Move the active window to the workspace `t` points at; it follows, as
+    /// with the classic `movetoworkspace`.
+    pub fn move_window_to_workspace(&self, t: &WorkspaceTarget) -> io::Result<()> {
+        self.dispatch_ok(&move_window_to_workspace_expr(t))
     }
 
     /// Toggle fullscreen on the active window. Repeated calls flip it on/off
@@ -534,6 +520,41 @@ fn rel_arg(n: i32) -> String {
     }
 }
 
+/// The Hyprland selector string a [`WorkspaceTarget`] stands for.
+///
+/// Only [`Relative`](WorkspaceTarget::Relative) is translated (to `e±n`);
+/// a [`Number`](WorkspaceTarget::Number) becomes the bare id — never `name:N`,
+/// which would allocate a *named* workspace with a negative id when id `N` does
+/// not exist yet — and a [`Selector`](WorkspaceTarget::Selector) is handed over
+/// exactly as written, because the compositor owns that grammar.
+fn workspace_arg(t: &WorkspaceTarget) -> String {
+    match t {
+        WorkspaceTarget::Relative(n) => rel_arg(*n),
+        WorkspaceTarget::Number(n) => n.to_string(),
+        WorkspaceTarget::Selector(s) => s.clone(),
+    }
+}
+
+/// The `hl.dsp.focus` expression that switches to `t`. Pure, so the wire form
+/// is tested without a compositor.
+fn focus_workspace_expr(t: &WorkspaceTarget) -> String {
+    format!(
+        "hl.dsp.focus({{ workspace = \"{}\" }})",
+        lua_escape(&workspace_arg(t))
+    )
+}
+
+/// The `hl.dsp.window.move` expression that takes the active window to `t`.
+/// `follow` is left unset, which is the dispatcher's default (`silent` is only
+/// true when `follow` is present and false — `LuaBindingsDispatchers.cpp:900-901`),
+/// so the window is followed. Pure, like [`focus_workspace_expr`].
+fn move_window_to_workspace_expr(t: &WorkspaceTarget) -> String {
+    format!(
+        "hl.dsp.window.move({{ workspace = \"{}\" }})",
+        lua_escape(&workspace_arg(t))
+    )
+}
+
 /// Parse a `j/activewindow` reply into the fields the modality layer needs.
 /// Pure, so it is tested against a captured live reply.
 fn parse_active_window(json: &str) -> ActiveWindowInfo {
@@ -923,6 +944,74 @@ mod tests {
         assert_eq!(rel_arg(-1), "e-1");
         assert_eq!(rel_arg(0), "e+0");
         assert_eq!(rel_arg(3), "e+3");
+    }
+
+    /// The selector each target turns into on the wire. Two of these are the
+    /// bug this module used to have: a `Number` went out as `name:N` and any
+    /// other word as `name:<word>`, both of which allocate a hidden named
+    /// workspace with a negative id when nothing by that name exists.
+    #[test]
+    fn workspace_targets_map_to_hyprland_selectors() {
+        assert_eq!(workspace_arg(&WorkspaceTarget::Relative(1)), "e+1");
+        assert_eq!(workspace_arg(&WorkspaceTarget::Relative(-2)), "e-2");
+        assert_eq!(workspace_arg(&WorkspaceTarget::Number(3)), "3");
+        for s in ["emptyn", "empty", "previous", "special:term", "name:foo", "e+1"] {
+            assert_eq!(
+                workspace_arg(&WorkspaceTarget::Selector(s.to_string())),
+                s,
+                "a selector is the compositor's to interpret"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_dispatch_expressions() {
+        assert_eq!(
+            focus_workspace_expr(&WorkspaceTarget::Number(3)),
+            r#"hl.dsp.focus({ workspace = "3" })"#
+        );
+        assert_eq!(
+            focus_workspace_expr(&WorkspaceTarget::Selector("emptyn".into())),
+            r#"hl.dsp.focus({ workspace = "emptyn" })"#
+        );
+        assert_eq!(
+            focus_workspace_expr(&WorkspaceTarget::Selector("name:foo".into())),
+            r#"hl.dsp.focus({ workspace = "name:foo" })"#
+        );
+        assert_eq!(
+            focus_workspace_expr(&WorkspaceTarget::Relative(1)),
+            r#"hl.dsp.focus({ workspace = "e+1" })"#
+        );
+    }
+
+    #[test]
+    fn move_dispatch_expressions() {
+        assert_eq!(
+            move_window_to_workspace_expr(&WorkspaceTarget::Number(3)),
+            r#"hl.dsp.window.move({ workspace = "3" })"#
+        );
+        assert_eq!(
+            move_window_to_workspace_expr(&WorkspaceTarget::Selector("emptyn".into())),
+            r#"hl.dsp.window.move({ workspace = "emptyn" })"#
+        );
+        assert_eq!(
+            move_window_to_workspace_expr(&WorkspaceTarget::Selector("name:foo".into())),
+            r#"hl.dsp.window.move({ workspace = "name:foo" })"#
+        );
+        assert_eq!(
+            move_window_to_workspace_expr(&WorkspaceTarget::Relative(1)),
+            r#"hl.dsp.window.move({ workspace = "e+1" })"#
+        );
+    }
+
+    /// A selector reaches the compositor inside a Lua string literal, so a
+    /// quote in a workspace name cannot break out of it.
+    #[test]
+    fn a_selector_cannot_escape_its_lua_string() {
+        assert_eq!(
+            focus_workspace_expr(&WorkspaceTarget::Selector(r#"name:a"b"#.into())),
+            r#"hl.dsp.focus({ workspace = "name:a\"b" })"#
+        );
     }
 
     #[test]

@@ -734,11 +734,13 @@ pub fn action_kind(a: &Action) -> &'static str {
     }
 }
 
+/// A workspace target in config spelling — what [`WorkspaceTarget::parse`]
+/// reads back.
 fn target(t: &WorkspaceTarget) -> String {
     match t {
         WorkspaceTarget::Relative(n) => format!("{n:+}"),
         WorkspaceTarget::Number(n) => n.to_string(),
-        WorkspaceTarget::Named(s) => s.clone(),
+        WorkspaceTarget::Selector(s) => s.clone(),
     }
 }
 
@@ -800,9 +802,9 @@ fn mouse_name(code: u16) -> Option<&'static str> {
 /// owner would write. `described: false` on the entry marks it as derived.
 pub fn derive_label(a: &Action) -> String {
     match a {
-        Action::Workspace(t) => format!("Workspace {}", relative_words(t)),
+        Action::Workspace(t) => workspace_label(t),
         Action::MoveWindowToWorkspace(t) => {
-            format!("Move window to workspace {}", relative_words(t))
+            format!("Move window to {}", uncapitalize(&workspace_label(t)))
         }
         Action::ToggleFullscreen => "Toggle fullscreen".to_string(),
         Action::Exec(cmd) => humanize_command(cmd),
@@ -828,13 +830,44 @@ pub fn derive_label(a: &Action) -> String {
     }
 }
 
-/// "next"/"previous" for the ±1 steps that make up almost every real config,
-/// and a literal target for everything else.
-fn relative_words(t: &WorkspaceTarget) -> String {
+/// A standalone label for a workspace target: "next"/"previous" for the ±1
+/// steps that make up almost every real config, an English phrase for the
+/// Hyprland selectors that have one, and the literal target for the rest.
+fn workspace_label(t: &WorkspaceTarget) -> String {
     match t {
-        WorkspaceTarget::Relative(1) => "next".to_string(),
-        WorkspaceTarget::Relative(-1) => "previous".to_string(),
-        other => target(other),
+        WorkspaceTarget::Relative(1) => "Workspace next".to_string(),
+        WorkspaceTarget::Relative(-1) => "Workspace previous".to_string(),
+        WorkspaceTarget::Selector(s) => selector_label(s),
+        other => format!("Workspace {}", target(other)),
+    }
+}
+
+/// English for the workspace selectors a controller config actually reaches
+/// for. Anything else prints verbatim rather than being guessed at — a derived
+/// label is allowed to be terse, never wrong.
+fn selector_label(s: &str) -> String {
+    // `empty` takes the flags `m` (this monitor only) and `n` (next empty
+    // above the active id), in either order; `n` is the one that changes what
+    // you land on enough to say out loud.
+    if let Some(flags) = s.strip_prefix("empty") {
+        if flags.chars().all(|c| c == 'm' || c == 'n') {
+            return if flags.contains('n') {
+                "Next empty workspace".to_string()
+            } else {
+                "Empty workspace".to_string()
+            };
+        }
+    }
+    if let Some(name) = s.strip_prefix("special:") {
+        return format!("Special workspace {name}");
+    }
+    match s {
+        "previous" | "previous_per_monitor" => "Previous workspace".to_string(),
+        "special" => "Special workspace".to_string(),
+        // Only reachable for a hand-built target: the parser turns a bare
+        // integer into `Number`.
+        _ if s.parse::<i32>().is_ok() => format!("Workspace {s}"),
+        _ => s.to_string(),
     }
 }
 
@@ -876,6 +909,17 @@ fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Drop a standalone label into the middle of a sentence ("Next empty
+/// workspace" -> "Move window to next empty workspace"). Only the first letter
+/// moves, so a selector that carries its own case (`name:Foo`) keeps it.
+fn uncapitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
         None => String::new(),
     }
 }
@@ -1181,6 +1225,60 @@ mod tests {
         // A bigger jump has no English name; show the literal target.
         assert_eq!(derive_label(&Action::Workspace(WorkspaceTarget::Relative(3))), "Workspace +3");
         assert_eq!(derive_label(&Action::Workspace(WorkspaceTarget::Number(4))), "Workspace 4");
+        // And the move variant reads as a sentence, whatever the target.
+        assert_eq!(
+            derive_label(&Action::MoveWindowToWorkspace(WorkspaceTarget::Relative(1))),
+            "Move window to workspace next"
+        );
+    }
+
+    #[test]
+    fn workspace_selectors_get_english_labels() {
+        let label = |s: &str| derive_label(&Action::Workspace(WorkspaceTarget::Selector(s.into())));
+        assert_eq!(label("empty"), "Empty workspace");
+        assert_eq!(label("emptym"), "Empty workspace");
+        assert_eq!(label("emptyn"), "Next empty workspace");
+        assert_eq!(label("emptynm"), "Next empty workspace");
+        assert_eq!(label("previous"), "Previous workspace");
+        assert_eq!(label("special"), "Special workspace");
+        assert_eq!(label("special:term"), "Special workspace term");
+        // No English for these: print what the config said rather than guess.
+        assert_eq!(label("name:foo"), "name:foo");
+        assert_eq!(label("e+1"), "e+1");
+        assert_eq!(label("r-1"), "r-1");
+        // Moving a window borrows the same phrase.
+        assert_eq!(
+            derive_label(&Action::MoveWindowToWorkspace(WorkspaceTarget::Selector(
+                "emptyn".into()
+            ))),
+            "Move window to next empty workspace"
+        );
+        assert_eq!(
+            derive_label(&Action::MoveWindowToWorkspace(WorkspaceTarget::Selector(
+                "name:foo".into()
+            ))),
+            "Move window to name:foo"
+        );
+    }
+
+    /// What the sheet prints as the machine-readable action — the same text
+    /// the config front-ends accept.
+    #[test]
+    fn workspace_action_strings_are_the_config_spelling() {
+        assert_eq!(
+            action_string(&Action::Workspace(WorkspaceTarget::Selector("emptyn".into()))),
+            "workspace emptyn"
+        );
+        assert_eq!(
+            action_string(&Action::Workspace(WorkspaceTarget::Number(3))),
+            "workspace 3"
+        );
+        assert_eq!(
+            action_string(&Action::MoveWindowToWorkspace(WorkspaceTarget::Selector(
+                "emptyn".into()
+            ))),
+            "movetoworkspace emptyn"
+        );
     }
 
     #[test]
@@ -1262,7 +1360,10 @@ mod tests {
             Action::Workspace(WorkspaceTarget::Relative(1)),
             Action::Workspace(WorkspaceTarget::Relative(-2)),
             Action::Workspace(WorkspaceTarget::Number(3)),
-            Action::MoveWindowToWorkspace(WorkspaceTarget::Named("special".into())),
+            Action::Workspace(WorkspaceTarget::Selector("emptyn".into())),
+            Action::Workspace(WorkspaceTarget::Selector("name:foo".into())),
+            Action::MoveWindowToWorkspace(WorkspaceTarget::Selector("special".into())),
+            Action::MoveWindowToWorkspace(WorkspaceTarget::Selector("emptyn".into())),
             Action::ToggleFullscreen,
             Action::Exec("omarchy-menu".into()),
             Action::Dispatch("hl.dsp.window.close()".into()),

@@ -51,20 +51,41 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Where a workspace action points.
+///
+/// Hyprland has its own workspace-selector grammar — `empty`, `emptyn`,
+/// `previous`, `e+1`, `r-1`, `m~2`, `special`, `special:foo`, `name:foo`, … —
+/// and resolves it when the dispatcher fires. hyprpad does not re-implement
+/// that grammar: anything but the two forms it has to understand itself is a
+/// [`Selector`](Self::Selector) and travels to the compositor verbatim.
+///
+/// The two it does understand:
+///
+/// * [`Relative`](Self::Relative) — `+n`/`-n`, rendered as Hyprland's `e±n`
+///   ("existing workspaces across all monitors, wrapping"), *not* the literal
+///   `+n` (which is "active id + n"). That is what `guide+r1` has always sent
+///   and the spelling is preserved.
+/// * [`Number`](Self::Number) — a bare integer, sent as the bare id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceTarget {
-    /// Relative move, e.g. `+1` / `-1` from the current workspace.
+    /// Relative move, e.g. `+1` / `-1` from the current workspace; dispatched
+    /// as Hyprland's `e±n`.
     Relative(i32),
-    /// A named (special) workspace.
-    Named(String),
-    /// An absolute workspace number.
+    /// A Hyprland workspace selector, passed through untouched.
+    ///
+    /// A **bare word is a selector, not a name**: `workspace empty` means
+    /// Hyprland's "first empty workspace", and a *named* workspace is spelled
+    /// `workspace name:foo`. It used to be the other way round, so
+    /// `workspace empty` silently created a hidden named workspace called
+    /// "empty" (`docs/research/empty-workspace.md` §1.1).
+    Selector(String),
+    /// An absolute workspace id, sent as the bare number.
     Number(i32),
 }
 
 impl WorkspaceTarget {
     /// Parse a target token: `+1`/`-2` -> [`Relative`](Self::Relative),
     /// a bare integer -> [`Number`](Self::Number), anything else ->
-    /// [`Named`](Self::Named).
+    /// [`Selector`](Self::Selector), verbatim.
     pub fn parse(s: &str) -> Result<WorkspaceTarget, String> {
         let s = s.trim();
         if s.is_empty() {
@@ -87,7 +108,7 @@ impl WorkspaceTarget {
         if let Ok(n) = s.parse::<i32>() {
             return Ok(WorkspaceTarget::Number(n));
         }
-        Ok(WorkspaceTarget::Named(s.to_string()))
+        Ok(WorkspaceTarget::Selector(s.to_string()))
     }
 }
 
@@ -1828,7 +1849,7 @@ mod tests {
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::B)),
-            Action::Workspace(WorkspaceTarget::Named("steam".to_string()))
+            Action::Workspace(WorkspaceTarget::Selector("steam".to_string()))
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
@@ -1967,9 +1988,61 @@ mod tests {
         );
         assert_eq!(
             WorkspaceTarget::parse("gaming").unwrap(),
-            WorkspaceTarget::Named("gaming".to_string())
+            WorkspaceTarget::Selector("gaming".to_string())
         );
         assert!(WorkspaceTarget::parse("+notanumber").is_err());
+        assert!(WorkspaceTarget::parse("").is_err());
+        assert!(WorkspaceTarget::parse("   ").is_err());
+    }
+
+    /// Hyprland's selector grammar is the compositor's business: everything
+    /// that is not `±n` or a bare id survives the parser byte for byte, so a
+    /// selector hyprpad has never heard of still works.
+    #[test]
+    fn hyprland_selectors_survive_the_parser_verbatim() {
+        for s in [
+            "empty",
+            "emptyn",
+            "emptym",
+            "emptynm",
+            "previous",
+            "previous_per_monitor",
+            "next",
+            "e+1",
+            "r-1",
+            "m~2",
+            "special",
+            "special:term",
+            "name:foo",
+            "name:7",
+            // A selector invented after this code was written.
+            "brandnewthing+3",
+        ] {
+            assert_eq!(
+                WorkspaceTarget::parse(s).unwrap(),
+                WorkspaceTarget::Selector(s.to_string()),
+                "{s} must reach Hyprland unchanged"
+            );
+        }
+        // Surrounding whitespace is the parser's, not the selector's.
+        assert_eq!(
+            WorkspaceTarget::parse("  emptyn  ").unwrap(),
+            WorkspaceTarget::Selector("emptyn".to_string())
+        );
+    }
+
+    /// The whole point of `Number`: `workspace 3` is workspace *id* 3. It used
+    /// to be dispatched as `name:3`, which creates a hidden named workspace
+    /// when id 3 does not exist yet.
+    #[test]
+    fn a_bare_integer_is_an_id_not_a_name() {
+        assert_eq!(WorkspaceTarget::parse("3").unwrap(), WorkspaceTarget::Number(3));
+        assert_eq!(WorkspaceTarget::parse("10").unwrap(), WorkspaceTarget::Number(10));
+        // A named workspace has to say so.
+        assert_eq!(
+            WorkspaceTarget::parse("name:3").unwrap(),
+            WorkspaceTarget::Selector("name:3".to_string())
+        );
     }
 
     #[test]

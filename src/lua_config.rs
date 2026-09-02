@@ -1704,6 +1704,49 @@ mod tests {
         );
     }
 
+    /// `h.workspace` takes a Hyprland selector, a relative step, or a number,
+    /// and both front-ends share the grammar — so the TOML spelling of a
+    /// selector is the same word.
+    #[test]
+    fn workspace_takes_hyprland_selectors_from_either_front_end() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.bind("guide+x",  h.workspace "emptyn")
+            h.bind("guide+a",  h.workspace(3))
+            h.bind("guide+r1", h.workspace "+1")
+            h.bind("guide+b",  h.workspace "name:foo")
+            h.bind("guide+y",  h.move_to_workspace "emptyn")
+            h.bind("guide+menu", "workspace emptyn")     -- the TOML grammar
+            "#,
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::X)),
+            Action::Workspace(WorkspaceTarget::Selector("emptyn".into()))
+        );
+        // Not `Selector("3")`, and never `name:3`.
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::Workspace(WorkspaceTarget::Number(3))
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::BumperR1)),
+            Action::Workspace(WorkspaceTarget::Relative(1))
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::B)),
+            Action::Workspace(WorkspaceTarget::Selector("name:foo".into()))
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::Y)),
+            Action::MoveWindowToWorkspace(WorkspaceTarget::Selector("emptyn".into()))
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::Menu)),
+            Action::Workspace(WorkspaceTarget::Selector("emptyn".into()))
+        );
+    }
+
     #[test]
     fn bind_accepts_an_hl_style_description() {
         let c = load(r#"hyprpad.bind("guide+r1", "Workspace right", hyprpad.workspace "+1")"#);

@@ -11,6 +11,7 @@
 //! checking the state actually changed, and prints a few parsed events from
 //! the live stream.
 
+use hyprpad::config::WorkspaceTarget;
 use hyprpad::hypr::{self, Hypr, HyprEvent};
 use std::time::Duration;
 
@@ -42,12 +43,12 @@ fn main() {
     // Subscribe first so we can watch the dispatches land as events.
     let events = hypr::subscribe().expect("subscribe to event stream");
 
-    println!("== workspace_relative ==");
+    println!("== workspace (relative) ==");
     let before = active_ws_id(&h);
-    h.workspace_relative(1).unwrap();
+    h.workspace(&WorkspaceTarget::Relative(1)).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     let after = active_ws_id(&h);
-    h.workspace_relative(-1).unwrap();
+    h.workspace(&WorkspaceTarget::Relative(-1)).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     let restored = active_ws_id(&h);
     println!("  ws before={before} after(+1)={after} restored(-1)={restored}");
@@ -70,14 +71,14 @@ fn main() {
         .to_string();
     println!("  fullscreen field: {fs0} -> {fs1} -> {fs2}");
 
-    println!("== move_window_to_workspace_relative (+1 then -1) ==");
+    println!("== move_window_to_workspace (+1 then -1) ==");
     let addr_before = field(&h.query("activewindow").unwrap(), "address")
         .unwrap_or("?")
         .to_string();
-    h.move_window_to_workspace_relative(1).unwrap();
+    h.move_window_to_workspace(&WorkspaceTarget::Relative(1)).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     let ws_moved = active_ws_id(&h);
-    h.move_window_to_workspace_relative(-1).unwrap();
+    h.move_window_to_workspace(&WorkspaceTarget::Relative(-1)).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     let ws_back = active_ws_id(&h);
     println!("  active window {addr_before} followed to ws {ws_moved}, back to {ws_back}");
@@ -111,8 +112,8 @@ fn main() {
     h.spawn("foot --title hyprpad-evt-probe sh -c 'sleep 1'");
     h.toggle_fullscreen().unwrap();
     h.toggle_fullscreen().unwrap();
-    h.workspace_relative(1).unwrap();
-    h.workspace_relative(-1).unwrap();
+    h.workspace(&WorkspaceTarget::Relative(1)).unwrap();
+    h.workspace(&WorkspaceTarget::Relative(-1)).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut n = 0;
     while n < 12 {

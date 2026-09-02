@@ -83,7 +83,7 @@
 
 use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, HapticsConfig, RumbleMode,
-    ScrollConfig, ScrollMode, WorkspaceTarget,
+    ScrollConfig, ScrollMode,
 };
 use crate::filter::{AngleAccumulator, PadDamper};
 use crate::gamepad::{self, VirtualGamepad};
@@ -2458,20 +2458,11 @@ fn is_guide_scoped(ge: &GestureEvent) -> bool {
 /// longer read for itself.
 fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
     match action {
-        Action::Workspace(t) => match t {
-            WorkspaceTarget::Relative(n) => hypr.workspace_relative(*n),
-            WorkspaceTarget::Number(n) => hypr.workspace_named(&n.to_string()),
-            WorkspaceTarget::Named(s) => hypr.workspace_named(&format!("name:{s}")),
-        },
-        Action::MoveWindowToWorkspace(t) => match t {
-            WorkspaceTarget::Relative(n) => hypr.move_window_to_workspace_relative(*n),
-            WorkspaceTarget::Number(n) => {
-                hypr.dispatch_raw(&format!("hl.dsp.window.move({{ workspace = \"{n}\" }})")).map(|_| ())
-            }
-            WorkspaceTarget::Named(s) => hypr
-                .dispatch_raw(&format!("hl.dsp.window.move({{ workspace = \"name:{s}\" }})"))
-                .map(|_| ()),
-        },
+        // Both arms hand the target to `hypr`, which owns the one mapping from
+        // a `WorkspaceTarget` to a Hyprland selector — so `focus` and `move`
+        // can never disagree about what `h.workspace "emptyn"` means.
+        Action::Workspace(t) => hypr.workspace(t),
+        Action::MoveWindowToWorkspace(t) => hypr.move_window_to_workspace(t),
         Action::ToggleFullscreen => hypr.toggle_fullscreen(),
         Action::Exec(cmd) => {
             hypr.spawn_env(cmd, &[("HYPRPAD_MODE", mode)]);
@@ -2494,6 +2485,7 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WorkspaceTarget;
 
     /// A `config.lua` whose rule walks the process tree, so the periodic
     /// rescan has something to be armed for.
