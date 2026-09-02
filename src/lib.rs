@@ -10,6 +10,7 @@
 
 pub mod arbitrate;
 pub mod bindings_sheet;
+pub mod broker;
 pub mod config;
 pub mod filter;
 pub mod gamepad;

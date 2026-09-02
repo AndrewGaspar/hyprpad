@@ -75,7 +75,7 @@
 //! one. If the queue is full the pulse is dropped, which is the right answer for
 //! feedback: a late tick is worse than no tick.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc;
@@ -470,14 +470,16 @@ impl PuckWriter {
     /// that is streaming input. Returns whether anything is open afterwards.
     fn reopen(&mut self) -> bool {
         self.last_open = Some(Instant::now());
-        // Read-write: an output report is a write to the device (the passive
-        // input tap opens read-only), and read access is what lets the probe
-        // below see which slot is live.
-        let nodes = crate::hidraw::puck_nodes().unwrap_or_default();
-        let opened: Vec<File> = nodes
-            .iter()
-            .filter_map(|n| OpenOptions::new().read(true).write(true).open(n).ok())
-            .collect();
+        // Through the same acquire path the readers use, so haptics keep working
+        // once `packaging/udev/72-hyprpad-puck.rules` has made the nodes
+        // root-only: the broker hands over descriptors opened with
+        // `hidraw::OPEN_FLAGS`, which is read-write because of exactly this —
+        // an output report is a write to the device — and read access is what
+        // lets the probe below see which slot is live.
+        let opened: Vec<File> = match crate::hidraw::PuckSource::acquire() {
+            Some(source) => source.into_fds().into_iter().map(File::from).collect(),
+            None => Vec::new(),
+        };
         if opened.is_empty() {
             self.fds.clear();
             self.fail_once("no writable Steam Controller puck node (28de:1304)");

@@ -724,23 +724,49 @@ fn poll_readable(fd: libc::c_int, timeout: Duration) -> bool {
 // The fd-injection boundary
 // ---------------------------------------------------------------------------
 
-/// Obtain a read-write descriptor for `/dev/uhid`.
+/// Obtain a read-write descriptor for `/dev/uhid`, and say where it came from.
 ///
-/// **This is the seam the host-integration half replaces.** Today it is a plain
-/// `open()`, which on an ordinary desktop fails with `EACCES`: the node is
-/// `crw------- 1 root root 10, 239` and no shipped udev rule opens it (verified
-/// locally; see `docs/research/uhid-steam-controller.md` §1.4). That failure is
-/// expected, is logged once, and leaves the daemon running with no relay.
+/// **This is the seam the host-integration half fills**, and it is now filled:
+/// the descriptor comes from the root broker ([`crate::broker`]) when one is
+/// installed, and from a plain `open()` when one is not.
 ///
-/// Whatever eventually provides the descriptor — a udev rule granting `uaccess`,
-/// a systemd socket, or a small privileged helper passing an fd over a unix
-/// socket — only has to return an `OwnedFd` here. Nothing else in this module
-/// knows where the descriptor came from, and `UHID_CREATE2` (unlike the legacy
-/// `UHID_CREATE`) has no `f_cred != current_cred()` check, so an fd opened by
-/// another process is usable as-is.
-pub fn acquire_uhid() -> io::Result<OwnedFd> {
+/// The direct open is still tried, and on an un-set-up machine still fails with
+/// `EACCES`: the node is `crw------- 1 root root 10, 239` and no shipped udev
+/// rule opens it (verified locally; see
+/// `docs/research/uhid-steam-controller.md` §1.4). That failure is expected, is
+/// logged once by [`crate::run`], and leaves the daemon running with no relay.
+///
+/// Nothing else in this module knows where the descriptor came from, and
+/// `UHID_CREATE2` (unlike the legacy `UHID_CREATE`) has no
+/// `f_cred != current_cred()` check, so a descriptor opened by root and passed
+/// over `SCM_RIGHTS` is usable as-is — which is the whole reason this design
+/// works at all.
+pub fn acquire_uhid_from() -> io::Result<(OwnedFd, &'static str)> {
+    let path = crate::broker::socket_path();
+    match crate::broker::request_at(&path, crate::broker::Request::Uhid) {
+        Ok(fds) => match fds.into_iter().next() {
+            Some(fd) => return Ok((fd, "broker")),
+            // `ok 0` for `uhid` would be a broker bug rather than an ordinary
+            // fallback condition, so it gets a line of its own — but falling
+            // through to the direct open is still the right thing to do.
+            None => eprintln!("warning: the fd broker answered `uhid` with no descriptor"),
+        },
+        // A missing socket is the ordinary state on a machine that has not run
+        // `hyprpad setup` and is not worth a word here; a broker that is there
+        // and said no is.
+        Err(e) if path.exists() => {
+            eprintln!("warning: the fd broker refused /dev/uhid ({e}); opening it directly")
+        }
+        Err(_) => {}
+    }
     let file = OpenOptions::new().read(true).write(true).open("/dev/uhid")?;
-    Ok(OwnedFd::from(file))
+    Ok((OwnedFd::from(file), "direct"))
+}
+
+/// [`acquire_uhid_from`] without the provenance, for callers that only want the
+/// descriptor.
+pub fn acquire_uhid() -> io::Result<OwnedFd> {
+    acquire_uhid_from().map(|(fd, _)| fd)
 }
 
 #[cfg(test)]

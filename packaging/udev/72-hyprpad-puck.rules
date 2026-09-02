@@ -1,0 +1,96 @@
+# hyprpad — make the REAL Steam Controller puck (28de:1304) invisible to Steam.
+#
+# WHY
+# ---
+# hyprpad presents Steam a *virtual* Valve controller on /dev/uhid and streams
+# the real puck into it (docs/design/uhid-relay.md). For that to be worth
+# anything Steam must not also see the real puck: otherwise every press arrives
+# twice — once from the fake, once from the real device — and Steam lists two
+# controllers (risk R10).
+#
+# Steam and hyprpad run as the SAME user, so no group or ACL can separate them.
+# The split is made in two halves:
+#
+#   1. THIS RULE takes the puck's hidraw nodes away from every unprivileged
+#      process, the session user included. Nothing running as you can open them.
+#   2. A tiny root broker (hyprpad-broker.socket / .service) opens them on
+#      request and passes the open descriptors to the unprivileged hyprpad
+#      daemon over a unix socket with SCM_RIGHTS.
+#
+# Valve's own /usr/lib/udev/rules.d/60-steam-input.rules hands `uaccess` to every
+# 28de hidraw node by vendor id, which is what makes the puck reachable today —
+# and, helpfully, it is also what makes hyprpad's *virtual* 28de:1302 / 28de:12f0
+# node reachable with no rule of our own. This file must therefore undo Valve's
+# grant for 1304 ONLY, and leave the fake alone. It does: the match below pins
+# idProduct to 1304, and the virtual device has no USB parent at all so
+# ATTRS{idVendor} never matches it (research §2).
+#
+# WHY THE NUMBER IS 72  (this is the load-bearing detail)
+# ------------------------------------------------------
+# `TAG+="uaccess"` does not itself grant anything. It only sets a tag. The ACL is
+# applied much later, by systemd's /usr/lib/udev/rules.d/73-seat-late.rules:
+#
+#     TAG=="uaccess|xaccess-*", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+#
+# and `man udev` is explicit that RUN entries are "executed after processing of
+# all the rules for the event", with the list only clearable wholesale by
+# `RUN=""` / `RUN:=""`. So once 73-seat-late.rules has seen the tag and queued
+# the builtin, removing the tag afterwards changes nothing — the ACL is applied
+# regardless, and an ACL beats the mode bits, so even MODE:="0600" would leave
+# `user:<you>:rw-` on the node.
+#
+# The window for `TAG-="uaccess"` is therefore:
+#
+#     after   60-steam-input.rules   (Valve adds the tag)
+#     after   70-uaccess.rules       (systemd's own tag adders)
+#     BEFORE  73-seat-late.rules     (the tag is consumed here)
+#
+# 72 sits in that window. 71 would work too (71-seat.rules does not touch
+# uaccess) but 72 leaves room. **75, 95 or 99 would NOT work** — which is why the
+# W12-era reference rule scripts/99-hyprpad-claim-puck.rules is superseded by
+# this one. Verify the local ordering with:
+#
+#     grep -rn uaccess /usr/lib/udev/rules.d/7*.rules
+#
+# WHAT IS DELIBERATELY NOT MATCHED
+# --------------------------------
+# The puck's `input`/`event` nodes. hyprpad reads the controller over hidraw and
+# only over hidraw; the evdev side is left exactly as the system configures it.
+# (On this machine the puck's vendor-collection descriptor produces no evdev node
+# at all, so there is normally nothing there to hide — but if a future firmware
+# grows one, hiding it is a separate decision and not this file's business.)
+#
+# `MODE`/`OWNER`/`GROUP` use the `:=` final-assignment operator so no later rule
+# can widen them back.
+#
+# INSTALL
+#     sudo install -Dm644 packaging/udev/72-hyprpad-puck.rules \
+#          /etc/udev/rules.d/72-hyprpad-puck.rules
+#     sudo udevadm control --reload
+#     sudo udevadm trigger --subsystem-match=hidraw
+#
+# VERIFY
+#     # which nodes are the puck's, and what udev thinks their parents are
+#     udevadm info -a -n /dev/hidraw7 | grep -E 'idVendor|idProduct|KERNELS'
+#     # the puck's nodes must be root-only, with NO '+' (no ACL)
+#     ls -l /dev/hidraw*
+#     getfacl /dev/hidraw7          # expect only user::rw- / group::--- / other::---
+#     # and the fake must still carry an ACL for you
+#     getfacl /dev/hidrawN          # the 28de:1302 or 28de:12f0 node
+#
+# REVERT
+#     sudo rm /etc/udev/rules.d/72-hyprpad-puck.rules
+#     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+
+ACTION=="remove", GOTO="hyprpad_puck_end"
+SUBSYSTEM!="hidraw", GOTO="hyprpad_puck_end"
+
+# The puck's hidraw nodes: matched exactly the way src/hidraw.rs matches them —
+# the vendor and product of the USB device the hidraw node hangs off. The puck
+# publishes one interface per pairing slot plus a dongle-control interface, and
+# ATTRS{} walks up to the shared USB parent, so a single rule covers all of them
+# however many there are and whatever they are numbered this boot.
+ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", \
+    TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+
+LABEL="hyprpad_puck_end"

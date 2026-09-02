@@ -1,3 +1,15 @@
+# SUPERSEDED — DO NOT INSTALL. Use packaging/udev/72-hyprpad-puck.rules instead.
+#
+# The number below is wrong, and the reason is the whole point of the newer file.
+# `TAG+="uaccess"` grants nothing by itself; the ACL is applied by systemd's
+# 73-seat-late.rules (`TAG=="uaccess" … RUN{builtin}+="uaccess"`), and `man udev`
+# says a RUN entry is "executed after processing of all the rules for the event".
+# So by the time a 99- rule runs, the builtin has already been queued and this
+# file's `TAG-="uaccess"` changes nothing — the session user keeps an ACL that
+# beats the MODE/GROUP set here. The removal must land BEFORE 73-seat-late.rules.
+#
+# Kept only as the W12 experiment's record. See docs/design/uhid-relay.md §6.1.
+#
 # W12 reference rule — hand the 2026 Steam Controller puck to hyprpad, not the
 # session user. Ordered 99- so it runs after Steam's 60-steam-input.rules (which
 # adds MODE=0660 + TAG+="uaccess") and after 70-uaccess.rules.

@@ -2,7 +2,9 @@
 
 *Implements the device-independent core of `docs/research/uhid-steam-controller.md`.
 Code: `src/uhid.rs` and `src/uhid/{profile,translate,settings,relay}.rs`, wired
-into `src/run.rs` beside `src/gamepad.rs`.*
+into `src/run.rs` beside `src/gamepad.rs`. The privileged host half — the udev
+rule, the root fd broker and the systemd units that make Steam see the fake and
+only the fake — is §6, and lives in `src/broker.rs` and `packaging/`.*
 
 ## What it is
 
@@ -351,54 +353,253 @@ impl SteamRelay {
 fn start_relay(cfg: &GamepadConfig) -> Option<SteamRelay>;
 ```
 
-`acquire_uhid` is the seam, and it is deliberately three lines: open `/dev/uhid`
-read-write and return the error. **On this machine it fails with `EACCES`** —
-the node is `crw------- 1 root root 10, 239` and no shipped udev rule opens it.
-That is the expected outcome today. The daemon logs it once, with the rule that
-would fix it, and carries on with no game sink.
+`acquire_uhid` is the seam. **It is now filled** (§6): it asks the root broker
+first and falls back to a plain `open("/dev/uhid")`, which on a machine that has
+not run `hyprpad setup` still fails with `EACCES` — the node is
+`crw------- 1 root root 10, 239` and no shipped udev rule opens it. That failure
+is logged once, and the daemon carries on with no game sink.
 
 `UHID_CREATE2` — unlike the legacy `UHID_CREATE` — has **no
 `f_cred != current_cred()` check**, so a descriptor opened by another process is
-usable as-is. Replacing `acquire_uhid` with a `SCM_RIGHTS` receive from a
-privileged helper needs no other change anywhere in the module.
-
-The path that opens the puck's hidraw nodes (`src/hidraw.rs`) is untouched by
-this feature.
+usable as-is. That is precisely what makes the broker in §6 possible, and why
+filling this seam needed no change anywhere else in `src/uhid/`.
 
 ---
 
-## 6. Host integration — **a separate task, out of scope here**
+## 6. Host integration — the privileged half
 
-Two things this build deliberately does not do. Both are privileged, both are
-somebody else's ticket, and the code above is shaped so neither requires
-re-opening it.
+Two problems, one shape. Getting a writable `/dev/uhid`, and taking the real puck
+away from Steam, both need root; and because **Steam and hyprpad run as the same
+user**, no group and no ACL can separate them. Anything the session-user daemon
+may open, session-user Steam may open too.
 
-1. **Getting a writable `/dev/uhid`.** Options, from the research doc §1.4 and
-   §6 R2:
-   * a shipped udev rule —
-     `KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uhid"`.
-     `static_node=` is **mandatory**: the node is materialised by
-     `systemd-tmpfiles` before udev runs, so a plain rule never applies;
-   * a minimal root helper that opens the node and passes the fd over a unix
-     socket;
-   * running the daemon as a system service.
+So the privilege is moved out of the daemon entirely, into two pieces.
 
-   Whichever is chosen, the deliverable into this code is one function returning
-   an `OwnedFd`.
+### 6.1 The udev rule — `packaging/udev/72-hyprpad-puck.rules`
 
-2. **Hiding the real puck from Steam.** Without it Steam sees *both* the real
-   `28de:1304` (five hidraw nodes, five controller slots) and the fake, and a
-   game double-counts every press — risk R10. The battle-tested pattern is hhd's
-   `src/hhd/controller/lib/hide.py`: a generated
-   `/run/udev/rules.d/95-…-devhide-*.rules` that sets `MODE:="000"` and
-   `TAG-="uaccess"` on the hidden device's hidraw and input nodes, then
-   `udevadm control --reload-rules` and a remove/add trigger. It needs root — the
-   same prerequisite as (1), so the two decisions collapse into one.
+```udev
+ACTION=="remove", GOTO="hyprpad_puck_end"
+SUBSYSTEM!="hidraw", GOTO="hyprpad_puck_end"
+ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", \
+    TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+LABEL="hyprpad_puck_end"
+```
 
-   `docs/experiments/w12-device-denial.md` and research §8.3 carry the detail.
+The match is the one `src/hidraw.rs` uses — vendor and product of the USB device
+the hidraw node hangs off — so a single rule covers all five interface slots
+however they are numbered this boot. `:=` is final assignment, so nothing later
+can widen the permissions back.
 
-Also out of scope: `hyprpad setup` does not install any of it, and no udev rule
-is shipped in this change.
+**It matches hidraw only.** The puck's `input`/`event` nodes are deliberately
+left exactly as the system configures them: hyprpad reads the controller over
+hidraw and only over hidraw, and on this machine the vendor-only descriptor
+produces no evdev node at all. Hiding an evdev node that might appear on a future
+firmware is a separate decision, not this file's.
+
+It does not touch the *virtual* device. Valve's `60-steam-input.rules` line
+`SUBSYSTEM=="hidraw", KERNELS=="000[356]:28DE:*"` gives `uaccess` to hyprpad's
+`28de:1302` / `28de:12f0` clone for free (research §2), and our rule pins
+`idProduct` to `1304` — which the clone could not match anyway, having no USB
+parent.
+
+#### The uaccess-ordering finding — why the number is 72, and why 99 was wrong
+
+This is the detail the W12 log left open ("whether an inherited `uaccess` tag can
+be removed vs. only overriding `MODE`/`GROUP` still needs a live test").
+
+`TAG+="uaccess"` grants nothing by itself. It sets a tag. The ACL is applied
+later, by systemd's `73-seat-late.rules`:
+
+```udev
+TAG=="uaccess|xaccess-*", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+```
+
+and `man udev` is explicit that a `RUN` entry is *"executed after processing of
+all the rules for the event"*, with the list only clearable wholesale by
+`RUN=""` / `RUN:=""`. **So once `73-seat-late.rules` has seen the tag and queued
+the builtin, removing the tag afterwards changes nothing** — the ACL is applied
+anyway. And an ACL beats the mode bits: a node at `0600 root:root` with
+`user:you:rw-` on it is still openable by you.
+
+The window for `TAG-="uaccess"` is therefore bounded on *both* sides:
+
+| Must run after | Because |
+|---|---|
+| `60-steam-input.rules` | Valve adds the tag there |
+| `70-uaccess.rules` | systemd's own tag adders (none match a Steam Controller today, but ordering after it costs nothing) |
+
+| Must run **before** | Because |
+|---|---|
+| `73-seat-late.rules` | the tag is consumed and the ACL queued there |
+
+`72-` is in that window. `71-` would also work (`71-seat.rules` does not touch
+uaccess). **`75-`, `95-` and `99-` do not** — which retires
+`scripts/99-hyprpad-claim-puck.rules`, the W12-era reference rule, whose number
+put it after the tag had already been spent. That file now carries a header
+saying so and pointing here.
+
+*(VERIFIED by reading the shipped rules on this machine, systemd 261: `grep -rn
+uaccess /usr/lib/udev/rules.d/7*.rules` shows `73-seat-late.rules` as the only
+consumer. Not yet verified by installing the rule — that is the owner's step.)*
+
+### 6.2 The broker — `src/broker.rs`, `hyprpad broker`
+
+A root helper whose whole vocabulary is two words. It opens what it is asked for
+and passes the open descriptors back over a unix socket with `SCM_RIGHTS`.
+
+```text
+->  "uhid\n"        <-  "ok 1\n"  + 1 fd    /dev/uhid,  O_RDWR|O_CLOEXEC
+->  "puck\n"        <-  "ok 5\n"  + 5 fds   every 28de:1304 hidraw node,
+                                            hidraw::OPEN_FLAGS
+->  anything else   <-  "err unknown request\n"  + 0 fds
+```
+
+One request per connection, then close. The client half-closes its write side, so
+the broker's read always terminates.
+
+Security posture, and why it is a small surface:
+
+* **It takes nothing from the client but a choice between two hard-coded verbs.**
+  No path, no flags, no numbers. `parse_request` is an allowlist of two exact
+  words: no leading space, no different case, no arguments, nothing over 32 bytes.
+* **It never reads from, writes to or ioctls a device.** It opens and hands over.
+* **It caches nothing.** Every `puck` rescans `/sys/class/hidraw`, so the puck
+  sleeping and coming back on different node numbers needs no special handling
+  anywhere — it is just a later request returning different descriptors.
+* **Two gates on who may ask.** The socket is `0660 root:hyprpad`, so only
+  members of that group can connect — this is the default and the documented
+  control. `--uid N` / `HYPRPAD_UID=N` adds an `SO_PEERCRED` check on top, for a
+  machine several humans share. uid 0 is always allowed, since root can open the
+  nodes without asking.
+* **It logs every decision to stderr**, which under the shipped unit is the
+  journal.
+
+The `cmsg` arithmetic is hand-rolled (`CMSG_ALIGN`/`CMSG_LEN`/`CMSG_SPACE` are C
+macros with nothing to call from Rust) and checked against `libc`'s own
+implementations for every payload size a reply can have, so a wrong `sizeof`
+assumption fails `cargo test` rather than silently truncating a descriptor array.
+A truncated control message is an error, never a short set that looks complete.
+
+### 6.3 The units — `packaging/systemd/`
+
+`hyprpad-broker.socket` owns `/run/hyprpad/broker.sock` at `0660 root:hyprpad`,
+`Accept=no`, and starts the service on the first connection, handing it the
+listening descriptor as fd 3. The broker implements `sd_listen_fds` by hand
+(`LISTEN_PID` + `LISTEN_FDS`), so **it never creates, chmods or chowns anything**
+— which is why the service can run with no writable filesystem at all.
+
+`hyprpad-broker.service` runs `/usr/local/bin/hyprpad broker` as root under:
+
+| Setting | Why |
+|---|---|
+| `CapabilityBoundingSet=` (empty), `AmbientCapabilities=` | it is uid 0 and only ever opens root-**owned** nodes, so plain DAC owner-match suffices and no capability is ever needed. If the rule's `OWNER:=` ever stops being root, this becomes `CAP_DAC_OVERRIDE`. |
+| `NoNewPrivileges=yes` | nothing it execs could gain more |
+| `DevicePolicy=closed` + `DeviceAllow=/dev/uhid rw` + `DeviceAllow=char-hidraw rw` | the cgroup device controller is the wall behind the socket: even a compromised broker can reach only the two device classes it exists for |
+| **no** `PrivateDevices=` | it would replace `/dev` with a minimal one that has neither `/dev/uhid` nor the hidraw nodes |
+| `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `UMask=0077` | it writes no files |
+| `RestrictAddressFamilies=AF_UNIX`, `PrivateNetwork=yes`, `IPAddressDeny=any` | the socket is the only channel |
+| `ProtectProc=invisible`, `ProcSubset=pid` | it never inspects other processes |
+| `SystemCallFilter=@system-service`, `SystemCallArchitectures=native`, `LockPersonality`, `MemoryDenyWriteExecute`, `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`, `ProtectKernel{Tunables,Logs}`, `ProtectClock`, `ProtectHostname`, `ProtectControlGroups` | ordinary hardening, none of it load-bearing for function |
+| **no** `ProtectKernelModules=` | opening `/dev/uhid` can trigger a char-major module autoload, and there is no upside to gambling on that when an empty capability bounding set already makes a deliberate `modprobe` impossible. `uhid` is loaded on any desktop anyway — BlueZ uses it. |
+
+`packaging/sysusers.d/hyprpad.conf` creates the group: a system group with no
+members and no user of its own, only ever a filter on who may connect.
+
+### 6.4 The daemon side
+
+One function expresses the whole preference, and everything that touches the puck
+goes through it:
+
+```rust
+// src/hidraw.rs
+pub enum PuckSource { Paths(Vec<PathBuf>), Fds(Vec<OwnedFd>) }
+impl PuckSource { pub fn acquire() -> Option<PuckSource>; }
+```
+
+| Broker answer | What the daemon does |
+|---|---|
+| no socket at `/run/hyprpad/broker.sock` | direct opens; one quiet line, once per process |
+| socket there, exchange failed (refused, wrong uid, mid-restart) | direct opens; one warning, once per process |
+| `ok 0` | direct opens — nothing usable, and the puck may simply be away |
+| `ok N`, N ≥ 1 | use the passed descriptors |
+
+`None` means neither route worked, which is exactly the condition the startup
+wait and the reconnect wait already sit on — so **both waits now poll
+`PuckSource::acquire` at `RECONNECT_SCAN_INTERVAL`**, and both ask the broker
+first. The answer is re-evaluated on every generation, so starting the broker
+under a running daemon is picked up by the next reconnect, and stopping it falls
+back.
+
+`spawn_reader_pipeline` takes a `PuckSource` by value (a brokered generation *is*
+the descriptors; there is nothing to re-open from). `haptics.rs`'s periodic
+re-open and `lizard.rs`'s feature-report sends go through the same function —
+which they must, or installing the rule would break haptics and lizard ownership
+even while input kept working.
+
+`hidraw::OPEN_FLAGS` is the shared contract: `O_RDWR | O_CLOEXEC`, and
+deliberately **not** `O_NONBLOCK`.
+
+* `O_RDWR` because `HIDIOCSFEATURE` (lizard) and output reports (haptics) are
+  writes, and once the broker is the only way in there is one descriptor set
+  serving reading and writing alike.
+* `O_CLOEXEC` because the daemon spawns the OSK as a child; the broker's replies
+  get the same property from `MSG_CMSG_CLOEXEC`.
+* Not `O_NONBLOCK` because `read_all`'s per-node threads block in `read` by
+  design — a non-blocking descriptor would turn each into a spin loop on
+  `EAGAIN`.
+
+`status.json` grows one field:
+
+```json
+{"connected": true, "relay": "steam", "source": "broker", …}
+```
+
+`"source"` is `"broker"` or `"direct"` and answers a different question from
+`"connected"`: not *is the controller here* but *is Steam able to see it too*.
+
+### 6.5 Install and verify
+
+`hyprpad setup` **prints** the root block and never runs it; `hyprpad setup
+--print` prints only the block; `hyprpad setup --check` reports on it read-only,
+opening nothing:
+
+```
+hyprpad setup --check (read-only; opens nothing)
+
+  ok  Valve's udev rule      /usr/lib/udev/rules.d/60-steam-input.rules
+  NO  hyprpad udev rule      72-hyprpad-puck.rules not installed — …
+  NO  broker socket          nothing at /run/hyprpad/broker.sock — …
+  ?   broker: uhid           no socket to ask
+  ?   broker: puck           no socket to ask
+  NO  puck nodes root-only   still reachable: /dev/hidraw7 (0660 uid 0), …
+
+NOT READY. Missing or wrong: … See `hyprpad setup --print` for the install block.
+```
+
+The node check is `stat` only, and that is sufficient: when a POSIX ACL grants
+anyone anything, the group bits of `st_mode` become the ACL *mask*, so a
+`uaccess` ACL shows up as non-zero group bits. Which is just as well — the one
+thing the check must not do is open the node whose unopenability it is testing.
+
+The two `broker:` lines are the part a file listing cannot replace. They catch
+the failure that looks like success: everything installed and enabled, and the
+shell still refusing because it predates `usermod -aG hyprpad`.
+
+### 6.6 What is still unverified
+
+Everything in §6 is tested where it can be tested without privilege, and the
+broker's socket, peer-credential, parse and refusal paths were exercised end to
+end over a real unix socket. Not verified, because it needs an install:
+
+* that udev actually applies the rule at 72 and the puck's nodes come back
+  `0600 root:root` with no ACL — the ordering argument is read off the shipped
+  rules and `man udev`, not off a live trigger;
+* the socket-activation path (`LISTEN_FDS`); the standalone `--socket` path was
+  exercised;
+* a `puck` or `uhid` request that actually *succeeds* — both need root, and the
+  descriptor hand-over itself is covered by unit tests over a `socketpair` with
+  pipes standing in for devices;
+* that Steam, with the real puck hidden, sees exactly one controller (§8 step 4).
 
 ---
 
@@ -420,44 +621,59 @@ is shipped in this change.
 
 ## 8. Manual test plan (for the owner)
 
-Everything below needs the host-integration half (§6) first — without a writable
-`/dev/uhid` the daemon logs one line and runs with no relay, which is step 0's
-expected result today.
+Everything below needs the host-integration half (§6) installed first — without a
+writable `/dev/uhid` the daemon logs one line and runs with no relay, which is
+step 0's expected result on a machine that has not run `hyprpad setup`.
 
 ### Step 0 — confirm the current, expected failure
 
 ```bash
-hyprpad run          # with kind = "steam" configured
+hyprpad setup --check     # expect NOT READY, everything but Valve's rule missing
+hyprpad run               # with kind = "steam" configured
 ```
 
-Expect exactly one line naming `/dev/uhid` and the udev rule, and:
+Expect one line naming `/dev/uhid` and pointing at `hyprpad setup`, and:
 
 ```bash
-jq .relay "$XDG_RUNTIME_DIR/hyprpad/status.json"    # "none"
+jq -r '.relay, .source' "$XDG_RUNTIME_DIR/hyprpad/status.json"   # "none", "direct"
 ```
 
-### Step 1 — grant access, restart, confirm the device exists
+### Step 1 — install the host half, restart, confirm the device exists
+
+Run the block `hyprpad setup --print` emits (§6.5), **re-login or `newgrp
+hyprpad`**, then:
 
 ```bash
-printf 'KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uhid"\n' \
-  | sudo tee /etc/udev/rules.d/72-hyprpad-uhid.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger
-getfacl /dev/uhid            # expect an ACL for your uid
+hyprpad setup --check     # expect READY, all six lines ok
+```
+
+The two checks that matter most, spelled out by hand:
+
+```bash
+# the real puck must be root-only, with NO '+' and no ACL
+ls -l /dev/hidraw*
+getfacl /dev/hidraw7      # expect user::rw- / group::--- / other::--- only
+
+# …while the FAKE still carries an ACL for you, from Valve's own rule
+for h in /sys/class/hidraw/hidraw*; do
+  grep -qi '28DE:1302\|28DE:12F0' "$h/device/uevent" && { echo "== $h"; cat "$h/device/uevent"; }
+done
+getfacl /dev/hidrawN      # the fake: expect user:<you>:rw-
 ```
 
 Restart the daemon, then:
 
 ```bash
-jq .relay "$XDG_RUNTIME_DIR/hyprpad/status.json"    # "steam"
-
-# the virtual node, and that Valve's own rule gave it uaccess
-for h in /sys/class/hidraw/hidraw*; do
-  grep -qi '28DE:1302\|28DE:12F0' "$h/device/uevent" && { echo "== $h"; cat "$h/device/uevent"; }
-done
-getfacl /dev/hidrawN         # expect user:<you>:rw-
+jq -r '.relay, .source' "$XDG_RUNTIME_DIR/hyprpad/status.json"   # "steam", "broker"
+journalctl -u hyprpad-broker -n 20                              # one line per request
 ```
 
-The daemon's startup line names the identity and VID:PID it created.
+The daemon's startup line names the identity, the VID:PID it created, and which
+half produced `/dev/uhid`.
+
+If `source` says `"direct"` after all this, the group has not reached the
+daemon's process: it was started before `usermod -aG hyprpad`. Restart it from a
+shell that has the group.
 
 ### Step 2 — establish the baseline **before** trusting any negative
 
@@ -544,4 +760,26 @@ All pure, no devices. `cargo test` gates on the exit code.
 * **`config.rs` / `lua_config.rs`** — `kind` and `identity` on both front-ends,
   their aliases, their defaults, and that a typo fails the whole parse.
 * **`status.rs` / `run.rs`** — the `"relay"` field, and that it reports the sink
-  that exists rather than the one configured.
+  that exists rather than the one configured; the `"source"` field, and that
+  `Source::of` is the one mapping from a live generation to the wire value.
+* **`broker.rs`** — the two-verb allowlist and everything it refuses (case,
+  spacing, arguments, embedded NUL, overlength); the status-line round trip; the
+  hand-rolled `CMSG_ALIGN`/`CMSG_LEN`/`CMSG_SPACE` against `libc`'s own for every
+  payload size a reply can have; an `SCM_RIGHTS` round trip over a `socketpair`
+  passing pipe descriptors, asserting the *received* descriptor works and that
+  five of them land on the five right pipes; that a truncated control message is
+  an error rather than a short set; the uid gate's decision table; `SO_PEERCRED`
+  against our own uid; argument and bind-path precedence; the daemon's fallback
+  decision table; and `serve` driven over a real socket for the refused-verb,
+  refused-peer and split-request cases.
+* **`hidraw.rs`** — that `OPEN_FLAGS` is read-write, cloexec and *blocking*;
+  `open_node` on a real file and on a missing one; that a `PuckSource` knows
+  which half it came from; `read_all` streaming from passed descriptors and
+  closing its channel when they end; and that one dead path does not sink a whole
+  direct generation.
+* **`setup.rs`** — that the printed block names every file actually shipped under
+  `packaging/` and carries every required step; that the module never spawns a
+  process (it *prints* the privileged half); and the whole `--check` verdict
+  table against an injected `HostView`, covering a fully installed machine, an
+  untouched one, a broker that refuses, a rule installed but not yet applied, an
+  absent puck, a missing Valve rule, and an `ok 0` answer.
