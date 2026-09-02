@@ -24,6 +24,7 @@ It is **opt-in and off by default**. One config line turns it on:
 [gamepad]
 kind = "steam"          # xbox (default) | steam
 identity = "triton"     # triton (default) | deck
+gyro = false            # hold the IMU on regardless of Steam (diagnosis; §3.1)
 ```
 
 ```lua
@@ -310,7 +311,8 @@ same byte means different things:
 | `SetSettingsValues` | `0x87` | feature | **Decoded, not applied.** Parsed into `(setting, u16)` pairs and logged by SDL name. |
 | ↳ `SETTING_LIZARD_MODE` | 9 | | **Ignored — hyprpad's.** `src/lizard.rs` holds it at 0 and re-sends every 30 s. |
 | ↳ `SETTING_STEAM_WATCHDOG_ENABLE` | 71 | | **Ignored — hyprpad's**, same reason. |
-| ↳ everything else | | | Logged, dropped. |
+| ↳ `SETTING_IMU_MODE` | 48 | | **RELAYED — the one setting that is.** Written to the real puck through `lizard.rs`'s frame builder. See §3.1. |
+| ↳ everything else | | | Logged by SDL name (all 82 of them), dropped. |
 | `TriggerRumbleCommand` | `0xEB` | feature | **Translated.** `left_speed`/`right_speed` (u16 LE at bytes 5..7, 7..9 of `PackedRumbleReport`) become `haptics::Haptics::rumble`'s two `FF_RUMBLE` magnitudes. |
 | `TriggerHapticPulse` | `0x8F` | feature | **Translated.** `[pad][duration][interval][count][gain]` per the kernel's `steam_haptic_pulse`; the wire side is un-XORed to a logical `haptics::Pad`, the gain dropped (the IBEX pulse struct has no gain field). |
 | `TriggerHapticCommand` | `0xEA` | feature | **Translated, partly UNVERIFIED** — see §7. |
@@ -333,8 +335,138 @@ implementation takes (A.4), for two structural reasons:
    relay to go through it and "never open a second writable fd on the puck". So
    rumble and haptics are *translated into that path*, not forwarded as bytes.
 
-**What this costs:** Steam's IMU-enable does not reach the puck, so gyro does not
-start streaming by itself. Recorded in §7.
+**What this cost, and what it stopped costing:** Steam's IMU-enable did not
+reach the puck, so the gyro never started streaming. That was gap G5, and §3.1
+is how it is closed — without breaking either reason above, because the gyro
+goes out through *lizard's* frame builder rather than a second writer.
+
+
+### 3.1 The gyro — the one setting that *is* relayed
+
+Gap G5. Everything above is "hyprpad can satisfy this itself, so it does"; the
+IMU is the one thing it cannot. **Only the real puck can turn its own IMU on.**
+Its `0x42` carries no gyro bytes at all until it has been told to put them
+there, and no amount of interpreting on this side of the wire conjures them.
+
+So `SETTING_IMU_MODE` is relayed to the hardware, and it is the only setting
+that is.
+
+**The number, and where it comes from.** SDL's `controller_constants.h` declares
+the `ControllerSettings` enum append-only ("*only add to this enum and never
+change the order*"), which makes an index a stable identity:
+
+| | |
+|---|---|
+| `SETTING_IMU_MODE` | **48** (`0x30`). Older headers spell the same slot `SETTING_GYRO_MODE`. |
+| value | a `u16` bitmask: `OFF 0x0000`, `STEERING 0x0001`, `TILT 0x0002`, `SEND_ORIENTATION 0x0004`, `SEND_RAW_ACCEL 0x0008`, `SEND_RAW_GYRO 0x0010` |
+| what Steam writes | `HIDAPI_DriverSteam_SetSensorsEnabled` (`SDL_hidapi_steam.c`) sends a one-pair `0x87` frame: `SEND_RAW_ACCEL \| SEND_RAW_GYRO` = **`0x0018`** to enable, `OFF` to disable. That is the whole of Steam's gyro request. |
+
+`src/uhid/settings.rs` now carries the **entire** 82-entry enum as
+`SETTING_NAMES`, not just the six numbers the daemon spells by name, so a
+`HYPRSC_DEBUG` log never prints `SETTING_?` again — the first live Triton
+session logged eight distinct unnamed ids, and an unnamed id is a question
+nobody can answer from the log alone. Six of those numbers are independently
+corroborated: sc-controller's `configure()` sends
+`87 15 32 t_lo t_hi 18 00 00 31 02 00 08 07 00 07 07 00 30 gy 00 2e 00 00`
+(`docs/research/guide-hold-poweroff.md` §2), which reads back as settings **50,
+24, 49, 8, 7, 48, 46** in that order — sleep timeout, smooth mouse, packet
+version, both trackpad modes at `TRACKPAD_NONE` (7), **the gyro**, raw joystick.
+Five of the seven land on values that only make sense under this numbering, and
+the sixth is the gyro variable itself.
+
+**The write path, and the one-writer invariant.** The relay does not write it.
+`settings::imu_mode` lifts the value out of the decoded `0x87` and `run.rs`
+puts it in a cell that `src/lizard.rs` owns; `disable_lizard_pairs` then appends
+`(48, mode)` to the **same** `ID_SET_SETTINGS_VALUES` frame that module has
+always built:
+
+```text
+[01][87][09][09 00 00][47 00 00][30 18 00]
+ id  cmd len  lizard=0  watchdog=0  IMU=raw-accel|raw-gyro
+```
+
+One frame builder, one writer, one heartbeat. Research §5.2's "never open a
+second writable fd on the puck" is satisfied structurally rather than by
+convention, and three properties fall out for free, with no new timer and no new
+code path:
+
+* it **survives the 30 s `RESEND_INTERVAL` re-send**, because it is *in* the
+  frame that re-send sends;
+* it **survives a reconnect and a power cycle**, for the same reason — the
+  re-send exists to re-cover a controller that came back with firmware defaults,
+  and the gyro is now part of what gets re-covered;
+* it **cannot race the ownership loop**, because the ownership loop is the only
+  thread that sends it.
+
+Steam's request must not wait up to 30 s, though, so `lizard::nudge()` rings a
+condvar the ownership loop now waits on instead of sleeping. The daemon's 250 Hz
+loop takes an uncontended lock and signals; it never does the I/O itself, which
+keeps a 12-retry `EPIPE` budget on a sleeping controller (~240 ms per node) off
+the frame path. `set_imu_requested` returns whether the effective mode actually
+*changed*, so Steam re-stating a mode the puck already holds — which it does,
+repeatedly — is not a feature report.
+
+**Who decides, and what "off" means.** Two authorities, and the rule is one
+line: *Steam wins while it is asking; hyprpad's preference is what is left.*
+
+| State | Written to the puck |
+|---|---|
+| Nothing has ever asked (**the default**, and every `kind = "xbox"` install) | **no `SETTING_IMU_MODE` pair at all** — the frame is byte-for-byte the two-pair frame this module has always sent |
+| Steam asked for sensors | Steam's mask, verbatim |
+| Steam asked for `OFF`, or closed the fake, or the relay stopped | hyprpad's preference, **written explicitly as `0`** — not omitted, which would leave the firmware holding whatever it was last told |
+| `h.gamepad { gyro = true }` | `SEND_RAW_ACCEL \| SEND_RAW_GYRO`, held whether or not Steam is asking |
+
+The first row is load-bearing: a feature nobody uses must write nothing to
+anybody's controller, and
+`lizard::tests::an_unengaged_hold_leaves_the_historical_frame_byte_for_byte_unchanged`
+pins it.
+
+`gyro = true` is a **diagnostic knob, not a feature switch.** Its use is telling
+"the gyro is not working" apart from "Steam never asked": turn it on and the IMU
+bytes appear in the puck's `0x42` with no Steam in the picture at all. In
+ordinary use it should stay off, because a gyro streaming for a desktop nobody is
+aiming with is battery spent for nothing.
+
+**Why it is deliberately *not* gated on the forwarding gate.** Gating the IMU on
+game focus would be one line, and it would be wrong. The forwarding gate flips on
+every focus change — the guide held for a chord, the OSK raised, a moment on the
+desktop — many times a minute in ordinary use, and each flip would become a
+feature-report write to a battery-powered controller. That is a write storm to
+save power. Two things already do the job better:
+
+* **Steam's request is already game-scoped.** SDL calls `SetSensorsEnabled` when
+  a game turns its sensors on and again when it turns them off, so the IMU is up
+  only while something is actually reading it.
+* **Not-forwarding already parks the gyro from Steam's side.** While hyprpad owns
+  the controller the relay streams `translate::triton_neutral`, whose IMU bytes
+  are zero — so a game sees a stationary gyro during a guide chord regardless of
+  what the firmware is doing.
+
+The power question is answered by the default being off and by the restore, not
+by chasing focus.
+
+**Where the bytes land, and what is still UNVERIFIED.** `src/report.rs` decodes
+bytes 0..30 of the 54-byte `0x42` and says of the rest: *"Bytes 30+ carry the IMU
+and stream only after an enable feature-report (Steam sends one); they are
+untouched here."* The `triton` profile is a pass-through — `puck_to_triton`
+copies all 54 bytes and clears two bits — so **nothing else has to change**: the
+moment the puck starts filling bytes 30+, Steam gets them. The classic Valve
+state packet puts accel `x,y,z`, gyro `x,y,z` and the orientation quaternion
+`w,x,y,z` there as ten little-endian `i16`s (offsets 30..50), which fits the 24
+undecoded bytes with 4 to spare.
+
+That last sentence is **inferred from the report table and the classic layout,
+not observed** — no IMU-enabled `0x42` has been captured from this puck. Two
+things would falsify it: the puck answering the enable but putting IMU data in a
+*different* report (the descriptor also declares inputs `0x43`, `0x44`, `0x45`,
+`0x79`, `0x7b`, none of which the relay forwards), or the firmware ignoring
+setting 48 entirely. Both are visible in one step — see §8 step 6.
+
+**`deck` gets none of this.** `puck_to_deck` transcodes from `report::Frame`,
+which has no IMU fields, so the Deck report's accel/gyro/magnetometer bytes stay
+zero however the puck is configured. The setting still reaches the hardware; the
+transcode is what drops it. Decoding the IMU into `Frame` is the follow-on that
+would close it, and it is worth doing only if `deck` ever becomes the default.
 
 ### `GET_REPORT` answers
 
@@ -696,7 +828,7 @@ end over a real unix socket. Not verified, because it needs an install:
 | G2 | `triton`'s `GetAttributesValues` blob | **UNVERIFIED.** No `1302` blob was ever captured. It is the Deck blob with `ATTRIB_PRODUCT_ID` patched to `0x1302`. Steam's log shows a real Triton survives a *failed* attribute probe (`Deck Controller PCB Serial# invalid: NA`), so a well-formed wrong answer is low severity. Replace when a real blob is captured. |
 | G3 | `triton`'s chip id | **UNVERIFIED.** Modelled on the Deck answer. |
 | G4 | `TriggerHapticCommand` (`0xEA`) shape | **Partly UNVERIFIED.** The `PackedHapticReport` layout is verbatim, but `PadSide`/`Intensity` are enums whose discriminants were not captured, and the command carries **no duration** — only an intensity class. hyprpad fires its own calibrated single tick (`0x190` = 400 µs, from the kernel's `steam_haptic_pulse`) on the named side, reading side as `0 = left, 1 = right`. The first live session's `HYPRSC_DEBUG` log settles it. |
-| G5 | **Gyro does not reach Steam.** | By construction on `deck` (`report::Frame` has no IMU) and because Steam's IMU-enable is not relayed on either profile. On `triton` the pass-through *would* carry it if the enable reached the puck — the smallest follow-on with the largest payoff. |
+| G5 | **Gyro does not reach Steam.** | **CLOSED on `triton`, pending a live check** — §3.1. Steam's `SETTING_IMU_MODE` (48) is now written to the real puck through `lizard.rs`'s frame builder, and the pass-through carries whatever the puck then puts in bytes 30+. That the puck answers setting 48 by filling those bytes of the *same* `0x42` is **inferred from the report table, not observed** — §8 step 6 is the check. Still open **by construction on `deck`**: `puck_to_deck` transcodes from `report::Frame`, which has no IMU fields. |
 | G6 | Quick Access is never stripped | `StripMask` supports it; nothing sets it. §4.4 suggests deriving the whole mask from the live binding table so any bound button is withheld. Follow-on. |
 | G7 | `identity` / `kind` do not take effect on `hyprpad reload` | They choose a device created once at startup. Restart the daemon. |
 | G8 | Latency of the extra userspace hop | Unmeasured (risk R7). Both hops are non-blocking; budget ≪1 ms. Measure on the first live run. |
@@ -799,7 +931,7 @@ Steam → Settings → Controller:
   Xbox pad is still being created — the latter would be a bug in this change, as
   `kind = "steam"` must not create it;
 * the device should show **trackpads, gyro and back grips**, not a generic pad.
-  Missing gyro is expected today (G5).
+  Gyro is now wired (§3.1) but unproven — step 6 is where it is settled.
 
 ### Step 5 — routing and haptics
 
@@ -815,6 +947,77 @@ Steam → Settings → Controller:
   the empirical answer to G4, and to what Steam actually sends a Triton (Q-u2).
 
 ---
+
+### Step 6 — the gyro (§3.1), the one thing this build added and cannot prove
+
+Three checks, in order of what they distinguish. Run the daemon with
+`HYPRSC_DEBUG=1` for all of them.
+
+**6a — does Steam ask?** Open a game with gyro in its Steam Input config (or
+Steam → Settings → Controller → *Calibration & Advanced*, which enables sensors
+to draw the gyro readout):
+
+```
+[relay] SetSettingsValues [SETTING_IMU_MODE=24 [raw-accel+raw-gyro]]
+[relay] IMU raw-accel+raw-gyro -> puck (Steam asked)
+```
+
+No such line means Steam never asked, and nothing downstream is hyprpad's
+problem yet. `gyro = true` in the config forces the same write with no Steam in
+the picture, which is how to carry on testing regardless.
+
+**6b — does the puck obey?** Read the *fake's* stream and watch bytes 30+, which
+are zero on every neutral frame:
+
+```bash
+h=$(for d in /sys/class/hidraw/hidraw*; do
+      grep -qi '28DE:0*1302' "$d/device/uevent" && basename "$d"; done)
+sudo -u "$USER" python3 - <<'EOF'
+import os, binascii
+fd = os.open("/dev/$h", os.O_RDONLY)
+for _ in range(200):
+    d = os.read(fd, 64)
+    if any(d[30:]):
+        print("IMU:", binascii.hexlify(d[30:50], " ").decode()); break
+else:
+    print("bytes 30+ stayed zero")
+EOF
+```
+
+Move the puck while it runs. Non-zero, changing bytes 30..50 is **G5 proven**:
+the enable reached the firmware and the pass-through is carrying it.
+
+If they stay zero while 6a logged the write, the firmware either ignored setting
+48 or put the IMU somewhere else. The descriptor declares five other input
+reports the relay does not forward (`0x43`, `0x44`, `0x45`, `0x79`, `0x7b`), so
+the next step is to read the **real puck** instead of the fake and see which
+report id grew:
+
+```bash
+sudo python3 -c "
+import os,binascii
+fd=os.open('/dev/hidraw7',os.O_RDONLY)
+seen={}
+for _ in range(2000):
+    d=os.read(fd,64); seen[d[0]]=len(d)
+print(seen)"
+```
+
+A report id appearing there that was not there before the enable is the answer,
+and it makes the fix a `translate` change rather than a settings one.
+
+**6c — does Steam use it?** Steam → Settings → Controller → the fake →
+*Calibration & Advanced*. The gyro readout should move when the puck does. That
+is the end-to-end verdict, and the one to report.
+
+**And check the restore.** Quit Steam (or close the game) and confirm:
+
+```
+[relay] Steam closed the device; IMU restored to hyprpad's preference
+```
+
+then re-run 6b: bytes 30+ must go back to zero. A puck left streaming IMU data
+to nobody is exactly the battery drain §3.1's default exists to avoid.
 
 ## 9. Tests
 
@@ -837,9 +1040,20 @@ All pure, no devices. `cargo test` gates on the exit code.
   analog offset; neutral for both profiles; and a guard that every mapped button
   lands on a distinct bit.
 * **`settings.rs`** — the exact `0x87` frame `src/lizard.rs` builds, decoded
-  back; multi-pair and malformed frames; `0xEB`/`0x8F`/`0xEA`; and the round trip
+  back; multi-pair and malformed frames; `0xEB`/`0x8F`/`0xEA`; the round trip
   that `haptics.rs`'s own `0x80`/`0x81` output reports decode to what they were
-  built from.
+  built from; the full 82-entry `SETTING_NAMES` table with every named constant
+  pinned to its own slot from both directions; the `SettingGyroMode` bits; and
+  Steam's one-pair IMU enable and disable decoded to a mode, including the
+  last-pair-wins rule for a gyro folded into a larger write.
+* **`lizard.rs`** (the gyro half) — that an unengaged hold leaves the settings
+  frame **byte-for-byte** the historical two-pair one; that Steam's enable rides
+  out in lizard's own frame as `[01][87][09][09 00 00][47 00 00][30 18 00]`; that
+  "off" is an explicit zero rather than a missing pair; the gyro pair's place
+  behind the power knobs; the four states of the Steam-versus-preference
+  authority rule; that the exit frame restores the preference and discards what
+  Steam asked; that a re-stated mode reports no change (so it becomes no write);
+  and that a nudge is never dropped and wakes a blocked wait.
 * **`relay.rs`** — the neutral stream, the advancing Deck counter, the untouched
   Triton counter, and the staleness decay.
 * **`config.rs` / `lua_config.rs`** — `kind` and `identity` on both front-ends,

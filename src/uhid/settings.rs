@@ -36,10 +36,23 @@
 //!    stores the selector and replies from the profile's canned data. Those
 //!    classify as [`Action::Answered`], not as drops.
 //!
-//! Everything else is dropped with a debug log. Note what that costs: Steam's
-//! IMU-enable would not reach the puck, so gyro does not start streaming by
-//! itself. That is a known limitation of this build, recorded in
-//! `docs/design/uhid-relay.md`.
+//! Everything else is dropped with a debug log.
+//!
+//! # The one exception: `SETTING_IMU_MODE`, and why it is relayed
+//!
+//! The policy above has exactly one hole, and it was gap G5 of
+//! `docs/design/uhid-relay.md`: **only the real puck can turn its own IMU on.**
+//! Steam's gyro request is not something hyprpad can satisfy on its own behalf
+//! the way it satisfies the lizard-mode writes, and it is not an actuator
+//! command that can be translated into `haptics.rs` — it is a firmware setting
+//! that has to reach the hardware or the gyro bytes never appear in the puck's
+//! `0x42` at all.
+//!
+//! So [`setting::IMU_MODE`] (48) is **relayed**, and it is the only setting that
+//! is. It does not become a second writer: [`imu_mode`] lifts the value out of
+//! the decoded write and the daemon hands it to `src/lizard.rs`, which folds it
+//! into the *same* `0x87` frame it already builds and re-sends every 30 s. One
+//! frame builder, one writer, one heartbeat — see `lizard::set_imu_requested`.
 //!
 //! # Sources for every byte layout below
 //!
@@ -159,9 +172,20 @@ pub fn command_name(id: u8) -> &'static str {
     }
 }
 
-/// `SETTING_*` numbers, from SDL's `controller_constants.h` as catalogued in
-/// `docs/research/guide-hold-poweroff.md`.
+/// `SETTING_*` numbers, from SDL's `controller_constants.h` — the
+/// `ControllerSettings` enum, whose header says *"only add to this enum and
+/// never change the order"*, which is what makes a bare index a stable name.
+///
+/// [`SETTING_NAMES`] carries the **whole** enum in order, so a debug log never
+/// prints `SETTING_?` for anything Valve has named; the constants below are the
+/// handful the daemon refers to by name, each pinned against its index in that
+/// table by `every_named_constant_matches_its_slot_in_the_full_table`.
 pub mod setting {
+    /// `SETTING_LEFT_TRACKPAD_MODE` — one of the pair SDL sets to
+    /// `TRACKPAD_NONE` (7) to stop the firmware driving a mouse.
+    pub const LEFT_TRACKPAD_MODE: u8 = 7;
+    /// `SETTING_RIGHT_TRACKPAD_MODE`.
+    pub const RIGHT_TRACKPAD_MODE: u8 = 8;
     /// `SETTING_LIZARD_MODE` — the master firmware keyboard/mouse switch.
     /// **hyprpad's**: `src/lizard.rs` holds it at 0.
     pub const LIZARD_MODE: u8 = 9;
@@ -169,8 +193,24 @@ pub mod setting {
     pub const SMOOTH_ABSOLUTE_MOUSE: u8 = 24;
     /// `SETTING_STEAMBUTTON_POWEROFF_TIME`.
     pub const STEAMBUTTON_POWEROFF_TIME: u8 = 25;
+    /// `SETTING_IMU_MODE` — **the gyro switch**, and the reason G5 existed.
+    ///
+    /// A `u16` bitmask of [`super::gyro_mode`] flags. SDL's
+    /// `HIDAPI_DriverSteam_SetSensorsEnabled` writes exactly this setting and
+    /// nothing else when a game turns its sensors on or off
+    /// (`SDL_hidapi_steam.c`), so it is the one number Steam's IMU-enable
+    /// reduces to. Older headers spell it `SETTING_GYRO_MODE`, which is why the
+    /// value enum still carries that name.
+    pub const IMU_MODE: u8 = 48;
+    /// `SETTING_WIRELESS_PACKET_VERSION`.
+    pub const WIRELESS_PACKET_VERSION: u8 = 49;
     /// `SETTING_SLEEP_INACTIVITY_TIMEOUT`.
     pub const SLEEP_INACTIVITY_TIMEOUT: u8 = 50;
+    /// `SETTING_LEFT_TRACKPAD_CLICK_PRESSURE` — SDL writes `0xFFFF` here to
+    /// disable the clicky pad.
+    pub const LEFT_TRACKPAD_CLICK_PRESSURE: u8 = 52;
+    /// `SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE`.
+    pub const RIGHT_TRACKPAD_CLICK_PRESSURE: u8 = 53;
     /// `SETTING_STEAM_WATCHDOG_ENABLE` — reverts the pad to lizard mode when no
     /// host heartbeat arrives. **hyprpad's**: `src/lizard.rs` holds it at 0.
     pub const STEAM_WATCHDOG_ENABLE: u8 = 71;
@@ -178,17 +218,179 @@ pub mod setting {
     pub const DEVICE_POWER_STATUS: u8 = 78;
 }
 
+/// Every `SETTING_*` name, indexed by its number.
+///
+/// Transcribed from the `ControllerSettings` enum of SDL's
+/// `src/joystick/hidapi/steam/controller_constants.h` (82 entries, 0 through
+/// `SETTING_TIMP_MODE_MTE`, before the `SETTING_COUNT` terminator). The enum is
+/// declared append-only by its own comment, so an index is a stable identity;
+/// six of these numbers are independently corroborated by the frame
+/// sc-controller's `configure()` sends (`docs/research/guide-hold-poweroff.md`
+/// §2: settings 50, 24, 49, 8, 7, 48, 46 in that order), which is why the table
+/// can be trusted for the entries nothing in this tree writes.
+///
+/// It exists so `HYPRSC_DEBUG` never prints `SETTING_?` again: the first live
+/// Triton session logged eight distinct unnamed ids, and an unnamed id is a
+/// question nobody can answer from the log alone.
+pub const SETTING_NAMES: [&str; 82] = [
+    // 0
+    "SETTING_MOUSE_SENSITIVITY",
+    "SETTING_MOUSE_ACCELERATION",
+    "SETTING_TRACKBALL_ROTATION_ANGLE",
+    "SETTING_HAPTIC_INTENSITY_UNUSED",
+    "SETTING_LEFT_GAMEPAD_STICK_ENABLED",
+    "SETTING_RIGHT_GAMEPAD_STICK_ENABLED",
+    "SETTING_USB_DEBUG_MODE",
+    "SETTING_LEFT_TRACKPAD_MODE",
+    "SETTING_RIGHT_TRACKPAD_MODE",
+    "SETTING_LIZARD_MODE",
+    // 10
+    "SETTING_DPAD_DEADZONE",
+    "SETTING_MINIMUM_MOMENTUM_VEL",
+    "SETTING_MOMENTUM_DECAY_AMOUNT",
+    "SETTING_TRACKPAD_RELATIVE_MODE_TICKS_PER_PIXEL",
+    "SETTING_HAPTIC_INCREMENT",
+    "SETTING_DPAD_ANGLE_SIN",
+    "SETTING_DPAD_ANGLE_COS",
+    "SETTING_MOMENTUM_VERTICAL_DIVISOR",
+    "SETTING_MOMENTUM_MAXIMUM_VELOCITY",
+    "SETTING_TRACKPAD_Z_ON",
+    // 20
+    "SETTING_TRACKPAD_Z_OFF",
+    "SETTING_SENSITIVITY_SCALE_AMOUNT",
+    "SETTING_LEFT_TRACKPAD_SECONDARY_MODE",
+    "SETTING_RIGHT_TRACKPAD_SECONDARY_MODE",
+    "SETTING_SMOOTH_ABSOLUTE_MOUSE",
+    "SETTING_STEAMBUTTON_POWEROFF_TIME",
+    "SETTING_UNUSED_1",
+    "SETTING_TRACKPAD_OUTER_RADIUS",
+    "SETTING_TRACKPAD_Z_ON_LEFT",
+    "SETTING_TRACKPAD_Z_OFF_LEFT",
+    // 30
+    "SETTING_TRACKPAD_OUTER_SPIN_VEL",
+    "SETTING_TRACKPAD_OUTER_SPIN_RADIUS",
+    "SETTING_TRACKPAD_OUTER_SPIN_HORIZONTAL_ONLY",
+    "SETTING_TRACKPAD_RELATIVE_MODE_DEADZONE",
+    "SETTING_TRACKPAD_RELATIVE_MODE_MAX_VEL",
+    "SETTING_TRACKPAD_RELATIVE_MODE_INVERT_Y",
+    "SETTING_TRACKPAD_DOUBLE_TAP_BEEP_ENABLED",
+    "SETTING_TRACKPAD_DOUBLE_TAP_BEEP_PERIOD",
+    "SETTING_TRACKPAD_DOUBLE_TAP_BEEP_COUNT",
+    "SETTING_TRACKPAD_OUTER_RADIUS_RELEASE_ON_TRANSITION",
+    // 40
+    "SETTING_RADIAL_MODE_ANGLE",
+    "SETTING_HAPTIC_INTENSITY_MOUSE_MODE",
+    "SETTING_LEFT_DPAD_REQUIRES_CLICK",
+    "SETTING_RIGHT_DPAD_REQUIRES_CLICK",
+    "SETTING_LED_BASELINE_BRIGHTNESS",
+    "SETTING_LED_USER_BRIGHTNESS",
+    "SETTING_ENABLE_RAW_JOYSTICK",
+    "SETTING_ENABLE_FAST_SCAN",
+    "SETTING_IMU_MODE",
+    "SETTING_WIRELESS_PACKET_VERSION",
+    // 50
+    "SETTING_SLEEP_INACTIVITY_TIMEOUT",
+    "SETTING_TRACKPAD_NOISE_THRESHOLD",
+    "SETTING_LEFT_TRACKPAD_CLICK_PRESSURE",
+    "SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE",
+    "SETTING_LEFT_BUMPER_CLICK_PRESSURE",
+    "SETTING_RIGHT_BUMPER_CLICK_PRESSURE",
+    "SETTING_LEFT_GRIP_CLICK_PRESSURE",
+    "SETTING_RIGHT_GRIP_CLICK_PRESSURE",
+    "SETTING_LEFT_GRIP2_CLICK_PRESSURE",
+    "SETTING_RIGHT_GRIP2_CLICK_PRESSURE",
+    // 60
+    "SETTING_PRESSURE_MODE",
+    "SETTING_CONTROLLER_TEST_MODE",
+    "SETTING_TRIGGER_MODE",
+    "SETTING_TRACKPAD_Z_THRESHOLD",
+    "SETTING_FRAME_RATE",
+    "SETTING_TRACKPAD_FILT_CTRL",
+    "SETTING_TRACKPAD_CLIP",
+    "SETTING_DEBUG_OUTPUT_SELECT",
+    "SETTING_TRIGGER_THRESHOLD_PERCENT",
+    "SETTING_TRACKPAD_FREQUENCY_HOPPING",
+    // 70
+    "SETTING_HAPTICS_ENABLED",
+    "SETTING_STEAM_WATCHDOG_ENABLE",
+    "SETTING_TIMP_TOUCH_THRESHOLD_ON",
+    "SETTING_TIMP_TOUCH_THRESHOLD_OFF",
+    "SETTING_FREQ_HOPPING",
+    "SETTING_TEST_CONTROL",
+    "SETTING_HAPTIC_MASTER_GAIN_DB",
+    "SETTING_THUMB_TOUCH_THRESH",
+    "SETTING_DEVICE_POWER_STATUS",
+    "SETTING_HAPTIC_INTENSITY",
+    // 80
+    "SETTING_STABILIZER_ENABLED",
+    "SETTING_TIMP_MODE_MTE",
+];
+
+/// The `SettingGyroMode` bitmask — the values [`setting::IMU_MODE`] takes.
+///
+/// Verbatim from SDL's `controller_constants.h`:
+///
+/// ```text
+/// SETTING_GYRO_MODE_OFF               = 0x0000
+/// SETTING_GYRO_MODE_STEERING          = 0x0001
+/// SETTING_GYRO_MODE_TILT              = 0x0002
+/// SETTING_GYRO_MODE_SEND_ORIENTATION  = 0x0004
+/// SETTING_GYRO_MODE_SEND_RAW_ACCEL    = 0x0008
+/// SETTING_GYRO_MODE_SEND_RAW_GYRO     = 0x0010
+/// ```
+///
+/// The flags choose *what the controller puts in its input report*, which is
+/// why this is the switch that makes the puck's `0x42` carry IMU data at all.
+pub mod gyro_mode {
+    /// `SETTING_GYRO_MODE_OFF` — no IMU data in the input report.
+    pub const OFF: u16 = 0x0000;
+    /// `SETTING_GYRO_MODE_STEERING`.
+    pub const STEERING: u16 = 0x0001;
+    /// `SETTING_GYRO_MODE_TILT`.
+    pub const TILT: u16 = 0x0002;
+    /// `SETTING_GYRO_MODE_SEND_ORIENTATION` — the fused quaternion.
+    pub const SEND_ORIENTATION: u16 = 0x0004;
+    /// `SETTING_GYRO_MODE_SEND_RAW_ACCEL` — raw accelerometer.
+    pub const SEND_RAW_ACCEL: u16 = 0x0008;
+    /// `SETTING_GYRO_MODE_SEND_RAW_GYRO` — raw rate gyro.
+    pub const SEND_RAW_GYRO: u16 = 0x0010;
+
+    /// What SDL itself turns on for a game that asked for sensors:
+    /// `SETTING_GYRO_MODE_SEND_RAW_ACCEL | SETTING_GYRO_MODE_SEND_RAW_GYRO`
+    /// (`HIDAPI_DriverSteam_SetSensorsEnabled`, `SDL_hidapi_steam.c`). This is
+    /// hyprpad's own value for `h.gamepad { gyro = true }`, so the puck is
+    /// configured the way the reference client configures it and not some
+    /// third thing.
+    pub const SENSORS_ON: u16 = SEND_RAW_ACCEL | SEND_RAW_GYRO;
+
+    /// A human description of a mode bitmask, for logging.
+    pub fn describe(mode: u16) -> String {
+        if mode == OFF {
+            return "off".to_string();
+        }
+        let mut on = Vec::new();
+        for (bit, name) in [
+            (STEERING, "steering"),
+            (TILT, "tilt"),
+            (SEND_ORIENTATION, "orientation"),
+            (SEND_RAW_ACCEL, "raw-accel"),
+            (SEND_RAW_GYRO, "raw-gyro"),
+        ] {
+            if mode & bit != 0 {
+                on.push(name);
+            }
+        }
+        let rest = mode & !(STEERING | TILT | SEND_ORIENTATION | SEND_RAW_ACCEL | SEND_RAW_GYRO);
+        if rest != 0 {
+            return format!("{}+{rest:#06x}", on.join("+"));
+        }
+        on.join("+")
+    }
+}
+
 /// A human name for a setting number, for logging only.
 pub fn setting_name(id: u8) -> &'static str {
-    match id {
-        setting::LIZARD_MODE => "SETTING_LIZARD_MODE",
-        setting::SMOOTH_ABSOLUTE_MOUSE => "SETTING_SMOOTH_ABSOLUTE_MOUSE",
-        setting::STEAMBUTTON_POWEROFF_TIME => "SETTING_STEAMBUTTON_POWEROFF_TIME",
-        setting::SLEEP_INACTIVITY_TIMEOUT => "SETTING_SLEEP_INACTIVITY_TIMEOUT",
-        setting::STEAM_WATCHDOG_ENABLE => "SETTING_STEAM_WATCHDOG_ENABLE",
-        setting::DEVICE_POWER_STATUS => "SETTING_DEVICE_POWER_STATUS",
-        _ => "SETTING_?",
-    }
+    SETTING_NAMES.get(id as usize).copied().unwrap_or("SETTING_?")
 }
 
 /// One `(setting, value)` pair out of a `SetSettingsValues` write.
@@ -211,8 +413,27 @@ impl Setting {
 }
 
 /// Whether hyprpad, not Steam, is the authority on a setting.
+///
+/// Deliberately **not** [`setting::IMU_MODE`]: the gyro is the one setting
+/// Steam asks for that hyprpad cannot satisfy on its own behalf, because only
+/// the real puck can turn its IMU on. That one is *relayed*, through
+/// `src/lizard.rs`'s frame builder — see [`imu_mode`].
 fn owned_by_hyprpad(id: u8) -> bool {
     matches!(id, setting::LIZARD_MODE | setting::STEAM_WATCHDOG_ENABLE)
+}
+
+/// The [`setting::IMU_MODE`] value out of a decoded `SetSettingsValues`, if it
+/// carried one.
+///
+/// The whole of "did Steam just ask for the gyro". SDL's
+/// `HIDAPI_DriverSteam_SetSensorsEnabled` builds a `0x87` frame with exactly
+/// one pair — `SETTING_IMU_MODE` set to either
+/// `SEND_RAW_ACCEL | SEND_RAW_GYRO` or `OFF` — so in practice this reads a
+/// one-pair frame; it scans the whole list anyway because Steam is free to fold
+/// the setting into a larger write, and takes the **last** occurrence, which is
+/// what a firmware applying pairs in order would end up holding.
+pub fn imu_mode(settings: &[Setting]) -> Option<u16> {
+    settings.iter().rev().find(|s| s.id == setting::IMU_MODE).map(|s| s.value)
 }
 
 /// Decode a `SetSettingsValues` (`0x87`) command frame into its pairs.
@@ -287,6 +508,17 @@ impl Action {
                     .iter()
                     .map(|p| {
                         let own = if p.owned_by_hyprpad { " (hyprpad's; ignored)" } else { "" };
+                        // The gyro mask is the one value whose *bits* are the
+                        // meaning, and the one this log is read to answer
+                        // ("did Steam ask for the IMU, and for what?").
+                        if p.id == setting::IMU_MODE {
+                            return format!(
+                                "{}={} [{}]",
+                                p.name(),
+                                p.value,
+                                gyro_mode::describe(p.value)
+                            );
+                        }
                         format!("{}={}{}", p.name(), p.value, own)
                     })
                     .collect();
@@ -697,5 +929,149 @@ mod tests {
         assert_eq!(command_name(0xEA), "TriggerHapticCommand");
         assert_eq!(command_name(0xEB), "TriggerRumbleCommand");
         assert_eq!(command_name(cmd::INPUT_DATA), "InputData");
+    }
+
+    // -----------------------------------------------------------------------
+    // The setting table, and the gyro (gap G5)
+    // -----------------------------------------------------------------------
+
+    /// The whole point of [`SETTING_NAMES`]: a debug log that used to print
+    /// `SETTING_?` eight times a session now names everything Valve named.
+    ///
+    /// The four ids in the first live Triton log whose meaning had to be
+    /// guessed from their values are checked by name here, together with the
+    /// values SDL is on record writing to them — 7 is `TRACKPAD_NONE` and
+    /// `0xFFFF` is "no click pressure", both straight out of
+    /// `SDL_hidapi_steamdeck.c`'s five-pair configure frame.
+    #[test]
+    fn the_full_setting_table_names_the_ids_the_first_live_session_could_not() {
+        assert_eq!(SETTING_NAMES.len(), 82, "the enum through SETTING_TIMP_MODE_MTE");
+        assert_eq!(setting_name(setting::LEFT_TRACKPAD_MODE), "SETTING_LEFT_TRACKPAD_MODE");
+        assert_eq!(setting_name(setting::RIGHT_TRACKPAD_MODE), "SETTING_RIGHT_TRACKPAD_MODE");
+        assert_eq!(setting_name(setting::IMU_MODE), "SETTING_IMU_MODE");
+        assert_eq!(
+            setting_name(setting::WIRELESS_PACKET_VERSION),
+            "SETTING_WIRELESS_PACKET_VERSION"
+        );
+        assert_eq!(
+            setting_name(setting::LEFT_TRACKPAD_CLICK_PRESSURE),
+            "SETTING_LEFT_TRACKPAD_CLICK_PRESSURE"
+        );
+        assert_eq!(
+            setting_name(setting::RIGHT_TRACKPAD_CLICK_PRESSURE),
+            "SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE"
+        );
+        // Past the end of the enum there is still no panic and still a name.
+        assert_eq!(setting_name(200), "SETTING_?");
+        assert_eq!(setting_name(u8::MAX), "SETTING_?", "SETTING_ALL is not a real slot");
+    }
+
+    /// Every constant the daemon spells by name must be its own slot in the
+    /// table — the one thing that could silently go wrong when a table is
+    /// transcribed by index rather than by name.
+    #[test]
+    fn every_named_constant_matches_its_slot_in_the_full_table() {
+        for (id, name) in [
+            (setting::LEFT_TRACKPAD_MODE, "SETTING_LEFT_TRACKPAD_MODE"),
+            (setting::RIGHT_TRACKPAD_MODE, "SETTING_RIGHT_TRACKPAD_MODE"),
+            (setting::LIZARD_MODE, "SETTING_LIZARD_MODE"),
+            (setting::SMOOTH_ABSOLUTE_MOUSE, "SETTING_SMOOTH_ABSOLUTE_MOUSE"),
+            (setting::STEAMBUTTON_POWEROFF_TIME, "SETTING_STEAMBUTTON_POWEROFF_TIME"),
+            (setting::IMU_MODE, "SETTING_IMU_MODE"),
+            (setting::WIRELESS_PACKET_VERSION, "SETTING_WIRELESS_PACKET_VERSION"),
+            (setting::SLEEP_INACTIVITY_TIMEOUT, "SETTING_SLEEP_INACTIVITY_TIMEOUT"),
+            (setting::LEFT_TRACKPAD_CLICK_PRESSURE, "SETTING_LEFT_TRACKPAD_CLICK_PRESSURE"),
+            (setting::RIGHT_TRACKPAD_CLICK_PRESSURE, "SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE"),
+            (setting::STEAM_WATCHDOG_ENABLE, "SETTING_STEAM_WATCHDOG_ENABLE"),
+            (setting::DEVICE_POWER_STATUS, "SETTING_DEVICE_POWER_STATUS"),
+        ] {
+            assert_eq!(SETTING_NAMES[id as usize], name, "setting {id}");
+        }
+        // The three numbers this project had before the table existed, pinned
+        // again from the other direction so a re-transcription cannot shift the
+        // enum without failing here.
+        assert_eq!(setting::LIZARD_MODE, 9);
+        assert_eq!(setting::IMU_MODE, 48);
+        assert_eq!(setting::STEAM_WATCHDOG_ENABLE, 71);
+    }
+
+    /// The gyro bitmask, and the one value hyprpad writes of its own accord.
+    #[test]
+    fn the_gyro_mode_bits_are_sdls_and_sensors_on_is_what_sdl_enables() {
+        use gyro_mode::*;
+        assert_eq!(OFF, 0x0000);
+        assert_eq!(STEERING, 0x0001);
+        assert_eq!(TILT, 0x0002);
+        assert_eq!(SEND_ORIENTATION, 0x0004);
+        assert_eq!(SEND_RAW_ACCEL, 0x0008);
+        assert_eq!(SEND_RAW_GYRO, 0x0010);
+        // `HIDAPI_DriverSteam_SetSensorsEnabled`, SDL_hidapi_steam.c:
+        // ADD_SETTING(SETTING_IMU_MODE, SEND_RAW_ACCEL | SEND_RAW_GYRO)
+        assert_eq!(SENSORS_ON, 0x0018);
+        assert_eq!(describe(OFF), "off");
+        assert_eq!(describe(SENSORS_ON), "raw-accel+raw-gyro");
+        assert_eq!(describe(SEND_ORIENTATION | SEND_RAW_GYRO), "orientation+raw-gyro");
+        // sc-controller's `configure()` writes 0x14 here.
+        assert_eq!(describe(0x14), "orientation+raw-gyro");
+        // An unknown bit is shown, not swallowed.
+        assert!(describe(0x8000).contains("0x8000"));
+    }
+
+    /// The exact frame SDL sends when a game turns its sensors on, decoded
+    /// back — and the value the daemon lifts out of it.
+    ///
+    /// `HIDAPI_DriverSteam_SetSensorsEnabled` builds `buf[1] = 0x87`, one pair,
+    /// `buf[2] = 3`. That is the whole of Steam's gyro request.
+    #[test]
+    fn steams_imu_enable_and_disable_writes_are_decoded_to_a_mode() {
+        let on = feature(&[0x87, 3, setting::IMU_MODE, 0x18, 0x00]);
+        let Action::Settings(pairs) = classify(&on) else { panic!("not a settings write") };
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].id, setting::IMU_MODE);
+        assert_eq!(pairs[0].value, gyro_mode::SENSORS_ON);
+        assert!(!pairs[0].owned_by_hyprpad, "the gyro is relayed, not held by hyprpad");
+        assert_eq!(imu_mode(&pairs), Some(gyro_mode::SENSORS_ON));
+
+        let off = feature(&[0x87, 3, setting::IMU_MODE, 0x00, 0x00]);
+        let Action::Settings(pairs) = classify(&off) else { panic!("not a settings write") };
+        assert_eq!(imu_mode(&pairs), Some(gyro_mode::OFF));
+    }
+
+    /// A settings write with no gyro pair asks for nothing — the common case,
+    /// and the one that must not nudge the puck.
+    #[test]
+    fn a_settings_write_without_the_gyro_pair_asks_for_nothing() {
+        // The lizard-disable frame hyprpad itself sends.
+        let w = feature(&[0x87, 6, 9, 0, 0, 71, 0, 0]);
+        let Action::Settings(pairs) = classify(&w) else { panic!("not a settings write") };
+        assert_eq!(imu_mode(&pairs), None);
+        assert_eq!(imu_mode(&[]), None);
+    }
+
+    /// Steam is free to fold the gyro into a larger write, and to state it
+    /// twice; the last value is the one a firmware applying pairs in order
+    /// would be left holding.
+    #[test]
+    fn the_last_gyro_pair_in_a_multi_setting_write_wins() {
+        let w = feature(&[
+            0x87, 12, //
+            setting::SMOOTH_ABSOLUTE_MOUSE, 0, 0, //
+            setting::IMU_MODE, 0x18, 0x00, //
+            setting::LEFT_TRACKPAD_MODE, 7, 0, //
+            setting::IMU_MODE, 0x00, 0x00, //
+        ]);
+        let Action::Settings(pairs) = classify(&w) else { panic!("not a settings write") };
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(imu_mode(&pairs), Some(gyro_mode::OFF), "the later pair wins");
+    }
+
+    /// The debug log is the only place a human sees the gyro request, so the
+    /// mask is spelled out rather than printed as a bare number.
+    #[test]
+    fn the_debug_line_spells_the_gyro_mask_out() {
+        let w = feature(&[0x87, 3, setting::IMU_MODE, 0x18, 0x00]);
+        let line = classify(&w).describe();
+        assert!(line.contains("SETTING_IMU_MODE=24"), "{line}");
+        assert!(line.contains("raw-accel+raw-gyro"), "{line}");
     }
 }

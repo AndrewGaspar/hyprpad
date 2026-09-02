@@ -114,6 +114,11 @@ const SETTING_STEAMBUTTON_POWEROFF_TIME: u8 =
 /// UNVERIFIED on Triton.
 const SETTING_SLEEP_INACTIVITY_TIMEOUT: u8 =
     crate::uhid::settings::setting::SLEEP_INACTIVITY_TIMEOUT;
+/// `SETTING_IMU_MODE` (48 / `0x30`) — the gyro switch. A `u16` bitmask of
+/// [`crate::uhid::settings::gyro_mode`] flags; `0` is off. Written into the same
+/// `0x87` frame as everything else here, which is what keeps the "one writer"
+/// invariant true while Steam drives the puck's IMU through the relay.
+const SETTING_IMU_MODE: u8 = crate::uhid::settings::setting::IMU_MODE;
 
 /// `ID_GET_SETTINGS_VALUES` — ask the firmware what a setting is *currently*
 /// set to.
@@ -280,6 +285,133 @@ pub fn power_settings() -> PowerSettings {
     POWER_SETTINGS.read().map(|p| *p).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// The IMU (gyro) hold — gap G5 of `docs/design/uhid-relay.md`
+// ---------------------------------------------------------------------------
+
+/// Who currently decides what the puck's IMU is doing, and what they decided.
+///
+/// # Why this lives here and not in the relay
+///
+/// The relay decodes Steam's writes; it does not own a descriptor on the real
+/// puck and must not acquire one. `docs/research/uhid-steam-controller.md` §5.2
+/// is explicit that hyprpad writes the hardware **through one writer**, and for
+/// feature reports that writer is this module. So the relay's contribution is a
+/// number in this cell, and the number rides out on the *same*
+/// `ID_SET_SETTINGS_VALUES` frame [`disable_lizard_settings_report`] already
+/// builds — which is also what makes it survive the 30 s
+/// [`RESEND_INTERVAL`] re-send, a puck reconnect and a power cycle for free,
+/// with no second timer and no second code path.
+///
+/// # The two authorities
+///
+/// * [`preference`](Self::preference) is **hyprpad's own**, from
+///   `h.gamepad { gyro = … }`. It is what the IMU goes back to when Steam is
+///   not asking — the default is [`gyro_mode::OFF`], because a gyro streaming
+///   for a desktop nobody is aiming with is battery spent for nothing.
+/// * [`steam`](Self::steam) is what the relay last saw Steam write, and it
+///   **wins while it is set**. Steam's request is already scoped to a game that
+///   asked its runtime for sensors (SDL calls
+///   `HIDAPI_DriverSteam_SetSensorsEnabled` on exactly that), so following it
+///   verbatim is both the most faithful behaviour and the cheapest.
+///
+/// # Why the hold is *not* gated on hyprpad's forwarding gate
+///
+/// It would be one line, and it would be wrong. The forwarding gate flips on
+/// every focus change — the guide held for a chord, the OSK raised, a moment on
+/// the desktop — many times a minute in ordinary use, and each flip would
+/// become a feature-report write to the controller. That is a write storm on a
+/// battery device to save power. Steam's own request is already the right
+/// granularity, and while hyprpad is not forwarding the relay streams the
+/// *neutral* report anyway (`translate::triton_neutral`), whose IMU bytes are
+/// zero — so a game sees a parked gyro during a guide chord regardless of what
+/// the firmware is doing. The power question is answered by the default being
+/// off and by the restore below, not by chasing focus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImuHold {
+    /// hyprpad's own baseline, from the config.
+    preference: u16,
+    /// What Steam asked the relay for, while the relay is live.
+    steam: Option<u16>,
+    /// Whether anything has ever asked for a mode.
+    ///
+    /// Until something does, **no `SETTING_IMU_MODE` pair is written at all**
+    /// and the frame is byte-for-byte the one this module has always sent. That
+    /// matters: `kind = "xbox"` users, which is the default, must not start
+    /// having a new setting written to their controller because a feature they
+    /// do not use exists.
+    engaged: bool,
+}
+
+impl ImuHold {
+    /// The mode the puck should be holding right now, or `None` while nothing
+    /// has ever asked and the frame should stay as it was.
+    pub fn effective(&self) -> Option<u16> {
+        if !self.engaged {
+            return None;
+        }
+        Some(self.steam.unwrap_or(self.preference))
+    }
+
+    /// The `(setting, value)` pair to append to the settings frame — empty
+    /// until something has asked.
+    pub fn pair(&self) -> Option<(u8, u16)> {
+        self.effective().map(|mode| (SETTING_IMU_MODE, mode))
+    }
+
+    /// The pair the **exit** path writes: hyprpad's own preference, with
+    /// Steam's request discarded, because Steam is about to lose the device.
+    fn restore_pair(&self) -> Option<(u8, u16)> {
+        self.engaged.then_some((SETTING_IMU_MODE, self.preference))
+    }
+}
+
+/// The IMU hold, shared between the daemon loop (which sets it) and the
+/// ownership loop (which sends it). Same shape and same reasoning as
+/// [`POWER_SETTINGS`]: the ownership loop runs on its own thread with no
+/// channel back to the daemon.
+static IMU_HOLD: std::sync::RwLock<ImuHold> =
+    std::sync::RwLock::new(ImuHold { preference: 0, steam: None, engaged: false });
+
+/// Install hyprpad's own gyro preference (`h.gamepad { gyro = … }`). Called on
+/// startup and on every live reload, exactly like [`set_power_settings`].
+///
+/// A non-off preference engages the hold immediately, so the very next re-send
+/// carries it; an off preference does not, so the default config's frame is
+/// unchanged until Steam actually asks for something.
+pub fn set_imu_preference(mode: u16) {
+    if let Ok(mut hold) = IMU_HOLD.write() {
+        hold.preference = mode;
+        if mode != crate::uhid::settings::gyro_mode::OFF {
+            hold.engaged = true;
+        }
+    }
+}
+
+/// Record what Steam asked the relay for — `Some(mode)` for a write it made,
+/// `None` when it has stopped asking (it closed the fake, or the relay went
+/// away), which hands the IMU back to [`ImuHold::preference`].
+///
+/// Returns whether the effective mode changed, so the caller can skip the
+/// [`nudge`] when Steam re-sends a mode the puck is already holding — Steam
+/// repeats its settings writes, and each one must not become a feature report.
+pub fn set_imu_requested(mode: Option<u16>) -> bool {
+    let Ok(mut hold) = IMU_HOLD.write() else { return false };
+    let before = hold.effective();
+    hold.steam = mode;
+    if mode.is_some() {
+        hold.engaged = true;
+    }
+    hold.effective() != before
+}
+
+/// The IMU hold as it currently stands. A poisoned lock reads as "nothing
+/// asked", which is the historical frame — the safe direction, as for
+/// [`power_settings`].
+pub fn imu_hold() -> ImuHold {
+    IMU_HOLD.read().map(|h| *h).unwrap_or_default()
+}
+
 /// Build the `ID_CLEAR_DIGITAL_MAPPINGS` feature frame.
 fn clear_digital_mappings_report() -> [u8; WIRE_LEN] {
     let mut buf = [0u8; WIRE_LEN];
@@ -313,28 +445,33 @@ fn settings_report(pairs: &[(u8, u16)]) -> [u8; WIRE_LEN] {
 
 /// The `(setting, value)` pairs of the disable-lizard write: the two settings
 /// this module has always written, plus whatever [`PowerSettings`] the config
-/// asked for — so the power knobs are carried by the *same* frame that already
-/// goes out every [`RESEND_INTERVAL`] and survives a reconnect for free.
-fn disable_lizard_pairs(power: PowerSettings) -> Vec<(u8, u16)> {
+/// asked for and whatever [`ImuHold`] is in force — so the power knobs and the
+/// gyro are carried by the *same* frame that already goes out every
+/// [`RESEND_INTERVAL`] and survives a reconnect for free.
+///
+/// Ordered by setting number, and the two historical pairs come first, so the
+/// default config's frame is byte-for-byte what it has always been.
+fn disable_lizard_pairs(power: PowerSettings, imu: ImuHold) -> Vec<(u8, u16)> {
     let mut pairs = vec![
         (SETTING_LIZARD_MODE, 0),
         (SETTING_STEAM_WATCHDOG_ENABLE, 0),
     ];
     pairs.extend(power.pairs());
+    pairs.extend(imu.pair());
     pairs
 }
 
 /// Build the `ID_SET_SETTINGS_VALUES` feature frame that turns lizard mode and
 /// the revert-watchdog off (the IBEX/Deck disable path), plus any configured
-/// power settings.
-fn disable_lizard_settings_report(power: PowerSettings) -> [u8; WIRE_LEN] {
-    settings_report(&disable_lizard_pairs(power))
+/// power settings and the current gyro hold.
+fn disable_lizard_settings_report(power: PowerSettings, imu: ImuHold) -> [u8; WIRE_LEN] {
+    settings_report(&disable_lizard_pairs(power, imu))
 }
 
 /// The full disable-lizard feature sequence, in send order: clear the digital
 /// mappings, then write the disabling settings.
-fn disable_sequence(power: PowerSettings) -> [[u8; WIRE_LEN]; 2] {
-    [clear_digital_mappings_report(), disable_lizard_settings_report(power)]
+fn disable_sequence(power: PowerSettings, imu: ImuHold) -> [[u8; WIRE_LEN]; 2] {
+    [clear_digital_mappings_report(), disable_lizard_settings_report(power, imu)]
 }
 
 /// Build the `ID_SET_DEFAULT_DIGITAL_MAPPINGS` feature frame — restore the
@@ -361,16 +498,26 @@ fn set_default_digital_mappings_report() -> [u8; WIRE_LEN] {
 /// the daemon wrote is in any case not known to survive a power cycle.
 /// `hyprpad puck-settings 25 50` reads the firmware's own defaults
 /// (`0x8C ID_GET_SETTINGS_DEFAULTS`) for anyone who wants to put them back.
-fn enable_lizard_settings_report() -> [u8; WIRE_LEN] {
-    settings_report(&[(SETTING_LIZARD_MODE, 1), (SETTING_STEAM_WATCHDOG_ENABLE, 1)])
+///
+/// It **does** revert the gyro, and unlike the power settings there is
+/// something to revert it *to*: hyprpad wrote `SETTING_IMU_MODE` in the first
+/// place only because Steam asked, and Steam is losing the device. So the pair
+/// goes out one last time carrying [`ImuHold::preference`] — off unless the
+/// owner asked for `gyro = true`. Without this, a session that ended while a
+/// game had the gyro on would leave the puck streaming IMU data to nobody until
+/// its next power cycle.
+fn enable_lizard_settings_report(imu: ImuHold) -> [u8; WIRE_LEN] {
+    let mut pairs = vec![(SETTING_LIZARD_MODE, 1), (SETTING_STEAM_WATCHDOG_ENABLE, 1)];
+    pairs.extend(imu.restore_pair());
+    settings_report(&pairs)
 }
 
 /// The full enable-lizard feature sequence, in send order: restore the default
 /// digital mappings, then write the enabling settings. Undoes exactly what
 /// [`disable_sequence`] did, so the firmware keyboard/mouse comes back when
 /// hyprpad exits.
-fn enable_sequence() -> [[u8; WIRE_LEN]; 2] {
-    [set_default_digital_mappings_report(), enable_lizard_settings_report()]
+fn enable_sequence(imu: ImuHold) -> [[u8; WIRE_LEN]; 2] {
+    [set_default_digital_mappings_report(), enable_lizard_settings_report(imu)]
 }
 
 // `HIDIOCSFEATURE(len)` from <linux/hidraw.h> is `_IOC(_IOC_WRITE|_IOC_READ,
@@ -510,7 +657,7 @@ fn apply_to_puck(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
 /// turn `SETTING_LIZARD_MODE` and the revert-watchdog off), carrying whatever
 /// [`PowerSettings`] the config installed in the same settings write.
 pub fn disable_lizard_mode() -> Result<(), String> {
-    apply_to_puck(&disable_sequence(power_settings()))
+    apply_to_puck(&disable_sequence(power_settings(), imu_hold()))
 }
 
 /// Build the `ID_TURN_OFF_CONTROLLER` feature frame.
@@ -562,7 +709,7 @@ pub fn turn_off_controller() -> Result<(), String> {
 /// fine on exit — the firmware powers up in lizard mode by default, so the next
 /// wake restores it anyway.
 pub fn enable_lizard_mode() -> Result<(), String> {
-    apply_to_puck(&enable_sequence())
+    apply_to_puck(&enable_sequence(imu_hold()))
 }
 
 // ---------------------------------------------------------------------------
@@ -840,10 +987,47 @@ pub fn restore_lizard_on_exit() {
     }
 }
 
+/// The ownership loop's doorbell: `(re-send wanted, condvar)`.
+///
+/// [`nudge`] rings it and [`own_lizard_loop`] waits on it instead of sleeping,
+/// so a setting the daemon just changed reaches the controller in milliseconds
+/// rather than at the next 30 s tick — **without a second thread ever touching
+/// the puck**. That is the whole point: `docs/research/uhid-steam-controller.md`
+/// §5.2 requires one writer, and this keeps the feature-report writer singular
+/// while still being responsive to Steam.
+static RESEND_NOW: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Ask the ownership loop to re-send the settings frame now.
+///
+/// Cheap, non-blocking and safe to call from the daemon's frame loop — it takes
+/// an uncontended lock and signals. It never does I/O itself, which is what
+/// keeps a 12-retry `EPIPE` budget on a sleeping controller (up to ~240 ms per
+/// node) off the 250 Hz path.
+pub fn nudge() {
+    let (lock, cv) = &RESEND_NOW;
+    if let Ok(mut wanted) = lock.lock() {
+        *wanted = true;
+        cv.notify_all();
+    }
+}
+
+/// Block until [`nudge`] rings or `timeout` elapses, and clear the bell.
+fn wait_for_nudge(timeout: Duration) {
+    let (lock, cv) = &RESEND_NOW;
+    let Ok(wanted) = lock.lock() else { return };
+    // A nudge that arrived while the loop was mid-send is still pending here,
+    // so this returns immediately and the send it asked for happens next —
+    // never dropped on the floor.
+    let Ok((mut wanted, _)) = cv.wait_timeout_while(wanted, timeout, |w| !*w) else { return };
+    *wanted = false;
+}
+
 /// Run lizard-mode ownership forever: disable it now, then re-send on a timer to
 /// re-cover the controller across power-cycles/reconnects
-/// ([`RESEND_INTERVAL`]). Degrades gracefully — a failed write logs a warning
-/// and the loop keeps trying rather than taking the daemon down.
+/// ([`RESEND_INTERVAL`]), or immediately whenever [`nudge`] rings. Degrades
+/// gracefully — a failed write logs a warning and the loop keeps trying rather
+/// than taking the daemon down.
 ///
 /// Intended to be spawned on its own thread from [`crate::run`].
 pub fn own_lizard_loop() {
@@ -887,7 +1071,7 @@ pub fn own_lizard_loop() {
                 last_ok = false;
             }
         }
-        std::thread::sleep(RESEND_INTERVAL);
+        wait_for_nudge(RESEND_INTERVAL);
     }
 }
 
@@ -994,7 +1178,7 @@ mod tests {
 
     #[test]
     fn set_settings_report_bytes() {
-        let r = disable_lizard_settings_report(PowerSettings::default());
+        let r = disable_lizard_settings_report(PowerSettings::default(), ImuHold::default());
         assert_eq!(r.len(), 64);
         // 0x87 SET_SETTINGS_VALUES, len 6, (9,0,0) lizard off, (71,0,0) watchdog off.
         assert_eq!(
@@ -1006,7 +1190,7 @@ mod tests {
 
     #[test]
     fn sequence_is_clear_then_settings() {
-        let seq = disable_sequence(PowerSettings::default());
+        let seq = disable_sequence(PowerSettings::default(), ImuHold::default());
         assert_eq!(seq.len(), 2);
         assert_eq!(seq[0][1], 0x81); // clear digital mappings first
         assert_eq!(seq[1][1], 0x87); // then set settings values
@@ -1018,7 +1202,7 @@ mod tests {
     fn the_settings_frame_is_unchanged_when_no_power_knob_is_set() {
         // The default must be *today's* behaviour, byte for byte: an owner who
         // does not ask for the power knobs must not get a different write.
-        let plain = disable_lizard_settings_report(PowerSettings::default());
+        let plain = disable_lizard_settings_report(PowerSettings::default(), ImuHold::default());
         assert_eq!(plain[2], 6, "payload is still two pairs");
         assert!(plain[9..].iter().all(|&b| b == 0));
         assert!(PowerSettings::default().is_empty());
@@ -1027,10 +1211,13 @@ mod tests {
 
     #[test]
     fn the_settings_frame_carries_setting_25_when_the_knob_is_set() {
-        let r = disable_lizard_settings_report(PowerSettings {
-            steam_button_poweroff: Some(0x1234),
+        let r = disable_lizard_settings_report(
+                PowerSettings {
+                steam_button_poweroff: Some(0x1234),
             sleep_inactivity_timeout: None,
-        });
+                },
+                ImuHold::default(),
+            );
         // Three pairs now: lizard, watchdog, then 25 = 0x1234 little-endian.
         assert_eq!(r[2], 9);
         assert_eq!(&r[3..12], &[0x09, 0, 0, 0x47, 0, 0, 25, 0x34, 0x12]);
@@ -1039,10 +1226,13 @@ mod tests {
 
     #[test]
     fn the_settings_frame_carries_both_power_settings_in_id_order() {
-        let r = disable_lizard_settings_report(PowerSettings {
-            steam_button_poweroff: Some(POWER_SETTING_OFF),
+        let r = disable_lizard_settings_report(
+                PowerSettings {
+                steam_button_poweroff: Some(POWER_SETTING_OFF),
             sleep_inactivity_timeout: Some(600),
-        });
+                },
+                ImuHold::default(),
+            );
         assert_eq!(r[2], 12, "four pairs");
         assert_eq!(
             &r[3..15],
@@ -1053,10 +1243,13 @@ mod tests {
 
     #[test]
     fn the_sleep_timeout_alone_is_the_only_extra_pair() {
-        let r = disable_lizard_settings_report(PowerSettings {
-            steam_button_poweroff: None,
+        let r = disable_lizard_settings_report(
+                PowerSettings {
+                steam_button_poweroff: None,
             sleep_inactivity_timeout: Some(1),
-        });
+                },
+                ImuHold::default(),
+            );
         assert_eq!(r[2], 9);
         assert_eq!(&r[9..12], &[50, 0x01, 0x00]);
     }
@@ -1081,7 +1274,7 @@ mod tests {
     fn the_enable_frame_never_carries_power_settings() {
         // Restore-on-exit must not write a guess at settings whose defaults we
         // do not know: it is the two-pair frame it always was.
-        let en = enable_lizard_settings_report();
+        let en = enable_lizard_settings_report(ImuHold::default());
         assert_eq!(&en[..9], &[0x01, 0x87, 0x06, 0x09, 0x01, 0x00, 0x47, 0x01, 0x00]);
         assert!(en[9..].iter().all(|&b| b == 0));
     }
@@ -1247,7 +1440,7 @@ mod tests {
 
     #[test]
     fn enable_settings_report_bytes() {
-        let r = enable_lizard_settings_report();
+        let r = enable_lizard_settings_report(ImuHold::default());
         assert_eq!(r.len(), 64);
         // 0x87 SET_SETTINGS_VALUES, len 6, (9,1,0) lizard on, (71,1,0) watchdog on.
         assert_eq!(
@@ -1259,7 +1452,7 @@ mod tests {
 
     #[test]
     fn enable_sequence_is_default_mappings_then_settings() {
-        let seq = enable_sequence();
+        let seq = enable_sequence(ImuHold::default());
         assert_eq!(seq.len(), 2);
         assert_eq!(seq[0][1], 0x85); // restore default digital mappings first
         assert_eq!(seq[1][1], 0x87); // then set settings values
@@ -1268,8 +1461,8 @@ mod tests {
     #[test]
     fn enable_exactly_inverts_disable_settings() {
         // Same command, same settings, same order — only the values flip 0 <-> 1.
-        let dis = disable_lizard_settings_report(PowerSettings::default());
-        let en = enable_lizard_settings_report();
+        let dis = disable_lizard_settings_report(PowerSettings::default(), ImuHold::default());
+        let en = enable_lizard_settings_report(ImuHold::default());
         assert_eq!(dis[1], en[1]); // ID_SET_SETTINGS_VALUES
         assert_eq!(dis[2], en[2]); // payload length
         assert_eq!(dis[3], en[3]); // SETTING_LIZARD_MODE id
@@ -1284,5 +1477,223 @@ mod tests {
         assert_eq!(hidiocsfeature(WIRE_LEN), 0xC040_4806);
         // Length is encoded in the size field, so a 2-byte report differs.
         assert_eq!(hidiocsfeature(2), 0xC002_4806);
+    }
+
+    // -----------------------------------------------------------------------
+    // The gyro hold (gap G5) — pure frame tests, no device anywhere
+    // -----------------------------------------------------------------------
+
+    use crate::uhid::settings::gyro_mode;
+
+    /// A hold as the daemon would leave it after Steam asked for sensors.
+    fn steam_asked(mode: u16) -> ImuHold {
+        ImuHold { preference: gyro_mode::OFF, steam: Some(mode), engaged: true }
+    }
+
+    /// **The invariant that made this safe to ship.** With nothing asking for
+    /// the gyro — which is every `kind = "xbox"` install, the default — the
+    /// settings frame is byte-for-byte the two-pair frame this module has
+    /// always sent. A feature nobody uses writes nothing to anybody's
+    /// controller.
+    #[test]
+    fn an_unengaged_hold_leaves_the_historical_frame_byte_for_byte_unchanged() {
+        let before =
+            settings_report(&[(SETTING_LIZARD_MODE, 0), (SETTING_STEAM_WATCHDOG_ENABLE, 0)]);
+        let now = disable_lizard_settings_report(PowerSettings::default(), ImuHold::default());
+        assert_eq!(now, before);
+        assert_eq!(now[2], 6, "two pairs, exactly as before");
+        assert_eq!(ImuHold::default().pair(), None);
+        assert_eq!(ImuHold::default().effective(), None);
+    }
+
+    /// Steam's IMU-enable reaching lizard's frame builder: the one wire fact
+    /// the whole gyro path reduces to.
+    ///
+    /// `[01][87][len][9,0,0][71,0,0][48,0x18,0x00]` — the pair rides in the
+    /// *same* frame as the two lizard settings, which is what makes it survive
+    /// the 30 s re-send, a reconnect and a power cycle with no second timer.
+    #[test]
+    fn steams_imu_enable_rides_out_in_lizards_own_settings_frame() {
+        let r = disable_lizard_settings_report(
+            PowerSettings::default(),
+            steam_asked(gyro_mode::SENSORS_ON),
+        );
+        assert_eq!(r[0], REPORT_ID_FEATURES_CONTROLLER);
+        assert_eq!(r[1], ID_SET_SETTINGS_VALUES);
+        assert_eq!(r[2], 9, "three pairs");
+        assert_eq!(
+            &r[3..12],
+            &[
+                SETTING_LIZARD_MODE, 0, 0, //
+                SETTING_STEAM_WATCHDOG_ENABLE, 0, 0, //
+                SETTING_IMU_MODE, 0x18, 0x00, // SEND_RAW_ACCEL | SEND_RAW_GYRO
+            ]
+        );
+        assert!(r[12..].iter().all(|&b| b == 0), "rest must be zero-padded");
+        assert_eq!(r.len(), WIRE_LEN, "still one 64-byte feature report");
+    }
+
+    /// Turning it back off is the same frame with a zero value — not the
+    /// absence of the pair, which would leave the firmware holding whatever it
+    /// was last told.
+    #[test]
+    fn the_imu_off_write_is_an_explicit_zero_not_a_missing_pair() {
+        let off =
+            disable_lizard_settings_report(PowerSettings::default(), steam_asked(gyro_mode::OFF));
+        assert_eq!(off[2], 9, "the pair is still there");
+        assert_eq!(&off[9..12], &[SETTING_IMU_MODE, 0x00, 0x00]);
+
+        let on = disable_lizard_settings_report(
+            PowerSettings::default(),
+            steam_asked(gyro_mode::SENSORS_ON),
+        );
+        assert_ne!(on, off, "and the two frames differ");
+    }
+
+    /// The gyro pair comes last, after the power knobs, so a config that sets
+    /// everything still produces one well-formed frame in setting order.
+    #[test]
+    fn the_gyro_pair_rides_behind_the_power_knobs_in_one_frame() {
+        let r = disable_lizard_settings_report(
+            PowerSettings {
+                steam_button_poweroff: Some(POWER_SETTING_OFF),
+                sleep_inactivity_timeout: Some(600),
+            },
+            steam_asked(gyro_mode::SENSORS_ON),
+        );
+        assert_eq!(r[2], 15, "five pairs");
+        assert_eq!(
+            &r[3..18],
+            &[
+                SETTING_LIZARD_MODE, 0, 0, //
+                SETTING_STEAM_WATCHDOG_ENABLE, 0, 0, //
+                SETTING_STEAMBUTTON_POWEROFF_TIME, 0xFF, 0xFF, //
+                SETTING_SLEEP_INACTIVITY_TIMEOUT, 0x58, 0x02, //
+                SETTING_IMU_MODE, 0x18, 0x00,
+            ]
+        );
+        assert!(r[18..].iter().all(|&b| b == 0));
+    }
+
+    /// Steam wins over hyprpad's preference while it is asking, and hyprpad's
+    /// preference is what is left when it stops — the whole authority model, in
+    /// the four states it has.
+    #[test]
+    fn steam_outranks_the_preference_only_while_it_is_asking() {
+        let off_pref = gyro_mode::OFF;
+        let on_pref = gyro_mode::SENSORS_ON;
+
+        // Nothing asked at all: no pair.
+        let idle = ImuHold { preference: off_pref, steam: None, engaged: false };
+        assert_eq!(idle.effective(), None);
+
+        // Steam asked, hyprpad prefers off: Steam wins.
+        let asked = ImuHold { preference: off_pref, steam: Some(on_pref), engaged: true };
+        assert_eq!(asked.effective(), Some(on_pref));
+
+        // Steam let go: back to hyprpad's preference, explicitly written.
+        let released = ImuHold { steam: None, ..asked };
+        assert_eq!(released.effective(), Some(off_pref));
+
+        // With `gyro = true` the preference is on, so letting go changes
+        // nothing — the gyro stays up.
+        let held = ImuHold { preference: on_pref, steam: None, engaged: true };
+        assert_eq!(held.effective(), Some(on_pref));
+    }
+
+    /// The exit path restores hyprpad's preference, discarding Steam's request
+    /// — Steam is losing the device, so its opinion stops counting. Without
+    /// this a session that ended with a gyro game open would leave the puck
+    /// streaming IMU data to nobody.
+    #[test]
+    fn the_exit_frame_restores_the_preference_and_forgets_what_steam_asked() {
+        // Steam had it on; hyprpad's own preference is off.
+        let r = enable_lizard_settings_report(steam_asked(gyro_mode::SENSORS_ON));
+        assert_eq!(r[1], ID_SET_SETTINGS_VALUES);
+        assert_eq!(r[2], 9, "lizard on, watchdog on, gyro back to the preference");
+        assert_eq!(
+            &r[3..12],
+            &[
+                SETTING_LIZARD_MODE, 1, 0, //
+                SETTING_STEAM_WATCHDOG_ENABLE, 1, 0, //
+                SETTING_IMU_MODE, 0x00, 0x00, // the preference: off
+            ]
+        );
+
+        // With `gyro = true` the exit frame holds it on instead.
+        let kept = enable_lizard_settings_report(ImuHold {
+            preference: gyro_mode::SENSORS_ON,
+            steam: Some(gyro_mode::OFF),
+            engaged: true,
+        });
+        assert_eq!(&kept[9..12], &[SETTING_IMU_MODE, 0x18, 0x00]);
+
+        // Nothing ever asked: the exit frame is the historical two-pair one.
+        let untouched = enable_lizard_settings_report(ImuHold::default());
+        assert_eq!(untouched[2], 6);
+        assert_eq!(
+            &untouched[3..9],
+            &[SETTING_LIZARD_MODE, 1, 0, SETTING_STEAM_WATCHDOG_ENABLE, 1, 0]
+        );
+    }
+
+    /// `set_imu_requested` reports whether anything actually changed, which is
+    /// what keeps Steam's repeated settings writes from becoming a feature
+    /// report each. The process-wide cell is exercised end to end here, so the
+    /// engage-once rule and the restore are both covered.
+    ///
+    /// Serialised by hand into one test because the cell is a static: two
+    /// `#[test]`s touching it would race under the default threaded harness.
+    #[test]
+    fn the_shared_hold_engages_once_and_only_reports_real_changes() {
+        set_imu_preference(gyro_mode::OFF);
+        assert_eq!(imu_hold().effective(), None, "an off preference does not engage");
+
+        assert!(set_imu_requested(Some(gyro_mode::SENSORS_ON)), "first ask is a change");
+        assert_eq!(imu_hold().effective(), Some(gyro_mode::SENSORS_ON));
+        assert!(
+            !set_imu_requested(Some(gyro_mode::SENSORS_ON)),
+            "Steam re-stating the same mode must not write again"
+        );
+
+        assert!(set_imu_requested(None), "letting go restores the preference");
+        assert_eq!(imu_hold().effective(), Some(gyro_mode::OFF), "explicitly off, not absent");
+        assert!(!set_imu_requested(None), "and letting go twice is not a change");
+
+        // `gyro = true` engages on its own, with no Steam in the picture.
+        set_imu_preference(gyro_mode::SENSORS_ON);
+        assert_eq!(imu_hold().effective(), Some(gyro_mode::SENSORS_ON));
+
+        // Leave the cell as the rest of the suite found it.
+        set_imu_preference(gyro_mode::OFF);
+        set_imu_requested(None);
+    }
+
+    /// The doorbell is what lets the daemon's 250 Hz loop ask for an immediate
+    /// write without ever doing one itself: a nudge that arrives before the
+    /// wait is not dropped, and one that arrives during it wakes the wait.
+    #[test]
+    fn a_nudge_wakes_the_wait_and_is_never_dropped() {
+        let long = Duration::from_secs(30);
+
+        // Rung before the wait: returns at once, well inside the 30 s timeout.
+        nudge();
+        let t0 = std::time::Instant::now();
+        wait_for_nudge(long);
+        assert!(t0.elapsed() < Duration::from_secs(1), "a pending nudge is not lost");
+
+        // Rung from another thread while the wait is blocked.
+        let t1 = std::time::Instant::now();
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            nudge();
+        });
+        wait_for_nudge(long);
+        assert!(t1.elapsed() < Duration::from_secs(5), "a nudge wakes a blocked wait");
+
+        // And the bell is cleared, so the next wait actually waits.
+        let t2 = std::time::Instant::now();
+        wait_for_nudge(Duration::from_millis(30));
+        assert!(t2.elapsed() >= Duration::from_millis(25), "the bell was cleared");
     }
 }

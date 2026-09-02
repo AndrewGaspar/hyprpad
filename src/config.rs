@@ -1535,6 +1535,19 @@ pub struct GamepadConfig {
     /// With `kind = "steam"`, which Valve identity to present. Default
     /// [`Identity::Triton`]; ignored entirely under `kind = "xbox"`.
     pub identity: Identity,
+    /// Keep the puck's IMU (gyro + accelerometer) streaming even when Steam has
+    /// not asked for it. Default **`false`**.
+    ///
+    /// The gyro is normally driven *by Steam*: a game that turns its sensors on
+    /// makes Steam write `SETTING_IMU_MODE` to the controller, the relay passes
+    /// that to the real puck through `src/lizard.rs`, and it is turned back off
+    /// when Steam stops asking. This knob changes what "off" means — set it and
+    /// the IMU is held on as hyprpad's own baseline, which costs battery on a
+    /// wireless controller for no benefit unless something is actually reading
+    /// it. Its one use is diagnosis: turning it on makes the IMU bytes appear in
+    /// the puck's `0x42` with no Steam in the picture at all, which is how you
+    /// tell "the gyro is not working" from "Steam never asked".
+    pub gyro: bool,
 }
 
 impl Default for GamepadConfig {
@@ -1547,6 +1560,24 @@ impl Default for GamepadConfig {
             rumble_intensity: 1.0,
             kind: GamepadKind::Xbox,
             identity: Identity::Triton,
+            gyro: false,
+        }
+    }
+}
+
+impl GamepadConfig {
+    /// hyprpad's own `SETTING_IMU_MODE` baseline — what the puck's IMU goes back
+    /// to when Steam is not asking for it.
+    ///
+    /// `gyro = true` writes the value SDL itself writes for a game that enabled
+    /// sensors (`SEND_RAW_ACCEL | SEND_RAW_GYRO`), so the puck is configured the
+    /// way the reference client configures it rather than some third thing.
+    pub fn imu_preference(&self) -> u16 {
+        use crate::uhid::settings::gyro_mode;
+        if self.gyro {
+            gyro_mode::SENSORS_ON
+        } else {
+            gyro_mode::OFF
         }
     }
 }
@@ -2018,6 +2049,7 @@ forward_guide = false       # send the guide button to the game as BTN_MODE (it 
 rumble = true               # forward a game's force feedback to the puck's actuators
 rumble_mode = native        # native (the puck's 0x80 rumble report) | pulse (approximate with 0x81 trains)
 rumble_intensity = 1.0      # scale on both FF magnitudes; 1.0 passes the game's request through
+gyro = false                # hold the puck's IMU on even when Steam has not asked (diagnosis; costs battery)
 "#;
 
 impl Config {
@@ -2351,6 +2383,7 @@ impl Config {
                             gamepad.identity = Identity::parse(&val)
                                 .map_err(|e| format!("line {lineno}: {e}"))?;
                         }
+                        "gyro" | "imu" | "sensors" => flag(&mut gamepad.gyro)?,
                         other => {
                             return Err(format!(
                                 "line {lineno}: unknown [gamepad] setting '{other}'"
@@ -4662,5 +4695,39 @@ h.osk_button("r3", h.osk "commit")
         assert_eq!(TransientExit::parse("click"), Ok(TransientExit::Click));
         let e = TransientExit::parse("elsewhere").unwrap_err();
         assert!(e.contains("unknown transient exit 'elsewhere'"), "{e}");
+    }
+
+    /// `gyro` — hyprpad's own IMU baseline, and what it becomes on the wire.
+    ///
+    /// Off by default, and deliberately so: the gyro is normally driven by
+    /// Steam through the relay, and a controller streaming IMU data for a
+    /// desktop nobody is aiming with is battery spent for nothing.
+    #[test]
+    fn the_gyro_knob_defaults_off_and_maps_to_sdls_own_imu_mode_value() {
+        use crate::uhid::settings::gyro_mode;
+
+        let d = GamepadConfig::default();
+        assert!(!d.gyro, "off by default — Steam asks for the gyro when a game wants it");
+        assert_eq!(d.imu_preference(), gyro_mode::OFF);
+
+        let on = Config::from_toml_str("[gamepad]\ngyro = true\n").unwrap();
+        assert!(on.gamepad().gyro);
+        assert_eq!(
+            on.gamepad().imu_preference(),
+            gyro_mode::SENSORS_ON,
+            "the value SDL's own SetSensorsEnabled writes"
+        );
+        assert_eq!(gyro_mode::SENSORS_ON, 0x0018);
+
+        // The aliases, and that an explicit false is still false.
+        for src in ["[gamepad]\nimu = true\n", "[gamepad]\nsensors = true\n"] {
+            assert!(Config::from_toml_str(src).unwrap().gamepad().gyro, "{src}");
+        }
+        let off = Config::from_toml_str("[gamepad]\ngyro = false\n").unwrap();
+        assert!(!off.gamepad().gyro);
+        assert_eq!(off.gamepad().imu_preference(), gyro_mode::OFF);
+
+        // The shipped default config parses and keeps the default.
+        assert!(!Config::load_default().gamepad().gyro);
     }
 }

@@ -1688,6 +1688,10 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                     b.gamepad.identity =
                         crate::uhid::Identity::parse(&as_string(&v, &k)?).map_err(err)?;
                 }
+                // Hold the puck's IMU on regardless of Steam. Off by default:
+                // Steam turns the gyro on for itself through the relay, and a
+                // gyro streaming for nobody is battery spent for nothing.
+                "gyro" | "imu" => b.gamepad.gyro = as_bool(&v, &k)?,
                 other => {
                     return Err(unknown_key(
                         "h.gamepad",
@@ -1697,6 +1701,7 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                             "kind",
                             "identity",
                             "forward_guide",
+                            "gyro",
                             "rumble",
                             "rumble_mode",
                             "rumble_intensity",
@@ -3709,4 +3714,35 @@ l2 = "osk shift"
 "guide+l4" = "seq: key f; set_mode hints"
 "guide+l5" = "seq: key shift+f; set_mode hints"
 "#;
+
+    /// `h.gamepad { gyro = … }` — the Lua half of the IMU baseline, and that
+    /// the two front-ends agree, which is the whole point of having both.
+    #[test]
+    fn the_gyro_knob_parses_on_the_lua_front_end_and_matches_toml() {
+        use crate::uhid::settings::gyro_mode;
+
+        // Default: off, as in TOML.
+        assert!(!load(r#"hyprpad.gamepad { kind = "steam" }"#).gamepad().gyro);
+
+        let c = load(r#"hyprpad.gamepad { kind = "steam", gyro = true }"#);
+        assert!(c.gamepad().gyro);
+        assert_eq!(c.gamepad().imu_preference(), gyro_mode::SENSORS_ON);
+
+        // The alias.
+        assert!(load(r#"hyprpad.gamepad { imu = true }"#).gamepad().gyro);
+
+        // And the two dialects produce the same config from the same intent.
+        let toml = crate::config::Config::from_toml_str("[gamepad]\nkind = steam\ngyro = true\n")
+            .unwrap();
+        assert_eq!(c.gamepad(), toml.gamepad());
+    }
+
+    /// A typo in the gyro knob fails the whole parse and says what was allowed
+    /// — the standing rule for every `h.*` block.
+    #[test]
+    fn a_misspelled_gyro_key_is_refused_and_lists_the_real_one() {
+        let e = load_str(r#"hyprpad.gamepad { gyroscope = true }"#, "t.lua").unwrap_err();
+        assert!(e.contains("gyroscope"), "{e}");
+        assert!(e.contains("gyro"), "{e}");
+    }
 }

@@ -134,7 +134,7 @@ use crate::mode::ModeEngine;
 use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::status::{RelayKind, StatusWriter};
-use crate::uhid::settings::Action as RelayAction;
+use crate::uhid::settings::{self, Action as RelayAction};
 use crate::uhid::translate::StripMask;
 use crate::uhid::SteamRelay;
 use crate::{hidraw, report, status, uhid};
@@ -299,6 +299,9 @@ pub fn run() -> std::io::Result<()> {
     // the module that builds it rather than threading them through the four
     // places that ask for a disable. Re-installed on every reload, below.
     crate::lizard::set_power_settings(config.power_settings());
+    // Same cell, same frame, same reason: hyprpad's own gyro baseline, which the
+    // relay then overrides for as long as Steam is asking for the IMU.
+    crate::lizard::set_imu_preference(config.gamepad().imu_preference());
 
     // When we own lizard we must give it back on the way out, or the firmware
     // keyboard/mouse stays dead and the user has no pointer until a power-cycle.
@@ -2707,6 +2710,14 @@ struct GamepadState {
     /// rumble goes through exactly the same 20 Hz coalescing clock as the Xbox
     /// pad's: [`drive_rumble`] reads it once a frame.
     relay_rumble: (u16, u16),
+    /// Whether Steam held the virtual device open on the previous frame.
+    ///
+    /// Only the **falling** edge matters, and only for one thing: it is when
+    /// the puck's IMU goes back to hyprpad's own preference, because whoever
+    /// asked for it has stopped listening. Starts `false`, so a daemon that
+    /// comes up with Steam already holding the device sees one rising edge and
+    /// no spurious restore.
+    relay_open: bool,
     /// Whether creation has been attempted, so a failure warns exactly once
     /// instead of on every frame of every game.
     tried: bool,
@@ -2729,6 +2740,7 @@ impl GamepadState {
             pad: None,
             relay: None,
             relay_rumble: (0, 0),
+            relay_open: false,
             tried: false,
             forwarding: false,
             rumble: (0, 0),
@@ -2904,10 +2916,50 @@ fn absorb_relay_writes(
                 let on_us = gamepad::scale_magnitude(on_us, cfg.rumble_intensity);
                 haptics.pulse(pad, on_us, off_us, count);
             }
-            // Settings, drops, malformed frames, and every actuator command
-            // that arrived while hyprpad owns the pads: logged above, and
-            // deliberately not acted on. See `uhid::settings` for the policy.
+            // The one setting that is relayed rather than interpreted: only the
+            // real puck can turn its own IMU on, so Steam's gyro request has to
+            // reach the hardware or the gyro bytes never appear in the `0x42`
+            // the triton profile is already passing through (gap G5).
+            //
+            // It does **not** become a second writer. The value goes into
+            // `lizard`'s shared cell and rides out on the same `0x87` frame that
+            // module already re-sends every 30 s; `nudge` only asks it to send
+            // now instead of at the next tick, and is skipped entirely when
+            // Steam re-states a mode the puck is already holding — which it
+            // does, repeatedly.
+            RelayAction::Settings(ref pairs) => {
+                if let Some(mode) = settings::imu_mode(pairs) {
+                    if crate::lizard::set_imu_requested(Some(mode)) {
+                        if debug {
+                            eprintln!(
+                                "[relay] IMU {} -> puck (Steam asked)",
+                                settings::gyro_mode::describe(mode)
+                            );
+                        }
+                        crate::lizard::nudge();
+                    }
+                }
+            }
+            // Drops, malformed frames, and every actuator command that arrived
+            // while hyprpad owns the pads: logged above, and deliberately not
+            // acted on. See `uhid::settings` for the policy.
             _ => {}
+        }
+    }
+
+    // Steam letting go of the fake hands the IMU back to hyprpad's own
+    // preference — off, unless `gyro = true`. Without this, quitting Steam with
+    // a gyro game open would leave the puck streaming IMU data to nobody until
+    // its next power cycle. Edge-triggered, so an ordinary session of Steam
+    // holding the device open costs nothing.
+    let open = relay.is_open();
+    if open != st.relay_open {
+        st.relay_open = open;
+        if !open && crate::lizard::set_imu_requested(None) {
+            if debug {
+                eprintln!("[relay] Steam closed the device; IMU restored to hyprpad's preference");
+            }
+            crate::lizard::nudge();
         }
     }
 }
@@ -3247,6 +3299,11 @@ fn apply_reload(
     // reload retunes them with nothing to restart — within one `RESEND_INTERVAL`
     // if ownership was already on, and immediately if it just came on.
     crate::lizard::set_power_settings(config.power_settings());
+    crate::lizard::set_imu_preference(config.gamepad().imu_preference());
+    // The gyro baseline is the one of the two a reload can make *urgent* — the
+    // owner flipped `gyro` expecting to see IMU bytes — so ring the doorbell
+    // rather than making them wait out a 30 s tick.
+    crate::lizard::nudge();
 
     let new_own = lizard_ownership_enabled(config);
     if new_own != *own_lizard {

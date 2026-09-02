@@ -586,6 +586,26 @@ If the broker is not installed, or is installed and refuses, **nothing breaks**:
 hyprpad opens the puck directly exactly as it always has, says so once, and runs
 with no Steam relay. `status.json`'s `source` field says which half is live.
 
+### The gyro
+
+You should not have to do anything. When a game turns its sensors on, Steam
+writes `SETTING_IMU_MODE` to the virtual controller, and hyprpad passes that to
+the **real** puck — through the same feature-report writer that owns lizard mode,
+so there is still exactly one thing writing to the controller. The puck then puts
+its IMU data in the report hyprpad is already forwarding, and it reaches Steam
+untouched. When Steam stops asking, or lets go of the device, the IMU goes back
+off.
+
+One knob exists, and it is for diagnosis rather than use:
+
+```lua
+h.gamepad { kind = "steam", gyro = true }   -- hold the IMU on regardless of Steam
+```
+
+It tells "the gyro is not working" apart from "Steam never asked" — with it on,
+the IMU streams with no Steam in the picture at all. Leave it off otherwise: a
+gyro running for a desktop nobody is aiming with is battery spent for nothing.
+
 ## Documents
 
 | | |
