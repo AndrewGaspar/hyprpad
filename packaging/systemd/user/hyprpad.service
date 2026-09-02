@@ -1,0 +1,121 @@
+# hyprpad — the daemon, as a systemd USER unit.
+#
+# WHAT IT IS FOR
+#   Two things, and the second is the interesting one.
+#
+#   1. The daemon comes up with the graphical session instead of being launched
+#      by hand from a shell, so the controller drives Hyprland from login.
+#   2. It is the half that makes `[daemon] restore_lizard_on_exit = false` — the
+#      lizard-free boot of docs/12-lizard-free.md — safe to turn on. With the
+#      knob off, a stopped daemon leaves the puck doing *nothing* on the desktop;
+#      `Restart=on-failure` below is what puts it back. Enabling the knob without
+#      something that restarts the daemon is the configuration to avoid.
+#
+#   The firmware powers up in lizard mode and that cannot be changed from the
+#   host, so there is always a window between "controller connects" and "hyprpad
+#   disables lizard". Running from login is what makes that window small: the
+#   daemon is already up and its reconnect poll re-disables lizard within one
+#   RECONNECT_SCAN_INTERVAL (1.5 s) of the puck reappearing.
+#
+# INSTALL
+#     install -Dm644 packaging/systemd/user/hyprpad.service \
+#             ~/.config/systemd/user/hyprpad.service
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now hyprpad.service
+#
+#   Stop the hand-launched daemon first, or two of them fight over the puck:
+#     pkill -TERM -f 'hyprpad run'
+#
+#   Confirm, read-only, with `hyprpad setup --check`.
+#
+# REVERT
+#     systemctl --user disable --now hyprpad.service
+#     rm ~/.config/systemd/user/hyprpad.service && systemctl --user daemon-reload
+
+[Unit]
+Description=hyprpad — drive Hyprland from a Steam Controller
+Documentation=https://github.com/AndrewGaspar/hyprpad
+Documentation=file:///usr/share/doc/hyprpad/12-lizard-free.md
+
+# The daemon talks to Hyprland over its IPC socket and injects a virtual pointer
+# through the Wayland compositor, so it is meaningless without a graphical
+# session and must go away with one. `PartOf=` is what systemd.special(7)
+# prescribes for exactly this ("units which only apply to a graphical session");
+# `After=` keeps us from racing the compositor's socket at login.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+
+# The installed symlink, not the build tree: ~/.local/bin/hyprpad is what this
+# machine already has on PATH (it points at target/release/hyprpad). %h is the
+# user's home, so the unit is portable without templating.
+ExecStart=%h/.local/bin/hyprpad run
+
+# `hyprpad reload` finds the daemon through its pidfile ($XDG_RUNTIME_DIR/
+# hyprpad.pid) and sends it SIGHUP, which is a live config re-read and NOT a
+# restart — so ExecReload= must be that command and not `kill -HUP $MAINPID`
+# by another name. `systemctl --user reload hyprpad` and `hyprpad reload` then
+# do the same thing, whichever the user reaches for.
+ExecReload=%h/.local/bin/hyprpad reload
+
+# The on-screen keyboard is a separate binary from a separate crate (osk/), and
+# the daemon resolves it as: $HYPRPAD_OSK_BIN, then `hyprpad-osk` on PATH, then
+# the in-tree dev build. A systemd user unit does NOT inherit the login shell's
+# PATH, so naming the binary here is the reliable route.
+#
+# NOTE: ~/.local/bin/hyprpad-osk may not exist yet. Create it the same way
+# ~/.local/bin/hyprpad was created:
+#     ln -sf "$PWD/osk/target/release/hyprpad-osk" ~/.local/bin/hyprpad-osk
+# If it is missing, the OSK simply fails to spawn and everything else keeps
+# working — src/osk.rs degrades rather than taking the daemon down.
+Environment=HYPRPAD_OSK_BIN=%h/.local/bin/hyprpad-osk
+
+# `on-failure`, not `always`: a clean `systemctl --user stop` (or a SIGTERM the
+# daemon handled and exited 0 from) is a deliberate stop and must stay stopped,
+# or nobody can ever turn the daemon off. A crash is not, and comes back.
+Restart=on-failure
+RestartSec=2
+
+# Everything the daemon says goes to the journal — `journalctl --user -u hyprpad`
+# — which is the point of running it here rather than from a shell whose
+# scrollback is gone by the time something is wrong.
+StandardOutput=journal
+StandardError=journal
+
+# --- The group, and why it is NOT set here ----------------------------------
+# With the broker installed, the daemon reaches /run/hyprpad/broker.sock only if
+# its process is in the `hyprpad` group (the socket is 0660 root:hyprpad).
+#
+# The obvious `SupplementaryGroups=hyprpad` DOES NOT WORK HERE. systemd.exec(5)
+# puts SupplementaryGroups= under "USER/GROUP IDENTITY", a section that opens:
+# "These options are only available for system services and are not supported
+# for services running in per-user instances of the service manager." A user
+# manager has no CAP_SETGID, so it cannot call setgroups() at all. Worse, it is
+# a silent trap: `systemd-analyze --user verify` accepts the directive without
+# complaint.
+#
+# What actually decides the group is the LOGIN SESSION. The user manager
+# (systemd --user) inherits its supplementary groups from the session that
+# started it, and every unit it launches inherits them in turn. So:
+#
+#     sudo usermod -aG hyprpad $USER    # then LOG OUT AND BACK IN
+#
+# `newgrp hyprpad` fixes only the shell you type it in — it cannot reach the
+# already-running user manager. Check what the manager actually has with:
+#
+#     grep ^Groups: /proc/$(pgrep -u "$USER" -x systemd)/status
+#     getent group hyprpad              # the gid to look for
+#
+# and `hyprpad setup --check` reports the same thing off the running daemon.
+# Without the group the daemon does not break: it says so once and opens the
+# puck directly, exactly as it did before the broker existed.
+
+[Install]
+# The session target pulls the unit in at login and drops it at logout. Under
+# uwsm (Hyprland on this machine) graphical-session.target is bound to
+# wayland-session@<compositor>.target and is what carries the session's user
+# services, so this is the right hook: `systemctl --user enable` writes the
+# symlink into graphical-session.target.wants/ alongside the session's others.
+WantedBy=graphical-session.target

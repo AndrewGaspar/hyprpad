@@ -23,7 +23,7 @@
 //! local h = hyprpad
 //!
 //! -- Settings: one call per section, taking the same keys the TOML has.
-//! h.daemon  { own_lizard = true, steam_button_poweroff = "off", process_rescan_ms = 500 }
+//! h.daemon  { own_lizard = true, restore_lizard_on_exit = false, steam_button_poweroff = "off", process_rescan_ms = 500 }
 //! h.cursor  { sens = 0.06, one_euro_min_cutoff = 0.3, hysteresis = 0.0008 }
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
 //! h.scrub   { detent_deg = 15, select = "l5" }   -- guide + circle the left pad = caret
@@ -658,6 +658,9 @@ fn finish(
         buttons: b.buttons,
         osk_buttons: b.osk_buttons,
         own_lizard: b.own_lizard,
+        // `None` means the file never said: the default is TRUE (restore on exit),
+        // which `Build`'s derived `Default` cannot express for a bare `bool`.
+        restore_lizard_on_exit: b.restore_lizard_on_exit.unwrap_or(true),
         steam_button_poweroff: b.steam_button_poweroff,
         sleep_inactivity_timeout: b.sleep_inactivity_timeout,
         rescan_on_title_change: b.rescan_on_title_change,
@@ -743,6 +746,9 @@ struct Build {
     button_descs: HashMap<crate::report::Button, String>,
     osk_button_descs: HashMap<crate::report::Button, String>,
     own_lizard: bool,
+    /// `None` until `h.daemon` writes it; see the `Config` construction above for
+    /// why this is an `Option` when the setting is a plain `bool`.
+    restore_lizard_on_exit: Option<bool>,
     steam_button_poweroff: Option<u16>,
     sleep_inactivity_timeout: Option<u16>,
     rescan_on_title_change: Option<bool>,
@@ -1328,9 +1334,9 @@ fn default_mode_fn(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
 
 // --- settings sections -----------------------------------------------------
 
-/// `h.daemon { own_lizard = true, steam_button_poweroff = "off",
-/// sleep_inactivity_timeout = 600, rescan_on_title_change = true,
-/// process_rescan_ms = 500 }`.
+/// `h.daemon { own_lizard = true, restore_lizard_on_exit = false,
+/// steam_button_poweroff = "off", sleep_inactivity_timeout = 600,
+/// rescan_on_title_change = true, process_rescan_ms = 500 }`.
 fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
     lua.create_function(move |_, t: Table| {
@@ -1339,6 +1345,9 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
             let (k, v) = pair?;
             match k.as_str() {
                 "own_lizard" => b.own_lizard = as_bool(&v, &k)?,
+                "restore_lizard_on_exit" => {
+                    b.restore_lizard_on_exit = Some(as_bool(&v, &k)?)
+                }
                 "steam_button_poweroff" => {
                     b.steam_button_poweroff = Some(as_power_setting(&v, &k)?)
                 }
@@ -1355,6 +1364,7 @@ fn section_daemon(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
                         other,
                         &[
                             "own_lizard",
+                            "restore_lizard_on_exit",
                             "steam_button_poweroff",
                             "sleep_inactivity_timeout",
                             "rescan_on_title_change",
@@ -3544,6 +3554,36 @@ mod tests {
     }
 
     #[test]
+    fn restore_lizard_on_exit_defaults_true_and_parses_in_lua() {
+        // Default TRUE, exactly as the TOML front-end. `Build` derives
+        // `Default`, which for a bare `bool` would have made this false — the
+        // reason the builder field is an `Option`.
+        assert!(load("local h = hyprpad\nh.daemon { own_lizard = true }\n")
+            .restore_lizard_on_exit());
+        assert!(load("local h = hyprpad\nh.bind('guide+a', 'fullscreen')\n")
+            .restore_lizard_on_exit());
+
+        // The lizard-free setting.
+        let c = load(
+            "local h = hyprpad\n\
+             h.daemon { own_lizard = true, restore_lizard_on_exit = false }\n",
+        );
+        assert!(c.own_lizard());
+        assert!(!c.restore_lizard_on_exit());
+
+        // Explicit true is still true, and a non-boolean is an error naming the
+        // key rather than a silent default.
+        assert!(load("local h = hyprpad\nh.daemon { restore_lizard_on_exit = true }\n")
+            .restore_lizard_on_exit());
+        let e = load_str("hyprpad.daemon { restore_lizard_on_exit = 0 }", "t.lua").unwrap_err();
+        assert!(e.contains("restore_lizard_on_exit"), "{e}");
+
+        // And the key is in the "did you mean" list a typo gets shown.
+        let e = load_str("hyprpad.daemon { restore_lizard = false }", "t.lua").unwrap_err();
+        assert!(e.contains("restore_lizard_on_exit"), "{e}");
+    }
+
+    #[test]
     fn the_ported_sample_config_matches_the_toml_it_replaces() {
         // `config/hyprpad.lua` is the shipped translation of the owner's live
         // `config.toml`; the two must agree binding for binding.
@@ -3556,6 +3596,9 @@ mod tests {
         let toml = Config::from_toml_str(SAMPLE_TOML).expect("sample toml");
 
         assert_eq!(lua.own_lizard(), toml.own_lizard());
+        // Neither front-end spells it, so this pins the shared default: both keep
+        // the exit-restore safety net until a file turns it off.
+        assert_eq!(lua.restore_lizard_on_exit(), toml.restore_lizard_on_exit());
         // The firmware power knobs are `[daemon]` settings like `own_lizard`,
         // and both front-ends can spell them: commented out in the sample, so
         // this pins "neither file writes setting 25 or 50 by default".

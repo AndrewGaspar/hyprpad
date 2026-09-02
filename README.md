@@ -80,6 +80,7 @@ with the compositor's Lua state.
 local h = hyprpad
 
 h.daemon  { own_lizard = true, steam_button_poweroff = "off" }  -- see "Powering the controller off"
+-- h.daemon { restore_lizard_on_exit = false }                  -- see "Lizard-free boot"
 h.cursor  { sens = 0.06, hysteresis = 0.0008, only_in = { "desktop" } }
 h.scroll  { mode = "circular", only_in = { "desktop" } }
 h.scrub   { select = "l5", only_in = { "desktop" } }            -- guide + circle the left pad = caret
@@ -606,6 +607,91 @@ It tells "the gyro is not working" apart from "Steam never asked" — with it on
 the IMU streams with no Steam in the picture at all. Leave it off otherwise: a
 gyro running for a desktop nobody is aiming with is battery spent for nothing.
 
+## Running at login
+
+By default the daemon is launched by hand — from a shell that already has the
+`hyprpad` group:
+
+```
+newgrp hyprpad
+setsid env HYPRPAD_OSK_BIN=~/.local/bin/hyprpad-osk hyprpad run &
+```
+
+[`packaging/systemd/user/hyprpad.service`](packaging/systemd/user/hyprpad.service)
+replaces that with a systemd **user** unit, so the daemon comes up with the
+graphical session and restarts if it dies. `hyprpad setup --user` prints the
+install and never runs it:
+
+```
+pkill -TERM -f 'hyprpad run'        # stop the hand-launched one first
+install -Dm644 packaging/systemd/user/hyprpad.service \
+        ~/.config/systemd/user/hyprpad.service
+systemctl --user daemon-reload
+systemctl --user enable --now hyprpad.service
+```
+
+The unit runs `~/.local/bin/hyprpad` and sets
+`Environment=HYPRPAD_OSK_BIN=%h/.local/bin/hyprpad-osk`, because a user unit does
+**not** inherit your shell's `PATH`. If either symlink is missing, make it:
+
+```
+ln -sf "$PWD/target/release/hyprpad"          ~/.local/bin/hyprpad
+ln -sf "$PWD/osk/target/release/hyprpad-osk"  ~/.local/bin/hyprpad-osk
+```
+
+`ExecReload=` is `hyprpad reload`, which finds the daemon through its pidfile and
+sends SIGHUP — a live config re-read, not a restart — so `systemctl --user reload
+hyprpad` and `hyprpad reload` do the same thing. Logs go to the journal:
+`journalctl --user -u hyprpad -f`.
+
+**The group is the one thing the unit cannot fix.** With the broker installed the
+daemon reaches its socket only if its process is in the `hyprpad` group, and
+`SupplementaryGroups=` does not work in a user unit: systemd.exec(5) files it
+under *USER/GROUP IDENTITY*, "only available for system services and not
+supported for services running in per-user instances of the service manager" — a
+user manager has no `CAP_SETGID`. Worse, it is a silent trap, since
+`systemd-analyze --user verify` accepts the directive anyway. What actually
+decides the group is the **login session** the user manager inherited, so after
+`sudo usermod -aG hyprpad $USER` you must log out and back in. `newgrp` reaches
+only the shell you type it in, never the already-running user manager.
+
+`hyprpad setup --check` reports all of it, read-only and without running
+`systemctl` — it reads the unit file, the `graphical-session.target.wants/`
+symlink, and the running daemon's own `/proc` entry:
+
+```
+Running at login (optional; `hyprpad setup --user` prints the install)
+
+  NO  user unit              nothing at ~/.config/systemd/user/hyprpad.service — …
+  NO  user unit enabled      no …/graphical-session.target.wants/hyprpad.service — …
+  NO  daemon under the unit  pid 3933019 is hand-launched — `pkill -TERM -f 'hyprpad run'`, …
+  NO  daemon has the group   pid 3933019 lacks gid 949 (hyprpad) — … RE-LOGIN after `usermod -aG` …
+```
+
+### Lizard-free boot
+
+The unit is also what makes the lizard-free setting safe:
+
+```lua
+h.daemon { own_lizard = true, restore_lizard_on_exit = false }
+```
+
+`restore_lizard_on_exit` defaults to **true**: on a clean exit hyprpad re-enables
+the puck's firmware keyboard/mouse emulation, so a stopped daemon never leaves
+the controller inert. Set it **false** and exit leaves lizard mode *disabled*, so
+the puck never types arrow keys into the desktop between daemon restarts or at
+boot — the goal of [docs/12-lizard-free.md](docs/12-lizard-free.md).
+
+The trade is real and is the whole point: with `false`, a crashed or stopped
+daemon leaves a puck that does **nothing** on the desktop until hyprpad runs
+again. That is only acceptable when something restarts it — which is exactly what
+`Restart=on-failure` in the user unit is for — and when you still have a keyboard.
+Turning the knob off without the unit is the configuration to avoid.
+
+The setting is read live: flip it and `hyprpad reload`, and the *next* exit obeys
+the new value. It only means anything when `own_lizard` is on; with ownership off
+hyprpad never disabled lizard mode and has nothing to restore.
+
 ## Documents
 
 | | |
@@ -619,6 +705,7 @@ gyro running for a desktop nobody is aiming with is battery spent for nothing.
 | [07 — Open questions](docs/07-open-questions.md) | What is still unverified, and how to verify it |
 | [08 — The living-room vision](docs/08-living-room-vision.md) | The full target experience, and the input contract |
 | [09 — The programme](docs/09-programme.md) | **The costed attack on the vision** — work items, sizes, order, risks |
+| [12 — The lizard-free goal](docs/12-lizard-free.md) | Never boot into firmware lizard mode: the `restore_lizard_on_exit` knob and the user unit |
 | [research/](docs/research/) | Six consolidated deep-research reports the programme rests on |
 | [design/](docs/design/) | How the shipped features are built: the [uhid relay](docs/design/uhid-relay.md), the [puck's power](docs/design/puck-power.md) |
 

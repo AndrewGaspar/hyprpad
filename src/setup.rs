@@ -33,6 +33,15 @@
 //! | `packaging/sysusers.d/hyprpad.conf` | the `hyprpad` group that gates the broker socket |
 //! | `packaging/systemd/hyprpad-broker.socket` | `/run/hyprpad/broker.sock`, `0660 root:hyprpad` |
 //! | `packaging/systemd/hyprpad-broker.service` | the root fd broker ([`crate::broker`]) |
+//!
+//! # The third half: running at login
+//!
+//! [`user_unit_steps`] prints the *user-level* install of
+//! `packaging/systemd/user/hyprpad.service`, which starts the daemon with the
+//! graphical session. It needs no root either, but it is a separate decision
+//! from the Steam masking above — and it is the piece that makes
+//! `[daemon] restore_lizard_on_exit = false` safe (`docs/12-lizard-free.md`),
+//! since a daemon that is restarted is a puck that comes back.
 
 use std::fs;
 use std::io;
@@ -79,18 +88,27 @@ pub enum Mode {
     /// Print the root host-integration block and stop. Installs nothing at all,
     /// so it is safe to pipe.
     Print,
+    /// Print only the user-unit block ([`user_unit_steps`]) — the "run at login"
+    /// half. Installs nothing; needs no root.
+    User,
     /// Remove the user-level Steam hook.
     Revert,
 }
 
 /// `hyprpad setup`'s usage line.
-pub const USAGE: &str = "usage: hyprpad setup [--check | --print | --revert]";
+pub const USAGE: &str = "usage: hyprpad setup [--check | --print | --user | --revert]";
 
 /// Entry point for the `setup` subcommand.
 pub fn run(mode: Mode) -> io::Result<()> {
     match mode {
         Mode::Print => {
             print!("{}", host_install_steps());
+            println!();
+            print!("{}", user_unit_steps());
+            Ok(())
+        }
+        Mode::User => {
+            print!("{}", user_unit_steps());
             Ok(())
         }
         Mode::Check => {
@@ -324,6 +342,8 @@ fn print_install_summary(home: &Path, wrapper: &Path, desktop: &Path, autostart:
     println!("Revert everything:  hyprpad setup --revert");
     println!();
     print!("{}", host_install_steps());
+    println!();
+    print!("{}", user_unit_steps());
 }
 
 // ===========================================================================
@@ -392,6 +412,76 @@ To undo: remove /etc/udev/rules.d/{RULE_NAME} and reload udev, then
     )
 }
 
+// ===========================================================================
+// Running at login — the systemd user unit
+// ===========================================================================
+
+/// The user unit's name, as systemd knows it.
+pub const USER_UNIT_NAME: &str = "hyprpad.service";
+/// The shipped file that becomes it.
+pub const USER_UNIT_SOURCE: &str = "packaging/systemd/user/hyprpad.service";
+/// The session target that pulls the unit in at login. `systemctl --user enable`
+/// writes the symlink into `<this>.wants/`, which is how `--check` tells
+/// "enabled" from "merely installed" without running `systemctl`.
+pub const USER_UNIT_TARGET: &str = "graphical-session.target";
+/// The group that gates the broker's socket — the one thing a user unit cannot
+/// grant itself. See [`user_unit_steps`] for why.
+pub const BROKER_GROUP: &str = "hyprpad";
+
+/// The user-level block: how to run the daemon from the graphical session.
+///
+/// Printed, never run — the same contract as [`host_install_steps`], even though
+/// nothing here needs root. Pure, so what it says is a test.
+pub fn user_unit_steps() -> String {
+    format!(
+        "\
+Running at login — the systemd user unit (no root, but read it first)
+=====================================================================
+This starts the daemon with your graphical session instead of from a shell, and
+restarts it if it dies. It is also the half that makes `[daemon]
+restore_lizard_on_exit = false` safe: with that knob off, a stopped daemon
+leaves the puck doing nothing on the desktop, and `Restart=on-failure` is what
+puts it back (docs/12-lizard-free.md).
+
+    # 0. stop the hand-launched daemon, or two of them fight over the puck
+    pkill -TERM -f 'hyprpad run'
+
+    # 1. the unit
+    install -Dm644 {USER_UNIT_SOURCE} \\
+            ~/.config/systemd/user/{USER_UNIT_NAME}
+
+    # 2. enable it for the session
+    systemctl --user daemon-reload
+    systemctl --user enable --now {USER_UNIT_NAME}
+
+The unit runs ~/.local/bin/hyprpad, and points HYPRPAD_OSK_BIN at
+~/.local/bin/hyprpad-osk. A user unit does NOT inherit your shell's PATH, so if
+either symlink is missing, make it — from the checkout you built in:
+
+    ln -sf \"$PWD/target/release/hyprpad\"          ~/.local/bin/hyprpad
+    ln -sf \"$PWD/osk/target/release/hyprpad-osk\"  ~/.local/bin/hyprpad-osk
+
+THE GROUP IS NOT SOMETHING THE UNIT CAN FIX. With the broker installed, the
+daemon reaches its socket only if the process is in the `{BROKER_GROUP}` group —
+and `SupplementaryGroups=` is documented in systemd.exec(5) under USER/GROUP
+IDENTITY, which is \"only available for system services and not supported for
+services running in per-user instances of the service manager\". A user manager
+has no CAP_SETGID. What decides the group is the LOGIN SESSION the user manager
+inherited, so after `sudo usermod -aG {BROKER_GROUP} $USER` you must LOG OUT AND
+BACK IN — `newgrp` reaches only the shell you type it in, never the already
+running user manager. Without the group nothing breaks: the daemon says so once
+and opens the puck directly.
+
+    journalctl --user -u {USER_UNIT_NAME} -f      # what it is saying
+    systemctl --user reload {USER_UNIT_NAME}      # = `hyprpad reload` (SIGHUP)
+    hyprpad setup --check                        # read-only, incl. the group
+
+To undo: `systemctl --user disable --now {USER_UNIT_NAME}`, then remove
+~/.config/systemd/user/{USER_UNIT_NAME} and `systemctl --user daemon-reload`.
+"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // `hyprpad setup --check`
 // ---------------------------------------------------------------------------
@@ -434,6 +524,86 @@ pub trait HostView {
     /// The puck's hidraw nodes and what `stat` says about each. An empty vec
     /// means the puck is not plugged in.
     fn puck_nodes(&self) -> Vec<(PathBuf, Option<NodeStat>)>;
+
+    /// Where the user unit lives when it is installed:
+    /// `$XDG_CONFIG_HOME/systemd/user/hyprpad.service`.
+    fn user_unit_file(&self) -> PathBuf;
+
+    /// The symlink `systemctl --user enable` writes, in
+    /// `<target>.wants/`. Its presence is "enabled", and reading it is how this
+    /// check answers that question without running `systemctl`.
+    fn user_unit_enable_link(&self) -> PathBuf;
+
+    /// Does anything exist at `path`, symlink or not? Distinct from
+    /// [`file_exists`](HostView::file_exists), which follows symlinks and wants
+    /// a regular file at the end — a dangling enable symlink is still an enable
+    /// symlink, and saying so is more useful than pretending it is absent.
+    fn path_exists(&self, path: &Path) -> bool;
+
+    /// The running daemon, read out of `/proc`. `None` when no live daemon
+    /// could be found through the pidfile.
+    fn running_daemon(&self) -> Option<DaemonProc>;
+
+    /// The numeric gid of the [`BROKER_GROUP`] group, if the group exists.
+    fn hyprpad_gid(&self) -> Option<u32>;
+}
+
+/// What `--check` can learn about the running daemon by reading `/proc`, which
+/// is all it is allowed to do — it runs no commands, `systemctl` included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonProc {
+    /// The pid from `$XDG_RUNTIME_DIR/hyprpad.pid`, confirmed alive and named
+    /// `hyprpad` (a pidfile can be stale and pids are reused).
+    pub pid: u32,
+    /// Whether `/proc/<pid>/cgroup` places it inside [`USER_UNIT_NAME`] — i.e.
+    /// this daemon *is* the systemd unit, not a hand-launched `hyprpad run`.
+    pub under_unit: bool,
+    /// The supplementary gids from `/proc/<pid>/status`'s `Groups:` line. This
+    /// is the only honest answer to "does the daemon have the broker group",
+    /// because the group is inherited from the login session and neither the
+    /// unit file nor the group database can tell you what actually happened.
+    pub groups: Vec<u32>,
+}
+
+/// The gids on a `/proc/<pid>/status` `Groups:` line. A file with no such line
+/// yields an empty list, which is a real answer: a process may have no
+/// supplementary groups at all.
+pub fn parse_proc_groups(status: &str) -> Vec<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .map(|rest| rest.split_whitespace().filter_map(|g| g.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// The gid of `name` in an `/etc/group`-format body (`name:passwd:gid:members`).
+/// Read rather than shelled out to, because this module runs no commands.
+pub fn parse_group_gid(group_file: &str, name: &str) -> Option<u32> {
+    for line in group_file.lines() {
+        let mut fields = line.split(':');
+        if fields.next() != Some(name) {
+            continue;
+        }
+        // Skip the password field; the gid is the third.
+        if let Some(gid) = fields.nth(1).and_then(|g| g.parse().ok()) {
+            return Some(gid);
+        }
+    }
+    None
+}
+
+/// Whether a `/proc/<pid>/cgroup` body places the process inside `unit`.
+///
+/// A line is `hierarchy:controllers:path`, and on cgroup v2 there is exactly
+/// one: `0::/user.slice/user-1000.slice/user@1000.service/app.slice/hyprpad.service`.
+/// The unit must match a whole path *segment*, or `hyprpad.service` would also
+/// answer for `not-hyprpad.service`.
+pub fn cgroup_names_unit(cgroup: &str, unit: &str) -> bool {
+    cgroup.lines().any(|line| {
+        line.rsplit(':')
+            .next()
+            .is_some_and(|path| path.split('/').any(|seg| seg == unit))
+    })
 }
 
 /// One line of the report.
@@ -586,6 +756,124 @@ pub fn check_items(view: &dyn HostView) -> Vec<Check> {
     items
 }
 
+/// The "running at login" checks. Deliberately a **separate** list from
+/// [`check_items`]: the user unit is optional and answers a different question
+/// (does the daemon start itself) from the Steam masking above (can Steam see
+/// only the fake), so a machine with no unit installed must not be reported as
+/// not ready for the relay.
+pub fn user_unit_items(view: &dyn HostView) -> Vec<Check> {
+    let mut items = Vec::new();
+
+    // 1. The unit file itself.
+    let unit = view.user_unit_file();
+    items.push(if view.path_exists(&unit) {
+        Check::new(Verdict::Ok, "user unit", format!("{}", unit.display()))
+    } else {
+        Check::new(
+            Verdict::Bad,
+            "user unit",
+            format!(
+                "nothing at {} — `hyprpad setup --user` prints the install",
+                unit.display()
+            ),
+        )
+    });
+
+    // 2. Enabled, read as the `.wants/` symlink rather than by running
+    //    `systemctl is-enabled` — this module runs nothing.
+    let link = view.user_unit_enable_link();
+    items.push(if view.path_exists(&link) {
+        Check::new(Verdict::Ok, "user unit enabled", format!("wanted by {USER_UNIT_TARGET}"))
+    } else {
+        Check::new(
+            Verdict::Bad,
+            "user unit enabled",
+            format!("no {} — `systemctl --user enable --now {USER_UNIT_NAME}`", link.display()),
+        )
+    });
+
+    // 3. Is the daemon that is running *the unit's*? This is the check that
+    //    catches the state the first two cannot see: unit installed and enabled,
+    //    and a hand-launched `hyprpad run` from a shell holding the puck, so the
+    //    unit's own start silently loses the race for the device.
+    let daemon = view.running_daemon();
+    items.push(match &daemon {
+        None => Check::new(
+            Verdict::Unknown,
+            "daemon under the unit",
+            "no daemon running — start it with `systemctl --user start hyprpad`",
+        ),
+        Some(d) if d.under_unit => Check::new(
+            Verdict::Ok,
+            "daemon under the unit",
+            format!("pid {} is in {USER_UNIT_NAME}'s cgroup", d.pid),
+        ),
+        Some(d) => Check::new(
+            Verdict::Bad,
+            "daemon under the unit",
+            format!(
+                "pid {} is hand-launched — `pkill -TERM -f 'hyprpad run'`, then \
+                 `systemctl --user start {USER_UNIT_NAME}`",
+                d.pid
+            ),
+        ),
+    });
+
+    // 4. And the group, which is the whole reason this section exists: a user
+    //    unit cannot grant it, so the only way to know is to look at the process.
+    let gid = view.hyprpad_gid();
+    items.push(match (gid, &daemon) {
+        (None, _) => Check::new(
+            Verdict::Bad,
+            "daemon has the group",
+            format!("no `{BROKER_GROUP}` group here — see `hyprpad setup --print` step 2"),
+        ),
+        (Some(_), None) => Check::new(
+            Verdict::Unknown,
+            "daemon has the group",
+            "unknown until started — it is read off the running daemon",
+        ),
+        (Some(g), Some(d)) if d.groups.contains(&g) => Check::new(
+            Verdict::Ok,
+            "daemon has the group",
+            format!("gid {g} ({BROKER_GROUP}) — the broker will answer it"),
+        ),
+        (Some(g), Some(d)) => Check::new(
+            Verdict::Bad,
+            "daemon has the group",
+            format!(
+                "pid {} lacks gid {g} ({BROKER_GROUP}) — a user unit cannot add it, so \
+                 RE-LOGIN after `sudo usermod -aG {BROKER_GROUP} $USER`",
+                d.pid
+            ),
+        ),
+    });
+
+    items
+}
+
+/// The user-unit section's closing line. Same shape as [`verdict_line`], and
+/// deliberately worded so it can never be mistaken for the relay's verdict.
+pub fn user_unit_line(items: &[Check]) -> String {
+    let bad: Vec<&str> =
+        items.iter().filter(|c| c.verdict == Verdict::Bad).map(|c| c.label).collect();
+    let unknown: Vec<&str> =
+        items.iter().filter(|c| c.verdict == Verdict::Unknown).map(|c| c.label).collect();
+    if bad.is_empty() && unknown.is_empty() {
+        return "Running at login: the unit is installed, enabled, and the daemon is its own."
+            .to_string();
+    }
+    let mut out = String::from("NOT running from the unit. ");
+    if !bad.is_empty() {
+        out.push_str(&format!("Missing or wrong: {}. ", bad.join(", ")));
+    }
+    if !unknown.is_empty() {
+        out.push_str(&format!("Could not check: {}. ", unknown.join(", ")));
+    }
+    out.push_str("See `hyprpad setup --user` for the install block.");
+    out
+}
+
 /// The final line: ready, or exactly what is in the way.
 pub fn verdict_line(items: &[Check]) -> String {
     let bad: Vec<&str> = items.iter().filter(|c| c.verdict == Verdict::Bad).map(|c| c.label).collect();
@@ -618,6 +906,18 @@ pub fn check_report(view: &dyn HostView) -> String {
     }
     out.push('\n');
     out.push_str(&verdict_line(&items));
+    out.push('\n');
+
+    // The login half, under its own heading and its own verdict — see
+    // `user_unit_items` for why the two lists are never merged.
+    let user = user_unit_items(view);
+    out.push_str("\nRunning at login (optional; `hyprpad setup --user` prints the install)\n\n");
+    for item in &user {
+        out.push_str(&item.line());
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&user_unit_line(&user));
     out.push('\n');
     out
 }
@@ -660,6 +960,52 @@ impl HostView for LiveHost {
             })
             .collect()
     }
+
+    fn user_unit_file(&self) -> PathBuf {
+        user_unit_dir().join(USER_UNIT_NAME)
+    }
+
+    fn user_unit_enable_link(&self) -> PathBuf {
+        user_unit_dir().join(format!("{USER_UNIT_TARGET}.wants")).join(USER_UNIT_NAME)
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok()
+    }
+
+    fn running_daemon(&self) -> Option<DaemonProc> {
+        let pid: u32 = fs::read_to_string(crate::run::pid_file_path()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        // A pidfile outlives a signal-driven exit and pids get reused, so the
+        // pid alone proves nothing: only a live process actually named hyprpad
+        // counts as the daemon.
+        if fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim() != "hyprpad" {
+            return None;
+        }
+        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        Some(DaemonProc {
+            pid,
+            under_unit: cgroup_names_unit(&cgroup, USER_UNIT_NAME),
+            groups: parse_proc_groups(&status),
+        })
+    }
+
+    fn hyprpad_gid(&self) -> Option<u32> {
+        parse_group_gid(&fs::read_to_string("/etc/group").ok()?, BROKER_GROUP)
+    }
+}
+
+/// `$XDG_CONFIG_HOME/systemd/user`, or `~/.config/systemd/user` — read exactly
+/// the way systemd itself resolves it, so the paths `--check` reports are the
+/// ones `systemctl --user` would use.
+fn user_unit_dir() -> PathBuf {
+    crate::config::Config::config_home()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("systemd/user")
 }
 
 #[cfg(test)]
@@ -779,17 +1125,21 @@ Exec=/usr/bin/steam steam://open/bigpicture
     /// that fails when a new packaging file is added and forgotten here.
     #[test]
     fn the_printed_block_names_every_shipped_packaging_file() {
-        let block = host_install_steps();
+        // Both printed blocks together: the root half and the login half. A new
+        // file under `packaging/` that neither mentions is an incomplete install.
+        let block = format!("{}{}", host_install_steps(), user_unit_steps());
         for shipped in [
             "packaging/udev/72-hyprpad-puck.rules",
             "packaging/sysusers.d/hyprpad.conf",
             "packaging/systemd/hyprpad-broker.socket",
             "packaging/systemd/hyprpad-broker.service",
+            "packaging/systemd/user/hyprpad.service",
         ] {
             assert!(block.contains(shipped), "the install block never mentions {shipped}");
         }
         // And the file names match the constants `--check` looks for.
         assert!(block.contains(RULE_NAME));
+        assert!(block.contains(USER_UNIT_SOURCE));
     }
 
     /// Every step the task requires, and the re-login note without which the
@@ -841,7 +1191,17 @@ Exec=/usr/bin/steam steam://open/bigpicture
         uhid: Result<usize, String>,
         puck: Result<usize, String>,
         nodes: Vec<(PathBuf, Option<NodeStat>)>,
+        /// Paths that exist for [`HostView::path_exists`] — the unit file and
+        /// its enable symlink.
+        present: Vec<PathBuf>,
+        daemon: Option<DaemonProc>,
+        gid: Option<u32>,
     }
+
+    /// The unit file and the enable symlink, as [`FakeHost`] spells them.
+    const FAKE_UNIT: &str = "/home/u/.config/systemd/user/hyprpad.service";
+    const FAKE_LINK: &str =
+        "/home/u/.config/systemd/user/graphical-session.target.wants/hyprpad.service";
 
     impl FakeHost {
         /// Everything installed and working: the state `--check` calls READY.
@@ -862,6 +1222,9 @@ Exec=/usr/bin/steam steam://open/bigpicture
                         )
                     })
                     .collect(),
+                present: vec![PathBuf::from(FAKE_UNIT), PathBuf::from(FAKE_LINK)],
+                daemon: Some(DaemonProc { pid: 4242, under_unit: true, groups: vec![949, 1000] }),
+                gid: Some(949),
             }
         }
 
@@ -882,6 +1245,11 @@ Exec=/usr/bin/steam steam://open/bigpicture
                         )
                     })
                     .collect(),
+                // No unit, no group, and the daemon started by hand from a
+                // shell — the state of this machine today.
+                present: Vec::new(),
+                daemon: Some(DaemonProc { pid: 4242, under_unit: false, groups: vec![1000] }),
+                gid: None,
             }
         }
     }
@@ -904,6 +1272,21 @@ Exec=/usr/bin/steam steam://open/bigpicture
         }
         fn puck_nodes(&self) -> Vec<(PathBuf, Option<NodeStat>)> {
             self.nodes.clone()
+        }
+        fn user_unit_file(&self) -> PathBuf {
+            PathBuf::from(FAKE_UNIT)
+        }
+        fn user_unit_enable_link(&self) -> PathBuf {
+            PathBuf::from(FAKE_LINK)
+        }
+        fn path_exists(&self, path: &Path) -> bool {
+            self.present.iter().any(|p| p == path)
+        }
+        fn running_daemon(&self) -> Option<DaemonProc> {
+            self.daemon.clone()
+        }
+        fn hyprpad_gid(&self) -> Option<u32> {
+            self.gid
         }
     }
 
@@ -1070,11 +1453,226 @@ Exec=/usr/bin/steam steam://open/bigpicture
     #[test]
     fn every_reported_item_is_a_single_line() {
         for host in [FakeHost::ready(), FakeHost::untouched()] {
-            for item in check_items(&host) {
+            for item in check_items(&host).into_iter().chain(user_unit_items(&host)) {
                 assert!(!item.line().contains('\n'), "{:?}", item);
                 assert!(item.line().starts_with("  "), "{:?}", item);
             }
             assert!(!verdict_line(&check_items(&host)).contains('\n'));
+            assert!(!user_unit_line(&user_unit_items(&host)).contains('\n'));
         }
+    }
+
+    // --- the shipped user unit ---------------------------------------------
+
+    /// The unit file that `user_unit_steps` tells people to install.
+    const USER_UNIT: &str = include_str!("../packaging/systemd/user/hyprpad.service");
+
+    /// Everything the unit is *for*, asserted against the shipped file rather
+    /// than against a copy of it in a comment.
+    #[test]
+    fn the_shipped_user_unit_says_what_it_must() {
+        for directive in [
+            "ExecStart=%h/.local/bin/hyprpad run",
+            "ExecReload=%h/.local/bin/hyprpad reload",
+            "Environment=HYPRPAD_OSK_BIN=%h/.local/bin/hyprpad-osk",
+            "Restart=on-failure",
+            "RestartSec=2",
+            "After=graphical-session.target",
+            "PartOf=graphical-session.target",
+            "WantedBy=graphical-session.target",
+            "StandardOutput=journal",
+        ] {
+            assert!(USER_UNIT.contains(directive), "the unit is missing `{directive}`");
+        }
+    }
+
+    /// The trap this whole section exists to document: `SupplementaryGroups=`
+    /// is a system-service-only directive (systemd.exec(5), USER/GROUP
+    /// IDENTITY) that `systemd-analyze --user verify` accepts *without
+    /// complaint*, so nothing but a test stops it being re-added.
+    #[test]
+    fn the_user_unit_never_tries_to_set_a_supplementary_group() {
+        // The directive, not the word: the file explains at length why it is
+        // absent, and that explanation must be allowed to name it.
+        for line in USER_UNIT.lines() {
+            assert!(
+                !line.trim_start().starts_with("SupplementaryGroups="),
+                "a user manager has no CAP_SETGID; this directive cannot work here: {line}"
+            );
+        }
+        // And the explanation is present, so the next reader does not re-add it.
+        assert!(USER_UNIT.contains("SupplementaryGroups"), "the unit must say why it is absent");
+        assert!(USER_UNIT.contains("usermod -aG hyprpad"));
+    }
+
+    /// The unit runs the *installed symlink*, never a build-tree path, or it
+    /// would only work for the one checkout it was written in.
+    #[test]
+    fn the_user_unit_runs_the_installed_binary_not_the_build_tree() {
+        assert!(!USER_UNIT.contains("target/release/hyprpad run"));
+        assert!(!USER_UNIT.contains("ExecStart=cargo"));
+    }
+
+    // --- the printed user block --------------------------------------------
+
+    #[test]
+    fn the_user_block_carries_every_required_step() {
+        let block = user_unit_steps();
+        for step in [
+            "pkill -TERM -f 'hyprpad run'",
+            "install -Dm644 packaging/systemd/user/hyprpad.service",
+            "~/.config/systemd/user/hyprpad.service",
+            "systemctl --user daemon-reload",
+            "systemctl --user enable --now hyprpad.service",
+            "hyprpad-osk",
+            "usermod -aG hyprpad",
+            "hyprpad setup --check",
+        ] {
+            assert!(block.contains(step), "the user block is missing `{step}`");
+        }
+        // The two facts that are easy to get wrong and expensive to debug.
+        assert!(block.contains("SupplementaryGroups="), "the block must name the trap");
+        assert!(block.contains("LOG OUT AND"), "the block must say re-login, not newgrp");
+        assert!(block.contains("restore_lizard_on_exit"), "the block must say what it is for");
+    }
+
+    /// `--user` is reachable and advertised, and `--print` shows both halves —
+    /// so nobody who runs the documented command misses the login unit.
+    #[test]
+    fn the_user_block_is_advertised_and_included_in_print() {
+        assert!(USAGE.contains("--user"), "{USAGE}");
+        // `--print`'s output is the two blocks concatenated, and the user block
+        // must be all of the second one.
+        let both = format!("{}\n{}", host_install_steps(), user_unit_steps());
+        assert!(both.contains(&user_unit_steps()));
+        assert!(both.contains("Host integration"));
+        assert!(both.contains("Running at login"));
+    }
+
+    // --- `--check`'s login section -----------------------------------------
+
+    fn user_verdicts(host: &FakeHost) -> Vec<Verdict> {
+        user_unit_items(host).iter().map(|c| c.verdict).collect()
+    }
+
+    /// Four items, always the same four in the same order — the same contract
+    /// the six relay items have.
+    #[test]
+    fn the_login_section_always_reports_the_same_four_items_in_order() {
+        for host in [FakeHost::ready(), FakeHost::untouched()] {
+            let labels: Vec<&str> = user_unit_items(&host).iter().map(|c| c.label).collect();
+            assert_eq!(
+                labels,
+                vec![
+                    "user unit",
+                    "user unit enabled",
+                    "daemon under the unit",
+                    "daemon has the group",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_running_from_the_unit_passes_the_login_section() {
+        let host = FakeHost::ready();
+        assert_eq!(user_verdicts(&host), vec![Verdict::Ok; 4]);
+        let report = check_report(&host);
+        assert!(report.contains("Running at login: the unit is installed"), "{report}");
+        assert!(!report.contains("NOT running from the unit"), "{report}");
+    }
+
+    /// The state of this machine today: no unit, no group, and a hand-launched
+    /// daemon. Every one of those is a separate, actionable line.
+    #[test]
+    fn a_hand_launched_daemon_is_reported_as_such() {
+        let host = FakeHost::untouched();
+        assert_eq!(user_verdicts(&host), vec![Verdict::Bad; 4]);
+        let items = user_unit_items(&host);
+        assert!(items[0].detail.contains("setup --user"), "{}", items[0].detail);
+        assert!(items[1].detail.contains("systemctl --user enable"), "{}", items[1].detail);
+        assert!(items[2].detail.contains("pkill -TERM"), "{}", items[2].detail);
+        assert!(items[3].detail.contains("setup --print"), "{}", items[3].detail);
+        assert!(check_report(&host).contains("NOT running from the unit"));
+    }
+
+    /// The failure the machine actually has: everything installed, the group in
+    /// the database, and the login session that started the user manager older
+    /// than the `usermod`. Nothing but the daemon's own `/proc` entry can see it.
+    #[test]
+    fn a_daemon_whose_session_predates_the_group_is_caught() {
+        let host = FakeHost {
+            daemon: Some(DaemonProc { pid: 4242, under_unit: true, groups: vec![1000] }),
+            ..FakeHost::ready()
+        };
+        let items = user_unit_items(&host);
+        assert_eq!(items[3].verdict, Verdict::Bad);
+        assert!(items[3].detail.contains("RE-LOGIN"), "{}", items[3].detail);
+        assert!(items[3].detail.contains("949"), "{}", items[3].detail);
+        // And the first three still pass — this is not a unit problem.
+        assert_eq!(items[0].verdict, Verdict::Ok);
+        assert_eq!(items[2].verdict, Verdict::Ok);
+    }
+
+    /// With no daemon running, the two questions that need a process must say
+    /// "unknown", never "ok".
+    #[test]
+    fn no_running_daemon_makes_the_process_checks_unknown() {
+        let host = FakeHost { daemon: None, ..FakeHost::ready() };
+        assert_eq!(
+            user_verdicts(&host),
+            vec![Verdict::Ok, Verdict::Ok, Verdict::Unknown, Verdict::Unknown]
+        );
+        let items = user_unit_items(&host);
+        assert!(items[3].detail.contains("unknown until started"), "{}", items[3].detail);
+    }
+
+    /// The login section must never change the relay's verdict: a machine with
+    /// no user unit at all is still READY for `kind = "steam"`.
+    #[test]
+    fn the_login_section_does_not_change_the_relay_verdict() {
+        let host = FakeHost { present: Vec::new(), gid: None, daemon: None, ..FakeHost::ready() };
+        assert_eq!(verdicts(&host), vec![Verdict::Ok; 6]);
+        let report = check_report(&host);
+        assert!(report.contains("READY for `[gamepad] kind = \"steam\"`"), "{report}");
+        assert!(report.contains("NOT running from the unit"), "{report}");
+    }
+
+    // --- the /proc parsers --------------------------------------------------
+
+    #[test]
+    fn the_groups_line_is_read_off_a_real_status_file() {
+        // Trimmed from /proc/<pid>/status, tab-separated as the kernel writes it.
+        let status = "Name:\thyprpad\nUid:\t1000\t1000\t1000\t1000\n\
+                      Gid:\t1000\t1000\t1000\t1000\n\
+                      Groups:\t958 967 990 992 998 1000 \nThreads:\t9\n";
+        assert_eq!(parse_proc_groups(status), vec![958, 967, 990, 992, 998, 1000]);
+        // A process with no supplementary groups writes an empty line, and that
+        // is an answer, not a failure to parse.
+        assert!(parse_proc_groups("Name:\thyprpad\nGroups:\t\n").is_empty());
+        assert!(parse_proc_groups("Name:\thyprpad\n").is_empty());
+    }
+
+    #[test]
+    fn the_group_gid_is_read_off_an_etc_group_body() {
+        let group = "root:x:0:\nwheel:x:998:ajg\nhyprpad:x:949:ajg\ninput:x:994:ajg\n";
+        assert_eq!(parse_group_gid(group, "hyprpad"), Some(949));
+        assert_eq!(parse_group_gid(group, "wheel"), Some(998));
+        assert_eq!(parse_group_gid(group, "nosuch"), None);
+        // A name that is only a *prefix* of a real one must not match.
+        assert_eq!(parse_group_gid(group, "hyp"), None);
+    }
+
+    #[test]
+    fn the_cgroup_path_places_the_daemon_in_its_unit() {
+        let under = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hyprpad.service\n";
+        assert!(cgroup_names_unit(under, USER_UNIT_NAME));
+        // Hand-launched from a terminal: the session scope, not the unit.
+        let byhand = "0::/user.slice/user-1000.slice/session-2.scope\n";
+        assert!(!cgroup_names_unit(byhand, USER_UNIT_NAME));
+        // A segment must match whole, or a similarly-named unit answers for us.
+        let neighbour = "0::/user.slice/user-1000.slice/user@1000.service/not-hyprpad.service\n";
+        assert!(!cgroup_names_unit(neighbour, USER_UNIT_NAME));
+        assert!(!cgroup_names_unit("", USER_UNIT_NAME));
     }
 }

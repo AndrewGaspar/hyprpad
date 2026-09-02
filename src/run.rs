@@ -302,12 +302,20 @@ pub fn run() -> std::io::Result<()> {
     // Same cell, same frame, same reason: hyprpad's own gyro baseline, which the
     // relay then overrides for as long as Steam is asking for the IMU.
     crate::lizard::set_imu_preference(config.gamepad().imu_preference());
+    // And what the exit paths should do about lizard mode. Same shape as the two
+    // above and for the same reason: the exit runs from a signal-waiter thread
+    // and a `Drop` guard, neither of which can be handed a `Config`. Re-installed
+    // on every reload, below.
+    crate::lizard::set_restore_on_exit(config.restore_lizard_on_exit());
 
-    // When we own lizard we must give it back on the way out, or the firmware
+    // When we own lizard we normally give it back on the way out, or the firmware
     // keyboard/mouse stays dead and the user has no pointer until a power-cycle.
-    // Install the signal-driven restore early, so an immediate Ctrl-C is already
-    // covered, and pair it with a `_restore` guard that handles the normal-return
-    // and panic paths. The two never both fire: the signal path exits the process
+    // `restore_lizard_on_exit = false` deliberately opts out of that — the
+    // lizard-free boot of docs/12-lizard-free.md — but the wiring is the same
+    // either way, because the exit routine is what reads the knob. Install the
+    // signal-driven exit early, so an immediate Ctrl-C is already covered, and
+    // pair it with a `_restore` guard that handles the normal-return and panic
+    // paths. The two never both fire: the signal path exits the process
     // (skipping unwinding), the guard fires only when the function actually returns.
     let _restore = if own_lizard {
         crate::lizard::install_signal_restore();
@@ -3300,6 +3308,11 @@ fn apply_reload(
     // if ownership was already on, and immediately if it just came on.
     crate::lizard::set_power_settings(config.power_settings());
     crate::lizard::set_imu_preference(config.gamepad().imu_preference());
+    // The exit policy is re-read live too, so flipping `restore_lizard_on_exit`
+    // and reloading changes what the *next* exit does with no restart. The
+    // signal handler and the guard are installed once, at startup; both consult
+    // this cell at the moment they fire, which is what makes that work.
+    crate::lizard::set_restore_on_exit(config.restore_lizard_on_exit());
     // The gyro baseline is the one of the two a reload can make *urgent* — the
     // owner flipped `gyro` expecting to see IMU bytes — so ring the doorbell
     // rather than making them wait out a 30 s tick.

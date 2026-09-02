@@ -30,7 +30,7 @@
 //! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
 //! | `[osk_buttons]` | what buttons do while the on-screen keyboard is up — a key typed through it, or one of its own actions (`osk commit\|shift\|dismiss\|accept\|next`) — layered over the built-in Deck map ([`osk_builtins`]) |
 //! | `[keyboard]` | the on-screen keyboard's own settings ([`KeyboardConfig`]): `learn_deny`, the window classes its word predictor must never learn in |
-//! | `[daemon]` | daemon-wide switches (`own_lizard`, `steam_button_poweroff`, `sleep_inactivity_timeout`, `rescan_on_title_change`, `process_rescan_ms`) |
+//! | `[daemon]` | daemon-wide switches (`own_lizard`, `restore_lizard_on_exit`, `steam_button_poweroff`, `sleep_inactivity_timeout`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]); `guide_in = ["game"]` lists the modes where the pad drives the cursor *while the guide is held* |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
 //! | `[haptics]` | pad-actuator feedback: which events buzz, and how hard ([`HapticsConfig`]) |
@@ -1856,6 +1856,23 @@ pub struct Config {
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
     pub(crate) own_lizard: bool,
+    /// Whether a clean exit hands lizard mode back to the firmware. `true` (the
+    /// default) is the safety net: when hyprpad stops, the puck goes back to
+    /// typing arrows and moving a mouse by itself, so a stopped daemon never
+    /// leaves the controller inert. `false` is the **lizard-free boot** of
+    /// `docs/12-lizard-free.md`: exit leaves lizard mode DISABLED, so the puck
+    /// never types into the desktop between daemon restarts or at boot.
+    ///
+    /// The trade is the whole point and it is real: with `false`, a crashed or
+    /// stopped daemon leaves a puck that does nothing at all on the desktop
+    /// until hyprpad runs again. That is only acceptable when something
+    /// restarts it — which is what `packaging/systemd/user/hyprpad.service`
+    /// (`Restart=on-failure`) is for — and when the user still has a keyboard.
+    ///
+    /// Spelled `restore_lizard_on_exit` in `[daemon]` / `h.daemon`. Only ever
+    /// consulted when hyprpad owns lizard mode in the first place (`own_lizard`);
+    /// with ownership off there is nothing to restore.
+    pub(crate) restore_lizard_on_exit: bool,
     /// `SETTING_STEAMBUTTON_POWEROFF_TIME` (25) — how long the firmware wants
     /// the Steam button held before it powers the controller off. `None`, the
     /// default, writes nothing at all and leaves the firmware exactly as it is.
@@ -2059,6 +2076,8 @@ impl Config {
         let mut buttons = HashMap::new();
         let mut osk_buttons = HashMap::new();
         let mut own_lizard = false;
+        // Defaults TRUE: today's behaviour, the safety net. See the field docs.
+        let mut restore_lizard_on_exit = true;
         let mut steam_button_poweroff = None;
         let mut sleep_inactivity_timeout = None;
         let mut rescan_on_title_change = None;
@@ -2132,6 +2151,10 @@ impl Config {
                     match key.as_str() {
                         "own_lizard" => {
                             own_lizard = parse_bool(&unquote(v))
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "restore_lizard_on_exit" => {
+                            restore_lizard_on_exit = parse_bool(&unquote(v))
                                 .map_err(|e| format!("line {lineno}: {e}"))?;
                         }
                         "steam_button_poweroff" => {
@@ -2444,6 +2467,7 @@ impl Config {
             buttons,
             osk_buttons,
             own_lizard,
+            restore_lizard_on_exit,
             steam_button_poweroff,
             sleep_inactivity_timeout,
             rescan_on_title_change,
@@ -2591,6 +2615,15 @@ impl Config {
     /// section; default `false`.
     pub fn own_lizard(&self) -> bool {
         self.own_lizard
+    }
+
+    /// Whether a clean exit re-enables the firmware keyboard/mouse. `true` by
+    /// default (the safety net); `false` is the lizard-free boot — see the
+    /// `restore_lizard_on_exit` field docs and `docs/12-lizard-free.md`. Read
+    /// only when `own_lizard` is on: with ownership off, hyprpad never disabled
+    /// lizard mode and so has nothing to restore.
+    pub fn restore_lizard_on_exit(&self) -> bool {
+        self.restore_lizard_on_exit
     }
 
     /// The firmware power knobs to write alongside the lizard disable
@@ -3854,6 +3887,51 @@ r5 = "dispatch hl.dsp.window.close()"
         assert!(Config::from_toml_str("[daemon]\nnope = true\n")
             .unwrap_err()
             .contains("unknown [daemon] setting"));
+    }
+
+    #[test]
+    fn restore_lizard_on_exit_defaults_true_and_parses() {
+        // TRUE by default, and by the built-in config: the safety net stays on
+        // until a file deliberately turns it off. This is the assertion that
+        // fails if anyone ever "tidies" the default to match `own_lizard`.
+        assert!(Config::load_default().restore_lizard_on_exit());
+        assert!(Config::from_toml_str("[bindings]\n\"guide+a\" = \"fullscreen\"\n")
+            .unwrap()
+            .restore_lizard_on_exit());
+        // A [daemon] section that says nothing about it still leaves it on.
+        assert!(Config::from_toml_str("[daemon]\nown_lizard = true\n")
+            .unwrap()
+            .restore_lizard_on_exit());
+
+        // The lizard-free setting, alongside the ownership it only means
+        // anything with, and the bindings still parse.
+        let c = Config::from_toml_str(
+            "[daemon]\nown_lizard = true\nrestore_lizard_on_exit = false\n\
+             [bindings]\n\"guide+a\" = \"fullscreen\"\n",
+        )
+        .unwrap();
+        assert!(c.own_lizard());
+        assert!(!c.restore_lizard_on_exit());
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::A)),
+            Action::ToggleFullscreen
+        );
+
+        // The same spellings `own_lizard` accepts, since it is the same parser.
+        assert!(!Config::from_toml_str("[daemon]\nrestore_lizard_on_exit = off\n")
+            .unwrap()
+            .restore_lizard_on_exit());
+        assert!(!Config::from_toml_str("[daemon]\nrestore_lizard_on_exit = 0\n")
+            .unwrap()
+            .restore_lizard_on_exit());
+        assert!(Config::from_toml_str("[daemon]\nrestore_lizard_on_exit = true\n")
+            .unwrap()
+            .restore_lizard_on_exit());
+
+        // And a bad value is reported, not silently taken as "leave it on".
+        assert!(Config::from_toml_str("[daemon]\nrestore_lizard_on_exit = sometimes\n")
+            .unwrap_err()
+            .contains("boolean"));
     }
 
     #[test]

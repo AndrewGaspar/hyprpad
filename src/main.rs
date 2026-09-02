@@ -40,12 +40,14 @@ fn main() {
             // `setup`         install the user-level hook and PRINT the root
             //                 host-integration steps (never run them);
             // `setup --check` report, read-only, on the host integration;
-            // `setup --print` only print the root steps;
+            // `setup --print` only print the root steps (plus the user unit);
+            // `setup --user`  only print the systemd user unit's install;
             // `setup --revert` uninstall the user-level hook.
             let mode = match args.get(2).map(String::as_str) {
                 None => setup::Mode::Install,
                 Some("--check") => setup::Mode::Check,
                 Some("--print") => setup::Mode::Print,
+                Some("--user") => setup::Mode::User,
                 Some("--revert") => setup::Mode::Revert,
                 Some(other) => {
                     eprintln!("hyprpad setup: unknown argument {other:?}");
@@ -77,7 +79,7 @@ fn main() {
             eprintln!("  bindings [--json] print the current bindings (the cheat sheet's data)");
             eprintln!("  puck-settings [id…]  read firmware settings off the puck (read-only)");
             eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
-            eprintln!("  setup [--check]  install the Steam hook; print the root host-integration steps");
+            eprintln!("  setup [--check|--user]  install the Steam hook; print the host and login steps");
             eprintln!("  broker           privileged fd helper (root, socket-activated; see setup)");
             std::process::exit(2);
         }

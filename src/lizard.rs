@@ -978,12 +978,81 @@ pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
     ))
 }
 
-/// Best-effort lizard restore for the exit paths: re-enable lizard mode and log
-/// the outcome (never propagate the error — the process is on its way out).
+// ---------------------------------------------------------------------------
+// What the exit paths do about lizard mode — `docs/12-lizard-free.md` step 1
+// ---------------------------------------------------------------------------
+
+/// What an exit does about lizard mode. Two states, decided by one config knob,
+/// and named so the choice can be tested without a controller in the room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitAction {
+    /// Hand the puck back to its firmware: re-enable the keyboard/mouse
+    /// emulation so a stopped daemon never leaves the controller inert. The
+    /// default, and every release before the knob existed.
+    Restore,
+    /// Leave lizard mode **disabled** — the lizard-free boot. The puck stays
+    /// silent on the desktop between daemon restarts, which is the point: no
+    /// firmware arrow keys typing into whatever has focus while nothing owns
+    /// the controller. The cost is that a crashed or stopped daemon leaves a
+    /// puck that does nothing at all until hyprpad runs again, which is why
+    /// this pairs with a user unit that restarts it
+    /// (`packaging/systemd/user/hyprpad.service`).
+    LeaveDisabled,
+}
+
+impl ExitAction {
+    /// The decision, from the knob alone — pure, so both branches are a test
+    /// rather than a thing you can only find out by killing the daemon.
+    ///
+    /// `restore_on_exit` is `Config::restore_lizard_on_exit`, default `true`.
+    pub fn decide(restore_on_exit: bool) -> ExitAction {
+        if restore_on_exit {
+            ExitAction::Restore
+        } else {
+            ExitAction::LeaveDisabled
+        }
+    }
+
+    /// Whether this action writes anything to the controller at all.
+    pub fn writes_to_the_puck(self) -> bool {
+        matches!(self, ExitAction::Restore)
+    }
+}
+
+/// Whether a clean exit hands lizard mode back to the firmware. `true` is the
+/// historical behaviour and the default; [`set_restore_on_exit`] is how
+/// `[daemon] restore_lizard_on_exit` reaches the exit paths, which run from a
+/// signal-waiter thread and a `Drop` guard and so cannot be handed a `Config`.
+static RESTORE_ON_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Install the exit policy. Called on startup and on every live reload, exactly
+/// like [`set_power_settings`].
+pub fn set_restore_on_exit(restore: bool) {
+    RESTORE_ON_EXIT.store(restore, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The exit policy as it stands now.
+pub fn restore_on_exit() -> bool {
+    RESTORE_ON_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Best-effort lizard handling for the exit paths: do whatever
+/// [`ExitAction::decide`] says and log the outcome (never propagate the error —
+/// the process is on its way out).
 pub fn restore_lizard_on_exit() {
-    match enable_lizard_mode() {
-        Ok(()) => eprintln!("hyprpad: lizard mode re-enabled on exit (firmware kbd/mouse restored)"),
-        Err(e) => eprintln!("hyprpad: best-effort lizard restore on exit skipped: {e}"),
+    match ExitAction::decide(restore_on_exit()) {
+        ExitAction::Restore => match enable_lizard_mode() {
+            Ok(()) => eprintln!(
+                "hyprpad: lizard mode re-enabled on exit (firmware kbd/mouse restored)"
+            ),
+            Err(e) => eprintln!("hyprpad: best-effort lizard restore on exit skipped: {e}"),
+        },
+        ExitAction::LeaveDisabled => eprintln!(
+            "hyprpad: leaving lizard mode DISABLED on exit \
+             (restore_lizard_on_exit = false) — the puck does nothing on the \
+             desktop until hyprpad runs again"
+        ),
     }
 }
 
@@ -1075,12 +1144,14 @@ pub fn own_lizard_loop() {
     }
 }
 
-/// RAII guard that restores lizard mode when it drops. Owning one for the life
-/// of [`crate::run::run`] covers the *normal* exit paths: a clean return and a
-/// panic unwinding out of the daemon both run this destructor. Signal-driven
-/// exit (Ctrl-C / SIGTERM) does **not** unwind, so it is handled separately by
-/// [`install_signal_restore`], whose waiter calls `std::process::exit` before
-/// this guard could run — the two paths never both fire.
+/// RAII guard that settles lizard mode when it drops — restoring it, or
+/// deliberately leaving it disabled, per [`ExitAction::decide`]. Owning one for
+/// the life of [`crate::run::run`] covers the *normal* exit paths: a clean
+/// return and a panic unwinding out of the daemon both run this destructor.
+/// Signal-driven exit (Ctrl-C / SIGTERM) does **not** unwind, so it is handled
+/// separately by [`install_signal_restore`], whose waiter calls
+/// `std::process::exit` before this guard could run — the two paths never both
+/// fire.
 pub struct LizardRestoreGuard;
 
 impl Drop for LizardRestoreGuard {
@@ -1104,8 +1175,8 @@ extern "C" fn on_exit_signal(sig: libc::c_int) {
     }
 }
 
-/// Install SIGINT/SIGTERM handling that restores lizard mode before the process
-/// dies.
+/// Install SIGINT/SIGTERM handling that settles lizard mode before the process
+/// dies — restoring it, or leaving it disabled, per [`ExitAction::decide`].
 ///
 /// A `Drop` guard cannot cover a signal, because a signal terminates the process
 /// without unwinding — and the real restore (`open`/`ioctl`/allocation/logging)
@@ -1150,7 +1221,10 @@ pub fn install_signal_restore() {
         let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
         let sig = if n == 1 { libc::c_int::from(byte[0]) } else { 0 };
         if sig != 0 {
-            eprintln!("hyprpad: caught signal {sig}, restoring lizard mode before exit");
+            // What happens to lizard mode is the knob's call, not this line's,
+            // so say only what is certain here and let the exit routine report
+            // which of the two things it actually did.
+            eprintln!("hyprpad: caught signal {sig}, settling lizard mode before exit");
         }
         restore_lizard_on_exit();
         std::process::exit(128 + sig);
@@ -1160,6 +1234,49 @@ pub fn install_signal_restore() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- what an exit does about lizard mode (docs/12-lizard-free.md) -------
+
+    /// The default, and every release before the knob existed: a clean exit
+    /// hands the firmware keyboard/mouse back, so a stopped daemon never leaves
+    /// the controller inert.
+    #[test]
+    fn the_default_exit_restores_lizard_mode() {
+        assert_eq!(ExitAction::decide(true), ExitAction::Restore);
+        assert!(ExitAction::decide(true).writes_to_the_puck());
+    }
+
+    /// The lizard-free boot: exit leaves lizard mode DISABLED, so the puck never
+    /// types into the desktop between daemon restarts. The cost — a stopped
+    /// daemon means a puck that does nothing — is the trade the knob exists to
+    /// let an owner make, and it is why this pairs with a restarting user unit.
+    #[test]
+    fn the_lizard_free_exit_leaves_it_disabled_and_touches_nothing() {
+        assert_eq!(ExitAction::decide(false), ExitAction::LeaveDisabled);
+        assert!(
+            !ExitAction::decide(false).writes_to_the_puck(),
+            "the lizard-free exit must not write to the controller at all"
+        );
+    }
+
+    /// The knob is the only input to the decision, and it round-trips through
+    /// the cell the exit paths actually read — the signal waiter and the `Drop`
+    /// guard cannot be handed a `Config`, so this cell is the whole contract.
+    /// (The *default* is a config-layer fact, tested there; what this pins is
+    /// that setting the cell is what the exit paths then see.)
+    #[test]
+    fn the_exit_policy_cell_round_trips_the_knob() {
+        for wanted in [false, true, false, true] {
+            set_restore_on_exit(wanted);
+            assert_eq!(restore_on_exit(), wanted);
+            assert_eq!(
+                ExitAction::decide(restore_on_exit()),
+                if wanted { ExitAction::Restore } else { ExitAction::LeaveDisabled }
+            );
+        }
+        // Leave the process-wide cell as the rest of the suite expects it.
+        set_restore_on_exit(true);
+    }
 
     #[test]
     fn wire_length_is_64() {
