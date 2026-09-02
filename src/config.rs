@@ -28,7 +28,7 @@
 //! |---|---|
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
 //! | `[buttons]` | bare buttons -> any action: a key or mouse button is held with the button, anything else fires on the press edge (D-pad = arrows, pad click / triggers = clicks by default) |
-//! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
+//! | `[osk_buttons]` | what buttons do while the on-screen keyboard is up — a key typed through it, or one of its own actions (`osk commit\|shift\|dismiss`) — layered over the built-in Deck map ([`osk_builtins`]) |
 //! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
 //! | `[scroll]` | left-pad scroll mode and feel ([`ScrollConfig`]) |
@@ -166,6 +166,18 @@ impl Action {
                 }
             }
             "keyboard" | "osk" => {
+                // `osk commit|shift|dismiss` is one of the keyboard's OWN
+                // actions — an `[osk_buttons]` binding, live only while it is
+                // up — not a chord action. Say so, rather than reporting an
+                // unknown keyboard option.
+                if let Some(word) = rest.split_whitespace().next() {
+                    if osk_verb(word).is_some() {
+                        return Err(format!(
+                            "'osk {word}' is an on-screen keyboard binding, not an action: \
+                             it belongs in [osk_buttons] (h.osk_button)"
+                        ));
+                    }
+                }
                 // Grammar: `keyboard [bottom|split] [overlay|reflow]`. Both
                 // words optional; overlay (float over the desktop) is the
                 // default presentation, matching the OSK's own default.
@@ -265,6 +277,115 @@ impl ButtonAction {
             ButtonAction::Fire(a) => a.clone(),
         }
     }
+}
+
+/// What a button does while the on-screen keyboard is up (`[osk_buttons]` /
+/// `h.osk_button`).
+///
+/// The keyboard has three verbs of its own, plus a key typed through it. Every
+/// behaviour the daemon used to hardwire while the keyboard owned the pads is
+/// one of these, so the built-in map ([`osk_builtins`]) and a config's entries
+/// are the same kind of thing and layer cleanly ([`Config::osk_buttons_in`]).
+/// None of them means anything on a chord or a bare button: the keyboard is
+/// not up there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OskAction {
+    /// Tap this raw evdev key through the keyboard's own virtual keyboard
+    /// (`key space`, `h.key "space"`): the Deck's Y = Space, X = Backspace,
+    /// R2 = Enter. Never a mouse button — there is no pointer in a keyboard.
+    Key(u16),
+    /// Type the key under the cursor of the pad on this button's side of the
+    /// puck (`osk commit`, `h.osk "commit"`): the pad clicks.
+    Commit,
+    /// Hold Shift for as long as the button is down (`osk shift`,
+    /// `h.osk "shift"`): the Deck's L2. Momentary, like the key itself — it
+    /// forces the shifted level while held and leaves the keyboard's own
+    /// one-shot/caps latch exactly as it was.
+    Shift,
+    /// Close the keyboard (`osk dismiss`, `h.osk "dismiss"`; `close` and
+    /// `hide` are aliases): B and Menu.
+    Dismiss,
+    /// Nothing — how a config takes a built-in away from a button
+    /// (`menu = "none"`, `h.osk_button("menu", h.none())`).
+    None,
+}
+
+/// The error for a mouse button in the keyboard's table, worded for both
+/// front-ends: the TOML section and the Lua call each get named.
+const OSK_MOUSE_ERR: &str = "osk_buttons send keys through the on-screen keyboard; a mouse \
+                             button makes no sense there — bind it in [buttons] / h.button instead";
+
+impl OskAction {
+    /// Parse an `[osk_buttons]` value: `key <name>`, `osk <commit|shift|dismiss>`,
+    /// or `none`. The `key` half is [`Action::parse`]'s own grammar, so a key
+    /// is spelled the same in every table.
+    pub fn parse(s: &str) -> Result<OskAction, String> {
+        let s = s.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("none") {
+            return Ok(OskAction::None);
+        }
+        let (verb, rest) = match s.split_once(char::is_whitespace) {
+            Some((v, r)) => (v, r.trim()),
+            None => (s, ""),
+        };
+        match verb.to_ascii_lowercase().as_str() {
+            "osk" => osk_verb(rest).ok_or_else(|| {
+                format!("unknown on-screen keyboard action '{rest}' (want osk commit|shift|dismiss)")
+            }),
+            "key" | "mouse" | "click" => match Action::parse(s)? {
+                Action::Key(code) if is_mouse_code(code) => Err(OSK_MOUSE_ERR.to_string()),
+                Action::Key(code) => Ok(OskAction::Key(code)),
+                other => Err(format!("'{s}' is not a key ({other:?})")),
+            },
+            _ => Err("osk_buttons values must be a 'key <name>', one of the keyboard's own \
+                      actions ('osk commit|shift|dismiss'), or none"
+                .to_string()),
+        }
+    }
+}
+
+/// The keyboard's own verbs by their config word (`osk <word>`).
+fn osk_verb(word: &str) -> Option<OskAction> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "commit" | "type" => Some(OskAction::Commit),
+        "shift" => Some(OskAction::Shift),
+        "dismiss" | "close" | "hide" => Some(OskAction::Dismiss),
+        _ => None,
+    }
+}
+
+/// What the buttons do while the on-screen keyboard is up before a config says
+/// otherwise — the Steam Deck's own keyboard map, so the puck reads like the
+/// Deck: `(button, action, cheat-sheet label)`.
+///
+/// | button | does |
+/// |---|---|
+/// | left / right pad click | type the key under that pad's cursor |
+/// | L2 (full pull) | hold Shift |
+/// | R2 (full pull) | Enter |
+/// | Y | Space |
+/// | X | Backspace |
+/// | B, Menu | close the keyboard |
+///
+/// These are always on: a config's `osk_buttons` are layered **over** them
+/// ([`Config::osk_buttons_in`]), never in place of them, so a config that lists
+/// only `y = "key space"` keeps the pad clicks committing and B closing without
+/// saying so, and a built-in is taken away by binding its button to `none`.
+pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'static str)> {
+    use report::Button::*;
+    // KEY_ENTER / KEY_SPACE / KEY_BACKSPACE, as `key_code` spells them; a test
+    // pins the two together.
+    [
+        (PadLeftClick, OskAction::Commit, "Type the key under the cursor"),
+        (PadRightClick, OskAction::Commit, "Type the key under the cursor"),
+        (TriggerL2Full, OskAction::Shift, "Shift (hold)"),
+        (TriggerR2Full, OskAction::Key(28), "Enter"),
+        (Y, OskAction::Key(57), "Space"),
+        (X, OskAction::Key(14), "Backspace"),
+        (B, OskAction::Dismiss, "Close the keyboard"),
+        (Menu, OskAction::Dismiss, "Close the keyboard"),
+    ]
+    .into_iter()
 }
 
 /// The normalized binding key a gesture event resolves against.
@@ -847,11 +968,14 @@ pub struct Config {
     /// from `bindings`, which are guide chords. The default maps the D-pad to
     /// the arrow keys and the pad click / triggers to mouse clicks.
     pub(crate) buttons: HashMap<report::Button, ButtonAction>,
-    /// OSK-helper buttons (the `[osk_buttons]` section): while the on-screen
-    /// keyboard is up, these buttons send a raw key THROUGH the OSK (its uinput
-    /// types it), Deck-style. Default: `Y` = Space, `X` = Backspace. Distinct
-    /// from `buttons`, which fire only when the OSK is down.
-    pub(crate) osk_buttons: HashMap<report::Button, u16>,
+    /// What the config says a button does while the on-screen keyboard is up
+    /// (the `[osk_buttons]` section) — a key typed THROUGH the OSK (its uinput
+    /// types it) or one of the keyboard's own actions ([`OskAction`]). Only
+    /// what the config wrote: the built-in Deck map these are layered over is
+    /// [`osk_builtins`], and the result of the layering is
+    /// [`Config::osk_buttons_in`]. Distinct from `buttons`, which are live only
+    /// when the OSK is down.
+    pub(crate) osk_buttons: HashMap<report::Button, OskAction>,
     /// Whether hyprpad should take ownership of the puck's lizard mode and keep
     /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
     /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
@@ -950,9 +1074,15 @@ rpad_click = "mouse left"
 r2 = "mouse left"
 l2 = "mouse right"
 
-# OSK helper buttons: while the on-screen keyboard is up, these send a raw key
-# THROUGH the OSK (its virtual keyboard types it), like the Steam Deck's
-# keyboard chords. Y taps Space, X taps Backspace — no cursor hunting.
+# What buttons do while the on-screen keyboard is up. The Steam Deck's own map
+# is built in and always on: a pad click types the key under that pad's cursor
+# ("osk commit"), L2 holds Shift ("osk shift" — momentary, the keyboard's own
+# one-shot/caps latch is untouched), R2 is Enter, Y is Space, X is Backspace,
+# and B or Menu close it ("osk dismiss"). Entries here are layered OVER that
+# map, one button at a time, never in place of it: rebind a button with a
+# "key <name>" (typed THROUGH the OSK) or an "osk commit|shift|dismiss", or
+# take a built-in away with "none" (menu = "none"). The two below restate the
+# built-ins, as a worked example of the syntax.
 [osk_buttons]
 y = "key space"
 x = "key backspace"
@@ -1044,34 +1174,16 @@ impl Config {
                         .map_err(|e| format!("line {lineno}: {e}"))?;
                     buttons.insert(button, action);
                 }
-                // OSK helper buttons: while the on-screen keyboard is up, the
-                // button sends its key THROUGH the OSK (Deck-style Y=Space,
-                // X=Backspace). Same button names and `key <name>` values.
+                // The on-screen keyboard's table: what a button does while it
+                // is up. Same button names; the values are `OskAction`'s own
+                // grammar (a key typed THROUGH the OSK, or `osk commit|shift|
+                // dismiss`), layered over the built-in Deck map.
                 "osk_buttons" => {
                     let button = parse_button(&unquote(k).trim().to_ascii_lowercase())
                         .map_err(|e| format!("line {lineno}: {e}"))?;
-                    let action = Action::parse(&unquote(v))
+                    let action = OskAction::parse(&unquote(v))
                         .map_err(|e| format!("line {lineno}: {e}"))?;
-                    match action {
-                        // The OSK types a key by name through its own virtual
-                        // keyboard; a mouse button has no meaning there (and
-                        // the OSK already owns the pad clicks as key commits).
-                        Action::Key(code) if is_mouse_code(code) => {
-                            return Err(format!(
-                                "line {lineno}: osk_buttons send keys through the on-screen \
-                                 keyboard; a mouse button makes no sense there — bind it in \
-                                 [buttons]"
-                            ));
-                        }
-                        Action::Key(code) => {
-                            osk_buttons.insert(button, code);
-                        }
-                        _ => {
-                            return Err(format!(
-                                "line {lineno}: [osk_buttons] values must be a 'key <name>' action"
-                            ));
-                        }
-                    }
+                    osk_buttons.insert(button, action);
                 }
                 // Daemon-wide settings (not gesture bindings).
                 "daemon" => {
@@ -1350,10 +1462,11 @@ impl Config {
         &self.buttons
     }
 
-    /// The OSK helper buttons (`[osk_buttons]` section): while the on-screen
-    /// keyboard is up, each of these taps its key through the OSK's virtual
-    /// keyboard (Deck-style; default `Y` = Space, `X` = Backspace).
-    pub fn osk_buttons(&self) -> &HashMap<report::Button, u16> {
+    /// What the config itself says a button does while the on-screen keyboard
+    /// is up (`[osk_buttons]` section) — its entries only, before the built-in
+    /// Deck map is layered underneath. What the keyboard actually gets is
+    /// [`osk_buttons_in`](Self::osk_buttons_in).
+    pub fn osk_buttons(&self) -> &HashMap<report::Button, OskAction> {
         &self.osk_buttons
     }
 
@@ -1470,9 +1583,25 @@ impl Config {
         live
     }
 
-    /// The OSK-helper map filtered to the bindings live in `st`.
-    pub fn osk_buttons_in(&self, st: &ModeState) -> HashMap<report::Button, u16> {
-        filter_buttons(&self.osk_buttons, &self.osk_button_guards, st)
+    /// What the buttons do while the on-screen keyboard is up, in `st`: the
+    /// built-in Deck map ([`osk_builtins`]) with the config's `osk_buttons`
+    /// layered over it. A config entry replaces the built-in for its button —
+    /// with nothing, when it is `none` — and an entry whose guard fails in
+    /// `st` lets the built-in show through, so a helper guarded into one mode
+    /// never leaves its button dead in the others.
+    pub fn osk_buttons_in(&self, st: &ModeState) -> HashMap<report::Button, OskAction> {
+        let mut live: HashMap<_, _> = osk_builtins().map(|(b, a, _)| (b, a)).collect();
+        for (b, a) in filter_buttons(&self.osk_buttons, &self.osk_button_guards, st) {
+            match a {
+                OskAction::None => {
+                    live.remove(&b);
+                }
+                a => {
+                    live.insert(b, a);
+                }
+            }
+        }
+        live
     }
 
     /// Whether the right pad drives the desktop cursor in `st`
@@ -2018,6 +2147,100 @@ mod tests {
     }
 
     #[test]
+    fn osk_actions_parse_the_keyboards_own_verbs_and_keys() {
+        use OskAction::*;
+        assert_eq!(OskAction::parse("osk commit"), Ok(Commit));
+        assert_eq!(OskAction::parse("osk type"), Ok(Commit));
+        assert_eq!(OskAction::parse("OSK Shift"), Ok(Shift));
+        assert_eq!(OskAction::parse("osk dismiss"), Ok(Dismiss));
+        assert_eq!(OskAction::parse("osk close"), Ok(Dismiss));
+        assert_eq!(OskAction::parse("osk hide"), Ok(Dismiss));
+        assert_eq!(OskAction::parse("key space"), Ok(Key(57)));
+        assert_eq!(OskAction::parse("  key enter "), Ok(Key(28)));
+        assert_eq!(OskAction::parse("none"), Ok(None));
+        assert_eq!(OskAction::parse(""), Ok(None));
+
+        let e = OskAction::parse("osk frobnicate").unwrap_err();
+        assert!(e.contains("commit|shift|dismiss"), "{e}");
+        assert!(OskAction::parse("osk").is_err(), "a bare `osk` is not a binding");
+        for not_a_binding in ["exec foo", "keyboard split", "workspace +1", "set_mode game"] {
+            let e = OskAction::parse(not_a_binding).unwrap_err();
+            assert!(e.contains("osk_buttons values must be"), "{not_a_binding}: {e}");
+        }
+        assert!(OskAction::parse("key frobnicate").unwrap_err().contains("unknown key"));
+    }
+
+    #[test]
+    fn the_keyboards_own_verbs_are_not_chord_actions() {
+        // `osk` alone still toggles the keyboard, and takes its layout words…
+        assert_eq!(
+            Action::parse("osk"),
+            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: false })
+        );
+        assert_eq!(
+            Action::parse("osk split reflow"),
+            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: true })
+        );
+        // …but its own verbs are bindings for [osk_buttons], and the error
+        // says where they go instead of calling `commit` a bad layout.
+        for verb in ["commit", "shift", "dismiss"] {
+            let e = Action::parse(&format!("osk {verb}")).unwrap_err();
+            assert!(e.contains("[osk_buttons]"), "{e}");
+            assert!(e.contains("not an action"), "{e}");
+        }
+        assert!(Action::parse("keyboard commit").is_err());
+    }
+
+    #[test]
+    fn the_keyboards_built_in_map_is_the_decks_and_a_config_layers_over_it() {
+        use OskAction::*;
+        let anywhere = ModeState::new("whatever", vec![]);
+        // Names and codes agree with the key table the config grammar uses.
+        for (b, what, _) in osk_builtins() {
+            match (b, what) {
+                (Button::TriggerR2Full, Key(c)) => assert_eq!(c, key_code("enter").unwrap()),
+                (Button::Y, Key(c)) => assert_eq!(c, key_code("space").unwrap()),
+                (Button::X, Key(c)) => assert_eq!(c, key_code("backspace").unwrap()),
+                (Button::PadLeftClick | Button::PadRightClick, Commit) => {}
+                (Button::TriggerL2Full, Shift) => {}
+                (Button::B | Button::Menu, Dismiss) => {}
+                other => panic!("unexpected built-in {other:?}"),
+            }
+        }
+        assert_eq!(osk_builtins().count(), 8);
+
+        // No config at all: the built-ins are what the keyboard gets.
+        let bare = Config::from_toml_str("").expect("empty config");
+        assert!(bare.osk_buttons().is_empty());
+        let live = bare.osk_buttons_in(&anywhere);
+        assert_eq!(live.get(&Button::TriggerL2Full), Some(&Shift));
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&Key(28)));
+        assert_eq!(live.get(&Button::PadLeftClick), Some(&Commit));
+        assert_eq!(live.get(&Button::B), Some(&Dismiss));
+        assert_eq!(live.len(), 8);
+
+        // The owner's config restates Y and X and lists nothing else: the pad
+        // clicks, the triggers and B/Menu are all still there.
+        let owner = Config::from_toml_str("[osk_buttons]\ny = \"key space\"\nx = \"key backspace\"\n")
+            .expect("parse");
+        assert_eq!(owner.osk_buttons_in(&anywhere), live);
+
+        // A config rebinds a built-in, adds a button, and takes one away.
+        let c = Config::from_toml_str(
+            "[osk_buttons]\nr2 = \"osk commit\"\nl1 = \"key tab\"\nmenu = \"none\"\n",
+        )
+        .expect("parse");
+        assert_eq!(c.osk_buttons().get(&Button::Menu), Some(&None), "the raw table keeps `none`");
+        let live = c.osk_buttons_in(&anywhere);
+        assert_eq!(live.get(&Button::TriggerR2Full), Some(&Commit), "rebound over the built-in");
+        assert_eq!(live.get(&Button::BumperL1), Some(&Key(15)), "added");
+        assert_eq!(live.get(&Button::Menu), Option::None, "taken away, nothing in its place");
+        assert_eq!(live.get(&Button::B), Some(&Dismiss), "the other built-ins survive");
+        assert_eq!(live.get(&Button::TriggerL2Full), Some(&Shift));
+        assert_eq!(live.len(), 8, "one in, one out");
+    }
+
+    #[test]
     fn buttons_section_parses_aliases_and_reports_errors() {
         // Uses the same button-name aliases as the guide chords, plus a
         // non-D-pad button; a `key <name>` value is held with the button.
@@ -2547,7 +2770,13 @@ rumble_intensity = 0.25
         // engine a no-op for an existing config.
         let anywhere = ModeState::new("whatever", vec![]);
         assert_eq!(c.buttons_in(&anywhere), *c.buttons());
-        assert_eq!(c.osk_buttons_in(&anywhere), *c.osk_buttons());
+        // The keyboard's table is the config's entries over the built-ins, and
+        // with no guards every entry is in.
+        let osk = c.osk_buttons_in(&anywhere);
+        for (b, what) in c.osk_buttons() {
+            assert_eq!(osk.get(b), Some(what));
+        }
+        assert!(osk.len() >= c.osk_buttons().len());
         assert!(c.cursor_enabled_in(&anywhere) && c.scroll_enabled_in(&anywhere));
         assert_eq!(c.gesture_guard(&GestureEvent::GuideChord(Button::A)), &Guard::Always);
     }

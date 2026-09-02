@@ -36,7 +36,10 @@ use wayland_client::{
 };
 
 use crate::control::{Channel, Command};
-use crate::layout::{Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, ShiftState};
+use crate::layout::{
+    Key, Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, ShiftModel,
+    ShiftState,
+};
 use crate::output::VirtualKeyboard;
 use crate::render::{self, Canvas, Chrome, Cursor, Highlight, HighlightKind};
 use crate::surface;
@@ -134,8 +137,9 @@ pub struct Osk {
     right_norm: Option<(f32, f32)>,
     left_px: Option<(f32, f32)>,
     right_px: Option<(f32, f32)>,
-    // Shift/caps state machine ({Off, OneShot, Stuck}, osk-technology.md §4.6).
-    shift: ShiftState,
+    // The shift level: the {Off, OneShot, Stuck} latch the on-screen keys drive
+    // plus the daemon's held (momentary) shift, osk-technology.md §4.6.
+    shift: ShiftModel,
     trackpad_scale: f32,
 
     pub exit: bool,
@@ -180,7 +184,7 @@ impl Osk {
             right_norm: None,
             left_px: None,
             right_px: None,
-            shift: ShiftState::Off,
+            shift: ShiftModel::default(),
             trackpad_scale: 1.0,
             exit: false,
         };
@@ -265,6 +269,7 @@ impl Osk {
             Command::Cursor { pad, nx, ny } => self.update_cursor(pad, nx, ny),
             Command::Commit { pad } => self.commit(pad, qh),
             Command::Shift { state } => self.set_shift(state),
+            Command::ShiftHeld { down } => self.set_held_shift(down),
             Command::Layer { target } => self.set_layer(target.unwrap_or_else(|| self.layer.toggled())),
             Command::Reflow { on } => self.set_reflow(on, qh),
             Command::Key { keycode } => self.type_keycode(keycode),
@@ -329,6 +334,10 @@ impl Osk {
         }
         self.panels.clear();
         self.reset_pad_state();
+        // A held shift belongs to a button the daemon was holding while the
+        // keyboard was up; it cannot outlive the keyboard. The latch can — a
+        // re-show keeps Caps — so only the held bit is dropped.
+        self.shift = self.shift.with_held(false);
     }
 
     /// Clear both pads' focus and cursor state (on show/hide/layer swap).
@@ -457,10 +466,10 @@ impl Osk {
         let key = self.keyboard.keys[k].clone();
         match key.role {
             KeyRole::Shift => {
-                self.shift = self.shift.cycle_shift(); // Off→OneShot→Stuck→Off (§4.6)
+                self.shift = self.shift.tap_shift(); // Off→OneShot→Stuck→Off (§4.6)
             }
             KeyRole::Caps => {
-                self.shift = self.shift.toggle_caps(); // Off↔Stuck (§4.6)
+                self.shift = self.shift.tap_caps(); // Off↔Stuck (§4.6)
             }
             KeyRole::LayerToggle => {
                 self.set_layer(self.layer.toggled());
@@ -470,23 +479,14 @@ impl Osk {
                 self.set_reflow(!self.reflow, qh);
                 return; // set_reflow recreates the surface(s)
             }
-            KeyRole::Meta => {
-                // Arrows and other meta keys with a real keycode tap it; keycode
-                // 0 (emoji/close) stays inert (§4.6, deferred).
-                if key.keycode != 0 {
-                    self.tap(key.keycode, false);
+            KeyRole::Char | KeyRole::Meta | KeyRole::Backspace | KeyRole::Enter | KeyRole::Tab
+            | KeyRole::Space => {
+                if let Some((code, shifted)) = keystroke_for(&key, self.shift) {
+                    self.tap(code, shifted);
                 }
-            }
-            KeyRole::Char => {
-                // A single boolean drives both the drawn legend and the output,
-                // so the committed character matches what the key shows. A
-                // symbols-layer key can force shift (e.g. `!` from KEY_1).
-                let shift = self.shift.is_active() || key.force_shift;
-                self.tap(key.keycode, shift);
-                self.shift = self.shift.after_char(); // one-shot clears
-            }
-            KeyRole::Backspace | KeyRole::Enter | KeyRole::Tab | KeyRole::Space => {
-                self.tap(key.keycode, false);
+                if key.role == KeyRole::Char {
+                    self.shift = self.shift.after_char(); // one-shot clears
+                }
             }
         }
         self.rebuild_highlights();
@@ -563,10 +563,21 @@ impl Osk {
         }
     }
 
-    /// Set the shift/caps state directly (control channel) and redraw so the
-    /// legends and the Shift/Caps indicator update.
+    /// Set the latched shift/caps state directly (control channel) and redraw so
+    /// the legends and the Shift/Caps indicator update.
     fn set_shift(&mut self, state: ShiftState) {
-        self.shift = state;
+        self.shift = self.shift.with_latched(state);
+        self.mark_all_dirty();
+    }
+
+    /// Hold or release the physical shift (`shift down` / `shift up`): the
+    /// legends re-render shifted for as long as the daemon holds it, and every
+    /// commit in between types the shifted glyph. The latch is untouched.
+    fn set_held_shift(&mut self, down: bool) {
+        if self.shift.held == down {
+            return;
+        }
+        self.shift = self.shift.with_held(down);
         self.mark_all_dirty();
     }
 
@@ -936,9 +947,74 @@ delegate_shm!(Osk);
 delegate_layer!(Osk);
 delegate_registry!(Osk);
 
+/// What committing `key` types, as `(keycode, with Shift held)`, under the live
+/// shift level — or `None` for a key that changes state instead of typing
+/// (Shift, Caps, the layer and display toggles) and for an inert meta key
+/// (`keycode == 0`: emoji/close, §4.6, deferred). A character key follows the
+/// level so the committed glyph always matches the drawn legend; the editing
+/// keys and arrows never take Shift. Pure, so the effect of the daemon's
+/// `shift down` on what a commit produces is unit-testable without a display.
+pub(crate) fn keystroke_for(key: &Key, shift: ShiftModel) -> Option<(u16, bool)> {
+    match key.role {
+        KeyRole::Char => Some((key.keycode, shift.commits_shifted(key))),
+        KeyRole::Meta | KeyRole::Backspace | KeyRole::Enter | KeyRole::Tab | KeyRole::Space => {
+            (key.keycode != 0).then_some((key.keycode, false))
+        }
+        KeyRole::Shift | KeyRole::Caps | KeyRole::LayerToggle | KeyRole::DisplayToggle => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{parse, Command};
+
+    /// Apply a parsed shift command to a level, the way `handle` does.
+    fn apply(shift: ShiftModel, line: &str) -> ShiftModel {
+        match parse(line).expect("a shift command") {
+            Command::Shift { state } => shift.with_latched(state),
+            Command::ShiftHeld { down } => shift.with_held(down),
+            other => panic!("not a shift command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_held_shift_command_changes_what_a_commit_types() {
+        let kb = Keyboard::qwerty();
+        let key = |label: &str| kb.keys.iter().find(|k| k.label == label).unwrap();
+        let (a, one, space) = (key("a"), key("1"), key("Space"));
+
+        let level = ShiftModel::default();
+        assert_eq!(keystroke_for(a, level), Some((30, false)));
+        assert_eq!(keystroke_for(one, level), Some((2, false)));
+
+        // `shift down`: the same commits now carry Shift — `A`, `!` — and the
+        // legend the renderer draws agrees (it reads the same `is_active`).
+        let held = apply(level, "shift down");
+        assert!(held.is_active());
+        assert_eq!(keystroke_for(a, held), Some((30, true)));
+        assert_eq!(keystroke_for(one, held), Some((2, true)));
+        assert_eq!(a.display_label(held.is_active()), "A");
+        // Space and the other editing keys never take Shift.
+        assert_eq!(keystroke_for(space, held), Some((57, false)));
+        // A character commit does not consume a held shift (it is not a one-shot).
+        assert_eq!(held.after_char(), held);
+
+        // `shift up`: back to exactly the level before, lower-case again.
+        let released = apply(held, "shift up");
+        assert_eq!(released, level);
+        assert_eq!(keystroke_for(a, released), Some((30, false)));
+
+        // The latch commands still drive the latch, and neither touches the
+        // held bit: Caps set under a held shift outlives the release.
+        let caps_held = apply(held, "shift on");
+        assert_eq!(caps_held, ShiftModel { latched: ShiftState::Stuck, held: true });
+        assert_eq!(keystroke_for(a, apply(caps_held, "shift up")), Some((30, true)));
+
+        // State-changing keys type nothing; an inert meta key types nothing.
+        assert_eq!(keystroke_for(key("Shift"), held), None);
+        assert_eq!(keystroke_for(key("Push"), held), None);
+    }
 
     #[test]
     fn event_pad_tokens_match_the_control_grammar() {

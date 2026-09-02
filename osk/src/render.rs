@@ -13,7 +13,7 @@
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 
-use crate::layout::{Key, KeyRole, PlacedKey, ShiftState};
+use crate::layout::{Key, KeyRole, PlacedKey, ShiftModel};
 use crate::theme::{Color, Theme};
 
 /// Which input source a highlight comes from — mirrors osk-technology.md §4.5's
@@ -54,11 +54,12 @@ pub struct Cursor {
 }
 
 /// The live chrome state the draw path needs beyond the keys themselves: the
-/// shift/caps level (drives legends + the active indicator) and the current
-/// reflow policy (drives the `Push`/`Float` legend on the display-toggle key).
+/// shift level — latched *or* held, it drives the legends and lights the Shift
+/// keys either way — and the current reflow policy (drives the `Push`/`Float`
+/// legend on the display-toggle key).
 #[derive(Clone, Copy, Debug)]
 pub struct Chrome {
-    pub shift: ShiftState,
+    pub shift: ShiftModel,
     pub reflow: bool,
 }
 

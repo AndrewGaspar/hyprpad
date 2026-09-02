@@ -155,7 +155,8 @@ show <bottom|split> [reflow|overlay]   create + render the surface(s); OVERLAY i
 hide                                    DESTROY the surface(s) — never unmap
 cursor <L|R> <nx> <ny>                  pad absolute position, each axis in [-1,1]
 commit <L|R>                            commit the key under that pad's cursor (click-down)
-shift <off|oneshot|stuck|on>            set the shift/caps state (on = stuck / caps-lock)
+shift <off|oneshot|stuck|on>            set the latched shift/caps state (on = stuck / caps-lock)
+shift <down|up>                         hold / release a physical Shift (momentary; the latch is untouched)
 layer <base|symbols|toggle>             switch the base QWERTY ↔ numeric/symbols page
 reflow <on|off>                         displace (on, exclusive zone) vs overlay/float (off)
 key <keycode>                           commit a raw evdev keycode directly
@@ -165,8 +166,12 @@ quit                                    exit
 
 `cursor`/`commit` speak the per-pad model the daemon forwards. `commit` respects
 the live shift state, so `shift stuck` (or committing the on-screen Shift/Caps
-key) then `commit`-ing `1` types `!`. `shift`, `layer`, and `reflow` let the
-daemon drive/persist state the keyboard can also toggle from its own meta keys
+key) then `commit`-ing `1` types `!`. `shift down` … `shift up` is the daemon
+holding a trigger as a physical Shift (the Deck's L2): every legend draws shifted
+and every commit types shifted for exactly as long as it is down, and the latched
+state comes back untouched on release — a one-shot latched underneath still
+clears after one character. `shift`, `layer`, and `reflow` let the daemon
+drive/persist state the keyboard can also toggle from its own meta keys
 (`?123`/`ABC` = layer, `Push`/`Float` = reflow). `display <overlay|displace>` is
 accepted as an alias for `reflow`.
 
@@ -242,6 +247,11 @@ print anything else) without breaking an older daemon.
   `shift_active` token and every legend switches to its shifted glyph (letters
   uppercase, `1`→`!`, …); the committed keycode always matches the drawn glyph.
   Live-verified: `shift stuck` → uppercase + shifted number row + lit Shift/Caps.
+- **Held shift** (§4.6's `Held` bit) — `shift down` / `shift up` from the daemon
+  is a momentary physical Shift (its L2 binding): the level is
+  `held || latched` (`ShiftModel`), legends re-render shifted while it is down,
+  the latch is left exactly as it was, and `hide` drops the held bit so it can
+  never outlive the keyboard.
 - **Numeric / symbols layer** (§4.6 "Layers") — a second key set (`Keyboard::
   symbols()`) reached via the `?123`/`ABC` meta key or `layer <base|symbols|
   toggle>`. It mirrors the base grid geometry exactly, so switching never resizes
@@ -260,9 +270,8 @@ print anything else) without breaking an older daemon.
 
 - **Mode B render** — geometry/anchoring correct; keycap render is basic, final
   ergonomics deferred (§4).
-- **`Held` shift bit / physical chording** (§4.6) — the `{Off, OneShot, Stuck}`
-  states are implemented; the `Held` bit (a physical shift held during a chord)
-  has no analogue in this discrete-commit model and is not tracked.
+- **Physical chording** (§4.6) — the held shift bit is tracked (see Done), but
+  only Shift: there is no held Ctrl/Alt, since every input is a discrete commit.
 - **Concurrent per-source highlights** (§4.5) — the two pad highlights + cursors
   are driven; the third `Highlight{Focus}` source (a d-pad/stick focus cursor)
   is wired through the renderer but not yet driven.

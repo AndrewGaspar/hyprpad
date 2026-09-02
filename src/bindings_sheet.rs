@@ -30,9 +30,13 @@
 //! keyboard puts the pad in. It carries `builtin: true` and names the `section`
 //! whose rows ARE that context, so a reader — or the widget's tab strip — can
 //! show the keyboard's bindings as a mode without knowing what a keyboard is.
-//! The rows the daemon hardwires there (the pads' cursors, the commit clicks,
-//! the dismissal) are synthesized into that section, because a context whose
-//! only listed bindings are two helper keys is not one you could use.
+//! That section is what the keyboard actually routes: its built-in Deck map
+//! ([`crate::config::osk_builtins`] — pad clicks commit, L2 holds Shift, R2 is
+//! Enter, Y Space, X Backspace, B/Menu close) with the config's `osk_buttons`
+//! layered over it, plus the two pad cursors, which are not bindings at all.
+//! A built-in row is guarded to the keyboard's context and carries an authored
+//! label; a config row carries the config's own guard and description, like
+//! any other binding.
 //!
 //! # Control ids
 //!
@@ -43,7 +47,10 @@
 
 use std::fmt::Write as _;
 
-use crate::config::{Action, ButtonAction, Config, ConfigFormat, Guard, ModeState, WorkspaceTarget};
+use crate::config::{
+    osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, ModeState, OskAction,
+    WorkspaceTarget,
+};
 use crate::gesture::{Stick, StickDir};
 use crate::report::Button;
 
@@ -148,9 +155,10 @@ pub struct ModeRow {
 ///
 /// Not a declared mode — the daemon does not switch modes for the keyboard —
 /// but from the reader's side it is one: while the keyboard is up it owns both
-/// pads, the `[osk_buttons]` helpers type through it, and every other binding
-/// is suppressed (`route_osk` in `run.rs`). The sheet shows it as a mode
-/// because that is what it behaves like.
+/// pads, the buttons do what its own table says (`[osk_buttons]` over the
+/// built-in Deck map), and every other binding is suppressed (`route_osk` in
+/// `run.rs`). The sheet shows it as a mode because that is what it behaves
+/// like.
 pub const OSK_MODE: &str = "osk";
 
 /// Everything `hyprpad bindings` prints.
@@ -214,18 +222,25 @@ impl Sheet {
             entries.push(button_entry(alt.button, &alt.action, desc, guard));
         }
 
-        for (btn, code) in &c.osk_buttons {
-            entries.push(entry(
-                Section::OskButton,
-                button_name(*btn).to_string(),
-                button_name(*btn).to_string(),
-                button_label(*btn),
-                None,
-                button_rank(*btn),
-                &Action::Key(*code),
-                c.osk_button_descs.get(btn),
-                c.osk_button_guards.get(btn),
-            ));
+        // What the buttons do while the keyboard is up: the config's
+        // `osk_buttons` layered over the built-in Deck map — the overlay
+        // `route_osk` routes (`Config::osk_buttons_in`). A config entry takes
+        // its button from the built-ins whatever its guard says (the sheet
+        // shows what the author wrote, not what a mode would resolve), and
+        // `none` takes the button away with nothing in its place.
+        for (btn, what) in &c.osk_buttons {
+            if *what == OskAction::None {
+                continue;
+            }
+            let guard = c.osk_button_guards.get(btn).cloned().unwrap_or(Guard::Always);
+            entries.push(osk_entry(*btn, *what, c.osk_button_descs.get(btn), guard));
+        }
+        for (btn, what, label) in osk_builtins() {
+            if c.osk_buttons.contains_key(&btn) {
+                continue;
+            }
+            let label = label.to_string();
+            entries.push(osk_entry(btn, what, Some(&label), Guard::OnlyIn(vec![OSK_MODE.into()])));
         }
 
         // The trackpads' ambient behaviour. Not a binding you press, but the
@@ -253,11 +268,9 @@ impl Sheet {
             RANK_PAD,
         ));
 
-        // What the on-screen keyboard hardwires. None of this is a binding
-        // anyone can write — `route_osk` owns the pads, the clicks and the
-        // dismissal itself — so a sheet that listed only `[osk_buttons]` would
-        // describe the keyboard's context as two helper keys and nothing else,
-        // which is not a context you could actually use.
+        // The pads while the keyboard is up. Not a binding anyone can write —
+        // `route_osk` owns both cursors itself — but a keyboard context whose
+        // sheet left its two biggest controls blank would be lying.
         for (control, control_label, rank) in [
             ("lpad", "Left trackpad", RANK_PAD),
             ("rpad", "Right trackpad", RANK_PAD + 1),
@@ -268,22 +281,6 @@ impl Sheet {
                 "Move the keyboard's cursor",
                 "osk cursor",
                 rank,
-            ));
-        }
-        for (b, label, action) in [
-            (Button::PadLeftClick, "Type the key under the cursor", "osk commit"),
-            (Button::PadRightClick, "Type the key under the cursor", "osk commit"),
-            (Button::TriggerL2Full, "Type the key under the cursor", "osk commit"),
-            (Button::TriggerR2Full, "Type the key under the cursor", "osk commit"),
-            (Button::B, "Close the keyboard", "osk close"),
-            (Button::Menu, "Close the keyboard", "osk close"),
-        ] {
-            entries.push(osk_builtin(
-                button_name(b),
-                button_label(b),
-                label,
-                action,
-                button_rank(b),
             ));
         }
 
@@ -404,11 +401,33 @@ fn entry(
     }
 }
 
+/// A row for one on-screen keyboard binding ([`OskAction`]): a config entry
+/// (its own description and guard) or a built-in (an authored label, guarded to
+/// [`OSK_MODE`] so it belongs to the keyboard's context and to no declared
+/// mode). `action` is the config spelling either way — `key space`, `osk
+/// shift` — so a built-in reads as exactly what a config would write to keep
+/// it.
+fn osk_entry(btn: Button, what: OskAction, desc: Option<&String>, guard: Guard) -> Entry {
+    Entry {
+        section: Section::OskButton,
+        chord: button_name(btn).to_string(),
+        control: button_name(btn).to_string(),
+        direction: None,
+        control_label: button_label(btn),
+        label: desc.cloned().unwrap_or_else(|| derive_osk_label(what)),
+        described: desc.is_some(),
+        action: osk_action_string(what),
+        action_kind: osk_action_kind(what),
+        guard,
+        rank: button_rank(btn),
+    }
+}
+
 /// A row for something the daemon hardwires while the on-screen keyboard is up
-/// ([`crate::run`]'s `route_osk`). Not a binding: there is no config spelling
-/// for it, so `action` describes the behaviour instead of naming an action, and
-/// the label is authored here rather than derived. Guarded to [`OSK_MODE`], so
-/// it belongs to the keyboard's context and to no declared mode.
+/// and no binding can spell — the pad cursors ([`crate::run`]'s `route_osk`).
+/// `action` describes the behaviour instead of naming an action, and the label
+/// is authored here rather than derived. Guarded to [`OSK_MODE`], so it belongs
+/// to the keyboard's context and to no declared mode.
 fn osk_builtin(
     control: &str,
     control_label: String,
@@ -695,6 +714,41 @@ pub fn action_kind(a: &Action) -> &'static str {
     }
 }
 
+/// An on-screen keyboard binding in canonical config spelling — `key space`,
+/// `osk shift` — what [`OskAction::parse`] reads back.
+pub fn osk_action_string(a: OskAction) -> String {
+    match a {
+        OskAction::Key(code) => action_string(&Action::Key(code)),
+        OskAction::Commit => "osk commit".to_string(),
+        OskAction::Shift => "osk shift".to_string(),
+        OskAction::Dismiss => "osk dismiss".to_string(),
+        OskAction::None => "none".to_string(),
+    }
+}
+
+/// An on-screen keyboard binding's verb, for the widget to colour by: `key`
+/// for a key typed through the keyboard, `osk` for one of its own actions.
+pub fn osk_action_kind(a: OskAction) -> &'static str {
+    match a {
+        OskAction::Key(_) => "key",
+        OskAction::Commit | OskAction::Shift | OskAction::Dismiss => "osk",
+        OskAction::None => "none",
+    }
+}
+
+/// The derived label for an on-screen keyboard binding without a description —
+/// the same words the built-in map uses for the same actions, so a config that
+/// moves `osk shift` to another button reads the same as the default.
+pub fn derive_osk_label(a: OskAction) -> String {
+    match a {
+        OskAction::Key(code) => derive_label(&Action::Key(code)),
+        OskAction::Commit => "Type the key under the cursor".to_string(),
+        OskAction::Shift => "Shift (hold)".to_string(),
+        OskAction::Dismiss => "Close the keyboard".to_string(),
+        OskAction::None => "Unbound".to_string(),
+    }
+}
+
 fn target(t: &WorkspaceTarget) -> String {
     match t {
         WorkspaceTarget::Relative(n) => format!("{n:+}"),
@@ -922,7 +976,7 @@ impl Sheet {
         for (title, section) in [
             ("Guide chords (hold Steam, then press)", Section::Guide),
             ("Bare buttons (no modifier)", Section::Button),
-            ("OSK helpers (while the on-screen keyboard is up)", Section::OskButton),
+            ("On-screen keyboard (while it is up)", Section::OskButton),
             ("Trackpads (ambient)", Section::Ambient),
         ] {
             let rows: Vec<&Entry> = self.section(section).collect();
@@ -1114,11 +1168,21 @@ mod tests {
             .unwrap_or_else(|| panic!("no {chord}"))
     }
 
-    /// The rows the daemon synthesizes for the keyboard's context share their
-    /// chord with the control they sit on (`b`, `rpad`), so a test looking for
-    /// what the CONFIG said has to step over them.
+    /// The rows the daemon synthesizes for the keyboard's context — its
+    /// built-in map and the pad cursors — share their chord with the control
+    /// they sit on (`b`, `rpad`), so a test looking for what the CONFIG said
+    /// has to step over them. They are the rows guarded to that context; no
+    /// config can write that guard, since `osk` is not a mode a config declares.
     fn is_builtin(e: &Entry) -> bool {
-        e.action_kind == "builtin"
+        e.guard == Guard::OnlyIn(vec![OSK_MODE.to_string()])
+    }
+
+    /// The keyboard-context row on `chord` (see [`is_builtin`]).
+    fn builtin<'a>(s: &'a Sheet, chord: &str) -> &'a Entry {
+        s.entries
+            .iter()
+            .find(|e| e.chord == chord && is_builtin(e))
+            .unwrap_or_else(|| panic!("no built-in {chord}"))
     }
 
     // --- derived labels ----------------------------------------------------
@@ -1226,6 +1290,23 @@ mod tests {
             let s = action_string(&a);
             assert_eq!(Action::parse(&s), Ok(a.clone()), "round trip of {s:?}");
         }
+        // The keyboard's own table, through its own parser.
+        for a in [
+            OskAction::Key(57),
+            OskAction::Commit,
+            OskAction::Shift,
+            OskAction::Dismiss,
+            OskAction::None,
+        ] {
+            let s = osk_action_string(a);
+            assert_eq!(OskAction::parse(&s), Ok(a), "round trip of {s:?}");
+        }
+        assert_eq!(osk_action_kind(OskAction::Key(57)), "key");
+        assert_eq!(osk_action_kind(OskAction::Shift), "osk");
+        assert_eq!(derive_osk_label(OskAction::Key(57)), "Space");
+        assert_eq!(derive_osk_label(OskAction::Shift), "Shift (hold)");
+        assert_eq!(derive_osk_label(OskAction::Commit), "Type the key under the cursor");
+        assert_eq!(derive_osk_label(OskAction::Dismiss), "Close the keyboard");
     }
 
     #[test]
@@ -1409,10 +1490,11 @@ mod tests {
         let osk = s.modes.iter().find(|m| m.name == OSK_MODE).expect("an osk mode row");
         assert!(osk.builtin);
         assert_eq!(osk.section, Some("osk_button"), "the section that IS this context");
-        // Its rows are the whole section: what the config wrote, and what the
-        // daemon hardwires — a context listing only `y` would be unusable.
+        // Its rows are the whole section: what the config wrote, and the
+        // built-in Deck map under it — a context listing only `y` would be
+        // unusable.
         assert!(osk.active.contains(&"y".to_string()));
-        for chord in ["lpad", "rpad", "lpad_click", "rpad_click", "l2", "r2", "b", "menu"] {
+        for chord in ["lpad", "rpad", "lpad_click", "rpad_click", "l2", "r2", "x", "b", "menu"] {
             assert!(osk.active.contains(&chord.to_string()), "no built-in row for {chord}");
         }
         // No declared mode claims them: while the keyboard is up, nothing else
@@ -1421,20 +1503,71 @@ mod tests {
         assert!(!desktop.active.contains(&"lpad_click".to_string()));
         assert!(!desktop.active.contains(&"menu".to_string()));
 
-        let close = s
-            .entries
-            .iter()
-            .find(|e| e.chord == "menu" && is_builtin(e))
-            .expect("Menu closes the keyboard");
-        assert_eq!(close.label, "Close the keyboard");
+        // The Deck map, as the daemon routes it: L2 holds Shift, R2 is Enter,
+        // the pad clicks type under their cursor, B and Menu close. Each row
+        // spells the action a config would write to keep it.
+        let l2 = builtin(&s, "l2");
+        assert_eq!((l2.label.as_str(), l2.action.as_str(), l2.action_kind), ("Shift (hold)", "osk shift", "osk"));
+        let r2 = builtin(&s, "r2");
+        assert_eq!((r2.label.as_str(), r2.action.as_str(), r2.action_kind), ("Enter", "key enter", "key"));
+        for pad in ["lpad_click", "rpad_click"] {
+            let e = builtin(&s, pad);
+            assert_eq!((e.label.as_str(), e.action.as_str(), e.action_kind), ("Type the key under the cursor", "osk commit", "osk"));
+        }
+        let close = builtin(&s, "menu");
+        assert_eq!((close.label.as_str(), close.action.as_str()), ("Close the keyboard", "osk dismiss"));
+        assert_eq!(builtin(&s, "b").action, "osk dismiss");
+        assert_eq!(builtin(&s, "x").label, "Backspace");
         assert_eq!(close.section, Section::OskButton);
         assert!(close.described, "a built-in row is authored, not derived");
         assert_eq!(close.guard, Guard::OnlyIn(vec![OSK_MODE.to_string()]));
+        assert_eq!(builtin(&s, "lpad").action_kind, "builtin", "the cursors are not bindings");
+        // The config's `y` is the config's row, not a built-in: Space, derived.
+        let y = find(&s, "y");
+        assert_eq!((y.label.as_str(), y.action.as_str(), y.described), ("Space", "key space", false));
+        assert!(s.entries.iter().filter(|e| e.chord == "y" && e.section == Section::OskButton).count() == 1);
 
         let j = s.to_json();
         assert!(j.contains("\"builtin\": true"), "modes carry `builtin` in\n{j}");
         assert!(j.contains("\"section\": \"osk_button\""), "and the section in\n{j}");
         check_json(&j);
+    }
+
+    #[test]
+    fn a_config_rebinds_or_drops_a_keyboard_built_in() {
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.osk_button("r2", "Type here too", h.osk "commit")
+            h.osk_button("menu", h.none())
+            h.osk_button("l1", h.key "tab")
+            "#,
+        );
+        let osk_rows = |chord: &str| -> Vec<&Entry> {
+            s.entries.iter().filter(|e| e.chord == chord && e.section == Section::OskButton).collect()
+        };
+        // R2: one row, the config's, in place of the built-in Enter.
+        let r2 = osk_rows("r2");
+        assert_eq!(r2.len(), 1, "the built-in must not show through: {r2:?}");
+        assert_eq!((r2[0].label.as_str(), r2[0].action.as_str(), r2[0].action_kind), ("Type here too", "osk commit", "osk"));
+        assert!(r2[0].described && r2[0].guard == Guard::Always);
+        // Menu: taken away, nothing in its place.
+        assert!(osk_rows("menu").is_empty());
+        // L1: added, with a derived label.
+        let l1 = osk_rows("l1");
+        assert_eq!((l1[0].label.as_str(), l1[0].action.as_str(), l1[0].described), ("Tab", "key tab", false));
+        // The untouched built-ins are still there.
+        assert_eq!(builtin(&s, "b").action, "osk dismiss");
+        assert_eq!(builtin(&s, "l2").action, "osk shift");
+        let osk = s.modes.iter().find(|m| m.name == OSK_MODE).unwrap();
+        assert!(osk.active.contains(&"l1".to_string()) && !osk.active.contains(&"menu".to_string()));
+        check_json(&s.to_json());
+        // The text table has the section under its new title, and the row.
+        let t = s.to_text();
+        assert!(t.contains("On-screen keyboard (while it is up)"), "{t}");
+        assert!(t.contains("osk shift"), "{t}");
     }
 
     #[test]
@@ -1611,7 +1744,7 @@ mod tests {
         for want in [
             "Guide chords (hold Steam, then press)",
             "Bare buttons (no modifier)",
-            "OSK helpers (while the on-screen keyboard is up)",
+            "On-screen keyboard (while it is up)",
             "Trackpads (ambient)",
             "Modes (rules evaluated in order",
             "guide+r1",

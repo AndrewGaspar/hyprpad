@@ -97,8 +97,9 @@ h.osk_button("y",   h.key "space")                       -- only while the OSK i
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
 `h.keyboard`, `h.key`, `h.mouse`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`,
-`h.none`. A plain string (`"workspace +1"`) works too — it is parsed by the same
-grammar the TOML file uses.
+`h.none`, and — on `h.osk_button` only — `h.osk`. A plain string
+(`"workspace +1"`) works too — it is parsed by the same grammar the TOML file
+uses.
 
 The mouse buttons are bare-button bindings like any other. `h.mouse "left"`
 (`left|right|middle`; `"mouse left"` or `"click left"` in TOML) is a `h.key`
@@ -121,8 +122,29 @@ would do on a chord (`h.exec` gets `HYPRPAD_MODE`, `h.set_mode` runs the mode
 handoff). `h.button("l5", h.exec "voxtype record toggle")` is a push-to-talk
 toggle on a grip; `h.button("r4", h.keyboard { mode = "split" })` raises the
 keyboard without the modifier. `h.none` is not something a button can do —
-remove the line instead. `h.osk_button` stays keys-only: it types through the
-on-screen keyboard's own virtual keyboard.
+remove the line instead.
+
+`h.osk_button` is the keyboard's own table: what a button does **while the
+on-screen keyboard is up**. Out of the box it is the Steam Deck's map — a pad
+click types the key under that pad's cursor, **L2 holds Shift** (momentary,
+like the key itself: capitals while it is down, and the keyboard's own
+one-shot/caps latch untouched), R2 is Enter, Y is Space, X is Backspace, and B
+or Menu close it. A config's entries are layered *over* that map rather than
+replacing it, so `h.osk_button("y", h.key "space")` changes nothing and the pad
+clicks keep committing without being listed. A value is a key typed through
+the keyboard (`h.key "space"`) or one of its own three actions —
+`h.osk "commit"`, `h.osk "shift"`, `h.osk "dismiss"` (`"osk commit"` and so on
+in TOML) — and `h.none()` takes a built-in away
+(`h.osk_button("menu", h.none())`). `h.osk` means nothing on a chord or a bare
+button. The cheat sheet's `osk` tab shows the map as it ends up.
+
+A button still held when the controller changes hands never leaks into the
+new layer: B closes the keyboard without typing the desktop's Backspace, the Y
+of the `guide+Y` that raised it does not type a Space, a chord's button
+released after the guide does not fire its bare binding, and a key held while
+the mode flips away and back is not pressed again. Every layer acts on fresh
+presses only — which also means a key held straight through a guide tap has to
+be pressed again.
 
 ### Modes and guards
 
