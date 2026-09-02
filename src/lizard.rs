@@ -50,9 +50,7 @@
 //! `EPIPE` as retryable (up to 50 × 20 ms); we do the same on a shorter budget
 //! so a persistently-idle controller does not stall the re-send loop.
 
-use std::fs::OpenOptions;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
 use std::time::Duration;
 
 /// `REPORT_ID_FEATURES_CONTROLLER` — the IBEX feature-report id for the
@@ -234,17 +232,14 @@ fn send_feature_report(fd: RawFd, report: &[u8]) -> Result<(), SendErr> {
     }
 }
 
-/// Open one puck node read-write and send the whole disable sequence to it.
-fn send_sequence(node: &Path, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr> {
-    // Read-write: the passive tap opens read-only, but `HIDIOCSFEATURE` is a
-    // write to the device and needs a writable fd.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(node)
-        .map_err(|e| SendErr::Other(format!("open read-write: {e}")))?;
+/// Send the whole sequence to one already-open puck node.
+///
+/// The descriptor is writable by construction: [`crate::hidraw::OPEN_FLAGS`] is
+/// `O_RDWR` precisely because `HIDIOCSFEATURE` is a write to the device, and the
+/// broker opens with the same flags.
+fn send_sequence(fd: RawFd, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr> {
     for report in reports {
-        send_feature_report(file.as_raw_fd(), report)?;
+        send_feature_report(fd, report)?;
     }
     Ok(())
 }
@@ -265,15 +260,21 @@ fn send_sequence(node: &Path, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr>
 /// feature report) are expected and folded into the error only when they are
 /// total.
 fn apply_to_puck(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
-    let nodes = crate::hidraw::puck_nodes().map_err(|e| format!("enumerating puck nodes: {e}"))?;
-    if nodes.is_empty() {
-        return Err("no Steam Controller puck found (28de:1304)".to_string());
+    // Through the same acquire path everything else uses, so lizard ownership
+    // survives `packaging/udev/72-hyprpad-puck.rules` making the nodes root-only:
+    // with a broker installed these descriptors come from it, without one they
+    // are direct opens exactly as before.
+    let opened = crate::hidraw::PuckSource::acquire()
+        .ok_or_else(|| "no Steam Controller puck found (28de:1304)".to_string())?
+        .into_open();
+    if opened.is_empty() {
+        return Err("no Steam Controller puck node could be opened".to_string());
     }
     let mut accepted = 0usize;
     let mut stalls = 0usize;
     let mut hard_errors = Vec::new();
-    for node in &nodes {
-        match send_sequence(node, reports) {
+    for (node, fd) in &opened {
+        match send_sequence(fd.as_raw_fd(), reports) {
             Ok(()) => accepted += 1,
             Err(SendErr::Stall) => stalls += 1,
             Err(SendErr::Other(e)) => hard_errors.push(format!("{}: {e}", node.display())),

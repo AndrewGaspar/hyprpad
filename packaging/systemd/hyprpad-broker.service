@@ -1,0 +1,117 @@
+# hyprpad privileged fd broker — the service half.
+#
+# WHAT IT IS
+#   /dev/uhid is root 0600, and 72-hyprpad-puck.rules makes the real puck's
+#   hidraw nodes root 0600 too. This unit is the only privileged thing hyprpad
+#   installs: it opens those nodes on request and passes the open descriptors to
+#   the unprivileged `hyprpad run` over the socket unit's AF_UNIX socket, using
+#   SCM_RIGHTS. The daemon itself stays an ordinary user process.
+#
+# WHY THAT IS SAFE
+#   The broker's whole vocabulary is two words. It reads one line per connection,
+#   accepts exactly `uhid` or `puck`, and answers with descriptors and a status
+#   line. It never reads from, writes to, or ioctls a device; it never takes a
+#   path from the client; it never caches (every `puck` rescans /sys, so hotplug
+#   just works and a stale node is never handed out). The socket's 0660
+#   root:hyprpad ownership decides who may ask.
+#
+#     sudo install -Dm644 packaging/systemd/hyprpad-broker.service \
+#          /etc/systemd/system/hyprpad-broker.service
+#     sudo systemctl daemon-reload
+
+[Unit]
+Description=hyprpad privileged fd broker
+Documentation=https://github.com/AndrewGaspar/hyprpad
+Requires=hyprpad-broker.socket
+After=hyprpad-broker.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/hyprpad broker
+# Socket-activated: systemd hands the listening socket over as fd 3 and the
+# broker uses it instead of binding a path. It exits only on error, so a crash
+# is retried rather than leaving the daemon with no controller.
+Restart=on-failure
+RestartSec=1s
+StandardOutput=journal
+StandardError=journal
+
+# --- Who it runs as ---------------------------------------------------------
+# root, because that is the entire point: nothing less can open a root 0600 node.
+User=root
+Group=root
+
+# Pin the broker to one uid if you want a second lock beyond the socket group.
+# Unset (the default) means "anyone the socket's 0660 group lets connect".
+#Environment=HYPRPAD_UID=1000
+
+# --- Hardening --------------------------------------------------------------
+# Each of these is here for a reason; the reason is written down so a future
+# change can tell which ones are load-bearing.
+
+# It is uid 0 and it only ever opens root-OWNED nodes, so every capability check
+# it could face is satisfied by plain DAC owner-match. An empty bounding set
+# means even a compromised broker cannot regain one.
+# (If you ever change 72-hyprpad-puck.rules to OWNER:= something other than root,
+# this must become CapabilityBoundingSet=CAP_DAC_OVERRIDE.)
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# The cgroup device controller is the second wall behind the socket: even if the
+# broker were made to open something else, the only character devices it can
+# reach are the two it exists for. `closed` still permits the standard
+# /dev/null, /dev/zero, /dev/(u)random, tty set.
+DevicePolicy=closed
+DeviceAllow=/dev/uhid rw
+DeviceAllow=char-hidraw rw
+# NB: PrivateDevices= is deliberately NOT set. It would replace /dev with a
+# private minimal one that has neither /dev/uhid nor the hidraw nodes, which is
+# exactly the two things this unit exists to open.
+
+# Nothing outside the socket. AF_UNIX is the only family it ever uses.
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+IPAddressDeny=any
+
+# It writes no files at all. /usr and /etc read-only, /home invisible, a private
+# /tmp, /proc showing only its own processes.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+
+# The socket is created and owned by hyprpad-broker.socket, so the broker needs
+# nowhere writable in /run. If you ever run it standalone with `--socket PATH`,
+# add ReadWritePaths= for that path's directory.
+
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# NB: ProtectKernelModules= is deliberately NOT set. Opening /dev/uhid on a
+# system where the `uhid` module is not yet loaded triggers a char-major module
+# autoload, and blocking module operations for this unit is a gamble with no
+# upside — the broker cannot load a module on purpose anyway (CapabilityBoundingSet
+# is empty, so CAP_SYS_MODULE is unreachable). On an ordinary desktop `uhid` is
+# already loaded: BlueZ uses it for HID-over-Bluetooth.
+
+# NOTE: there is deliberately no [Install] section. This service is reached only
+# through hyprpad-broker.socket — `systemctl enable --now hyprpad-broker.socket`
+# is the whole install. Enabling the service directly would start it at boot with
+# no LISTEN_FDS, whereupon it would bind /run/hyprpad/broker.sock itself and
+# fight the socket unit for the path. `systemctl start hyprpad-broker.service`
+# by hand still works and still gets the socket, because systemd starts the
+# socket unit first through the Requires= above.

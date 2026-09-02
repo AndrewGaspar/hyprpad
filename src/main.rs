@@ -1,5 +1,6 @@
 use hyprpad::report::Frame;
-use hyprpad::{bindings_sheet, hidraw, run, setup};
+use hyprpad::{bindings_sheet, broker, hidraw, run, setup};
+use std::ffi::OsString;
 use std::io::Write;
 use std::time::Instant;
 
@@ -27,39 +28,61 @@ fn main() {
             bindings_sheet::run(json).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
         }
         Some("setup") => {
-            // `setup [--revert]`: install (or uninstall) the masked-Steam hook.
-            let revert = match args.get(2).map(String::as_str) {
-                None => false,
-                Some("--revert") => true,
+            // `setup`         install the user-level hook and PRINT the root
+            //                 host-integration steps (never run them);
+            // `setup --check` report, read-only, on the host integration;
+            // `setup --print` only print the root steps;
+            // `setup --revert` uninstall the user-level hook.
+            let mode = match args.get(2).map(String::as_str) {
+                None => setup::Mode::Install,
+                Some("--check") => setup::Mode::Check,
+                Some("--print") => setup::Mode::Print,
+                Some("--revert") => setup::Mode::Revert,
                 Some(other) => {
                     eprintln!("hyprpad setup: unknown argument {other:?}");
-                    eprintln!("usage: hyprpad setup [--revert]");
+                    eprintln!("{}", setup::USAGE);
                     std::process::exit(2);
                 }
             };
-            setup::run(revert).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
+            setup::run(mode).unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); });
+        }
+        // `broker`: the privileged fd helper. Meant to run as root under
+        // systemd (packaging/systemd/hyprpad-broker.{socket,service}); running
+        // it by hand is for debugging. See src/broker.rs for the protocol.
+        Some("broker") => {
+            let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
+            let env_uid = std::env::var(broker::UID_ENV).ok();
+            let opts = broker::parse_options(&rest, env_uid.as_deref()).unwrap_or_else(|e| {
+                eprintln!("hyprpad broker: {e}");
+                eprintln!("{}", broker::USAGE);
+                std::process::exit(2);
+            });
+            broker::run(&opts).unwrap_or_else(|e| { eprintln!("hyprpad broker: {e}"); std::process::exit(1); });
         }
         _ => {
-            eprintln!("usage: hyprpad <run|reload|bindings|monitor|setup>");
+            eprintln!("usage: hyprpad <run|reload|bindings|monitor|setup|broker>");
             eprintln!();
             eprintln!("  run              drive Hyprland from the controller (gestures -> dispatch)");
             eprintln!("  reload           tell the running daemon to re-read its config (SIGHUP)");
             eprintln!("  bindings [--json] print the current bindings (the cheat sheet's data)");
             eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
-            eprintln!("  setup [--revert] install (or remove) the masked-Steam launcher hook");
+            eprintln!("  setup [--check]  install the Steam hook; print the root host-integration steps");
+            eprintln!("  broker           privileged fd helper (root, socket-activated; see setup)");
             std::process::exit(2);
         }
     }
 }
 
 fn monitor() {
-    let nodes = hidraw::puck_nodes().expect("enumerate hidraw");
-    if nodes.is_empty() {
+    // Through the daemon's own acquire path, so `monitor` keeps working once the
+    // udev rule has made the nodes root-only: with a broker installed the
+    // descriptors come from it, without one they are direct opens as before.
+    let Some(source) = hidraw::PuckSource::acquire() else {
         eprintln!("no Steam Controller puck found (28de:1304)");
         std::process::exit(1);
-    }
-    eprintln!("monitoring {} node(s) (passive tap)", nodes.len());
-    let rx = hidraw::read_all(&nodes);
+    };
+    eprintln!("monitoring {} node(s), {} (passive tap)", source.len(), source.label());
+    let rx = hidraw::read_all(source);
     let mut prev = Frame::default();
     let t0 = Instant::now();
     let mut frames: u64 = 0;

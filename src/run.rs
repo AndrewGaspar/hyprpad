@@ -167,18 +167,41 @@ pub fn run() -> std::io::Result<()> {
     // symmetric, so a daemon launched at login (or restarted while the puck is
     // unplugged / asleep on a dead dongle) simply sits until it appears —
     // "leave it running" has to include "start it before the controller".
-    let nodes = {
-        let mut nodes = hidraw::puck_nodes()?;
-        if nodes.is_empty() {
-            eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
-            while nodes.is_empty() {
-                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
-                nodes = hidraw::puck_nodes()?;
+    //
+    // The wait polls exactly what the reconnect wait polls — `PuckSource::acquire`
+    // — so both paths ask the broker first and fall back to opening the nodes
+    // directly, and neither can be satisfied by a puck that is listed in `/sys`
+    // but not actually openable.
+    let source = {
+        let mut source = hidraw::PuckSource::acquire();
+        if source.is_none() {
+            // Distinguish the two ways this can fail, because they need
+            // different things from the user. A puck that is *listed* in `/sys`
+            // but not obtainable is a half-finished host install — the udev rule
+            // took the nodes away and no broker is handing them back — and
+            // "waiting for a controller" would be a misleading thing to say
+            // about a controller that is plugged in.
+            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
+            if listed > 0 {
+                eprintln!(
+                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
+                     obtained — the udev rule is installed and the fd broker is not \
+                     reachable. Run `hyprpad setup --check`. Waiting…"
+                );
+            } else {
+                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
             }
-            eprintln!("hyprpad: controller found ({} node(s))", nodes.len());
+            while source.is_none() {
+                std::thread::sleep(RECONNECT_SCAN_INTERVAL);
+                source = hidraw::PuckSource::acquire();
+            }
         }
-        nodes
+        let source = source.expect("the loop only exits with a source in hand");
+        eprintln!("hyprpad: controller found ({} node(s), {})", source.len(), source.label());
+        source
     };
+    let node_count = source.len();
+    status.set_source(status::Source::of(&source));
     status.set_connected(true);
     // Mutable because SIGHUP / `hyprpad reload` swaps in a freshly loaded config
     // live (see the `Input::Reload` arm and `apply_reload`).
@@ -230,7 +253,7 @@ pub fn run() -> std::io::Result<()> {
     // reload` treats a stale pidfile — a pid that is gone — as "not running").
 
     let hypr = Hypr::connect()?;
-    eprintln!("hyprpad: {} controller node(s), Hyprland IPC connected", nodes.len());
+    eprintln!("hyprpad: {node_count} controller node(s), Hyprland IPC connected");
 
     if own_lizard {
         eprintln!("hyprpad: lizard-mode ownership on; taking over the puck's firmware kbd/mouse");
@@ -249,7 +272,7 @@ pub fn run() -> std::io::Result<()> {
     // `hyprpad reload` works either way.
     install_reload_signal(&tx);
 
-    spawn_reader_pipeline(&nodes, &tx);
+    spawn_reader_pipeline(source, &tx);
 
     match crate::hypr::subscribe() {
         Ok(events) => {
@@ -463,8 +486,16 @@ pub fn run() -> std::io::Result<()> {
                 Ok(input) => input,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if waiting && Instant::now() >= next_scan {
-                        if let Some(nodes) = hidraw::puck_readable() {
-                            eprintln!("hyprpad: controller reconnected ({} node(s))", nodes.len());
+                        if let Some(source) = hidraw::PuckSource::acquire() {
+                            eprintln!(
+                                "hyprpad: controller reconnected ({} node(s), {})",
+                                source.len(),
+                                source.label()
+                            );
+                            // The answer can change under a running daemon —
+                            // start the broker and this is the reconnect that
+                            // notices — so republish it every generation.
+                            status.set_source(status::Source::of(&source));
                             if own_lizard {
                                 // Re-cover the fresh device now rather than waiting for
                                 // the ownership loop's periodic re-send.
@@ -472,7 +503,7 @@ pub fn run() -> std::io::Result<()> {
                                     eprintln!("warning: lizard re-disable on reconnect: {e}");
                                 }
                             }
-                            spawn_reader_pipeline(&nodes, &tx);
+                            spawn_reader_pipeline(source, &tx);
                             status.set_connected(true);
                             waiting = false;
                         }
@@ -739,12 +770,16 @@ pub fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Arm the hidraw reader pipeline for `nodes`: spawn `read_all`'s per-node
-/// reader threads and a forwarder that funnels their reports into the main
-/// loop's channel. Used for both the initial connect and every reconnect, so
-/// the two paths are identical.
-fn spawn_reader_pipeline(nodes: &[PathBuf], tx: &mpsc::Sender<Input>) {
-    let reports = hidraw::read_all(nodes);
+/// Arm the hidraw reader pipeline for one generation of descriptors: spawn
+/// `read_all`'s per-node reader threads and a forwarder that funnels their
+/// reports into the main loop's channel. Used for both the initial connect and
+/// every reconnect, so the two paths are identical.
+///
+/// Takes the [`hidraw::PuckSource`] by value because a brokered generation *is*
+/// the descriptors — there is nothing to re-open from, and handing them on is
+/// the only way to use them.
+fn spawn_reader_pipeline(source: hidraw::PuckSource, tx: &mpsc::Sender<Input>) {
+    let reports = hidraw::read_all(source);
     let tx = tx.clone();
     std::thread::spawn(move || forward_reports(reports, tx));
 }
@@ -1616,14 +1651,13 @@ fn start_relay(cfg: &GamepadConfig) -> Option<SteamRelay> {
         return None;
     }
     let profile = cfg.identity.profile();
-    let fd = match uhid::acquire_uhid() {
-        Ok(fd) => fd,
+    let (fd, from) = match uhid::acquire_uhid_from() {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!(
                 "hyprpad: [gamepad] kind = \"steam\" but /dev/uhid is unavailable ({e}); \
-                 games get no input. Grant access with a udev rule:\n  \
-                 KERNEL==\"uhid\", SUBSYSTEM==\"misc\", MODE=\"0660\", TAG+=\"uaccess\", \
-                 OPTIONS+=\"static_node=uhid\""
+                 games get no input. Install the root fd broker with `hyprpad setup`, \
+                 then check it with `hyprpad setup --check`."
             );
             return None;
         }
@@ -1631,7 +1665,8 @@ fn start_relay(cfg: &GamepadConfig) -> Option<SteamRelay> {
     match SteamRelay::start(fd, profile) {
         Ok(relay) => {
             eprintln!(
-                "hyprpad: virtual Steam Controller created ({}, identity '{}'); \
+                "hyprpad: virtual Steam Controller created ({}, identity '{}', \
+                 /dev/uhid from the {from}); \
                  streaming at 250 Hz, forwarding under game focus",
                 profile.vid_pid(),
                 profile.identity.as_str()

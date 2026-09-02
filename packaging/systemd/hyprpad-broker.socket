@@ -1,0 +1,41 @@
+# hyprpad privileged fd broker — the socket half.
+#
+# systemd owns and listens on the socket; the service below it is started on the
+# first connection and passed this listening descriptor as fd 3 (LISTEN_FDS).
+# That is deliberate: the broker never has to create, chmod or chown anything in
+# /run, so the service needs no writable filesystem at all.
+#
+#     sudo install -Dm644 packaging/systemd/hyprpad-broker.socket \
+#          /etc/systemd/system/hyprpad-broker.socket
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now hyprpad-broker.socket
+
+[Unit]
+Description=hyprpad privileged fd broker socket
+Documentation=https://github.com/AndrewGaspar/hyprpad
+
+[Socket]
+# The one well-known path. src/broker.rs's DEFAULT_SOCKET must match this.
+# systemd creates the parent directory (/run/hyprpad) for an AF_UNIX socket.
+ListenStream=/run/hyprpad/broker.sock
+
+# 0660 root:hyprpad is the access control. Anyone in the `hyprpad` group may ask
+# for the controller; nobody else can even connect. This is the *default* gate —
+# the broker additionally checks SO_PEERCRED and can be pinned to a single uid
+# with `--uid N` / HYPRPAD_UID in the service file if you want a second lock.
+SocketUser=root
+SocketGroup=hyprpad
+SocketMode=0660
+
+# One long-lived service handling every connection, not one process per
+# connection: the broker is a few hundred lines and rescans on every request, so
+# there is nothing to gain from per-connection isolation and a fork per haptic
+# re-open would be silly.
+Accept=no
+
+# Leave no stale socket behind when the unit is stopped, so `setup --check`'s
+# "socket present" answer is never a lie.
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

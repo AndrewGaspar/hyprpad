@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {"connected": true, "mode": "desktop", "controller": "Steam Controller Puck",
-//!  "relay": "xbox", "pid": 12345,
+//!  "relay": "xbox", "source": "direct", "pid": 12345,
 //!  "modes": ["cheatsheet", "omarchy-ui", "game", "desktop", "osk"],
 //!  "updated": 1725230000}
 //! ```
@@ -77,6 +77,43 @@ impl RelayKind {
     }
 }
 
+/// Where the daemon got the puck's descriptors — the `"source"` field of
+/// `status.json`.
+///
+/// Not a question about the *controller*, which is what `"connected"` answers,
+/// but about hyprpad's own plumbing: `"broker"` means the root fd broker handed
+/// the descriptors over, which is the only arrangement in which Steam cannot
+/// also see the real puck. `"direct"` means hyprpad opened the nodes itself, and
+/// so could anything else running as you.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Source {
+    /// hyprpad opened `/dev/hidraw*` itself. The default, and the state on any
+    /// machine that has not run `hyprpad setup`.
+    #[default]
+    Direct,
+    /// `hyprpad broker` passed the descriptors over `SCM_RIGHTS`.
+    Broker,
+}
+
+impl Source {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Direct => "direct",
+            Source::Broker => "broker",
+        }
+    }
+
+    /// The source a [`crate::hidraw::PuckSource`] generation represents.
+    pub fn of(source: &crate::hidraw::PuckSource) -> Source {
+        if source.is_broker() {
+            Source::Broker
+        } else {
+            Source::Direct
+        }
+    }
+}
+
 /// The published state. One value, so a publish is always a whole consistent
 /// object rather than a field at a time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +129,9 @@ pub struct Status {
     pub controller: String,
     /// Which virtual controller a focused game is actually being given.
     pub relay: RelayKind,
+    /// How hyprpad got hold of the real controller: through the root fd broker,
+    /// or by opening the nodes itself.
+    pub source: Source,
     /// The daemon's pid, so a reader can tell a live file from one a killed
     /// daemon left behind.
     pub pid: u32,
@@ -112,6 +152,8 @@ impl Status {
         push_str(&mut o, &self.controller);
         o.push_str(", \"relay\": ");
         push_str(&mut o, self.relay.as_str());
+        o.push_str(", \"source\": ");
+        push_str(&mut o, self.source.as_str());
         let _ = write!(o, ", \"pid\": {}, \"modes\": ", self.pid);
         push_strs(&mut o, &self.modes);
         let _ = write!(o, ", \"updated\": {}}}", self.updated);
@@ -195,6 +237,7 @@ impl StatusWriter {
                 mode: BUILTIN_DESKTOP.to_string(),
                 controller: DEFAULT_CONTROLLER.to_string(),
                 relay: RelayKind::None,
+                source: Source::default(),
                 pid: std::process::id(),
                 modes: Vec::new(),
                 updated: now_secs(),
@@ -277,6 +320,20 @@ impl StatusWriter {
             return;
         }
         self.status.relay = relay;
+        self.publish();
+    }
+
+    /// Record how the daemon got hold of the controller.
+    ///
+    /// Set every time a reader generation is armed — at startup and on every
+    /// reconnect — because the answer can change under a running daemon: start
+    /// the broker and the next reconnect flips to `"broker"`, stop it and the
+    /// one after flips back. Publishes only on a real change.
+    pub fn set_source(&mut self, source: Source) {
+        if self.status.source == source {
+            return;
+        }
+        self.status.source = source;
         self.publish();
     }
 
@@ -435,6 +492,7 @@ mod tests {
             mode: "desktop".to_string(),
             controller: "Steam Controller Puck".to_string(),
             relay: RelayKind::Xbox,
+            source: Source::Direct,
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
             updated: 1_725_230_000,
@@ -447,10 +505,52 @@ mod tests {
             sample().to_json(),
             "{\"connected\": true, \"mode\": \"desktop\", \
              \"controller\": \"Steam Controller Puck\", \"relay\": \"xbox\", \
-             \"pid\": 12345, \
+             \"source\": \"direct\", \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
              \"updated\": 1725230000}\n"
         );
+    }
+
+    /// The `"source"` field: which half of the host integration is live.
+    #[test]
+    fn json_carries_where_the_descriptors_came_from() {
+        let mut s = sample();
+        assert!(s.to_json().contains(r#""source": "direct""#), "{}", s.to_json());
+        s.source = Source::Broker;
+        assert!(s.to_json().contains(r#""source": "broker""#), "{}", s.to_json());
+        assert_eq!(Source::default(), Source::Direct, "no broker until one answers");
+        assert_eq!((Source::Direct.as_str(), Source::Broker.as_str()), ("direct", "broker"));
+    }
+
+    /// `Source::of` is the one mapping from a live generation to the wire value.
+    #[test]
+    fn a_generation_maps_to_its_source() {
+        use crate::hidraw::PuckSource;
+        assert_eq!(
+            Source::of(&PuckSource::Paths(vec![std::path::PathBuf::from("/dev/hidraw7")])),
+            Source::Direct
+        );
+        let (_r, w) = std::io::pipe().unwrap();
+        assert_eq!(
+            Source::of(&PuckSource::Fds(vec![std::os::fd::OwnedFd::from(w)])),
+            Source::Broker
+        );
+    }
+
+    #[test]
+    fn set_source_publishes_once_per_real_change() {
+        let dir = TempDir::new("source");
+        let file = dir.path().join("status.json");
+        let mut w = StatusWriter::in_dir(dir.path());
+        assert_eq!(w.status().source, Source::Direct);
+
+        w.set_source(Source::Broker);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""source": "broker""#));
+        let before = std::fs::read_to_string(&file).unwrap();
+        w.set_source(Source::Broker);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no republish");
+        w.set_source(Source::Direct);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""source": "direct""#));
     }
 
     /// The `"relay"` field: which sink a focused game is actually given.
