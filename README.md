@@ -90,13 +90,24 @@ h.bind("guide+x",  h.exec "omarchy-menu")
 h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 h.bind("guide+y",  h.keyboard { mode = "split" })
 h.button("dpad_up", h.key "up"):only_in("desktop")       -- bare button
+h.button("r2",      h.mouse "left"):only_in("desktop")   -- a mouse button, through the pointer
 h.osk_button("y",   h.key "space")                       -- only while the OSK is up
 ```
 
 Actions: `h.workspace`, `h.move_to_workspace`, `h.exec`, `h.dispatch`,
-`h.keyboard`, `h.key`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`, `h.none`.
-A plain string (`"workspace +1"`) works too — it is parsed by the same grammar
-the TOML file uses.
+`h.keyboard`, `h.key`, `h.mouse`, `h.fullscreen`, `h.set_mode`, `h.clear_mode`,
+`h.none`. A plain string (`"workspace +1"`) works too — it is parsed by the same
+grammar the TOML file uses.
+
+The mouse buttons are bare-button bindings like any other. `h.mouse "left"`
+(`left|right|middle`; `"mouse left"` or `"click left"` in TOML) is a `h.key`
+whose evdev code names a mouse button, and the daemon clicks it through the
+virtual pointer instead of typing it. By default a right-pad click and a full R2
+pull are a left click and a full L2 pull a right click (`rpad_click`, `r2`, `l2`
+in `[buttons]`); a config that declares its own buttons lists the ones it wants,
+so a mode can take a click away like anything else, and each shows on the cheat
+sheet with its guard. They obey the same gates as every bare button: off while
+the guide button is held or the on-screen keyboard is up.
 
 ### Modes and guards
 
@@ -140,6 +151,7 @@ binding, not per category**:
 
 ```lua
 h.button("a", h.key "enter"):only_in("desktop")
+h.button("l2", h.mouse "right"):only_in("desktop")
 h.bind("guide+l1", h.workspace "-1"):not_in("game")
 h.bind("guide+i", h.exec "…"):when(function(ctx) return ctx.focus.pid ~= nil end)
 ```

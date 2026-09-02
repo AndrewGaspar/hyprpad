@@ -131,6 +131,13 @@ h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui")
 h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui")     -- A = Enter/confirm
 h.button("b", h.key "backspace"):only_in("desktop") -- B = Backspace
 
+-- The mouse buttons. These were hardwired once; now they are bindings like
+-- any other, so the sheet shows them and a mode can take them away. Guarded
+-- exactly like the cursor above: where the pad moves the pointer, it clicks.
+h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui")
+h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui")
+h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui")
+
 -- The same button, a different meaning in a different mode. The cheat sheet has
 -- keyboard focus and closes on Escape, so B dismisses it — and the two never
 -- collide, because a mode is exclusive: under the sheet we are in `cheatsheet`,

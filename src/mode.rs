@@ -797,7 +797,12 @@ mod tests {
         m.focus_changed(&c, "foot", "ajg@framework", None);
         assert_eq!(m.active(), "desktop");
         assert!(m.cursor_enabled() && m.scroll_enabled() && !m.forwards());
-        assert_eq!(m.buttons().len(), 6, "d-pad + A + B");
+        assert_eq!(m.buttons().len(), 9, "d-pad + A + B + the three mouse clicks");
+        // The clicks are bindings now, and on the desktop they are live: pad
+        // click and R2 are a left click, L2 a right click.
+        assert_eq!(m.buttons().get(&report::Button::PadRightClick), Some(&0x110));
+        assert_eq!(m.buttons().get(&report::Button::TriggerR2Full), Some(&0x110));
+        assert_eq!(m.buttons().get(&report::Button::TriggerL2Full), Some(&0x111));
 
         for class in [
             "steam_app_413080",

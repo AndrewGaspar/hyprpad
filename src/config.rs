@@ -27,7 +27,7 @@
 //! | Section | What it configures |
 //! |---|---|
 //! | `[bindings]` | guide chords / stick flicks -> actions (the default section) |
-//! | `[buttons]` | bare buttons -> raw keys (D-pad = arrows by default) |
+//! | `[buttons]` | bare buttons -> raw keys or mouse buttons (D-pad = arrows, pad click / triggers = clicks by default) |
 //! | `[osk_buttons]` | buttons that type through the on-screen keyboard |
 //! | `[daemon]` | daemon-wide switches (`own_lizard`, `rescan_on_title_change`, `process_rescan_ms`) |
 //! | `[cursor]` (alias `[damping]`) | trackpad-cursor gain + smoothing ([`CursorConfig`]) |
@@ -45,6 +45,7 @@
 //! keeps builds fast. If the schema ever grows structure, switch to `toml`.
 
 use crate::gesture::{self, Stick, StickDir};
+use crate::output::{PointerButton, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use crate::report;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -109,10 +110,18 @@ pub enum Action {
     /// content is displaced around it. Driven by [`crate::osk::OskHandle`], not
     /// a Hyprland dispatch.
     ToggleKeyboard { mode: crate::osk::OskMode, reflow: bool },
-    /// Emit a raw evdev keycode (`KEY_*`). Bound to a *bare* controller button
-    /// in the `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
+    /// Emit a raw evdev code. Bound to a *bare* controller button in the
+    /// `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
     /// button is held and released when it lifts, so the kernel auto-repeats.
-    /// Driven by [`crate::keyboard::VirtualKeyboard`], not a Hyprland dispatch.
+    ///
+    /// The code space is evdev's own, so it names a mouse button as readily as
+    /// a key: a `KEY_*` code is typed through
+    /// [`crate::keyboard::VirtualKeyboard`], while a `BTN_*` mouse code
+    /// ([`BTN_LEFT`] / [`BTN_RIGHT`] / [`BTN_MIDDLE`] — spelled `mouse left`,
+    /// or `h.mouse "left"` in Lua) is clicked through the virtual pointer
+    /// ([`crate::output::VirtualPointer`]) instead. The daemon decides by the
+    /// code ([`PointerButton::from_evdev`]); the binding tables, guards and
+    /// mode engine never need to tell the two apart. Not a Hyprland dispatch.
     Key(u16),
     /// Force the named mode, overriding whatever the context rules resolve to
     /// ([`crate::mode::ModeEngine`]'s manual override — the top of the
@@ -182,6 +191,16 @@ impl Action {
                     Err("key needs a name".to_string())
                 } else {
                     Ok(Action::Key(key_code(rest)?))
+                }
+            }
+            // A mouse button is a key in evdev's code space (`BTN_LEFT` sits a
+            // little past the last `KEY_*`), so it is the same action; only the
+            // spelling — and the device the daemon routes it to — differs.
+            "mouse" | "click" => {
+                if rest.is_empty() {
+                    Err("mouse needs a button: left|right|middle".to_string())
+                } else {
+                    Ok(Action::Key(mouse_code(rest)?))
                 }
             }
             // The manual mode override (docs/13 "Owner decisions" #4). Spelled
@@ -323,9 +342,42 @@ pub(crate) fn key_code(name: &str) -> Result<u16, String> {
         "end" => 107,       // KEY_END
         "pageup" | "pgup" => 104, // KEY_PAGEUP
         "pagedown" | "pgdn" => 109, // KEY_PAGEDOWN
+        // The mouse buttons, under their evdev names: `key btn_left` is the
+        // same binding `mouse left` is. Routed to the pointer by the daemon.
+        "btn_left" => BTN_LEFT,
+        "btn_right" => BTN_RIGHT,
+        "btn_middle" => BTN_MIDDLE,
         other => return Err(format!("unknown key '{other}'")),
     };
     Ok(code)
+}
+
+/// Map a mouse-button name (the argument of a `mouse <button>` action, or
+/// `h.mouse "<button>"` in Lua) to its evdev `BTN_*` code, which
+/// [`Action::Key`] carries like any keycode.
+///
+/// Accepts `left|right|middle`, the evdev names `btn_left|btn_right|btn_middle`,
+/// the abbreviations `lmb|rmb|mmb`, and the X-style numbers `1|2|3`. Matched
+/// case-insensitively; an unknown name is a reported error naming the choices.
+pub(crate) fn mouse_code(name: &str) -> Result<u16, String> {
+    let code = match name.trim().to_ascii_lowercase().as_str() {
+        "left" | "btn_left" | "lmb" | "1" => BTN_LEFT,
+        "right" | "btn_right" | "rmb" | "2" => BTN_RIGHT,
+        "middle" | "btn_middle" | "mmb" | "3" => BTN_MIDDLE,
+        other => {
+            return Err(format!(
+                "unknown mouse button '{other}' (want left|right|middle; \
+                 also btn_left|btn_right|btn_middle, lmb|rmb|mmb, 1|2|3)"
+            ))
+        }
+    };
+    Ok(code)
+}
+
+/// Whether an [`Action::Key`] code is a mouse button — one the daemon clicks
+/// through the virtual pointer rather than typing through the virtual keyboard.
+pub(crate) fn is_mouse_code(code: u16) -> bool {
+    PointerButton::from_evdev(code).is_some()
 }
 
 /// Trackpad-cursor smoothing/damping knobs (the `[cursor]` — or its `[damping]`
@@ -831,15 +883,21 @@ pub const DEFAULT_TOML: &str = r#"
 "guide+x" = "exec walker"            # launcher
 "guide+y" = "keyboard"               # toggle the on-screen keyboard (bottom deck; configurable)
 
-# Bare buttons: pressed WITHOUT the guide modifier, they emit a raw key. The
-# D-pad acts as the arrow keys on the desktop (holding repeats, like a real
-# keyboard). These are suppressed while the guide layer or on-screen keyboard is
-# up, and in a focused game — there the D-pad reaches the game as a controller.
+# Bare buttons: pressed WITHOUT the guide modifier, they emit a raw key or a
+# mouse button. The D-pad acts as the arrow keys on the desktop (holding
+# repeats, like a real keyboard); a hard right-pad click or a full right-trigger
+# pull is a left click, a full left-trigger pull a right click. These are
+# suppressed while the guide layer or on-screen keyboard is up, and in a focused
+# game — there the D-pad reaches the game as a controller. A config that lists
+# its own [buttons] replaces this whole table, clicks included.
 [buttons]
 dpad_up = "key up"
 dpad_down = "key down"
 dpad_left = "key left"
 dpad_right = "key right"
+rpad_click = "mouse left"
+r2 = "mouse left"
+l2 = "mouse right"
 
 # OSK helper buttons: while the on-screen keyboard is up, these send a raw key
 # THROUGH the OSK (its virtual keyboard types it), like the Steam Deck's
@@ -951,6 +1009,16 @@ impl Config {
                     let action = Action::parse(&unquote(v))
                         .map_err(|e| format!("line {lineno}: {e}"))?;
                     match action {
+                        // The OSK types a key by name through its own virtual
+                        // keyboard; a mouse button has no meaning there (and
+                        // the OSK already owns the pad clicks as key commits).
+                        Action::Key(code) if is_mouse_code(code) => {
+                            return Err(format!(
+                                "line {lineno}: osk_buttons send keys through the on-screen \
+                                 keyboard; a mouse button makes no sense there — bind it in \
+                                 [buttons]"
+                            ));
+                        }
                         Action::Key(code) => {
                             osk_buttons.insert(button, code);
                         }
@@ -1831,8 +1899,72 @@ mod tests {
         assert_eq!(b.get(&Button::DpadDown), Some(&108));
         assert_eq!(b.get(&Button::DpadLeft), Some(&105));
         assert_eq!(b.get(&Button::DpadRight), Some(&106));
-        // Only the four D-pad buttons are bound by default.
-        assert_eq!(b.len(), 4);
+        // The mouse clicks that used to be hardwired in the cursor driver: pad
+        // click and a full R2 pull are a left click, a full L2 pull a right one.
+        assert_eq!(b.get(&Button::PadRightClick), Some(&BTN_LEFT));
+        assert_eq!(b.get(&Button::TriggerR2Full), Some(&BTN_LEFT));
+        assert_eq!(b.get(&Button::TriggerL2Full), Some(&BTN_RIGHT));
+        // Four arrows and three clicks, and nothing else, by default.
+        assert_eq!(b.len(), 7);
+    }
+
+    #[test]
+    fn a_config_with_its_own_buttons_replaces_the_default_clicks_too() {
+        // The rule is unchanged: listing [buttons] replaces the whole default
+        // table. A config that wants the clicks lists them (the shipped sample
+        // does); one that leaves them out has no clicks, by choice.
+        let c = Config::from_toml_str("[buttons]\ndpad_up = \"key up\"\n").expect("parse");
+        assert_eq!(c.buttons().len(), 1);
+        assert_eq!(c.buttons().get(&Button::PadRightClick), None);
+    }
+
+    #[test]
+    fn mouse_actions_parse_to_key_actions_in_the_btn_code_space() {
+        assert_eq!(Action::parse("mouse left"), Ok(Action::Key(272)));
+        assert_eq!(Action::parse("click right"), Ok(Action::Key(273)));
+        assert_eq!(Action::parse("MOUSE Middle"), Ok(Action::Key(274)));
+        // The evdev spelling works through `key` too: same code, same action.
+        assert_eq!(Action::parse("key btn_left"), Ok(Action::Key(272)));
+        assert_eq!(Action::parse("key btn_left"), Action::parse("mouse left"));
+        assert!(Action::parse("mouse").unwrap_err().contains("mouse needs a button"));
+        let e = Action::parse("mouse side").unwrap_err();
+        assert!(e.contains("unknown mouse button 'side'"), "{e}");
+        assert!(e.contains("left|right|middle"), "should list the choices: {e}");
+    }
+
+    #[test]
+    fn mouse_code_accepts_every_alias_case_insensitively() {
+        for name in ["left", "LEFT", "btn_left", "lmb", "1", " Left "] {
+            assert_eq!(mouse_code(name), Ok(BTN_LEFT), "{name:?}");
+        }
+        for name in ["right", "btn_right", "RMB", "2"] {
+            assert_eq!(mouse_code(name), Ok(BTN_RIGHT), "{name:?}");
+        }
+        for name in ["middle", "btn_middle", "mmb", "3"] {
+            assert_eq!(mouse_code(name), Ok(BTN_MIDDLE), "{name:?}");
+        }
+        assert!(mouse_code("4").is_err());
+        assert!(mouse_code("").is_err());
+        assert!(is_mouse_code(BTN_LEFT) && is_mouse_code(BTN_MIDDLE));
+        assert!(!is_mouse_code(103) && !is_mouse_code(0));
+    }
+
+    #[test]
+    fn buttons_accept_a_mouse_button_but_osk_buttons_reject_it() {
+        let c = Config::from_toml_str("[buttons]\nr2 = \"mouse left\"\nl2 = \"click rmb\"\n")
+            .expect("parse");
+        assert_eq!(c.buttons().get(&Button::TriggerR2Full), Some(&BTN_LEFT));
+        assert_eq!(c.buttons().get(&Button::TriggerL2Full), Some(&BTN_RIGHT));
+
+        for value in ["mouse left", "key btn_right", "click 3"] {
+            let e = Config::from_toml_str(&format!("[osk_buttons]\ny = \"{value}\"\n"))
+                .unwrap_err();
+            assert!(e.contains("line 2"), "{e}");
+            assert!(e.contains("mouse button makes no sense there"), "{e}");
+            assert!(e.contains("[buttons]"), "should point at the right section: {e}");
+        }
+        // A real key is still fine there.
+        assert!(Config::from_toml_str("[osk_buttons]\ny = \"key space\"\n").is_ok());
     }
 
     #[test]

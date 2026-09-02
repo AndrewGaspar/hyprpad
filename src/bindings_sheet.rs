@@ -659,7 +659,12 @@ pub fn action_string(a: &Action) -> String {
                 format!("keyboard {m}")
             }
         }
-        Action::Key(code) => format!("key {}", key_name(*code)),
+        // A mouse button is a `Key` in evdev's code space; spell it back the
+        // way a config would write it, so the round trip lands on `mouse`.
+        Action::Key(code) => match mouse_name(*code) {
+            Some(button) => format!("mouse {button}"),
+            None => format!("key {}", key_name(*code)),
+        },
         Action::SetMode(m) => format!("set_mode {m}"),
         Action::ClearMode => "clear_mode".to_string(),
         Action::None => "none".to_string(),
@@ -675,6 +680,7 @@ pub fn action_kind(a: &Action) -> &'static str {
         Action::Exec(_) => "exec",
         Action::Dispatch(_) => "dispatch",
         Action::ToggleKeyboard { .. } => "keyboard",
+        Action::Key(code) if mouse_name(*code).is_some() => "mouse",
         Action::Key(_) => "key",
         Action::SetMode(_) => "set_mode",
         Action::ClearMode => "clear_mode",
@@ -708,9 +714,28 @@ pub fn key_name(code: u16) -> String {
         107 => "end",
         104 => "pageup",
         109 => "pagedown",
+        158 => "back",
+        // The mouse buttons under their evdev names (`key btn_left` parses).
+        // `action_string` prefers the `mouse left` spelling; this is the
+        // fallback for anything that prints a code as a key name.
+        0x110 => "btn_left",
+        0x111 => "btn_right",
+        0x112 => "btn_middle",
         _ => return format!("keycode {code}"),
     }
     .to_string()
+}
+
+/// The mouse-button name (`left|right|middle`) a `Key` code stands for, or
+/// `None` for a keyboard code — the sheet's side of the daemon's routing
+/// decision ([`crate::output::PointerButton::from_evdev`]).
+fn mouse_name(code: u16) -> Option<&'static str> {
+    use crate::output::PointerButton;
+    Some(match PointerButton::from_evdev(code)? {
+        PointerButton::Left => "left",
+        PointerButton::Right => "right",
+        PointerButton::Middle => "middle",
+    })
 }
 
 /// A readable label for a binding the config gave no description.
@@ -738,7 +763,10 @@ pub fn derive_label(a: &Action) -> String {
                 format!("On-screen keyboard ({m})")
             }
         }
-        Action::Key(code) => capitalize(&key_name(*code).replace("page", "page ")),
+        Action::Key(code) => match mouse_name(*code) {
+            Some(button) => format!("{} click", capitalize(button)),
+            None => capitalize(&key_name(*code).replace("page", "page ")),
+        },
         Action::SetMode(m) => format!("Force {m} mode"),
         Action::ClearMode => "Back to automatic mode".to_string(),
         Action::None => "Unbound".to_string(),
@@ -1132,6 +1160,44 @@ mod tests {
     }
 
     #[test]
+    fn mouse_bindings_read_as_clicks() {
+        // A mouse button is a `Key` in evdev's code space; the sheet tells it
+        // apart by the code, exactly as the daemon does when routing it.
+        assert_eq!(derive_label(&Action::Key(0x110)), "Left click");
+        assert_eq!(derive_label(&Action::Key(0x111)), "Right click");
+        assert_eq!(derive_label(&Action::Key(0x112)), "Middle click");
+        assert_eq!(action_string(&Action::Key(0x110)), "mouse left");
+        assert_eq!(action_string(&Action::Key(0x111)), "mouse right");
+        assert_eq!(action_kind(&Action::Key(0x110)), "mouse");
+        assert_eq!(action_kind(&Action::Key(0x112)), "mouse");
+        // A keyboard code is untouched by this.
+        assert_eq!(action_kind(&Action::Key(103)), "key");
+        assert_eq!(action_string(&Action::Key(103)), "key up");
+        assert_eq!(key_name(0x110), "btn_left");
+        assert_eq!(key_name(0x112), "btn_middle");
+        assert_eq!(mouse_name(103), None);
+
+        // The default config's three clicks land on controls the diagram knows,
+        // in the bare-button section, with the `mouse` kind.
+        let sheet = Sheet::build(&Config::load_default(), None);
+        let mut clicks: Vec<(String, String, &str, String)> = sheet
+            .entries
+            .iter()
+            .filter(|e| e.action_kind == "mouse")
+            .map(|e| (e.control.clone(), e.label.clone(), e.section.wire(), e.action.clone()))
+            .collect();
+        clicks.sort();
+        assert_eq!(
+            clicks,
+            vec![
+                ("l2".into(), "Right click".into(), "button", "mouse right".into()),
+                ("r2".into(), "Left click".into(), "button", "mouse left".into()),
+                ("rpad_click".into(), "Left click".into(), "button", "mouse left".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn action_strings_round_trip_through_the_parser() {
         for a in [
             Action::Workspace(WorkspaceTarget::Relative(1)),
@@ -1144,6 +1210,8 @@ mod tests {
             Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false },
             Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true },
             Action::Key(103),
+            Action::Key(0x110),
+            Action::Key(0x112),
             Action::SetMode("game".into()),
             Action::ClearMode,
             Action::None,
