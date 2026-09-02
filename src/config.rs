@@ -279,6 +279,30 @@ pub enum Action {
     SetMode(String),
     /// Drop a manual override so the context rules decide again.
     ClearMode,
+    /// Several actions, performed **in order** on one press
+    /// (`h.seq { h.key "f", h.set_mode "hints" }`, `"seq: key f; set_mode
+    /// hints"`).
+    ///
+    /// The whole point is the two-step binding the browser hints need: type a
+    /// key into the focused window, *then* move the daemon into the mode whose
+    /// buttons are that page's hint letters
+    /// (docs/research/browser-hints.md Δ3). Every step goes through the same
+    /// `perform_action` path a lone action does, so a step means exactly what
+    /// it means on its own — with one deliberate difference:
+    ///
+    /// * An [`Action::Key`] step is a **tap** — pressed and released on the
+    ///   spot — not a held output. A held key needs a release edge to pair
+    ///   with, and a sequence has none: by the time the button lifts the
+    ///   sequence is long over, and the daemon may not even be in the mode
+    ///   that resolved it any more.
+    /// * [`SetMode`](Self::SetMode) / [`ClearMode`](Self::ClearMode) apply
+    ///   where they stand, so later steps run in the new mode; the "the mode
+    ///   moved" answer a binding gives its caller is the OR over the steps.
+    ///
+    /// A sequence never contains another sequence — nesting is refused at load
+    /// ([`Action::parse`], `value_to_action`) rather than flattened, so the
+    /// cheat sheet's label for a `seq` is always one flat list.
+    Seq(Vec<Action>),
     /// No action.
     None,
 }
@@ -290,6 +314,12 @@ impl Action {
         let s = s.trim();
         if s.is_empty() || s.eq_ignore_ascii_case("none") {
             return Ok(Action::None);
+        }
+        // `seq: key f; set_mode hints` — a sequence, before the ordinary
+        // verb split, because its steps carry whitespace of their own and one
+        // of them may itself be a `key f` with a space in it.
+        if let Some(rest) = strip_verb(s, "seq") {
+            return Action::parse_seq(rest);
         }
         let (verb, rest) = match s.split_once(char::is_whitespace) {
             Some((v, r)) => (v, r.trim()),
@@ -379,6 +409,50 @@ impl Action {
             other => Err(format!("unknown action '{other}'")),
         }
     }
+
+    /// Read the body of a `seq: …` action: the steps, `;`-separated, each in
+    /// the ordinary action grammar ([`Action::parse`]).
+    ///
+    /// A trailing separator is allowed (`"seq: key f; set_mode hints;"`), an
+    /// empty sequence is an error, and a step that is itself a sequence is
+    /// refused rather than flattened — see [`Action::Seq`].
+    fn parse_seq(body: &str) -> Result<Action, String> {
+        let mut steps = Vec::new();
+        for piece in body.split(';') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            match Action::parse(piece)? {
+                Action::Seq(_) => {
+                    return Err(format!(
+                        "'{piece}' is itself a sequence; a seq takes plain actions, \
+                         write them as further steps of this one"
+                    ))
+                }
+                step => steps.push(step),
+            }
+        }
+        if steps.is_empty() {
+            return Err("seq needs at least one step, e.g. 'seq: key f; set_mode hints'".to_string());
+        }
+        Ok(Action::Seq(steps))
+    }
+}
+
+/// Strip a leading verb from an action string, whether it is followed by
+/// whitespace or by the `:` that reads better on a sequence — `"seq: a; b"`,
+/// `"seq:a; b"` and `"seq a; b"` all yield `"a; b"`. Case-insensitive, like
+/// every other verb. `None` when `s` does not start with `verb`.
+fn strip_verb<'a>(s: &'a str, verb: &str) -> Option<&'a str> {
+    let rest = s.get(..verb.len()).filter(|head| head.eq_ignore_ascii_case(verb)).map(|_| &s[verb.len()..])?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    // A verb has to end somewhere: `sequence …` is not `seq`.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) && !s[verb.len()..].starts_with(':')
+    {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// What a bare button does: a held output that follows the button, or a
@@ -396,9 +470,12 @@ impl Action {
 ///   modifiers go down before the key and come up after it, and the kernel
 ///   auto-repeats the key with them still down.
 /// * [`Fire`](Self::Fire) — everything else (`exec`, `dispatch`, `workspace`,
-///   `keyboard`, `fullscreen`, `set_mode`, `clear_mode`). Performed **once**
-///   on the press edge, through the same path a guide chord takes after it
-///   resolves, and never again while the button stays down.
+///   `keyboard`, `fullscreen`, `set_mode`, `clear_mode`, `seq`). Performed
+///   **once** on the press edge, through the same path a guide chord takes
+///   after it resolves, and never again while the button stays down. A
+///   [`Action::Seq`] lands here even when it *contains* a key: a sequence taps
+///   its keys rather than holding them, so there is nothing for the button's
+///   release edge to let go of.
 ///
 /// [`Action::None`] is neither: a bare button with no action is a config
 /// error — remove the line instead ([`ButtonAction::classify`]).
@@ -1170,6 +1247,113 @@ pub struct ModeDef {
     /// mode is active (`h.mode("game", { forward = true })`). This is the mode
     /// model's replacement for "a game window is focused".
     pub forward: bool,
+    /// How this mode **lets go of itself**, for a mode that is entered by hand
+    /// and has to leave without anyone telling it to
+    /// (`h.mode("hints"):transient { … }`). `None` — the usual case — is a
+    /// mode that stays until the rules or a `clear_mode` move it.
+    ///
+    /// A transient mode never wins by rule (it must not have one), so the only
+    /// way in is [`Action::SetMode`]; see [`TransientSpec`].
+    pub transient: Option<TransientSpec>,
+}
+
+/// When a **transient** mode gives itself back
+/// (`h.mode("hints"):transient { max_presses = 3, exit_on = { "b", "focus" },
+/// timeout_ms = 8000 }`).
+///
+/// The browser-hints case is the one that needs this
+/// (docs/research/browser-hints.md Δ4): a chord types `f` into the page and
+/// forces the `hints` mode, in which the bare buttons are Vimium's hint
+/// letters — and then *nothing outside the page can say when the hints are
+/// gone*. Vimium sends no signal; a link may open in a background tab, or the
+/// page may be one Vimium ignores entirely. So the mode carries its own
+/// contract instead: hints last at most ⌈log_k n⌉ presses, B cancels them, and
+/// following a link changes the window's title.
+///
+/// Every field is optional in the config and every one has a default, so
+/// `transient {}` alone is the browser-hints shape. "Off" is spelled as the
+/// empty value, not by omission: `max_presses = 0` is no cap, `timeout_ms = 0`
+/// is no timer, `exit_on = {}` is no exits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransientSpec {
+    /// Bare-button presses that resolved in this mode before it clears itself,
+    /// or `0` for no cap. The press that spends the last of the budget is
+    /// still delivered — it is the keystroke that picked the link — and the
+    /// mode goes as soon as it has been.
+    pub max_presses: u32,
+    /// The events that end the mode outright. Empty means only the press cap
+    /// and the timer can.
+    pub exit_on: Vec<TransientExit>,
+    /// Milliseconds from entering the mode to it clearing itself, or `0` for
+    /// no timer. The wandered-off case: nothing else fires when the user
+    /// simply stops pressing.
+    pub timeout_ms: u64,
+}
+
+impl Default for TransientSpec {
+    /// The browser-hints defaults: three presses (Vimium's longest code on a
+    /// realistic page), B cancels, any context change or click drops it, and
+    /// eight seconds of silence ends it.
+    fn default() -> TransientSpec {
+        TransientSpec {
+            max_presses: 3,
+            exit_on: vec![
+                TransientExit::Button(report::Button::B),
+                TransientExit::Focus,
+                TransientExit::Title,
+                TransientExit::Click,
+            ],
+            timeout_ms: 8_000,
+        }
+    }
+}
+
+impl TransientSpec {
+    /// Whether pressing `b` is one of this mode's exits — the press that both
+    /// ends the mode and is swallowed by ending it.
+    pub fn exits_on_button(&self, b: report::Button) -> bool {
+        self.exit_on.contains(&TransientExit::Button(b))
+    }
+
+    /// Whether `what` — one of the context exits — ends this mode.
+    pub fn exits_on(&self, what: TransientExit) -> bool {
+        self.exit_on.contains(&what)
+    }
+}
+
+/// One way out of a [`TransientSpec`] mode, as named in `exit_on`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransientExit {
+    /// A named bare button was pressed (`"b"`). The press is **consumed**: it
+    /// is the exit, so it is not also delivered to the focused window.
+    Button(report::Button),
+    /// The focused window changed (`"focus"`).
+    Focus,
+    /// The focused window renamed itself (`"title"`) — following a link in the
+    /// current tab looks exactly like this.
+    Title,
+    /// A mouse button was emitted (`"click"`). Vimium's hints exit on a click
+    /// too, so the daemon should not be left behind holding the mode.
+    Click,
+}
+
+impl TransientExit {
+    /// Read one `exit_on` entry: a button name ([`parse_button`]) or one of the
+    /// three context words.
+    pub fn parse(s: &str) -> Result<TransientExit, String> {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "focus" => Ok(TransientExit::Focus),
+            "title" => Ok(TransientExit::Title),
+            "click" => Ok(TransientExit::Click),
+            other => parse_button(other).map(TransientExit::Button).map_err(|_| {
+                format!(
+                    "unknown transient exit '{other}' — want a button name (\"b\", \"r2\", …) \
+                     or one of focus/title/click"
+                )
+            }),
+        }
+    }
 }
 
 /// A **second** bare-button binding for a button that already carries one, with
@@ -1893,6 +2077,14 @@ impl Config {
     /// Empty for a TOML config — see [`crate::mode::ModeEngine`].
     pub fn modes(&self) -> &[ModeDef] {
         &self.modes
+    }
+
+    /// The transient contract of the mode called `name`, if it has one
+    /// ([`TransientSpec`]). `None` for an ordinary mode, for a mode this
+    /// config does not declare, and for every TOML config — only the Lua
+    /// front-end can declare a mode at all.
+    pub fn transient_of(&self, name: &str) -> Option<&TransientSpec> {
+        self.modes.iter().find(|m| m.name == name)?.transient.as_ref()
     }
 
     /// The mode selected when no rule matches. `"desktop"` unless the config
@@ -3469,5 +3661,85 @@ rumble_intensity = 0.25
         // A predicate whose result never arrived (it errored or timed out) is
         // "no match", never "yes by default".
         assert!(!Guard::When(9).allows(&desktop));
+    }
+
+    // --- h.seq / `seq: …` (docs/research/browser-hints.md Δ3) ------------
+
+    #[test]
+    fn a_sequence_parses_from_the_toml_grammar_in_every_spelling() {
+        // KEY_F = 33, KEY_LEFTSHIFT = 42.
+        let want = Action::Seq(vec![
+            Action::Key(KeyChord::parse("f").unwrap()),
+            Action::SetMode("hints".into()),
+        ]);
+        // The colon reads best, but it may hug the verb or the first step, and
+        // it may be a plain space instead — all one action.
+        for spelling in [
+            "seq: key f; set_mode hints",
+            "seq:key f; set_mode hints",
+            "seq key f; set_mode hints",
+            "SEQ: key f ; set_mode hints",
+            // A trailing separator is a typing convenience, not a third step.
+            "seq: key f; set_mode hints;",
+        ] {
+            assert_eq!(Action::parse(spelling), Ok(want.clone()), "{spelling}");
+        }
+        // The steps keep their own grammar, modifiers and all.
+        assert_eq!(
+            Action::parse("seq: key shift+f; set_mode hints"),
+            Ok(Action::Seq(vec![
+                Action::Key(KeyChord::parse("shift+f").unwrap()),
+                Action::SetMode("hints".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_sequence_refuses_to_nest_or_to_be_empty() {
+        // Nesting is REFUSED, not flattened: the cheat sheet's label for a
+        // `seq` is one flat list, and it stays that way by construction.
+        let e = Action::parse("seq: key f; seq: key g; key h").unwrap_err();
+        assert!(e.contains("itself a sequence"), "{e}");
+        // Nothing to do is a config bug, not an empty sequence.
+        assert!(Action::parse("seq:").is_err());
+        assert!(Action::parse("seq: ; ;").is_err());
+        // A step's own error is reported as its own.
+        let e = Action::parse("seq: key f; nonsense").unwrap_err();
+        assert!(e.contains("unknown action 'nonsense'"), "{e}");
+        // And a verb that merely starts with the letters is not a sequence.
+        assert!(Action::parse("sequence x").unwrap_err().contains("unknown action"));
+    }
+
+    #[test]
+    fn a_sequence_on_a_bare_button_fires_rather_than_holding() {
+        // A seq taps its keys, so there is nothing for the button's release
+        // edge to let go of: it is a `Fire`, even though it contains a key.
+        let seq = Action::parse("seq: key f; set_mode hints").unwrap();
+        assert_eq!(ButtonAction::classify(seq.clone()), Ok(ButtonAction::Fire(seq)));
+    }
+
+    // --- transient modes (Δ4) -------------------------------------------
+
+    #[test]
+    fn a_transient_spec_defaults_to_the_hints_contract() {
+        let t = TransientSpec::default();
+        assert_eq!(t.max_presses, 3);
+        assert_eq!(t.timeout_ms, 8_000);
+        assert!(t.exits_on_button(Button::B));
+        assert!(!t.exits_on_button(Button::A));
+        for what in [TransientExit::Focus, TransientExit::Title, TransientExit::Click] {
+            assert!(t.exits_on(what));
+        }
+    }
+
+    #[test]
+    fn a_transient_exit_names_a_button_or_a_context_change() {
+        assert_eq!(TransientExit::parse("b"), Ok(TransientExit::Button(Button::B)));
+        assert_eq!(TransientExit::parse(" R2 "), Ok(TransientExit::Button(Button::TriggerR2Full)));
+        assert_eq!(TransientExit::parse("focus"), Ok(TransientExit::Focus));
+        assert_eq!(TransientExit::parse("title"), Ok(TransientExit::Title));
+        assert_eq!(TransientExit::parse("click"), Ok(TransientExit::Click));
+        let e = TransientExit::parse("elsewhere").unwrap_err();
+        assert!(e.contains("unknown transient exit 'elsewhere'"), "{e}");
     }
 }

@@ -43,6 +43,12 @@
 //! h.osk_button("l2",  h.osk "shift")    -- …or one of its own actions (commit|shift|dismiss),
 //!                                       -- layered over the built-in Deck map; h.none() drops one
 //!
+//! -- Several actions on one press, in order. A key inside a sequence is a
+//! -- TAP (a sequence has no release edge to hold one against), and a
+//! -- set_mode/clear_mode applies where it stands, so later steps run in the
+//! -- new mode. Sequences do not nest.
+//! h.bind("guide+l4", "Link hints", h.seq { h.key "f", h.set_mode "hints" })
+//!
 //! -- Modes: a mode is a NAMED CONTEXT selected by a predicate. Rules run in
 //! -- definition order, first match wins, and only on a context change.
 //! h.mode("desktop")
@@ -50,6 +56,16 @@
 //!   return ctx.focus.class:match("^steam_app_") ~= nil
 //! end)
 //! h.default_mode "desktop"
+//!
+//! -- A TRANSIENT mode gives itself back. It has no rule — it is entered only
+//! -- by h.set_mode — and it clears itself on the first of: N bare-button
+//! -- presses that resolved in it, a named button (whose press is then eaten,
+//! -- not delivered), a focus or title change, a mouse click, or the timer.
+//! -- Every key is optional; `:transient {}` alone is the shape below. Off is
+//! -- the empty value: max_presses = 0, exit_on = {}, timeout_ms = 0.
+//! h.mode("hints"):transient { max_presses = 3,
+//!                             exit_on = { "b", "focus", "title", "click" },
+//!                             timeout_ms = 8000 }
 //!
 //! -- Per-binding guards: every binding decides for itself where it is live.
 //! h.cursor { only_in = { "desktop" }, guide_in = { "game" } } -- guide + pad = mouse in a game
@@ -116,7 +132,7 @@
 
 use crate::config::{
     Action, ButtonAction, ButtonAlt, Config, CursorConfig, GamepadConfig, Guard, HapticsConfig,
-    ModeDef, OskAction, ScrollConfig, ScrollMode,
+    ModeDef, OskAction, ScrollConfig, ScrollMode, TransientExit, TransientSpec,
 };
 use crate::config::{mouse_code, parse_button, GestureKey, KeyChord};
 use crate::mode::Context;
@@ -577,7 +593,7 @@ fn finish(
     // implicitly (with no rule) so `h.default_mode "desktop"` alone works.
     let default = b.default_mode.clone().unwrap_or_else(|| "desktop".to_string());
     if !b.modes.iter().any(|m| m.name == default) {
-        b.modes.push(ModeDef { name: default.clone(), rule: None, forward: false });
+        b.modes.push(ModeDef { name: default.clone(), rule: None, forward: false, transient: None });
     }
     // A guard naming a mode that was never declared is a typo, and a silent one
     // — the binding would simply never fire. Refuse to load instead.
@@ -591,6 +607,21 @@ fn finish(
                     if declared.is_empty() { "none".to_string() } else { declared.join(", ") }
                 ));
             }
+        }
+    }
+
+    // A transient mode is one you *enter*: it counts its own presses and times
+    // itself out, so resolving into it by rule would arm that contract nobody
+    // asked for and then clear it out from under the window that selected it.
+    // The engine skips such a mode in the rule scan; say so at load rather
+    // than letting a `:when` sit there looking live.
+    for m in &b.modes {
+        if m.transient.is_some() && m.rule.is_some() {
+            return Err(format!(
+                "mode '{}' is :transient and also has a :when rule — a transient mode is \
+                 entered by hand (h.set_mode \"{}\") and never wins by rule; drop one of them",
+                m.name, m.name
+            ));
         }
     }
 
@@ -866,6 +897,7 @@ fn install_api(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<()> {
     h.set("set_mode", action_ctor(lua, "set_mode", "name")?)?;
     h.set("fullscreen", action_nullary(lua, "fullscreen")?)?;
     h.set("clear_mode", action_nullary(lua, "clear_mode")?)?;
+    h.set("seq", seq_ctor(lua)?)?;
     h.set("none", action_nullary(lua, "none")?)?;
     h.set("keyboard", keyboard_ctor(lua)?)?;
     // The on-screen keyboard's own actions — `h.osk "commit"|"shift"|"dismiss"`
@@ -925,6 +957,7 @@ fn handle_index(
             (HandleKind::Guard, "when") => bound_guard_when(lua, &build, &this, slot)?,
             (HandleKind::Mode, "when") => bound_mode_when(lua, &build, &this, slot)?,
             (HandleKind::Mode, "forward") => bound_mode_forward(lua, &build, &this, slot)?,
+            (HandleKind::Mode, "transient") => bound_mode_transient(lua, &build, &this, slot)?,
             (HandleKind::Guard, other) => {
                 return Err(err(format!(
                     "a binding has no '{other}'; it takes only_in, not_in or when"
@@ -932,7 +965,7 @@ fn handle_index(
             }
             (HandleKind::Mode, other) => {
                 return Err(err(format!(
-                    "a mode has no '{other}'; it takes when or forward"
+                    "a mode has no '{other}'; it takes when, forward or transient"
                 )))
             }
         };
@@ -1028,6 +1061,81 @@ fn bound_mode_forward(
             return Err(err("forward called on something that is not a mode handle"));
         };
         b.modes[idx].forward = on;
+        drop(b);
+        Ok(this.clone())
+    })
+}
+
+/// `mode:transient { max_presses = 3, exit_on = { "b", "focus" },
+/// timeout_ms = 8000 }` — declare that this mode gives itself back
+/// ([`TransientSpec`]).
+///
+/// Every key is optional and each one that is absent keeps its default, so
+/// `:transient {}` (and `:transient()`) is the whole browser-hints contract:
+/// three presses, B cancels, focus/title/click drop it, eight seconds. Off is
+/// spelled with the empty value rather than by omission — `max_presses = 0`,
+/// `timeout_ms = 0`, `exit_on = {}`.
+fn bound_mode_transient(
+    lua: &Lua,
+    build: &Rc<RefCell<Build>>,
+    this: &Table,
+    slot: usize,
+) -> mlua::Result<Function> {
+    let build = Rc::clone(build);
+    let this = this.clone();
+    lua.create_function(move |_, args: MultiValue| {
+        // Ignore a leading handle from a `:` call; the options table, if any,
+        // is the first table that is not a handle.
+        let mut opts = None;
+        for v in args.iter() {
+            if let Value::Table(t) = v {
+                if t.raw_get::<Option<usize>>("__slot")?.is_some() {
+                    continue;
+                }
+                opts = Some(t.clone());
+                break;
+            }
+        }
+        let mut spec = TransientSpec::default();
+        if let Some(t) = opts {
+            for pair in t.pairs::<String, Value>() {
+                let (k, v) = pair?;
+                match k.as_str() {
+                    "max_presses" | "presses" => {
+                        let n = as_f64(&v, &k)?;
+                        if n < 0.0 || n.fract() != 0.0 || n > f64::from(u32::MAX) {
+                            return Err(err(format!(
+                                "'{k}' must be a whole number of presses (0 = no cap), got {n}"
+                            )));
+                        }
+                        spec.max_presses = n as u32;
+                    }
+                    "timeout_ms" | "timeout" => spec.timeout_ms = as_millis(&v, &k)?,
+                    "exit_on" | "exits" => {
+                        let mut exits = Vec::new();
+                        for name in mode_list(vec![v])? {
+                            let exit = TransientExit::parse(&name).map_err(err)?;
+                            if !exits.contains(&exit) {
+                                exits.push(exit);
+                            }
+                        }
+                        spec.exit_on = exits;
+                    }
+                    other => {
+                        return Err(unknown_key(
+                            "transient",
+                            other,
+                            &["max_presses", "exit_on", "timeout_ms"],
+                        ))
+                    }
+                }
+            }
+        }
+        let mut b = build.borrow_mut();
+        let Some(Slot::Mode(idx)) = b.slots.get(slot).cloned() else {
+            return Err(err("transient called on something that is not a mode handle"));
+        };
+        b.modes[idx].transient = Some(spec);
         drop(b);
         Ok(this.clone())
     })
@@ -1173,7 +1281,7 @@ fn mode_fn(
         if b.modes.iter().any(|m| m.name == name) {
             return Err(err(format!("mode '{name}' is declared twice")));
         }
-        b.modes.push(ModeDef { name, rule: None, forward });
+        b.modes.push(ModeDef { name, rule: None, forward, transient: None });
         let idx = b.modes.len() - 1;
         let slot = b.slot(Slot::Mode(idx));
         drop(b);
@@ -1460,6 +1568,29 @@ fn action_ctor(lua: &Lua, verb: &'static str, arg: &'static str) -> mlua::Result
     })
 }
 
+/// `h.seq { h.key "f", h.set_mode "hints" }` — several actions performed in
+/// order on one press ([`Action::Seq`]).
+///
+/// The steps are kept as the Lua values they are and read by
+/// [`value_to_action`] like any other action, so a step means on its own
+/// exactly what it means here — including `h.seq` itself, which is how nesting
+/// is *caught* rather than silently accepted.
+fn seq_ctor(lua: &Lua) -> mlua::Result<Function> {
+    lua.create_function(|lua, steps: Value| {
+        let Value::Table(steps) = steps else {
+            return Err(err(format!(
+                "h.seq needs a list of actions, e.g. h.seq {{ h.key \"f\", h.set_mode \"hints\" }}, \
+                 got {}",
+                steps.type_name()
+            )));
+        };
+        let t = lua.create_table()?;
+        t.set(ACTION_TAG, "seq")?;
+        t.set("steps", steps)?;
+        Ok(t)
+    })
+}
+
 /// A zero-argument action constructor, e.g. `h.fullscreen()`.
 fn action_nullary(lua: &Lua, verb: &'static str) -> mlua::Result<Function> {
     lua.create_function(move |lua, ()| {
@@ -1527,7 +1658,7 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
             let Some(verb) = verb else {
                 return Err(err(
                     "that table is not an action — use one of h.workspace/h.exec/h.dispatch/\
-                     h.keyboard/h.key/h.mouse/h.fullscreen/h.set_mode/h.clear_mode/h.none",
+                     h.keyboard/h.key/h.mouse/h.fullscreen/h.set_mode/h.clear_mode/h.seq/h.none",
                 ));
             };
             let arg: String = t.get::<Option<String>>("arg")?.unwrap_or_default();
@@ -1535,6 +1666,32 @@ fn value_to_action(v: &Value) -> mlua::Result<Action> {
                 "fullscreen" => Ok(Action::ToggleFullscreen),
                 "clear_mode" => Ok(Action::ClearMode),
                 "none" => Ok(Action::None),
+                // A sequence reads its steps through this same function, which
+                // is what makes a step mean exactly what it means alone — and
+                // what catches a nested `h.seq`, which is refused rather than
+                // flattened so the sheet's label is always one flat list.
+                "seq" => {
+                    let steps: Table = t.get("steps")?;
+                    let mut out = Vec::new();
+                    for step in steps.sequence_values::<Value>() {
+                        match value_to_action(&step?)? {
+                            Action::Seq(_) => {
+                                return Err(err(
+                                    "h.seq cannot contain another h.seq; write the inner \
+                                     steps as further steps of the outer one",
+                                ))
+                            }
+                            a => out.push(a),
+                        }
+                    }
+                    if out.is_empty() {
+                        return Err(err(
+                            "h.seq needs at least one action, e.g. \
+                             h.seq { h.key \"f\", h.set_mode \"hints\" }",
+                        ));
+                    }
+                    Ok(Action::Seq(out))
+                }
                 "key" => KeyChord::parse(&arg).map(Action::Key).map_err(err),
                 // A mouse button is a key in evdev's code space; the daemon
                 // routes it to the virtual pointer by its code.
@@ -2344,6 +2501,140 @@ mod tests {
         assert!(c.modes()[0].forward && !c.modes()[1].forward);
         assert!(c.modes()[0].rule.is_some() && c.modes()[2].rule.is_none());
         assert_eq!(c.default_mode(), "desktop");
+    }
+
+    #[test]
+    fn h_seq_reads_a_list_of_actions_in_order() {
+        // The browser-hints entry chord: type `f` into the page, then move the
+        // daemon into the mode whose buttons are that page's hint letters.
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("hints")
+            h.mode("desktop")
+            h.bind("guide+l4", "Link hints", h.seq { h.key "f", h.set_mode "hints" })
+            h.bind("guide+l5", h.seq { h.key "shift+f", h.set_mode "hints" })
+            h.button("l3", h.seq { h.key "escape", h.clear_mode() })
+            "#,
+        );
+        let want = Action::Seq(vec![
+            Action::Key(KeyChord::parse("f").unwrap()),
+            Action::SetMode("hints".into()),
+        ]);
+        assert_eq!(c.resolve(&GestureEvent::GuideChord(Button::GripL4)), want);
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideChord(Button::GripL5)),
+            Action::Seq(vec![
+                Action::Key(KeyChord::parse("shift+f").unwrap()),
+                Action::SetMode("hints".into()),
+            ])
+        );
+        // A bare button takes one too, and it fires rather than holding: a
+        // sequence taps its keys, so there is no held output to release.
+        assert_eq!(
+            c.buttons().get(&Button::L3),
+            Some(&Fire(Action::Seq(vec![
+                Action::Key(KeyChord::parse("escape").unwrap()),
+                Action::ClearMode,
+            ])))
+        );
+        // The TOML grammar spells the same thing, so the two front-ends cannot
+        // drift on what a sequence means.
+        let t = Config::from_toml_str("[bindings]\n\"guide+l4\" = \"seq: key f; set_mode hints\"\n")
+            .expect("parse");
+        assert_eq!(t.resolve(&GestureEvent::GuideChord(Button::GripL4)), want);
+    }
+
+    #[test]
+    fn h_seq_refuses_to_nest_to_be_empty_or_to_take_a_non_list() {
+        let e = load_str(
+            r#"hyprpad.bind("guide+l4", hyprpad.seq { hyprpad.key "f",
+               hyprpad.seq { hyprpad.key "g" } })"#,
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot contain another h.seq"), "{e}");
+
+        let e = load_str(r#"hyprpad.bind("guide+l4", hyprpad.seq {})"#, "t.lua").unwrap_err();
+        assert!(e.contains("at least one action"), "{e}");
+
+        let e = load_str(r#"hyprpad.bind("guide+l4", hyprpad.seq "key f")"#, "t.lua").unwrap_err();
+        assert!(e.contains("h.seq needs a list of actions"), "{e}");
+    }
+
+    #[test]
+    fn a_mode_can_declare_how_it_gives_itself_back() {
+        use crate::config::TransientExit;
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("hints"):transient { max_presses = 2, exit_on = { "b", "focus" },
+                                        timeout_ms = 4000 }
+            h.mode("bare"):transient {}
+            h.mode("plain")
+            h.default_mode "plain"
+            "#,
+        );
+        let hints = c.transient_of("hints").expect("hints is transient");
+        assert_eq!(hints.max_presses, 2);
+        assert_eq!(hints.timeout_ms, 4_000);
+        assert_eq!(
+            hints.exit_on,
+            vec![TransientExit::Button(Button::B), TransientExit::Focus]
+        );
+        // `transient {}` alone is the whole browser-hints contract.
+        assert_eq!(c.transient_of("bare"), Some(&crate::config::TransientSpec::default()));
+        // And an ordinary mode is not transient at all.
+        assert_eq!(c.transient_of("plain"), None);
+        assert_eq!(c.transient_of("nothing-by-that-name"), None);
+    }
+
+    #[test]
+    fn transient_switches_off_by_the_empty_value_not_by_omission() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("hints"):transient { max_presses = 0, exit_on = {}, timeout_ms = 0 }
+            h.mode("desktop")
+            "#,
+        );
+        let t = c.transient_of("hints").expect("still transient");
+        assert_eq!((t.max_presses, t.timeout_ms), (0, 0));
+        assert!(t.exit_on.is_empty(), "a mode with no exits at all is a legal, if odd, mode");
+    }
+
+    #[test]
+    fn a_transient_mode_may_not_also_have_a_rule() {
+        // A transient mode is one you *enter*: it counts its own presses and
+        // times itself out, and the engine never resolves into it by rule. A
+        // `:when` on one would sit there looking live, so refuse the file.
+        let e = load_str(
+            r#"
+            local h = hyprpad
+            hyprpad.mode("hints"):transient {}:when(function(ctx) return true end)
+            hyprpad.mode("desktop")
+            "#,
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("is :transient and also has a :when rule"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_transient_option_names_itself() {
+        let e = load_str(r#"hyprpad.mode("x"):transient { max_press = 3 }"#, "t.lua").unwrap_err();
+        assert!(e.contains("unknown transient key 'max_press'"), "{e}");
+
+        let e =
+            load_str(r#"hyprpad.mode("x"):transient { exit_on = { "nope" } }"#, "t.lua").unwrap_err();
+        assert!(e.contains("unknown transient exit 'nope'"), "{e}");
+
+        let e =
+            load_str(r#"hyprpad.mode("x"):transient { max_presses = -1 }"#, "t.lua").unwrap_err();
+        assert!(e.contains("whole number of presses"), "{e}");
+
+        let e = load_str(r#"hyprpad.mode("x"):tranzient {}"#, "t.lua").unwrap_err();
+        assert!(e.contains("when, forward or transient"), "{e}");
     }
 
     #[test]

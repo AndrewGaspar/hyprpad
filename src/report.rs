@@ -128,6 +128,25 @@ impl Frame {
         self.buttons & (1 << idx) != 0
     }
 
+    /// The same frame with `buttons` reported as *not* pressed.
+    ///
+    /// How a consumed press is spelled: a button whose press was taken by
+    /// something upstream — a transient mode's exit
+    /// ([`crate::mode::ModeEngine::note_press`]) — is masked out of the frame
+    /// the bare-button layer sees, so it produces no press edge for a `Hold`
+    /// binding and no [`edges_down`](Self::edges_down) for a `Fire` one. The
+    /// *unmasked* frame is what becomes the next frame's `prev`, so a button
+    /// still held after its press was eaten is simply down on both frames and
+    /// never becomes an edge again.
+    pub fn without(mut self, buttons: &[Button]) -> Frame {
+        for &b in buttons {
+            if let Some(i) = BUTTON_BITS.iter().position(|&(_, _, bb)| bb == b) {
+                self.buttons &= !(1 << i);
+            }
+        }
+        self
+    }
+
     /// Buttons newly pressed relative to `prev`.
     pub fn edges_down(&self, prev: &Frame) -> impl Iterator<Item = Button> + '_ {
         let changed = self.buttons & !prev.buttons;
