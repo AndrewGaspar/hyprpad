@@ -217,6 +217,10 @@ h.button("x", "Clear line", h.key "ctrl+u"):only_in("agent")
 -- tools that want it — a bumper, so a squeeze can't kill a running command.
 h.button("y",  "Escape / interrupt", h.key "escape"):only_in("agent")
 h.button("r1", "Interrupt (ctrl+c)", h.key "ctrl+c"):only_in("agent")
+-- Clipboard, as the terminal spells it: L1 pastes (ctrl+shift+v), View copies the
+-- selection (ctrl+shift+c) — a no-op with nothing highlighted, so a stray press is harmless.
+h.button("l1",   "Paste clipboard",    h.key "ctrl+shift+v"):only_in("agent")
+h.button("view", "Copy selection",     h.key "ctrl+shift+c"):only_in("agent")
 
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
