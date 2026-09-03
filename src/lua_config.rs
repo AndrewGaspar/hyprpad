@@ -3740,6 +3740,10 @@ l2 = "osk shift"
 "guide+x" = "workspace emptyn"
 "guide+stick_down" = "workspace previous"
 "guide+stick_up" = 'dispatch hl.dsp.workspace.toggle_special("scratchpad")'
+"guide+lstick_left" = 'dispatch hl.dsp.focus({ direction = "l" })'
+"guide+lstick_right" = 'dispatch hl.dsp.focus({ direction = "r" })'
+"guide+lstick_up" = 'dispatch hl.dsp.focus({ direction = "u" })'
+"guide+lstick_down" = 'dispatch hl.dsp.focus({ direction = "d" })'
 "guide+dpad_down" = "movetoworkspace emptyn"
 "guide+dpad_up" = "exec omarchy-shell -q hyprpad.status navEnter"
 "guide+a" = "exec voxtype record toggle"

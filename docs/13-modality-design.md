@@ -410,8 +410,8 @@ matching left optional. But "keep expectations low" rested on starting `claude`
 in an already-focused terminal needing a refocus to be noticed, and that is no
 longer true — `rescan_on_title_change` and the 500 ms `process_rescan_ms` sweep
 both close it, on by default, gated behind `process_rescan_useful`.
-`config/hyprpad.lua:107-112` still carries the old caveat verbatim ("needs a
-refocus to be noticed") and should be corrected when that file is next touched.
+The sample now ships the mode as `agent` — one rule covering Claude Code, Codex,
+Muse and OpenCode — and the "needs a refocus" caveat is gone from its comment.
 
 **4. Manual override is first class.** ✅ *Holds, and grew.*
 `h.set_mode` / `h.clear_mode` beat the rules (`src/mode.rs:22`), and `reconfigure`

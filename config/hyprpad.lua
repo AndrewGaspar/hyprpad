@@ -103,18 +103,19 @@ h.mode("browser").when(function(ctx)
   return c == "google-chrome" or c:match("^chrome%-") ~= nil
 end)
 
--- A terminal running Claude Code. Same window class as any other terminal, so
--- the rule has to look INSIDE the window: `process_tree_has` walks the focused
--- window's /proc descendants (once per focused pid, cached). No refocus needed:
--- the terminal renaming itself drops that cache (`rescan_on_title_change`), and
--- the periodic `process_rescan_ms` sweep catches a program that renames nothing.
--- Behaviour TBD; the mode is declared but nothing is guarded into
--- it yet, so it currently behaves exactly like the desktop.
---
--- Uncomment to try it, then guard bindings with `:only_in("claude")`:
--- h.mode("claude").when(function(ctx)
---   return ctx.focus:process_tree_has("claude")
--- end)
+-- An AI coding agent in the focused terminal: Claude Code, OpenAI Codex, Muse,
+-- OpenCode. Titles are project names with spinners, so the rule looks INSIDE the
+-- window: `process_tree_has` walks the focused window's /proc descendants and
+-- matches a lowercase substring of "<comm> <cmdline>". `muse-bin` because the
+-- binary is `muse-bin-<version>` (comm is truncated to 15 chars); `opencode`
+-- matches both `opencode2` and its bun child; `codex` also matches its
+-- `codex-code-mode` helper. No agent-specific bindings yet — this only names
+-- the context, so the bar and the cheat sheet show it and rules can key on it.
+h.mode("agent").when(function(ctx)
+  local f = ctx.focus
+  return f:process_tree_has("claude") or f:process_tree_has("codex")
+      or f:process_tree_has("muse-bin") or f:process_tree_has("opencode")
+end)
 
 -- Ordinary desktop use. No rule: it is the fallback.
 h.mode("desktop")
@@ -163,7 +164,7 @@ h.cursor {
   one_euro_beta = 1.0,
   one_euro_d_cutoff = 1.0,
   hysteresis = 0.0008,
-  only_in = { "desktop", "omarchy-ui", "browser" },
+  only_in = { "desktop", "omarchy-ui", "browser", "agent" },
   guide_in = { "game" }, -- except while the guide is held: then it is a mouse in a game too
 }
 
@@ -171,7 +172,7 @@ h.scroll {
   mode = "circular",
   sensitivity = 1.0,
   circular_step_degrees = 15.0,
-  only_in = { "desktop", "omarchy-ui", "browser" },
+  only_in = { "desktop", "omarchy-ui", "browser", "agent" },
 }
 
 -- The caret jog wheel (docs/research/text-scrub.md): with the guide HELD,
@@ -190,7 +191,7 @@ h.scrub {
   slow_deg_per_s   = 180.0,  -- and drops back below this (2:1, so it cannot chatter)
   word_tier        = true,   -- top rung is ctrl+arrow, not x4 characters
   select           = "l5",   -- hold the left grip to select as you scrub
-  only_in          = { "desktop", "omarchy-ui" },
+  only_in          = { "desktop", "omarchy-ui", "agent" },
 }
 
 h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
@@ -202,19 +203,22 @@ h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
 -- is what hands them to the game under a game-classed window.
 -- ---------------------------------------------------------------------------
 
-h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui", "browser")
-h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui", "browser")
-h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui", "browser")
-h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui", "browser")
-h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui", "browser")     -- A = Enter/confirm
-h.button("b", h.key "backspace"):only_in("desktop", "browser") -- B = Backspace
+h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui", "browser", "agent")     -- A = Enter/confirm
+h.button("b", h.key "backspace"):only_in("desktop", "browser", "agent") -- B = Backspace
+
+-- In an agent terminal, X clears the line (readline's ctrl+u); B is still Backspace.
+h.button("x", "Clear line", h.key "ctrl+u"):only_in("agent")
 
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
 -- exactly like the cursor above: where the pad moves the pointer, it clicks.
-h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser")
-h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser")
-h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui", "browser")
+h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui", "browser", "agent")
 
 -- The same button, a different meaning in a different mode. The cheat sheet has
 -- keyboard focus and closes on Escape, so B dismisses it — and the two never
@@ -276,6 +280,13 @@ h.bind("guide+l1",          "Workspace left",      h.workspace "-1")
 h.bind("guide+x",           h.workspace "emptyn")
 h.bind("guide+stick_down",  h.workspace "previous")
 h.bind("guide+stick_up",    "Scratchpad",          h.dispatch 'hl.dsp.workspace.toggle_special("scratchpad")')
+
+-- Desktop only: guide + a LEFT-stick flick moves focus between windows, the way
+-- Omarchy's SUPER + arrows do (hl.dsp.focus({ direction = … })).
+h.bind("guide+lstick_left",  "Focus window left",  h.dispatch 'hl.dsp.focus({ direction = "l" })'):only_in("desktop")
+h.bind("guide+lstick_right", "Focus window right", h.dispatch 'hl.dsp.focus({ direction = "r" })'):only_in("desktop")
+h.bind("guide+lstick_up",    "Focus window above", h.dispatch 'hl.dsp.focus({ direction = "u" })'):only_in("desktop")
+h.bind("guide+lstick_down",  "Focus window below", h.dispatch 'hl.dsp.focus({ direction = "d" })'):only_in("desktop")
 h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle")
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")

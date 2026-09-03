@@ -93,6 +93,7 @@ h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 h.bind("guide+x",  h.workspace "emptyn")                 -- first empty workspace to the right
 h.bind("guide+stick_down", h.workspace "previous")
 h.bind("guide+stick_up",   "Scratchpad", h.dispatch 'hl.dsp.workspace.toggle_special("scratchpad")')  -- toggles, unlike h.workspace
+h.bind("guide+lstick_left", "Focus window left", h.dispatch 'hl.dsp.focus({ direction = "l" })'):only_in("desktop")  -- the LEFT stick flicks move focus
 h.bind("guide+dpad_down",  h.move_to_workspace "emptyn")
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })
@@ -251,7 +252,7 @@ h.mode("browser").when(function(ctx)         -- a window class, like `game`:
   local c = ctx.focus.class:lower()           -- Chrome, and Omarchy's web apps
   return c == "google-chrome" or c:match("^chrome%-") ~= nil
 end)
-h.mode("claude").when(function(ctx)          -- Claude Code in a terminal:
+h.mode("agent").when(function(ctx)           -- an AI coding agent in a terminal:
   return ctx.focus:process_tree_has("claude") -- same class as any terminal, so
 end)                                          -- look inside the window
 h.mode("cheatsheet").when(function(ctx)      -- an overlay is a context too:
@@ -305,6 +306,15 @@ Modes are exclusive, so at most one of them is ever live. The sample's
 `browser` mode (Google Chrome, and Omarchy's `chrome-*` web apps) is where the
 browser-only bindings live — L1/R1 switch tabs there — and the desktop guards
 list it as well, so everything else behaves exactly as on the desktop.
+
+The sample's `agent` mode is the same idea one level in: an AI coding agent in
+the focused terminal — Claude Code, OpenAI Codex, Muse, OpenCode — has no window
+class of its own, so its rule asks `ctx.focus:process_tree_has(…)`, which matches
+a lowercase **substring** of `"<comm> <cmdline>"` across the focused window's
+`/proc` descendants (hence `muse-bin`: the binary is `muse-bin-<version>` and
+`comm` is truncated to 15 characters). It carries one binding of its own — bare
+X clears the line, readline's `ctrl+u` — and the desktop guards list it too, so
+the pad is otherwise exactly what it is on the desktop.
 
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:
