@@ -284,10 +284,10 @@ h.bind("guide+stick_up",    "Scratchpad",          h.dispatch 'hl.dsp.workspace.
 -- Everywhere: guide + a LEFT-stick flick moves focus between windows, the way
 -- Omarchy's SUPER + arrows do (hl.dsp.focus({ direction = … })). Guide chords are
 -- system-level, so this one is deliberately unguarded.
-h.bind("guide+lstick_left",  "Focus window left",  h.dispatch 'hl.dsp.focus({ direction = "l" })'):only_in("desktop")
-h.bind("guide+lstick_right", "Focus window right", h.dispatch 'hl.dsp.focus({ direction = "r" })'):only_in("desktop")
-h.bind("guide+lstick_up",    "Focus window above", h.dispatch 'hl.dsp.focus({ direction = "u" })'):only_in("desktop")
-h.bind("guide+lstick_down",  "Focus window below", h.dispatch 'hl.dsp.focus({ direction = "d" })'):only_in("desktop")
+h.bind("guide+lstick_left",  "Focus window left",  h.dispatch 'hl.dsp.focus({ direction = "l" })')
+h.bind("guide+lstick_right", "Focus window right", h.dispatch 'hl.dsp.focus({ direction = "r" })')
+h.bind("guide+lstick_up",    "Focus window above", h.dispatch 'hl.dsp.focus({ direction = "u" })')
+h.bind("guide+lstick_down",  "Focus window below", h.dispatch 'hl.dsp.focus({ direction = "d" })')
 h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle")
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")
