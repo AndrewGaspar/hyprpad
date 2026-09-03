@@ -69,6 +69,21 @@ pub const STREAM_PERIOD: Duration = Duration::from_millis(4);
 /// timer, not a jitter budget.
 pub const STALE_AFTER: Duration = Duration::from_millis(200);
 
+/// How many streamed ticks carry the synthesized guide press of
+/// [`SteamRelay::pulse_guide`] — 15 × [`STREAM_PERIOD`] = **60 ms**.
+///
+/// A duration rather than a single report because Steam acts on the guide
+/// button's *release*: it has to see the press, and then see it go away. One
+/// tick of press would be a 4 ms button, on a stream a host samples at its own
+/// pace; 60 ms is a human press by any measure and still far below the ~3 s
+/// after which Steam ignores a guide hold entirely (see the README's "second
+/// finding" — measured on the real puck, but the fake is the thing Steam reads
+/// now, and this is what it reads).
+///
+/// The Xbox pad's own pulse ([`crate::gamepad::VirtualGamepad::pulse_guide`])
+/// counts the same number of frames, which arrive at the same 250 Hz.
+pub const GUIDE_PULSE_TICKS: u32 = 15;
+
 /// The report currently being streamed.
 #[derive(Clone, Copy)]
 enum Streamed {
@@ -86,6 +101,9 @@ pub struct SteamRelay {
     /// The stream's own sequence counter, bumped once per tick exactly as
     /// InputPlumber bumps `frame.wrapping_add(1)` on every write.
     seq: Arc<AtomicU32>,
+    /// Ticks of synthesized guide press still owed, counted down by the
+    /// streamer. See [`SteamRelay::pulse_guide`].
+    guide_pulse: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
 }
 
@@ -104,6 +122,7 @@ impl SteamRelay {
             profile,
             state: Arc::new(Mutex::new(Streamed::Neutral)),
             seq: Arc::new(AtomicU32::new(0)),
+            guide_pulse: Arc::new(AtomicU32::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
         };
         relay.spawn_streamer()?;
@@ -114,11 +133,12 @@ impl SteamRelay {
         let device = self.device.sender();
         let state = Arc::clone(&self.state);
         let seq = Arc::clone(&self.seq);
+        let guide_pulse = Arc::clone(&self.guide_pulse);
         let stop = Arc::clone(&self.stop);
         let profile = self.profile;
         std::thread::Builder::new()
             .name("uhid-stream".to_string())
-            .spawn(move || stream_loop(&device, profile, &state, &seq, &stop))?;
+            .spawn(move || stream_loop(&device, profile, &state, &seq, &guide_pulse, &stop))?;
         Ok(())
     }
 
@@ -149,11 +169,34 @@ impl SteamRelay {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = next;
     }
 
+    /// Press the guide button on the fake for the next [`GUIDE_PULSE_TICKS`]
+    /// ticks, then let go — the synthesized *bare guide tap*.
+    ///
+    /// The one thing Steam cannot get from the relay any other way. The guide
+    /// layer outranks game forwarding, so the frames in which the owner is
+    /// actually holding the button are streamed as neutral and Steam never sees
+    /// it; when the release turns out to have meant nothing else
+    /// ([`crate::gesture::GestureEngine::guide_tap`]) and a game is being
+    /// forwarded to, the daemon replays it here instead.
+    ///
+    /// Rides *on top of* whatever the stream is otherwise carrying: a live
+    /// forwarded frame, or the neutral report between them — Steam must see the
+    /// button whether or not the puck is saying anything at that instant.
+    /// Calling it again restarts the countdown rather than extending it.
+    pub fn pulse_guide(&self) {
+        self.guide_pulse.store(GUIDE_PULSE_TICKS, Ordering::Relaxed);
+    }
+
     /// Stop forwarding: stream neutral from the next tick.
     ///
     /// Called on the falling edge of the forwarding gate, when the controller
     /// disconnects, and on the way out — the same three moments
     /// `gamepad::VirtualGamepad::neutral` covers. The device stays created.
+    ///
+    /// A guide pulse in flight is deliberately **not** cancelled: the overlay
+    /// opening is itself likely to move focus off the game and drop forwarding,
+    /// and a press whose release never arrived is worse than either. The pulse
+    /// simply finishes on top of the neutral stream.
     pub fn release(&self) {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Streamed::Neutral;
     }
@@ -198,6 +241,7 @@ fn stream_loop(
     profile: &'static Profile,
     state: &Arc<Mutex<Streamed>>,
     seq: &Arc<AtomicU32>,
+    guide_pulse: &Arc<AtomicU32>,
     stop: &Arc<AtomicBool>,
 ) {
     let mut next = Instant::now();
@@ -209,7 +253,7 @@ fn stream_loop(
         }
         let n = seq.fetch_add(1, Ordering::Relaxed);
         let current = *state.lock().unwrap_or_else(|e| e.into_inner());
-        let report = tick_report(profile, current, n, now);
+        let report = stream_tick(profile, current, n, now, guide_pulse);
         if let Err(e) = device.send_input(&report) {
             // The device is gone — the fd closed, or the kernel tore it down.
             // Nothing is recoverable from in here; re-creating it needs a fresh
@@ -234,6 +278,36 @@ fn stream_loop(
             next = now + STREAM_PERIOD;
         }
     }
+}
+
+/// One whole tick of the stream: the report this tick would carry, plus a
+/// synthesized guide press if the pulse still owes one.
+///
+/// The countdown is consumed **here**, once per written report, which is what
+/// makes the press exactly [`GUIDE_PULSE_TICKS`] × [`STREAM_PERIOD`] of wire
+/// time however busy the daemon is. Split out from [`stream_loop`] so the whole
+/// pulse — its length, its two profiles, and the fact that it rides on neutral
+/// ticks as readily as live ones — is testable with no device and no thread.
+fn stream_tick(
+    profile: &'static Profile,
+    current: Streamed,
+    seq: u32,
+    now: Instant,
+    guide_pulse: &AtomicU32,
+) -> Vec<u8> {
+    let mut report = tick_report(profile, current, seq, now);
+    // `checked_sub` returns None at zero, which `fetch_update` reports as Err:
+    // no pulse owed, nothing decremented.
+    let pressing = guide_pulse
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok();
+    if pressing {
+        match profile.kind {
+            ReportKind::Triton => translate::press_triton_guide(&mut report),
+            ReportKind::Deck => translate::press_deck_guide(&mut report),
+        }
+    }
+    report
 }
 
 /// The bytes for one tick: pure, so the whole streaming rule is testable.
@@ -379,6 +453,102 @@ mod tests {
         assert_eq!(out.len(), DECK_REPORT_LEN);
         assert_eq!(&out[..4], &[0x01, 0x00, 0x09, 0x40]);
         assert_eq!(out[8] & 0x80, 0x80, "A survived the transcode");
+    }
+
+    // -----------------------------------------------------------------------
+    // The synthesized guide tap
+    // -----------------------------------------------------------------------
+
+    /// Whether a streamed report has the guide button down, per profile.
+    fn guide_down(profile: &'static Profile, report: &[u8]) -> bool {
+        match profile.kind {
+            ReportKind::Triton => report[4] & 0x01 != 0,
+            ReportKind::Deck => report[9] & 0x20 != 0,
+        }
+    }
+
+    /// The pulse's whole contract: exactly `GUIDE_PULSE_TICKS` reports carry
+    /// the button, they are the *next* ones, and then it is gone — which is the
+    /// release Steam actually acts on.
+    #[test]
+    fn a_pulse_presses_the_guide_for_exactly_the_pulse_length_then_lets_go() {
+        let now = Instant::now();
+        for profile in [profile::triton(), profile::deck()] {
+            let pulse = AtomicU32::new(0);
+            // Nothing owed: the stream is untouched.
+            for n in 0..5 {
+                let r = stream_tick(profile, Streamed::Neutral, n, now, &pulse);
+                assert!(!guide_down(profile, &r), "no pulse, no guide bit");
+            }
+            pulse.store(GUIDE_PULSE_TICKS, Ordering::Relaxed);
+            let pressed = (0..GUIDE_PULSE_TICKS + 20)
+                .filter(|&n| {
+                    guide_down(profile, &stream_tick(profile, Streamed::Neutral, n, now, &pulse))
+                })
+                .count();
+            assert_eq!(
+                pressed as u32,
+                GUIDE_PULSE_TICKS,
+                "{:?}: the press lasts exactly the pulse",
+                profile.kind
+            );
+            // And it is over: the counter is spent, not merely paused.
+            assert_eq!(pulse.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// 15 ticks at 250 Hz is a 60 ms button — a human press, and nowhere near
+    /// the ~3 s beyond which Steam ignores a guide hold.
+    #[test]
+    fn the_pulse_is_sixty_milliseconds_of_wire_time() {
+        assert_eq!(STREAM_PERIOD * GUIDE_PULSE_TICKS, Duration::from_millis(60));
+        assert!(STREAM_PERIOD * GUIDE_PULSE_TICKS < Duration::from_secs(3));
+    }
+
+    /// The pulse rides on whatever the stream is carrying. A neutral tick is
+    /// the important case: the overlay opening moves focus off the game, so
+    /// forwarding usually drops *during* the press, and the release must still
+    /// arrive.
+    #[test]
+    fn the_pulse_rides_on_neutral_and_live_ticks_alike() {
+        let now = Instant::now();
+        let raw = translate::puck_to_triton(&raw_0x42(0x30), StripMask::guide_only()).unwrap();
+        let held = live(&raw, now);
+        let pulse = AtomicU32::new(0);
+        pulse.store(4, Ordering::Relaxed);
+
+        // Two live ticks, then the stream drops to neutral mid-pulse.
+        let a = stream_tick(profile::triton(), held, 1, now, &pulse);
+        let b = stream_tick(profile::triton(), held, 2, now, &pulse);
+        let c = stream_tick(profile::triton(), Streamed::Neutral, 3, now, &pulse);
+        let d = stream_tick(profile::triton(), Streamed::Neutral, 4, now, &pulse);
+        let e = stream_tick(profile::triton(), Streamed::Neutral, 5, now, &pulse);
+        for (i, r) in [&a, &b, &c, &d].iter().enumerate() {
+            assert!(guide_down(profile::triton(), r), "tick {i} carries the press");
+        }
+        assert!(!guide_down(profile::triton(), &e), "and the release still lands");
+        // A live tick under a pulse is otherwise the frame it always was.
+        assert_eq!(a[1], 0x30, "the puck's own counter, untouched");
+        assert_eq!(a[2] & 0x01, 1, "and A is still pressed");
+        // The neutral ones carry the button and nothing else.
+        let mut want = translate::triton_neutral(3).to_vec();
+        translate::press_triton_guide(&mut want);
+        assert_eq!(c, want);
+    }
+
+    /// Re-arming restarts the countdown rather than stacking, so a flurry of
+    /// taps cannot leave the button down for a second.
+    #[test]
+    fn a_second_pulse_restarts_rather_than_extends() {
+        let now = Instant::now();
+        let pulse = AtomicU32::new(0);
+        pulse.store(GUIDE_PULSE_TICKS, Ordering::Relaxed);
+        for n in 0..5 {
+            stream_tick(profile::triton(), Streamed::Neutral, n, now, &pulse);
+        }
+        assert_eq!(pulse.load(Ordering::Relaxed), GUIDE_PULSE_TICKS - 5);
+        pulse.store(GUIDE_PULSE_TICKS, Ordering::Relaxed);
+        assert_eq!(pulse.load(Ordering::Relaxed), GUIDE_PULSE_TICKS, "reset, not summed");
     }
 
     // -----------------------------------------------------------------------

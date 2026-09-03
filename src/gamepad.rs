@@ -417,6 +417,19 @@ impl PadReport {
         r
     }
 
+    /// Put `BTN_MODE` down on top of whatever this report already carries — the
+    /// synthesized guide tap ([`VirtualGamepad::pulse_guide`]).
+    ///
+    /// Deliberately separate from `forward_guide` in
+    /// [`from_frame`](Self::from_frame): that knob relays the button the owner
+    /// is *holding*, which the game never sees anyway (the guide layer outranks
+    /// forwarding, so those frames are not forwarded at all). This is the
+    /// press hyprpad makes up afterwards, out of a tap that turned out to mean
+    /// nothing else.
+    pub fn press_guide(&mut self) {
+        self.keys |= 1 << K_MODE;
+    }
+
     /// Whether this report is fully neutral. Used by tests and by the daemon's
     /// "did the transition actually release everything?" assertions.
     pub fn is_neutral(&self) -> bool {
@@ -558,6 +571,9 @@ pub struct VirtualGamepad {
     sent: PadReport,
     /// Cleared until the first report, which is therefore written in full.
     primed: bool,
+    /// Frames of synthesized `BTN_MODE` still owed, counted down by
+    /// [`VirtualGamepad::apply`]. See [`VirtualGamepad::pulse_guide`].
+    guide_pulse: u32,
     /// The rumble the game is asking for, published by the reader thread.
     rumble: Arc<RumbleChannel>,
     /// Tells the reader thread to wind up; it checks between `poll` timeouts.
@@ -658,6 +674,7 @@ impl VirtualGamepad {
             file,
             sent: PadReport::neutral(),
             primed: false,
+            guide_pulse: 0,
             rumble,
             stop,
         };
@@ -671,7 +688,30 @@ impl VirtualGamepad {
     /// Forward one decoded controller frame to the pad, as a single
     /// SYN-terminated report carrying only what changed.
     pub fn apply(&mut self, frame: &Frame, forward_guide: bool) {
-        self.send(PadReport::from_frame(frame, forward_guide));
+        let mut want = PadReport::from_frame(frame, forward_guide);
+        // A synthesized guide tap in progress is laid over the frame, so the
+        // game gets its input and Steam gets its button at the same time.
+        if self.guide_pulse > 0 {
+            self.guide_pulse -= 1;
+            want.press_guide();
+        }
+        self.send(want);
+    }
+
+    /// Press `BTN_MODE` for the next [`crate::uhid::relay::GUIDE_PULSE_TICKS`]
+    /// frames, then let go
+    /// — the Xbox pad's half of the synthesized *bare guide tap*
+    /// ([`crate::uhid::relay::SteamRelay::pulse_guide`], whose docs carry the
+    /// reasoning).
+    ///
+    /// Counted in frames rather than on a clock because this sink is written
+    /// from the frame path and nowhere else; the puck's frames arrive at the
+    /// same 250 Hz the relay streams at, so the two pulses are the same 60 ms.
+    /// A pulse that is still owed when forwarding stops is dropped by
+    /// [`Self::neutral`] along with everything else — the button goes up there,
+    /// which is the release Steam acts on.
+    pub fn pulse_guide(&mut self) {
+        self.guide_pulse = crate::uhid::relay::GUIDE_PULSE_TICKS;
     }
 
     /// Release everything: sticks centred, triggers zero, hats zero, every
@@ -679,6 +719,7 @@ impl VirtualGamepad {
     /// left holding input hyprpad has stopped feeding it. Idempotent — a second
     /// call writes nothing.
     pub fn neutral(&mut self) {
+        self.guide_pulse = 0;
         self.send(PadReport::neutral());
     }
 
@@ -1118,6 +1159,29 @@ mod tests {
         // Opt in and it becomes BTN_MODE.
         assert_eq!(PadReport::from_frame(&f, true).keys, 1 << K_MODE);
         assert_eq!(KEYS[K_MODE], 0x13c);
+    }
+
+    /// The synthesized tap: `BTN_MODE` goes down over whatever the frame was
+    /// already saying, and nothing else moves.
+    #[test]
+    fn a_pulsed_guide_presses_btn_mode_over_the_live_frame() {
+        let f = pressed(&[Button::A, Button::BumperR1]);
+        let plain = PadReport::from_frame(&f, false);
+        let mut pulsed = plain;
+        pulsed.press_guide();
+        assert_eq!(pulsed.keys, plain.keys | (1 << K_MODE), "the game keeps its input");
+        assert_eq!(pulsed.abs, plain.abs, "and every axis is untouched");
+        // Idempotent, and it is exactly the button `forward_guide` would send.
+        pulsed.press_guide();
+        assert_eq!(pulsed.keys, plain.keys | (1 << K_MODE));
+        let mut neutral = PadReport::neutral();
+        neutral.press_guide();
+        assert_eq!(
+            neutral,
+            PadReport::from_frame(&pressed(&[Button::Steam]), true),
+            "the same report a forwarded guide press would produce"
+        );
+        assert!(!neutral.is_neutral());
     }
 
     #[test]

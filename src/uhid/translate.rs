@@ -104,6 +104,22 @@ pub fn puck_to_triton(raw: &[u8], strip: StripMask) -> Option<TritonReport> {
     Some(out)
 }
 
+/// Set the Steam/guide bit in a triton report — the deliberate undo of
+/// [`StripMask::guide`], for the synthesized tap.
+///
+/// Steam never sees the real guide press (the guide layer outranks game
+/// forwarding, so those frames stream neutral), so a bare tap in a game is
+/// *put back* here, on top of whatever the relay was already streaming, for
+/// the handful of ticks `SteamRelay::pulse_guide` asks for.
+///
+/// Takes a slice rather than a [`TritonReport`] because the streamer builds its
+/// tick as a `Vec`; a report too short to hold the bit is left alone.
+pub fn press_triton_guide(report: &mut [u8]) {
+    if let Some(b) = report.get_mut(RAW_STEAM.0) {
+        *b |= RAW_STEAM.1;
+    }
+}
+
 /// A triton report with everything at rest: no buttons, centred sticks and pads,
 /// no trigger travel. `seq` becomes the byte-1 counter so a stream of neutrals
 /// still looks alive.
@@ -264,6 +280,14 @@ pub fn strip_deck(report: &mut DeckReport, strip: StripMask) {
     }
     if strip.quick_access {
         report[DECK_QUICK_ACCESS.0] &= !DECK_QUICK_ACCESS.1;
+    }
+}
+
+/// Set the Steam button's bit in a Deck report — [`press_triton_guide`]'s
+/// opposite number, for the same synthesized tap.
+pub fn press_deck_guide(report: &mut [u8]) {
+    if let Some(b) = report.get_mut(DECK_STEAM.0) {
+        *b |= DECK_STEAM.1;
     }
 }
 
@@ -518,6 +542,47 @@ mod tests {
         let mut d = deck_from(&[Button::Steam]);
         strip_deck(&mut d, StripMask::none());
         assert_eq!(d[9] & 0x20, 0x20, "nothing withheld when nothing is asked");
+    }
+
+    /// Putting the guide bit back is exactly the inverse of stripping it, in
+    /// both report shapes — and it touches nothing else.
+    #[test]
+    fn pressing_the_guide_is_the_exact_inverse_of_stripping_it() {
+        // triton: on a neutral report, and on a live one that was stripped.
+        let mut n = triton_neutral(7).to_vec();
+        press_triton_guide(&mut n);
+        assert!(Frame::decode(&n).unwrap().pressed(Button::Steam));
+        assert_eq!(n[1], 7, "the counter is untouched");
+        assert_eq!(n.iter().filter(|&&b| b != 0).count(), 3, "id, counter, guide");
+
+        let raw = raw_with(&[Button::Steam, Button::A]);
+        let stripped = puck_to_triton(&raw, StripMask::guide_only()).unwrap();
+        let mut back = stripped.to_vec();
+        press_triton_guide(&mut back);
+        assert_eq!(back.as_slice(), raw.as_slice(), "byte for byte, the original");
+
+        // deck: the same, on the transcode.
+        let mut d = deck_neutral(3).to_vec();
+        press_deck_guide(&mut d);
+        assert_eq!(d[9] & 0x20, 0x20, "the steam bit is set");
+        assert_eq!(&d[..4], &[0x01, 0x00, 0x09, 0x40], "the header is untouched");
+        assert!(d[10..].iter().all(|&b| b == 0), "and nothing else is set");
+
+        let mut d = deck_from(&[Button::Steam, Button::A]);
+        strip_deck(&mut d, StripMask::guide_only());
+        let want = deck_from(&[Button::Steam, Button::A]);
+        press_deck_guide(&mut d);
+        assert_eq!(d, want);
+    }
+
+    /// A report too short to hold the bit is left alone rather than panicking:
+    /// the streamer builds its tick as a `Vec` and these take a slice.
+    #[test]
+    fn pressing_the_guide_on_a_short_report_is_a_no_op() {
+        let mut short: Vec<u8> = vec![0x42];
+        press_triton_guide(&mut short);
+        press_deck_guide(&mut short);
+        assert_eq!(short, vec![0x42]);
     }
 
     #[test]

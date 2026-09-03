@@ -1499,6 +1499,46 @@ impl GamepadKind {
     }
 }
 
+/// What a **bare guide tap** does while a game is being forwarded to
+/// (`[gamepad] guide_tap`).
+///
+/// The guide button is hyprpad's global modifier, so it is stripped from every
+/// frame the game sink sees — otherwise `guide+r1` would also open the Steam
+/// overlay. That leaves a game with no Steam button at all, which is the one
+/// thing the owner still wants from it: a quick tap, meaning nothing else,
+/// should raise the overlay. So the daemon *synthesizes* the press instead of
+/// relaying it, on the release, once the gesture engine has established that
+/// the hold was nothing else ([`crate::gesture::GestureEngine::guide_tap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GuideTap {
+    /// Pulse the guide button on the virtual pad, so Steam opens its overlay.
+    /// **The default** — this is what the button is for in a game.
+    #[default]
+    Steam,
+    /// Do nothing. The guide stays hyprpad's alone, in a game as on the
+    /// desktop, and a bare tap is swallowed exactly as it was before.
+    None,
+}
+
+impl GuideTap {
+    /// Parse the `guide_tap = …` config value.
+    pub fn parse(s: &str) -> Result<GuideTap, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "steam" | "overlay" | "guide" | "on" => Ok(GuideTap::Steam),
+            "none" | "off" | "no" | "nothing" => Ok(GuideTap::None),
+            other => Err(format!("unknown guide_tap '{other}' (steam|none)")),
+        }
+    }
+
+    /// The name this setting is written as in a config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuideTap::Steam => "steam",
+            GuideTap::None => "none",
+        }
+    }
+}
+
 /// Virtual-gamepad knobs (the `[gamepad]` config section).
 ///
 /// The Tier-1 keystone: hyprpad owns the real puck, so Steam and games are fed a
@@ -1518,7 +1558,26 @@ pub struct GamepadConfig {
     /// Default **`false`**: docs/08's input contract makes `Guide` hyprpad's
     /// global modifier, and a chord must never also reach the game. Turn it on
     /// to hand Steam's overlay its own button back.
+    ///
+    /// It can only ever matter for a frame the game sink actually sees, and no
+    /// frame with the guide *down* is one: the guide layer outranks game
+    /// forwarding, so while the button is held the sink streams neutral.
+    /// [`guide_tap`](Self::guide_tap) is what actually opens the overlay, and
+    /// it does that by synthesizing the press after the fact.
     pub forward_guide: bool,
+    /// What a bare guide **tap** does while a game is being forwarded to.
+    /// Default [`GuideTap::Steam`]: a quick press-and-release that meant
+    /// nothing else is pulsed onto the virtual pad, so Steam opens its overlay
+    /// over the game. A chord, a flick, a hold the daemon spent on the pads and
+    /// any hold longer than [`guide_tap_max_ms`](Self::guide_tap_max_ms) are
+    /// all left alone — and on the desktop nothing changes at all, because
+    /// nothing is being forwarded there.
+    pub guide_tap: GuideTap,
+    /// How long a bare hold may last and still count as a *tap*, in
+    /// milliseconds. Default 400 ([`crate::gesture::GUIDE_TAP_MAX`]) — room for
+    /// an unhurried single press, but not for holding the guide while deciding
+    /// which chord to press and then thinking better of it.
+    pub guide_tap_max_ms: u64,
     /// Forward a game's force-feedback rumble to the puck's actuators. Default
     /// `true`.
     pub rumble: bool,
@@ -1555,6 +1614,8 @@ impl Default for GamepadConfig {
         GamepadConfig {
             enabled: true,
             forward_guide: false,
+            guide_tap: GuideTap::Steam,
+            guide_tap_max_ms: crate::gesture::GUIDE_TAP_MAX.as_millis() as u64,
             rumble: true,
             rumble_mode: RumbleMode::Native,
             rumble_intensity: 1.0,
@@ -1572,6 +1633,12 @@ impl GamepadConfig {
     /// `gyro = true` writes the value SDL itself writes for a game that enabled
     /// sensors (`SEND_RAW_ACCEL | SEND_RAW_GYRO`), so the puck is configured the
     /// way the reference client configures it rather than some third thing.
+    /// [`guide_tap_max_ms`](Self::guide_tap_max_ms) as the duration the gesture
+    /// engine wants ([`crate::gesture::GestureEngine::set_guide_tap_max`]).
+    pub fn guide_tap_max(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.guide_tap_max_ms)
+    }
+
     pub fn imu_preference(&self) -> u16 {
         use crate::uhid::settings::gyro_mode;
         if self.gyro {
@@ -2063,6 +2130,8 @@ enabled = true              # master switch for the whole forwarding path
 kind = xbox                 # xbox (a uinput Xbox-360 pad) | steam (a virtual Valve controller on /dev/uhid)
 identity = triton           # with kind = steam: triton (28de:1302, least translation) | deck (28de:12f0, proven)
 forward_guide = false       # send the guide button to the game as BTN_MODE (it is hyprpad's modifier)
+guide_tap = steam           # in a game, a bare guide tap opens the Steam overlay | none = it does nothing
+guide_tap_max_ms = 400      # longest bare hold that still counts as a tap (a longer one was deliberation)
 rumble = true               # forward a game's force feedback to the puck's actuators
 rumble_mode = native        # native (the puck's 0x80 rumble report) | pulse (approximate with 0x81 trains)
 rumble_intensity = 1.0      # scale on both FF magnitudes; 1.0 passes the game's request through
@@ -2388,6 +2457,14 @@ impl Config {
                         "enabled" | "enable" | "on" => flag(&mut gamepad.enabled)?,
                         "forward_guide" | "guide" | "forward_steam" => {
                             flag(&mut gamepad.forward_guide)?;
+                        }
+                        "guide_tap" | "steam_tap" | "tap" => {
+                            gamepad.guide_tap = GuideTap::parse(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "guide_tap_max_ms" | "tap_max_ms" => {
+                            gamepad.guide_tap_max_ms = parse_millis(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?;
                         }
                         "rumble" | "force_feedback" | "ff" => flag(&mut gamepad.rumble)?,
                         "rumble_mode" | "mode" => {
@@ -4221,6 +4298,11 @@ intensity = 0.5
         assert!(d.gamepad().rumble);
         assert_eq!(d.gamepad().rumble_mode, RumbleMode::Native);
         assert_eq!(d.gamepad().rumble_intensity, 1.0);
+        // …but a bare *tap* of it in a game does reach Steam, and that is on by
+        // default: it is the one thing the button is still for in a game.
+        assert_eq!(d.gamepad().guide_tap, GuideTap::Steam);
+        assert_eq!(d.gamepad().guide_tap_max_ms, 400);
+        assert_eq!(d.gamepad().guide_tap_max(), crate::gesture::GUIDE_TAP_MAX);
 
         // A `[gamepad]` section overrides individual knobs; bindings still parse.
         let c = Config::from_toml_str(
@@ -4273,6 +4355,38 @@ rumble_intensity = 0.25
         assert!(Config::from_toml_str("[gamepad]\nturbo = true\n")
             .unwrap_err()
             .contains("unknown [gamepad] setting"));
+    }
+
+    /// `[gamepad] guide_tap` — the policy word and the cap it measures against.
+    #[test]
+    fn the_guide_tap_knobs_parse_and_default_to_reaching_steam() {
+        assert_eq!(GamepadConfig::default().guide_tap, GuideTap::Steam);
+
+        let c = Config::from_toml_str("[gamepad]\nguide_tap = none\n").unwrap();
+        assert_eq!(c.gamepad().guide_tap, GuideTap::None);
+        assert_eq!(c.gamepad().guide_tap_max_ms, 400, "untouched knobs keep the default");
+        let c = Config::from_toml_str("[gamepad]\nguide_tap = \"steam\"\n").unwrap();
+        assert_eq!(c.gamepad().guide_tap, GuideTap::Steam);
+        // The aliases, and the cap.
+        assert_eq!(
+            Config::from_toml_str("[gamepad]\ntap = off\n").unwrap().gamepad().guide_tap,
+            GuideTap::None
+        );
+        let c = Config::from_toml_str("[gamepad]\nguide_tap_max_ms = 250\n").unwrap();
+        assert_eq!(c.gamepad().guide_tap_max_ms, 250);
+        assert_eq!(c.gamepad().guide_tap_max(), std::time::Duration::from_millis(250));
+        // Round-trips through the name a config writes it as.
+        for g in [GuideTap::Steam, GuideTap::None] {
+            assert_eq!(GuideTap::parse(g.as_str()), Ok(g));
+        }
+
+        // A typo is an error, never a silent "off".
+        assert!(Config::from_toml_str("[gamepad]\nguide_tap = overlay_pls\n")
+            .unwrap_err()
+            .contains("unknown guide_tap"));
+        assert!(Config::from_toml_str("[gamepad]\nguide_tap_max_ms = soon\n")
+            .unwrap_err()
+            .contains("milliseconds"));
     }
 
     #[test]

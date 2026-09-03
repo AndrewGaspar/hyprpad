@@ -12,7 +12,8 @@
 //! - a *bare* guide tap (no chord during the hold, and nothing the daemon
 //!   chose to spend the hold on — [`GestureEngine::consume_hold`]) is reported
 //!   as such so the daemon can pass it through to Steam, whose own guide
-//!   button acts on release.
+//!   button acts on release. [`GestureEngine::guide_tap`] narrows that to the
+//!   *quick* bare tap the daemon synthesizes onto the game sink.
 //!
 //! Timing uses the monotonic [`Instant`] passed by the caller, never the frame
 //! counter (which is a wrapping `u8`): the engine is therefore robust to
@@ -79,6 +80,22 @@ pub enum GestureEvent {
 /// (docs/03), so 300 ms separates them comfortably.
 pub const HOLD_THRESHOLD: Duration = Duration::from_millis(300);
 
+/// Longest a bare hold may last and still count as a **tap** for
+/// [`GestureEngine::guide_tap`] — the signal the daemon turns into a
+/// synthesized guide press on the game sink (`[gamepad] guide_tap`).
+///
+/// Deliberately looser than [`HOLD_THRESHOLD`], and the two answer different
+/// questions. `HOLD_THRESHOLD` is "is this hold deliberate *yet*", asked while
+/// the button is still down so an overlay can appear; this one is asked at the
+/// release, about the whole gesture, and its job is to keep the owner's
+/// *deliberating* case — guide down while deciding which chord to press, then
+/// thinking better of it — from opening the Steam overlay. 400 ms leaves room
+/// for a slow-but-still-single press without covering a pause for thought.
+///
+/// The default; `[gamepad] guide_tap_max_ms` overrides it per config
+/// ([`GestureEngine::set_guide_tap_max`]).
+pub const GUIDE_TAP_MAX: Duration = Duration::from_millis(400);
+
 /// Dominant-axis deflection required to fire a flick: ~60% of the ±32767 range.
 pub const FLICK_THRESHOLD: i32 = 19_660;
 
@@ -110,6 +127,18 @@ pub struct GestureEngine {
     /// the stick is still deflected from the last flick and must recenter.
     left_armed: bool,
     right_armed: bool,
+    /// A chordable button was **already down** when the guide went down. Such a
+    /// button never chords (only a press edge under the guide does), so without
+    /// this the hold would end as a bare tap even though the hand was plainly
+    /// doing something else. Blocks [`Self::guide_tap`] only — `was_chorded`
+    /// keeps its existing meaning.
+    tap_blocked: bool,
+    /// Whether the frame last handed to [`Self::update`] ended a quick bare
+    /// tap. Recomputed every call; see [`Self::guide_tap`].
+    guide_tap: bool,
+    /// The cap `guide_tap` measures against; [`GUIDE_TAP_MAX`] until the daemon
+    /// sets the config's value.
+    guide_tap_max: Duration,
 }
 
 impl GestureEngine {
@@ -124,7 +153,17 @@ impl GestureEngine {
             chorded: 0,
             left_armed: true,
             right_armed: true,
+            tap_blocked: false,
+            guide_tap: false,
+            guide_tap_max: GUIDE_TAP_MAX,
         }
+    }
+
+    /// Set the cap a bare hold must fall under to count as a tap
+    /// ([`Self::guide_tap`]). The daemon calls this from the live config, so
+    /// `hyprpad reload` retunes it on the next report.
+    pub fn set_guide_tap_max(&mut self, max: Duration) {
+        self.guide_tap_max = max;
     }
 
     /// Consume one frame at time `now` and return the gestures it produced
@@ -132,6 +171,9 @@ impl GestureEngine {
     pub fn update(&mut self, frame: &report::Frame, now: Instant) -> Vec<GestureEvent> {
         let mut events = Vec::new();
         let guide_now = frame.pressed(report::Button::Steam);
+        // One frame's worth of signal: true only for the call that saw the
+        // release, never carried over.
+        self.guide_tap = false;
 
         // Entering the guide layer.
         if guide_now && !self.guide_active {
@@ -144,6 +186,12 @@ impl GestureEngine {
             // a stick already deflected does not fire a spurious flick.
             self.left_armed = Self::centered(frame.left_stick);
             self.right_armed = Self::centered(frame.right_stick);
+            // Whatever the hand was already holding. `edges_down` against an
+            // empty frame is "every button down right now", using the same
+            // public accessor a real edge goes through.
+            self.tap_blocked = frame
+                .edges_down(&report::Frame::default())
+                .any(Self::chordable);
             events.push(GestureEvent::GuideEnter);
         }
 
@@ -188,6 +236,12 @@ impl GestureEngine {
         if !guide_now && self.guide_active {
             self.guide_active = false;
             self.chorded = 0;
+            // The quick-bare-tap signal, decided here and nowhere else: nothing
+            // recognised, nothing the daemon spent the hold on, nothing already
+            // held when it started, and short enough not to be a deliberation.
+            self.guide_tap = !self.was_chorded
+                && !self.tap_blocked
+                && now.saturating_duration_since(self.guide_since) <= self.guide_tap_max;
             events.push(GestureEvent::GuideLeave {
                 was_chorded: self.was_chorded,
             });
@@ -200,6 +254,32 @@ impl GestureEngine {
     /// Whether the guide layer is currently active (guide held).
     pub fn guide_active(&self) -> bool {
         self.guide_active
+    }
+
+    /// Whether the frame just handed to [`Self::update`] ended a **quick bare
+    /// tap** of the guide: press, release, and nothing in between.
+    ///
+    /// The narrow half of `GuideLeave { was_chorded: false }`. All four of
+    /// these must hold, and each rules out a hold the owner meant as something
+    /// else:
+    ///
+    /// * no chord or flick was recognised during the hold (`was_chorded`);
+    /// * the daemon did not spend the hold itself ([`Self::consume_hold`] —
+    ///   the guide-mouse and the caret scrub);
+    /// * no chordable button was already down when the guide went down (such a
+    ///   button cannot chord, having no press edge under the guide, but the
+    ///   hand is plainly mid-something);
+    /// * the whole hold fits inside [`GUIDE_TAP_MAX`] (or whatever
+    ///   [`Self::set_guide_tap_max`] was given), which is what keeps a long
+    ///   "what shall I press" hold from counting.
+    ///
+    /// True for exactly the one `update` call that saw the release, and false
+    /// again on the next. The daemon turns it into a synthesized guide press on
+    /// the virtual pad *if a game is being forwarded to* — see
+    /// `run::guide_tap_pulse`; on the desktop it means nothing and nothing
+    /// happens.
+    pub fn guide_tap(&self) -> bool {
+        self.guide_tap
     }
 
     /// Mark the current hold as spent by the desktop layer, so its release is
@@ -808,5 +888,129 @@ mod tests {
             g.update(&frame(&[]), t + ms(40)),
             vec![GestureEvent::GuideLeave { was_chorded: false }]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The quick bare tap: what `guide_tap()` answers, and what it refuses.
+    // -----------------------------------------------------------------------
+
+    /// Press, release, nothing in between — the gesture that must reach Steam.
+    #[test]
+    fn a_quick_bare_press_and_release_is_a_guide_tap() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        assert!(!g.update(&frame(&[Button::Steam]), t + ms(4)).is_empty());
+        assert!(!g.guide_tap(), "the press alone is not a tap; Steam acts on release");
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(120)),
+            vec![GestureEvent::GuideLeave { was_chorded: false }]
+        );
+        assert!(g.guide_tap(), "a 116 ms bare hold is the tap");
+        // One frame's worth of signal, and no more.
+        g.update(&frame(&[]), t + ms(124));
+        assert!(!g.guide_tap(), "it does not linger past the frame that produced it");
+    }
+
+    /// A hold the owner spent deliberating is not a tap, however it ends.
+    #[test]
+    fn a_hold_past_the_cap_is_not_a_tap() {
+        let t = Instant::now();
+        let at = |release: u64| {
+            let mut g = GestureEngine::new();
+            g.update(&frame(&[]), t);
+            g.update(&frame(&[Button::Steam]), t + ms(4));
+            g.update(&frame(&[]), t + ms(4 + release));
+            g.guide_tap()
+        };
+        assert!(at(399), "just under the cap");
+        assert!(at(400), "exactly the cap still counts");
+        assert!(!at(401), "one millisecond over and it is a deliberation");
+        assert!(!at(3_000));
+        assert_eq!(GUIDE_TAP_MAX, Duration::from_millis(400));
+    }
+
+    /// The cap is the config's to set, live.
+    #[test]
+    fn the_tap_cap_is_settable() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.set_guide_tap_max(ms(150));
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        g.update(&frame(&[]), t + ms(204));
+        assert!(!g.guide_tap(), "200 ms is over a 150 ms cap");
+        // And it applies from the next hold with no rebuild.
+        g.set_guide_tap_max(ms(1_000));
+        g.update(&frame(&[Button::Steam]), t + ms(300));
+        g.update(&frame(&[]), t + ms(900));
+        assert!(g.guide_tap(), "600 ms is under a 1 s cap");
+    }
+
+    /// Everything the desktop layer claims, it keeps: a chord, a flick and a
+    /// hold the daemon spent are all *not* taps.
+    #[test]
+    fn a_chord_a_flick_and_a_consumed_hold_are_not_taps() {
+        let t = Instant::now();
+
+        let mut chord = GestureEngine::new();
+        chord.update(&frame(&[]), t);
+        chord.update(&frame(&[Button::Steam]), t + ms(4));
+        chord.update(&frame(&[Button::Steam, Button::BumperR1]), t + ms(8));
+        chord.update(&frame(&[Button::Steam]), t + ms(12));
+        chord.update(&frame(&[]), t + ms(60));
+        assert!(!chord.guide_tap(), "guide+r1 belongs to the window manager");
+
+        let mut flick = GestureEngine::new();
+        flick.update(&frame(&[]), t);
+        flick.update(&frame(&[Button::Steam]), t + ms(4));
+        flick.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(8));
+        flick.update(&frame(&[]), t + ms(60));
+        assert!(!flick.guide_tap());
+
+        let mut spent = GestureEngine::new();
+        spent.update(&frame(&[]), t);
+        spent.update(&frame(&[Button::Steam]), t + ms(4));
+        spent.consume_hold(); // the guide-mouse, or the caret scrub's first detent
+        spent.update(&frame(&[]), t + ms(60));
+        assert!(!spent.guide_tap(), "a hold the daemon spent is never Steam's");
+    }
+
+    /// A button already down when the guide arrives has no press edge under the
+    /// guide, so it never chords — but the hand is mid-something, and the
+    /// release must not open an overlay over it.
+    #[test]
+    fn a_button_already_held_when_the_guide_arrives_blocks_the_tap() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[Button::BumperR1]), t);
+        g.update(&frame(&[Button::BumperR1, Button::Steam]), t + ms(4));
+        g.update(&frame(&[Button::BumperR1]), t + ms(60));
+        assert!(!g.guide_tap());
+        // It is not sticky: the next hold, with the hand off the bumper, taps.
+        g.update(&frame(&[]), t + ms(64));
+        g.update(&frame(&[Button::Steam]), t + ms(68));
+        g.update(&frame(&[]), t + ms(120));
+        assert!(g.guide_tap());
+    }
+
+    /// The touch bits are not "already held": a thumb resting on a pad, or a
+    /// deflected stick, is the ordinary state of a hand in a game, and neither
+    /// may cost the owner the tap.
+    #[test]
+    fn a_resting_thumb_or_a_deflected_stick_still_taps() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        let holding = frame_sticks(
+            &[Button::PadLeftTouch, Button::PadRightTouch],
+            (28_000, 0),
+            (0, -28_000),
+        );
+        g.update(&holding, t);
+        let mut with_guide = holding;
+        with_guide.set(Button::Steam, true);
+        g.update(&with_guide, t + ms(4));
+        g.update(&holding, t + ms(80));
+        assert!(g.guide_tap(), "a hand on the controller is not a chord");
     }
 }

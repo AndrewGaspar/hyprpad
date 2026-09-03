@@ -280,6 +280,16 @@ changed, and only these:
 The byte-1 sequence counter is **relayed untouched**. §4.4 is explicit:
 renumbering risks desync with the IMU timestamp path, and Steam tolerates gaps.
 
+There is a third change, and it goes the other way: the streamer **sets** the
+guide bit for 15 consecutive ticks (60 ms) when the daemon asks it to
+(`SteamRelay::pulse_guide`), on top of whatever it is otherwise streaming —
+live frame or neutral. That is the synthesized *bare guide tap*. `forward_guide`
+cannot deliver one however it is set, because no frame with the guide down is
+ever forwarded at all (the guide layer outranks game forwarding, so those ticks
+are neutral by rank); a quick press-and-release that meant nothing else is
+therefore replayed after the fact, on the release Steam acts on. The deck
+profile does the same thing at byte 9, bit 5. See `[gamepad] guide_tap`.
+
 Because the `1302` descriptor numbers every report type, all three `UHID_START`
 `dev_flags` bits are set and the report-id prefix is required in both directions
 — which the puck's own `raw[0] == 0x42` already provides. The pass-through is
@@ -1109,9 +1119,13 @@ Steam → Settings → Controller:
 * Foreground a game: input reaches it. Hold the guide: input **stops** and the
   game sees neutral, no stuck stick. Raise the OSK: same. Return to the desktop:
   same.
-* The guide button itself must **not** open the Steam overlay while
-  `forward_guide = false` — that is the strip mask working. Set
-  `forward_guide = true`, reload, and it should.
+* A guide **chord** must not open the Steam overlay — that is the strip mask
+  working. A bare **tap** of the guide, in a game, must: the daemon replays it
+  as a 60 ms pulse on the fake (§2.1). Check both, and check that a long hold
+  (past `guide_tap_max_ms`, 400 ms) opens nothing. `guide_tap = "none"` turns
+  the whole thing off. Note that `forward_guide` is not the knob for this and
+  never was: while the button is held nothing is forwarded, so setting it makes
+  no observable difference here.
 * Trigger rumble in-game: the puck's actuators should buzz. With the game
   backgrounded they must **not** (§5.2 arbitration).
 * Run with `HYPRSC_DEBUG=1` for one session and keep the `[relay]` log — it is
