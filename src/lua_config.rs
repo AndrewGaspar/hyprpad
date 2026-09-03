@@ -28,7 +28,7 @@
 //! h.scroll  { mode = "circular", sensitivity = 1.0 }
 //! h.scrub   { detent_deg = 15, select = "l5" }   -- guide + circle the left pad = caret
 //! h.haptics { cursor_spacing_px = 96 }
-//! h.gamepad { enabled = true, kind = "xbox", identity = "triton" }
+//! h.gamepad { enabled = true, kind = "xbox", identity = "triton", guide_tap = "steam" }
 //!
 //! -- Bindings. The optional middle string is a description, exactly as
 //! -- `o.bind(keys, desc, action)` reads in the Hyprland config.
@@ -1670,7 +1670,22 @@ fn section_haptics(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
     })
 }
 
-/// `h.gamepad { … }` — the `[gamepad]` knobs.
+/// `h.gamepad { … }` — the `[gamepad]` knobs: which virtual controller a
+/// focused game is given, what reaches it, and the rumble back-channel.
+///
+/// ```lua
+/// h.gamepad { kind = "steam", identity = "triton" }  -- a virtual Valve pad
+/// h.gamepad { guide_tap = "none" }                   -- keep the Steam button in a game too
+/// h.gamepad { guide_tap_max_ms = 250 }               -- a stricter idea of "a tap"
+/// ```
+///
+/// `guide_tap` is the one that changes what the *guide* does. The button is
+/// hyprpad's global modifier, so it is stripped from every frame the game sink
+/// sees; `"steam"` (the default) hands a **bare tap** of it back by
+/// synthesizing the press on the virtual pad afterwards, which is what opens
+/// the Steam overlay over a game. A chord, a flick, a hold the daemon spent on
+/// the pads, and any hold past `guide_tap_max_ms` are all untouched, and on the
+/// desktop nothing changes at all. See [`crate::config::GuideTap`].
 fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
     lua.create_function(move |_, t: Table| {
@@ -1680,6 +1695,15 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
             match k.as_str() {
                 "enabled" | "enable" | "on" => b.gamepad.enabled = as_bool(&v, &k)?,
                 "forward_guide" | "guide" => b.gamepad.forward_guide = as_bool(&v, &k)?,
+                // What a bare guide tap does in a game: "steam" (the default —
+                // pulse the button on the fake so the overlay opens) or "none".
+                "guide_tap" | "steam_tap" => {
+                    b.gamepad.guide_tap =
+                        crate::config::GuideTap::parse(&as_string(&v, &k)?).map_err(err)?;
+                }
+                "guide_tap_max_ms" => {
+                    b.gamepad.guide_tap_max_ms = as_millis(&v, &k)?;
+                }
                 "rumble" | "force_feedback" | "ff" => b.gamepad.rumble = as_bool(&v, &k)?,
                 "rumble_mode" => {
                     b.gamepad.rumble_mode =
@@ -1711,6 +1735,8 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                             "kind",
                             "identity",
                             "forward_guide",
+                            "guide_tap",
+                            "guide_tap_max_ms",
                             "gyro",
                             "rumble",
                             "rumble_mode",
@@ -3790,5 +3816,33 @@ l2 = "osk shift"
         let e = load_str(r#"hyprpad.gamepad { gyroscope = true }"#, "t.lua").unwrap_err();
         assert!(e.contains("gyroscope"), "{e}");
         assert!(e.contains("gyro"), "{e}");
+    }
+
+    /// `h.gamepad { guide_tap = … }` — and that the two front-ends agree.
+    #[test]
+    fn the_guide_tap_knob_parses_on_the_lua_front_end_and_matches_toml() {
+        use crate::config::GuideTap;
+
+        // Default: a bare tap in a game reaches Steam, on both dialects.
+        assert_eq!(load("").gamepad().guide_tap, GuideTap::Steam);
+        assert_eq!(load("").gamepad().guide_tap_max_ms, 400);
+
+        let c = load(r#"hyprpad.gamepad { guide_tap = "none", guide_tap_max_ms = 250 }"#);
+        assert_eq!(c.gamepad().guide_tap, GuideTap::None);
+        assert_eq!(c.gamepad().guide_tap_max_ms, 250);
+        let toml = crate::config::Config::from_toml_str(
+            "[gamepad]\nguide_tap = none\nguide_tap_max_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(c.gamepad(), toml.gamepad());
+
+        // A bad word and a bad number are both refused, and a typo lists the
+        // keys that exist.
+        let e = load_str(r#"hyprpad.gamepad { guide_tap = "maybe" }"#, "t.lua").unwrap_err();
+        assert!(e.contains("unknown guide_tap"), "{e}");
+        let e = load_str(r#"hyprpad.gamepad { guide_tap_max_ms = 1.5 }"#, "t.lua").unwrap_err();
+        assert!(e.contains("milliseconds"), "{e}");
+        let e = load_str(r#"hyprpad.gamepad { guide_taps = "steam" }"#, "t.lua").unwrap_err();
+        assert!(e.contains("guide_tap"), "{e}");
     }
 }

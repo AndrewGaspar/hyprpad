@@ -39,6 +39,13 @@ removable with a one-line Hyprland window rule
 (`suppressevent activatefocus, match:class steam`) or by restoring focus over
 IPC. Together these mean the passive design does not have to give anything up.
 
+Both halves were measured on the **real** puck, in the era when Steam was
+reading it directly. That is no longer the arrangement: with the forwarding path
+live, what Steam reads is the virtual pad hyprpad synthesizes, and the guide
+button is stripped from every frame of it. The release-not-press behaviour is
+still the thing that matters, but it is now something hyprpad *plays back* —
+see [the Steam button in a game](#the-steam-button-in-a-game).
+
 ## Recommendation in one paragraph
 
 Build **hyprpad** as a passive-tap userspace daemon: read the controller
@@ -85,7 +92,7 @@ h.cursor  { sens = 0.06, hysteresis = 0.0008, only_in = { "desktop" } }
 h.scroll  { mode = "circular", only_in = { "desktop" } }
 h.scrub   { select = "l5", only_in = { "desktop" } }            -- guide + circle the left pad = caret
 h.haptics { cursor_spacing_px = 96 }
-h.gamepad { enabled = true }
+h.gamepad { enabled = true, guide_tap = "steam" }               -- see "The Steam button in a game"
 
 h.bind("guide+r1", "Workspace right", h.workspace "+1")  -- desc is optional
 h.bind("guide+menu", h.exec "omarchy-menu")
@@ -552,6 +559,34 @@ cheat sheet's panel — it goes in a bar section of `shell.json` rather than in
 scripts/hyprpad-statusbar install
 omarchy plugin enable hyprpad.status --section right
 ```
+
+## The Steam button in a game
+
+While a game holds focus hyprpad feeds it a synthesized pad — the Xbox one by
+default, the virtual Valve controller with `[gamepad] kind = "steam"` — and the
+guide button is **stripped from every frame of it**, because the guide is
+hyprpad's global modifier and `guide+r1` must not also open the Steam overlay.
+Left there, that would take the Steam button away from Steam entirely: the guide
+layer outranks game forwarding, so the frames in which you are actually holding
+the button are streamed to the game as neutral, and the press never arrives.
+
+So hyprpad makes it up instead. A **bare tap** of the guide in a game — press,
+release, and nothing in between — is replayed onto the virtual pad as a 60 ms
+press of the guide button, which is what opens the Steam overlay. Nothing else
+qualifies: not a chord (`guide+r1` is a workspace change), not a stick flick,
+not a hold the daemon spent on the pads (the guide-mouse, the caret scrub), and
+not a hold longer than **400 ms** — that last one is the deliberating case,
+guide down while you decide which chord to press and then think better of it,
+and it must not end in an overlay. On the desktop the same tap does what it
+always did, which is nothing: there is no game being forwarded to.
+
+```lua
+h.gamepad { guide_tap = "none" }        -- the guide is hyprpad's alone, in a game too
+h.gamepad { guide_tap_max_ms = 250 }    -- a stricter idea of "a tap"
+```
+
+`guide_tap = "steam"` is the default. The cheat sheet shows it as a row on the
+Steam button's callout in the tab of every mode that forwards.
 
 ## Steam sees a Steam Controller (setup)
 

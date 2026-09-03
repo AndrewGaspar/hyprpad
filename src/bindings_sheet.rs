@@ -63,7 +63,7 @@
 use std::fmt::Write as _;
 
 use crate::config::{
-    osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, KeyChord, ModeState,
+    osk_builtins, Action, ButtonAction, Config, ConfigFormat, Guard, GuideTap, KeyChord, ModeState,
     OskAction, TransientExit, TransientSpec, WorkspaceTarget,
 };
 use crate::gesture::{Stick, StickDir};
@@ -341,6 +341,37 @@ impl Sheet {
                 "scrub select (hold)".to_string(),
                 &c.scrub_guard,
                 button_rank(sel),
+            ));
+        }
+        // The guide button's own row: a bare TAP of it, in a game, opens the
+        // Steam overlay (`[gamepad] guide_tap`). Not a binding either — nothing
+        // resolves against it, and a config cannot move it — but it is the one
+        // thing the Steam button does that is not a chord, and a sheet whose
+        // guide section says only "hold me" would be hiding it. Guarded to the
+        // modes that actually forward, because that is exactly where it works.
+        if c.gamepad().enabled && c.gamepad().guide_tap == GuideTap::Steam {
+            let forwarding: Vec<String> = c
+                .modes()
+                .iter()
+                .filter(|m| m.forward)
+                .map(|m| m.name.clone())
+                .collect();
+            let guard = Guard::OnlyIn(if forwarding.is_empty() {
+                // The built-in path: no modes are declared, and "a game holds
+                // focus" is spelled `game` there.
+                vec![crate::mode::BUILTIN_GAME.to_string()]
+            } else {
+                forwarding
+            });
+            entries.push(ambient(
+                Section::Guide,
+                "guide_tap",
+                "steam",
+                "Steam",
+                "Steam overlay",
+                "guide tap -> steam".to_string(),
+                &guard,
+                RANK_GUIDE,
             ));
         }
         let (scroll_label, scroll_mode) = match c.scroll().mode {
@@ -1589,13 +1620,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no {chord}"))
     }
 
-    /// The rows the daemon synthesizes for the keyboard's context — its
-    /// built-in map and the pad cursors — share their chord with the control
-    /// they sit on (`b`, `rpad`), so a test looking for what the CONFIG said
-    /// has to step over them. They are the rows guarded to that context; no
-    /// config can write that guard, since `osk` is not a mode a config declares.
+    /// The rows the daemon synthesizes rather than reading out of a config, so
+    /// a test looking for what the CONFIG said can step over them.
+    ///
+    /// Two kinds. The keyboard's context — its built-in map and the pad
+    /// cursors — shares its chord with the control it sits on (`b`, `rpad`) and
+    /// is guarded to `osk`, which no config can write because it is not a mode
+    /// a config declares. And the guide *tap*, guarded to whichever modes
+    /// forward, which no config can write either: nothing resolves against it.
     fn is_builtin(e: &Entry) -> bool {
-        e.guard == Guard::OnlyIn(vec![OSK_MODE.to_string()])
+        e.guard == Guard::OnlyIn(vec![OSK_MODE.to_string()]) || e.chord == "guide_tap"
     }
 
     /// The keyboard-context row on `chord` (see [`is_builtin`]).
@@ -2038,6 +2072,40 @@ mod tests {
         assert!(!desktop.has_rule);
         assert!(desktop.active.contains(&"a".to_string()));
         assert!(desktop.active.contains(&"b".to_string()));
+    }
+
+    /// The guide button's one non-chord row: a bare tap in a game opens the
+    /// Steam overlay, and the sheet says so in the game's tab and nowhere else.
+    #[test]
+    fn the_guide_tap_row_appears_in_the_forwarding_modes_only() {
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.bind("guide+r1", h.workspace "+1")
+            "#,
+        );
+        let tap = s.entries.iter().find(|e| e.chord == "guide_tap").expect("a guide_tap row");
+        assert_eq!(tap.section, Section::Guide);
+        assert_eq!(tap.control, "steam", "it sits on the Steam button's callout");
+        assert_eq!(tap.label, "Steam overlay");
+        assert_eq!(tap.action_kind, "ambient", "nothing resolves against it");
+        assert_eq!(tap.guard, Guard::OnlyIn(vec!["game".to_string()]));
+
+        // Switched off, the row goes with it — off is nothing, not a row that
+        // is live nowhere.
+        let off = sheet_from_toml("[gamepad]\nguide_tap = none\n");
+        assert!(!off.entries.iter().any(|e| e.chord == "guide_tap"));
+        let disabled = sheet_from_toml("[gamepad]\nenabled = false\n");
+        assert!(!disabled.entries.iter().any(|e| e.chord == "guide_tap"));
+
+        // With no modes declared, the built-in path's own name for "a game
+        // holds focus" is what it is guarded to.
+        let builtin = sheet_from_toml("[bindings]\n\"guide+r1\" = \"workspace +1\"\n");
+        let tap = builtin.entries.iter().find(|e| e.chord == "guide_tap").expect("a row");
+        assert_eq!(tap.guard, Guard::OnlyIn(vec![crate::mode::BUILTIN_GAME.to_string()]));
     }
 
     #[test]
