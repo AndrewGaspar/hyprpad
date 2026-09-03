@@ -3737,10 +3737,9 @@ l2 = "osk shift"
 [bindings]
 "guide+r1" = "workspace +1"
 "guide+l1" = "workspace -1"
-"guide+stick_right" = "workspace +1"
-"guide+stick_left"  = "workspace -1"
 "guide+x" = "workspace emptyn"
 "guide+stick_down" = "workspace previous"
+"guide+stick_up" = 'dispatch hl.dsp.workspace.toggle_special("scratchpad")'
 "guide+dpad_down" = "movetoworkspace emptyn"
 "guide+dpad_up" = "exec omarchy-shell -q hyprpad.status navEnter"
 "guide+a" = "exec voxtype record toggle"

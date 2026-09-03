@@ -11,9 +11,9 @@ the findings below.
 ## The goal
 
 Hold the **guide button** as a prime modifier and drive the window manager with
-it — e.g. *guide + right-stick flick* changes workspace. When a game is running,
-the game wins. Steam Input keeps working the rest of the time, so controller maps
-and older-game compatibility are unaffected.
+it — e.g. *guide + L1/R1* changes workspace. When a game is running, the game
+wins. Steam Input keeps working the rest of the time, so controller maps and
+older-game compatibility are unaffected.
 
 ## The finding that shapes everything
 
@@ -92,6 +92,7 @@ h.bind("guide+menu", h.exec "omarchy-menu")
 h.bind("guide+b",  h.dispatch "hl.dsp.window.close()")
 h.bind("guide+x",  h.workspace "emptyn")                 -- first empty workspace to the right
 h.bind("guide+stick_down", h.workspace "previous")
+h.bind("guide+stick_up",   "Scratchpad", h.dispatch 'hl.dsp.workspace.toggle_special("scratchpad")')  -- toggles, unlike h.workspace
 h.bind("guide+dpad_down",  h.move_to_workspace "emptyn")
 h.bind("guide+dpad_up",    "Bar panels", h.exec "omarchy-shell -q shell togglePanelAt right 1")  -- then R1 walks them
 h.bind("guide+y",  h.keyboard { mode = "split" })

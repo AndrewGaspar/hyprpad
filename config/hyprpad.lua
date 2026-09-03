@@ -273,10 +273,9 @@ h.osk_button("l2", "Hold for capitals", h.osk "shift")
 
 h.bind("guide+r1",          "Workspace right",     h.workspace "+1")
 h.bind("guide+l1",          "Workspace left",      h.workspace "-1")
-h.bind("guide+stick_right", "Workspace right",     h.workspace "+1")
-h.bind("guide+stick_left",  "Workspace left",      h.workspace "-1")
 h.bind("guide+x",           h.workspace "emptyn")
 h.bind("guide+stick_down",  h.workspace "previous")
+h.bind("guide+stick_up",    "Scratchpad",          h.dispatch 'hl.dsp.workspace.toggle_special("scratchpad")')
 h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle")
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")
@@ -295,9 +294,13 @@ h.bind("guide+rpad_click",  "Click (guide mouse)", h.mouse "left"):only_in("game
 -- `emptyn` is the first empty workspace to the RIGHT of this one, created at
 -- the end if none is free, and `previous` is where you were before it. They
 -- need no description of their own — the sheet words a selector itself ("Next
--- empty workspace"). "B closes, X opens", the right stick is a whole family
--- (left/right = ±1, down = back), and D-pad down takes the focused window
--- along to the new one.
+-- empty workspace"). The UP flick is deliberately NOT one of them: `h.workspace
+-- "special:scratchpad"` would compile to `hl.dsp.focus({ workspace = … })`,
+-- which only ever FOCUSES the scratchpad — flick up twice and it is still
+-- there. The dispatch above is `toggle_special`, the same verb Omarchy binds to
+-- SUPER + S, so the second flick puts it away again. "B closes, X opens", the
+-- stick's left/right flicks are free (L1/R1 already step the workspace), and
+-- D-pad down takes the focused window along to the new one.
 h.bind("guide+dpad_down",   h.move_to_workspace "emptyn")
 
 -- Up to the bar (docs/research/bar-navigation.md, phase 1): raises the focus
