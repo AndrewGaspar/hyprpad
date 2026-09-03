@@ -356,9 +356,9 @@ flick prefixes):
 - `guide_hold` (`GestureKey::Hold`).
 
 Not available: **trigger soft pulls** (only `r2`/`l2` *full* pulls exist as
-buttons, `src/config.rs:281-282`); **`guide_tap`** parses but is dead by design
-— a bare guide tap is handed to Steam before bindings are consulted
-(`src/run.rs:1945-1949`); pad touches.
+buttons, `src/config.rs:281-282`); pad touches. (**`guide_tap`** was dead when
+this was written — a bare tap went to Steam before bindings were consulted. It
+is a live binding now, outside the forwarding modes: `run::guide_tap_binding`.)
 
 ### 4.2 Proposed bindings
 

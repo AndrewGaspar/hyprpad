@@ -323,6 +323,25 @@ a lowercase **substring** of `"<comm> <cmdline>"` across the focused window's
 X clears the line, readline's `ctrl+u` — and the desktop guards list it too, so
 the pad is otherwise exactly what it is on the desktop.
 
+The sample's `launcher` mode is an overlay, like `cheatsheet`: Omarchy's gamepad
+launcher — the fullscreen app grid — maps a layer named `omarchy-launcher`, so
+`ctx.layers:has(…)` is the whole rule. The grid speaks its own keys, so four
+buttons are guarded into it (B backs out, X pins a tile, the bumpers turn pages)
+while the D-pad, A, the pad clicks and the cursor carry their desktop meanings
+straight in. Scroll and the caret scrub are left out on purpose: a grid of icons
+does neither. And what summons it is the Steam button itself, tapped bare:
+
+```lua
+h.bind("guide_tap", "App launcher", h.exec "omarchy launcher toggle"):not_in("game")
+```
+
+`guide_tap` is not a chord. It is a quick press and release with *nothing* in
+it, and that narrowness is what makes it safe to hang a binding off the modifier
+the whole guide layer lives on — a chord you thought better of, a caret fix, a
+guide-mouse drag and a long deliberating hold all bind nothing. In a game the
+same tap goes to Steam instead and no binding runs: see [the Steam button in a
+game](#the-steam-button-in-a-game).
+
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:
 
