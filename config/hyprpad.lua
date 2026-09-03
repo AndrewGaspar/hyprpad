@@ -64,6 +64,10 @@ h.mode("locked").when(function(ctx) return ctx.locked end)
 -- case wired into the daemon.
 h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatsheet") end)
 
+-- Omarchy's gamepad launcher (the fullscreen app grid): its own layer, its own
+-- keys (arrows, Enter, PgUp/PgDn, p = pin, Esc = clear filter then close).
+h.mode("launcher").when(function(ctx) return ctx.layers:has("omarchy-launcher") end)
+
 -- Game / Steam Big Picture. Steam launches native and Proton titles as
 -- `steam_app_<id>`; gamescope and Big Picture (`steamwebhelper`) are matched
 -- too, which is what fixes the double-input seen in Big Picture.
@@ -164,7 +168,7 @@ h.cursor {
   one_euro_beta = 1.0,
   one_euro_d_cutoff = 1.0,
   hysteresis = 0.0008,
-  only_in = { "desktop", "omarchy-ui", "browser", "agent" },
+  only_in = { "desktop", "omarchy-ui", "browser", "agent", "launcher" },
   guide_in = { "game" }, -- except while the guide is held: then it is a mouse in a game too
 }
 
@@ -203,11 +207,11 @@ h.haptics { cursor_spacing_px = 96 } -- sparser cursor texture (default 64)
 -- is what hands them to the game under a game-classed window.
 -- ---------------------------------------------------------------------------
 
-h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui", "browser", "agent")     -- A = Enter/confirm
+h.button("dpad_up",    h.key "up"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("dpad_down",  h.key "down"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("dpad_left",  h.key "left"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("dpad_right", h.key "right"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("a", h.key "enter"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")     -- A = Enter/confirm
 h.button("b", h.key "backspace"):only_in("desktop", "browser", "agent") -- B = Backspace
 
 -- In an agent terminal, X clears the line (readline's ctrl+u); B is still Backspace.
@@ -224,12 +228,19 @@ h.button("view", "Copy selection",     h.key "ctrl+shift+c"):only_in("agent")
 -- Menu expands the transcript (Claude Code's ctrl+o); a view toggle, harmless elsewhere.
 h.button("menu", "Expand transcript",  h.key "ctrl+o"):only_in("agent")
 
+-- In the launcher: B backs out (Esc clears the filter, then closes — the grid does
+-- not speak XF86Back), X pins the tile, bumpers turn pages.
+h.button("b",  "Back / close",   h.key "escape"):only_in("launcher")
+h.button("x",  "Pin / unpin",    h.key "p"):only_in("launcher")
+h.button("l1", "Previous page",  h.key "pageup"):only_in("launcher")
+h.button("r1", "Next page",      h.key "pagedown"):only_in("launcher")
+
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
 -- exactly like the cursor above: where the pad moves the pointer, it clicks.
-h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent")
-h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui", "browser", "agent")
+h.button("rpad_click", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("r2", h.mouse "left"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
+h.button("l2", h.mouse "right"):only_in("desktop", "omarchy-ui", "browser", "agent", "launcher")
 
 -- The same button, a different meaning in a different mode. The cheat sheet has
 -- keyboard focus and closes on Escape, so B dismisses it — and the two never
@@ -303,6 +314,15 @@ h.bind("guide+a",           "Dictation toggle",    h.exec "voxtype record toggle
 h.bind("guide+b",           "Close window",        h.dispatch "hl.dsp.window.close()")
 h.bind("guide+r5",          "Media play/pause",    h.exec "playerctl play-pause")
 h.bind("guide+menu",        "Omarchy menu",        h.exec "omarchy-menu")
+
+-- The bare Steam button: the launcher on the desktop, Steam's overlay in a game.
+-- Not a chord at all — a quick press and release with NOTHING in it, which is
+-- what makes it safe to bind next to the guide layer: a chord, a flick, a hold
+-- spent on the caret scrub or the guide-mouse, and anything past
+-- `guide_tap_max_ms` (400 ms of deliberating) each bind nothing. `:not_in("game")`
+-- spells out in the config what the daemon enforces anyway — in a game the tap
+-- is replayed to Steam and no binding runs.
+h.bind("guide_tap",         "App launcher",        h.exec "omarchy launcher toggle"):not_in("game")
 h.bind("guide+l2",          "Previous tab",        h.dispatch "hl.dsp.group.prev()")
 h.bind("guide+r2",          "Next tab",            h.dispatch "hl.dsp.group.next()")
 h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" })

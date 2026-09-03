@@ -1626,10 +1626,14 @@ mod tests {
     /// Two kinds. The keyboard's context — its built-in map and the pad
     /// cursors — shares its chord with the control it sits on (`b`, `rpad`) and
     /// is guarded to `osk`, which no config can write because it is not a mode
-    /// a config declares. And the guide *tap*, guarded to whichever modes
-    /// forward, which no config can write either: nothing resolves against it.
+    /// a config declares. And the guide *tap*'s Steam-overlay row, guarded to
+    /// whichever modes forward, which no config can write either: nothing
+    /// resolves against it, which is exactly what `ambient` marks. A `guide_tap`
+    /// **binding** shares the chord and is not built in — the two rows coexist
+    /// on the Steam button, guarded to disjoint modes.
     fn is_builtin(e: &Entry) -> bool {
-        e.guard == Guard::OnlyIn(vec![OSK_MODE.to_string()]) || e.chord == "guide_tap"
+        e.guard == Guard::OnlyIn(vec![OSK_MODE.to_string()])
+            || (e.chord == "guide_tap" && e.action_kind == "ambient")
     }
 
     /// The keyboard-context row on `chord` (see [`is_builtin`]).

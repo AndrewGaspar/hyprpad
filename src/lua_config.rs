@@ -1684,8 +1684,13 @@ fn section_haptics(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
 /// sees; `"steam"` (the default) hands a **bare tap** of it back by
 /// synthesizing the press on the virtual pad afterwards, which is what opens
 /// the Steam overlay over a game. A chord, a flick, a hold the daemon spent on
-/// the pads, and any hold past `guide_tap_max_ms` are all untouched, and on the
-/// desktop nothing changes at all. See [`crate::config::GuideTap`].
+/// the pads, and any hold past `guide_tap_max_ms` are all untouched.
+///
+/// It settles a precedence, not just a feature: a bare tap has exactly one
+/// consumer, so where the overlay pulse fires the `guide_tap` **binding** does
+/// not — in a game the Steam button is Steam's — and everywhere else (or with
+/// `"none"`, which leaves no pulse anywhere to defer to) the binding is what
+/// the tap does. See [`crate::config::GuideTap`].
 fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
     let build = Rc::clone(build);
     lua.create_function(move |_, t: Table| {
@@ -3705,7 +3710,10 @@ mod tests {
                 out.push(GestureEvent::GuideStickFlick { stick, dir });
             }
         }
-        out.push(GestureEvent::GuideLeave { was_chorded: false });
+        // The bare tap, in the one shape that binds anything: `bare_tap` is
+        // what `GestureKey::Tap` resolves against, so a broad unchorded leave
+        // here would compare two `Action::None`s and prove nothing.
+        out.push(GestureEvent::GuideLeave { was_chorded: false, bare_tap: true });
         out.push(GestureEvent::GuideHold);
         out
     }
@@ -3777,6 +3785,7 @@ l2 = "osk shift"
 "guide+r5" = "exec playerctl play-pause"
 "guide+r4" = "exec omarchy screenshot fullscreen"
 "guide+menu" = "exec omarchy-menu"
+"guide_tap" = "exec omarchy launcher toggle"
 "guide+l2" = "dispatch hl.dsp.group.prev()"
 "guide+r2" = "dispatch hl.dsp.group.next()"
 "guide+y" = "keyboard split"

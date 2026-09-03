@@ -30,7 +30,7 @@
 //!
 //!    Both spend the hold ([`GestureEngine::consume_hold`]) the moment they
 //!    actually do something, so the guide's release is never handed on as the
-//!    bare tap Steam acts on.
+//!    bare tap Steam — or a `guide_tap` binding — acts on.
 //! 2. **On-screen keyboard** — `osk.is_active()`. It owns both pads.
 //! 3. **Game forwarding** — [`drive_gamepad`], when the active mode forwards
 //!    and neither layer above is claiming.
@@ -93,13 +93,21 @@
 //! *consumed* ([`GestureEngine::consume_hold`]): its release is never handed on
 //! as the bare guide tap Steam acts on.
 //!
-//! What is left — a quick press and release that meant nothing else — is handed
-//! to the *game*, and only to a game ([`guide_tap_pulse`]). The guide is
-//! stripped from every frame the game sink sees, and while it is held nothing
-//! is forwarded at all, so the button Steam needs for its overlay is
-//! synthesized on the fake instead: a 60 ms pulse on the release
-//! (`SteamRelay::pulse_guide`, [`VirtualGamepad::pulse_guide`]). On the desktop
-//! a bare tap still does nothing, exactly as before.
+//! What is left — a quick press and release that meant nothing else — has
+//! **exactly one** consumer, and the forwarding gate picks it.
+//!
+//! In a game it is the *game's* ([`guide_tap_pulse`]). The guide is stripped
+//! from every frame the game sink sees, and while it is held nothing is
+//! forwarded at all, so the button Steam needs for its overlay is synthesized
+//! on the fake instead: a 60 ms pulse on the release
+//! (`SteamRelay::pulse_guide`, [`VirtualGamepad::pulse_guide`]). No binding
+//! runs there — in a game the Steam button is Steam's.
+//!
+//! Everywhere else it is the `guide_tap` **binding's** ([`guide_tap_binding`]):
+//! an ordinary gesture binding, resolved through the same guard and the same
+//! [`perform_action`] tail as a chord. The narrowness above is what makes that
+//! safe — a caret fix, a guide-mouse drag and a long deliberating hold are all
+//! unchorded releases, and none of them binds anything.
 //!
 //! ## Layer transitions: a held button never leaks into the next layer
 //!
@@ -976,7 +984,22 @@ pub fn run() -> std::io::Result<()> {
                 // The one gesture threshold a config can move, read fresh so
                 // `hyprpad reload` retunes it on the very next report.
                 engine.set_guide_tap_max(config.gamepad().guide_tap_max());
-                for ge in engine.update(&frame, now) {
+                let gestures = engine.update(&frame, now);
+                // The forwarding gate, asked HERE — after the update, so the
+                // guide is already up on a release frame, and before any
+                // binding can move the mode, so the answer is about the mode
+                // the gesture happened in. `handle_gesture` needs it for one
+                // question only: a bare guide tap in a game is Steam's (the
+                // pulse `drive_gamepad` fires below with the same inputs), and
+                // everywhere else it is the `guide_tap` binding's.
+                let tap_forwarding = gamepad_forwarding(
+                    config.gamepad().enabled,
+                    modes.forwards(),
+                    modes.desktop_yielded(),
+                    engine.guide_active(),
+                    osk.is_active(),
+                );
+                for ge in gestures {
                     if debug {
                         eprintln!("[gesture] {ge:?} -> {:?}", config.resolve_in(&ge, modes.state()));
                     }
@@ -989,6 +1012,7 @@ pub fn run() -> std::io::Result<()> {
                         &mut chord_keys,
                         &mut keyboard,
                         pointer.as_mut(),
+                        tap_forwarding,
                         ge,
                     );
                 }
@@ -2669,6 +2693,37 @@ fn guide_tap_pulse(cfg: &GamepadConfig, forwarding: bool, bare_tap: bool) -> boo
     cfg.guide_tap == GuideTap::Steam && forwarding && bare_tap
 }
 
+/// Whether this frame's guide release should run the **`guide_tap` binding**
+/// ([`crate::config::GestureKey::Tap`]).
+///
+/// The other consumer of the same bare tap, and the precedence between the two
+/// written down in one line: *a bare tap has exactly one consumer, and
+/// [`guide_tap_pulse`] gets first refusal.* In a game the pulse takes it and no
+/// binding runs — the owner's rule, "in a game the Steam button is Steam's" —
+/// and everywhere else the binding does.
+///
+/// The two conjuncts:
+///
+/// * `bare_tap` — the engine's narrow decision, carried on the event
+///   ([`gesture::GestureEvent::GuideLeave`]). A chorded hold, a hold the
+///   guide-mouse or the caret scrub spent, a hold already holding a button, and
+///   a hold past `guide_tap_max_ms` are each a leave that binds nothing: a
+///   caret fix must not also summon whatever `guide_tap` is bound to, and
+///   neither must three seconds of deliberating.
+/// * not [`guide_tap_pulse`] — so the tap Steam is about to be handed is not
+///   *also* a binding. Note what this leaves standing: with `guide_tap =
+///   "none"` there is no pulse to defer to anywhere, so the binding runs in a
+///   game too, which is exactly what that word means ("the guide is hyprpad's
+///   alone, in a game too").
+///
+/// The binding's own guard is a separate, later question — `:not_in("game")`
+/// on the config side says the same thing again, in the language a config has.
+///
+/// Pure, so the decision table is unit-testable without a device.
+fn guide_tap_binding(cfg: &GamepadConfig, forwarding: bool, bare_tap: bool) -> bool {
+    bare_tap && !guide_tap_pulse(cfg, forwarding, bare_tap)
+}
+
 /// Create the virtual Steam Controller, if the config asks for one *and* a
 /// `/dev/uhid` descriptor can be had.
 ///
@@ -3718,6 +3773,11 @@ fn handle_gesture(
     chords: &mut ChordKeys,
     keyboard: &mut Option<VirtualKeyboard>,
     mut pointer: Option<&mut VirtualPointer>,
+    // The forwarding gate as it stands at this gesture — the same
+    // [`gamepad_forwarding`] answer the frame's input rides on. Read by the
+    // guide's release alone, to decide whether a bare tap is Steam's or a
+    // binding's.
+    forwarding: bool,
     ge: GestureEvent,
 ) -> bool {
     match ge {
@@ -3736,10 +3796,16 @@ fn handle_gesture(
         _ => {}
     }
 
-    // A bare guide tap belongs to Steam: do nothing so the client sees its own
-    // button (it acts on release). Chords and flicks are ours.
-    if let GestureEvent::GuideLeave { was_chorded: false } = ge {
-        return false;
+    // The guide's release. It binds something only when it was a *narrow* bare
+    // tap that no game is about to be handed instead — the whole rule is in
+    // `guide_tap_binding`, and both halves matter here: a scrub session's
+    // release and a three-second deliberation are unchorded leaves that must
+    // summon nothing, and in a game the tap is Steam's (`guide_tap_pulse`
+    // replays it onto the sink this same frame), so no binding runs there.
+    if let GestureEvent::GuideLeave { bare_tap, .. } = ge {
+        if !guide_tap_binding(config.gamepad(), forwarding, bare_tap) {
+            return false;
+        }
     }
 
     // The modality gate. On the built-in path this is the old rule verbatim —
@@ -4833,7 +4899,8 @@ mod tests {
         macro_rules! gesture {
             ($ge:expr) => {
                 handle_gesture(
-                    &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, $ge,
+                    &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
+                    false, $ge,
                 )
             };
         }
@@ -4847,7 +4914,7 @@ mod tests {
         // And the guide letting go first does the same.
         assert!(!gesture!(GestureEvent::GuideChord(A)));
         assert_eq!(chords.held.len(), 1);
-        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true }));
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }));
         assert!(chords.held.is_empty());
     }
 
@@ -5290,14 +5357,14 @@ mod tests {
         // Recognition performs the whole sequence and reports the mode move,
         // so the caller runs the handoff.
         assert!(handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
+            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, false,
             GestureEvent::GuideChord(GripL4),
         ));
         assert_eq!(modes.active(), "hints");
         assert!(chords.held.is_empty(), "a sequence holds nothing: its key was tapped");
         // The chord's release therefore has nothing to let go of.
         assert!(!handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
+            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, false,
             GestureEvent::GuideChordRelease(GripL4),
         ));
         assert_eq!(modes.active(), "hints");
@@ -5648,6 +5715,100 @@ mod tests {
                 assert!(!guide_tap_pulse(&off, forwarding, tap));
             }
         }
+    }
+
+    /// The other consumer of the same bare tap, and the precedence between the
+    /// two: exactly one of them gets it, and `forwarding` is what picks.
+    #[test]
+    fn a_bare_tap_binds_everywhere_the_pulse_does_not() {
+        let on = GamepadConfig::default();
+        let off = GamepadConfig { guide_tap: GuideTap::None, ..GamepadConfig::default() };
+
+        // In a game the pulse takes it and the binding does not run: the
+        // owner's rule, "in a game the Steam button is Steam's".
+        assert!(guide_tap_pulse(&on, true, true));
+        assert!(!guide_tap_binding(&on, true, true), "in a game the Steam button is Steam's");
+        // On the desktop nothing is being forwarded to, so the binding is the
+        // tap's only consumer — this is what summons the launcher.
+        assert!(!guide_tap_pulse(&on, false, true));
+        assert!(guide_tap_binding(&on, false, true));
+
+        // Never both, and never neither, for a real tap — whatever the config
+        // and whatever the mode.
+        for cfg in [&on, &off] {
+            for forwarding in [true, false] {
+                assert!(
+                    guide_tap_pulse(cfg, forwarding, true)
+                        ^ guide_tap_binding(cfg, forwarding, true),
+                    "a bare tap has exactly one consumer"
+                );
+            }
+        }
+
+        // What the engine did NOT call a tap binds nothing, in either mode: a
+        // chord, a flick, a hold the scrub or the guide-mouse spent, a hold
+        // past the cap.
+        for forwarding in [true, false] {
+            assert!(!guide_tap_binding(&on, forwarding, false));
+            assert!(!guide_tap_binding(&off, forwarding, false));
+        }
+
+        // `guide_tap = "none"` means "the guide is hyprpad's alone, in a game
+        // too": with no pulse anywhere to defer to, the binding runs in a game
+        // as well.
+        assert!(guide_tap_binding(&off, true, true));
+    }
+
+    /// End to end through the real engine and the real config: which guide
+    /// releases run a `guide_tap` binding. The narrow decision, not "the leave
+    /// was unchorded" — the two differ exactly where the owner would feel it.
+    #[test]
+    fn the_tap_binding_is_the_engines_narrow_tap_not_any_unchorded_leave() {
+        let cfg =
+            Config::from_toml_str("[bindings]\n\"guide_tap\" = \"exec omarchy launcher toggle\"\n")
+                .expect("parse");
+        let bound = Action::Exec("omarchy launcher toggle".to_string());
+
+        let bit = |b: report::Button| -> u32 {
+            (0..32)
+                .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
+                .expect("button has a bit")
+        };
+        let frame = |buttons: &[report::Button]| report::Frame {
+            buttons: buttons.iter().fold(0, |acc, &b| acc | (1 << bit(b))),
+            ..report::Frame::default()
+        };
+
+        // Hold the guide for `hold_ms`, optionally spending it the way the
+        // caret scrub and the guide-mouse do, and resolve the leave it ends in.
+        let leave = |hold_ms: u64, consume: bool| -> Action {
+            let mut engine = GestureEngine::new();
+            let t = Instant::now();
+            engine.update(&frame(&[]), t);
+            engine.update(&frame(&[report::Button::Steam]), t + Duration::from_millis(4));
+            if consume {
+                engine.consume_hold();
+            }
+            let ev = engine
+                .update(&frame(&[]), t + Duration::from_millis(4 + hold_ms))
+                .into_iter()
+                .find(|e| matches!(e, GestureEvent::GuideLeave { .. }))
+                .expect("the release is a leave");
+            cfg.resolve(&ev)
+        };
+
+        // A quick press and release with nothing in it: the binding.
+        assert_eq!(leave(120, false), bound, "a bare tap is what the binding is for");
+        // A hold the scrub or the guide-mouse spent: nothing. Without this,
+        // every caret fix would summon the launcher on the way out.
+        assert_eq!(leave(120, true), Action::None, "a consumed hold binds nothing");
+        assert_eq!(leave(3_000, true), Action::None);
+        // A long deliberating hold that ended in nothing at all: also nothing,
+        // even though its leave is unchorded.
+        assert_eq!(leave(3_000, false), Action::None, "3 s is deliberating, not tapping");
+        // And the cap is where the owner set it.
+        assert_eq!(leave(400, false), bound, "the cap itself is still a tap");
+        assert_eq!(leave(401, false), Action::None, "one ms past it is not");
     }
 
     /// The gate the pulse rides on is the *same* gate the frame's input rides
@@ -6207,7 +6368,7 @@ mod tests {
         let up = report::Frame::default();
         assert_eq!(
             engine.update(&up, now + Duration::from_millis(4)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
     }
 
@@ -6239,7 +6400,7 @@ mod tests {
         assert!(!st.consumed, "a still thumb emits nothing and spends nothing");
         assert_eq!(
             engine.update(&report::Frame::default(), now + Duration::from_millis(4)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
     }
 
@@ -6518,6 +6679,9 @@ mod tests {
                     &mut chords,
                     &mut kbd,
                     None,
+                    // A game holds focus in this test, so a bare tap is
+                    // Steam's, not a binding's.
+                    true,
                     $ge,
                 )
             };
@@ -6539,7 +6703,7 @@ mod tests {
         assert!(chords.held.contains_key(&GripL5));
         // The guide letting go first releases whatever is left.
         assert!(!gesture!(GestureEvent::GuideChord(PadRightClick)));
-        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true }));
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }));
         assert!(chords.held.is_empty());
         // A release for a button holding nothing, and a chord that is not a
         // key, hold nothing. (An unbound chord resolves to `None` before it
@@ -6547,8 +6711,8 @@ mod tests {
         assert!(!gesture!(GestureEvent::GuideChordRelease(BumperR1)));
         assert!(!gesture!(GestureEvent::GuideChord(BumperR1)));
         assert!(chords.held.is_empty());
-        // And a bare tap still belongs to Steam.
-        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: false }));
+        // And a bare tap in a game still belongs to Steam, not to a binding.
+        assert!(!gesture!(GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }));
     }
 
     /// The lock, all the way through the daemon's event arm: a

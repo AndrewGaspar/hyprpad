@@ -323,6 +323,25 @@ a lowercase **substring** of `"<comm> <cmdline>"` across the focused window's
 X clears the line, readline's `ctrl+u` — and the desktop guards list it too, so
 the pad is otherwise exactly what it is on the desktop.
 
+The sample's `launcher` mode is an overlay, like `cheatsheet`: Omarchy's gamepad
+launcher — the fullscreen app grid — maps a layer named `omarchy-launcher`, so
+`ctx.layers:has(…)` is the whole rule. The grid speaks its own keys, so four
+buttons are guarded into it (B backs out, X pins a tile, the bumpers turn pages)
+while the D-pad, A, the pad clicks and the cursor carry their desktop meanings
+straight in. Scroll and the caret scrub are left out on purpose: a grid of icons
+does neither. And what summons it is the Steam button itself, tapped bare:
+
+```lua
+h.bind("guide_tap", "App launcher", h.exec "omarchy launcher toggle"):not_in("game")
+```
+
+`guide_tap` is not a chord. It is a quick press and release with *nothing* in
+it, and that narrowness is what makes it safe to hang a binding off the modifier
+the whole guide layer lives on — a chord you thought better of, a caret fix, a
+guide-mouse drag and a long deliberating hold all bind nothing. In a game the
+same tap goes to Steam instead and no binding runs: see [the Steam button in a
+game](#the-steam-button-in-a-game).
+
 Every binding then decides for itself where it is live — **guards are per
 binding, not per category**:
 
@@ -572,21 +591,43 @@ the button are streamed to the game as neutral, and the press never arrives.
 
 So hyprpad makes it up instead. A **bare tap** of the guide in a game — press,
 release, and nothing in between — is replayed onto the virtual pad as a 60 ms
-press of the guide button, which is what opens the Steam overlay. Nothing else
-qualifies: not a chord (`guide+r1` is a workspace change), not a stick flick,
-not a hold the daemon spent on the pads (the guide-mouse, the caret scrub), and
-not a hold longer than **400 ms** — that last one is the deliberating case,
-guide down while you decide which chord to press and then think better of it,
-and it must not end in an overlay. On the desktop the same tap does what it
-always did, which is nothing: there is no game being forwarded to.
+press of the guide button, which is what opens the Steam overlay.
+
+Nothing else qualifies, and the list is the whole point: not a chord (`guide+r1`
+is a workspace change), not a stick flick, not a hold the daemon spent on the
+pads (the guide-mouse, the caret scrub), and not a hold longer than **400 ms** —
+that last one is the deliberating case, guide down while you decide which chord
+to press and then think better of it, and it must not end in an overlay.
+
+On the desktop that same bare tap is a **binding**, `guide_tap`, resolved
+through the same guard and performing the same actions as any guide chord:
+
+```lua
+h.bind("guide_tap", "App launcher", h.exec "omarchy launcher toggle"):not_in("game")
+```
+
+The two never both fire. A bare tap has exactly one consumer and the forwarding
+gate picks it: **in a game the Steam button is Steam's** — the overlay pulse
+goes out and no binding runs — and everywhere else the binding does. The
+`:not_in("game")` above says the same thing a second time, in the language a
+config has, which is worth writing anyway so the cheat sheet reads right.
+
+What makes a binding safe to hang off the same button as the whole guide layer
+is that narrowness. A caret fix, a guide-mouse drag, a chord you thought better
+of and a three-second deliberating hold all end in a release that binds
+**nothing** — so a scrub session cannot summon the launcher on its way out, and
+neither can a long think.
 
 ```lua
 h.gamepad { guide_tap = "none" }        -- the guide is hyprpad's alone, in a game too
 h.gamepad { guide_tap_max_ms = 250 }    -- a stricter idea of "a tap"
 ```
 
-`guide_tap = "steam"` is the default. The cheat sheet shows it as a row on the
-Steam button's callout in the tab of every mode that forwards.
+`guide_tap = "steam"` is the default. The cheat sheet shows the overlay as a row
+on the Steam button's callout in the tab of every mode that forwards, and a
+`guide_tap` binding as a row of its own. With `guide_tap = "none"` there is no
+pulse anywhere to defer to, so the binding runs in a game as well — which is
+exactly what that word means.
 
 ## Steam sees a Steam Controller (setup)
 
