@@ -667,7 +667,22 @@ pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'stat
 pub(crate) enum GestureKey {
     Chord(report::Button),
     Flick(Stick, StickDir),
-    /// A bare guide tap (`GuideLeave { was_chorded: false }`).
+    /// A bare guide tap: the guide pressed and released with **nothing** in
+    /// between — `GuideLeave { bare_tap: true }`, the narrow decision
+    /// [`crate::gesture::GestureEngine::guide_tap`] documents.
+    ///
+    /// Narrow on purpose, and not the same thing as "the leave was not
+    /// chorded". A hold the caret scrub or the guide-mouse spent
+    /// ([`crate::gesture::GestureEngine::consume_hold`]) and a hold longer than
+    /// `[gamepad] guide_tap_max_ms` both end in an *unchorded* leave, and
+    /// neither resolves here: a caret fix must not also summon whatever
+    /// `guide_tap` is bound to, and neither must three seconds of deliberating.
+    ///
+    /// One further gate lives in the daemon rather than here, because it is
+    /// about the *mode* and not about the gesture: in a forwarding mode the
+    /// bare tap is Steam's (`run::guide_tap_pulse`) and no binding runs — in a
+    /// game the Steam button is Steam's. Everywhere else this binding is what
+    /// the tap does (`run::guide_tap_binding`).
     Tap,
     /// The guide crossing the hold threshold (`GuideHold`).
     Hold,
@@ -675,17 +690,23 @@ pub(crate) enum GestureKey {
 
 impl GestureKey {
     /// The binding key a gesture event resolves against, or `None` for the
-    /// lifecycle events that carry no binding — `GuideEnter`, a *chorded*
-    /// `GuideLeave`, and a chord button's release (the daemon pairs that with
-    /// the chord it already resolved; nothing is bound to it).
+    /// lifecycle events that carry no binding — `GuideEnter`, a `GuideLeave`
+    /// that was not a *narrow* bare tap, and a chord button's release (the
+    /// daemon pairs that with the chord it already resolved; nothing is bound
+    /// to it).
+    ///
+    /// The tap reads the event's `bare_tap` bit, never `was_chorded`: the
+    /// engine has already ruled out the chorded hold, the consumed hold and the
+    /// over-long one, and this is where that decision is honoured (see
+    /// [`GestureKey::Tap`]).
     pub(crate) fn of(ev: &gesture::GestureEvent) -> Option<GestureKey> {
         use gesture::GestureEvent as E;
         match ev {
             E::GuideChord(b) => Some(GestureKey::Chord(*b)),
             E::GuideStickFlick { stick, dir } => Some(GestureKey::Flick(*stick, *dir)),
-            E::GuideLeave { was_chorded: false } => Some(GestureKey::Tap),
+            E::GuideLeave { bare_tap: true, .. } => Some(GestureKey::Tap),
             E::GuideHold => Some(GestureKey::Hold),
-            E::GuideEnter | E::GuideLeave { was_chorded: true } | E::GuideChordRelease(_) => None,
+            E::GuideEnter | E::GuideLeave { bare_tap: false, .. } | E::GuideChordRelease(_) => None,
         }
     }
 
@@ -2653,9 +2674,11 @@ impl Config {
 
     /// Resolve a gesture event to its bound action, or [`Action::None`].
     ///
-    /// Lifecycle events that carry no binding — `GuideEnter` and a *chorded*
-    /// `GuideLeave` — always resolve to `None`. A bare `GuideLeave` maps to the
-    /// optional `guide_tap` binding, and `GuideHold` to `guide_hold`.
+    /// Lifecycle events that carry no binding — `GuideEnter`, and every
+    /// `GuideLeave` that was not a narrow bare tap (chorded, consumed, or held
+    /// past the cap) — always resolve to `None`. A `GuideLeave` carrying
+    /// `bare_tap` maps to the optional `guide_tap` binding, and `GuideHold` to
+    /// `guide_hold`.
     pub fn resolve(&self, ev: &gesture::GestureEvent) -> Action {
         let Some(key) = GestureKey::of(ev) else { return Action::None };
         self.bindings.get(&key).cloned().unwrap_or(Action::None)
@@ -3218,11 +3241,11 @@ mod tests {
         // Lifecycle events.
         assert_eq!(c.resolve(&GestureEvent::GuideEnter), Action::None);
         assert_eq!(
-            c.resolve(&GestureEvent::GuideLeave { was_chorded: false }),
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }),
             Action::None
         );
         assert_eq!(
-            c.resolve(&GestureEvent::GuideLeave { was_chorded: true }),
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }),
             Action::None
         );
     }
@@ -3305,12 +3328,42 @@ mod tests {
             Action::Workspace(WorkspaceTarget::Relative(1))
         );
         assert_eq!(
-            c.resolve(&GestureEvent::GuideLeave { was_chorded: false }),
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }),
             Action::Exec("steam-bigpicture".to_string())
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideHold),
             Action::Dispatch("overlay".to_string())
+        );
+    }
+
+    /// `guide_tap` resolves from the engine's **narrow** tap and from nothing
+    /// else. "The leave was not chorded" is a broader thing and is not enough:
+    /// a hold the caret scrub or the guide-mouse spent, and a hold that ran
+    /// past `guide_tap_max_ms`, are both unchorded leaves — and if either one
+    /// resolved here, every caret fix and every three-second deliberation
+    /// would fire whatever `guide_tap` is bound to.
+    #[test]
+    fn the_tap_binding_resolves_only_from_a_narrow_bare_tap() {
+        let c = Config::from_toml_str("[bindings]\n\"guide_tap\" = \"exec launcher\"\n")
+            .expect("parse");
+        let bound = Action::Exec("launcher".to_string());
+
+        // Press, release, nothing in between.
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }),
+            bound
+        );
+        // Unchorded, but not a tap: consumed, or held past the cap.
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: false, bare_tap: false }),
+            Action::None,
+            "a consumed or over-long hold ends in an unchorded leave that binds nothing"
+        );
+        // Chorded, as before.
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }),
+            Action::None
         );
     }
 

@@ -13,7 +13,8 @@
 //!   chose to spend the hold on — [`GestureEngine::consume_hold`]) is reported
 //!   as such so the daemon can pass it through to Steam, whose own guide
 //!   button acts on release. [`GestureEngine::guide_tap`] narrows that to the
-//!   *quick* bare tap the daemon synthesizes onto the game sink.
+//!   *quick* bare tap — the one thing the daemon either synthesizes onto the
+//!   game sink or resolves as the `guide_tap` binding, never both.
 //!
 //! Timing uses the monotonic [`Instant`] passed by the caller, never the frame
 //! counter (which is a wrapping `u8`): the engine is therefore robust to
@@ -67,12 +68,23 @@ pub enum GestureEvent {
     /// reveal an on-screen layer overlay). A bare hold on its own does *not*
     /// set `was_chorded`.
     GuideHold,
-    /// Guide released. `was_chorded == false` means a bare tap that the daemon
-    /// should pass through to Steam; `true` means the hold carried at least one
-    /// chord or flick — or the daemon spent it on something of its own
+    /// Guide released. Two bits, and they answer different questions.
+    ///
+    /// `was_chorded == true` means the hold carried at least one chord or
+    /// flick — or the daemon spent it on something of its own
     /// ([`GestureEngine::consume_hold`]) — and was consumed by the desktop
-    /// layer.
-    GuideLeave { was_chorded: bool },
+    /// layer. Nothing resolves against such a leave.
+    ///
+    /// `bare_tap` is the *narrow* half: the whole gesture was a quick
+    /// press-and-release with nothing in it, the exact decision
+    /// [`GestureEngine::guide_tap`] documents (and the same value it returns
+    /// for this frame), carried on the event so every consumer asks the same
+    /// question. It is what the `guide_tap` binding resolves against
+    /// ([`crate::config::GestureKey::Tap`]) and what the daemon replays onto
+    /// the game sink as a Steam press. `was_chorded == false` alone is *not*
+    /// enough for either: a three-second deliberating hold that ended in
+    /// nothing is `was_chorded == false, bare_tap == false`.
+    GuideLeave { was_chorded: bool, bare_tap: bool },
 }
 
 /// How long the guide must be held to count as a deliberate hold rather than a
@@ -244,6 +256,11 @@ impl GestureEngine {
                 && now.saturating_duration_since(self.guide_since) <= self.guide_tap_max;
             events.push(GestureEvent::GuideLeave {
                 was_chorded: self.was_chorded,
+                // The same bit, on the event: a consumer that only ever sees
+                // the event (`Config::resolve`) must not have to ask the
+                // engine, and must not be able to mistake a *broad* bare leave
+                // for a tap.
+                bare_tap: self.guide_tap,
             });
         }
 
@@ -259,7 +276,8 @@ impl GestureEngine {
     /// Whether the frame just handed to [`Self::update`] ended a **quick bare
     /// tap** of the guide: press, release, and nothing in between.
     ///
-    /// The narrow half of `GuideLeave { was_chorded: false }`. All four of
+    /// The narrow half of a bare `GuideLeave`, and the value its
+    /// [`bare_tap`](GestureEvent::GuideLeave) field carries. All four of
     /// these must hold, and each rules out a hold the owner meant as something
     /// else:
     ///
@@ -274,29 +292,31 @@ impl GestureEngine {
     ///   "what shall I press" hold from counting.
     ///
     /// True for exactly the one `update` call that saw the release, and false
-    /// again on the next. The daemon turns it into a synthesized guide press on
-    /// the virtual pad *if a game is being forwarded to* — see
-    /// `run::guide_tap_pulse`; on the desktop it means nothing and nothing
-    /// happens.
+    /// again on the next. It has exactly one consumer per release, and the
+    /// forwarding gate picks which: in a game the daemon turns it into a
+    /// synthesized guide press on the virtual pad (`run::guide_tap_pulse` — in
+    /// a game the Steam button is Steam's), and everywhere else it resolves the
+    /// `guide_tap` binding (`run::guide_tap_binding`).
     pub fn guide_tap(&self) -> bool {
         self.guide_tap
     }
 
     /// Mark the current hold as spent by the desktop layer, so its release is
-    /// reported as `GuideLeave { was_chorded: true }` — never as the bare tap
-    /// Steam would act on — exactly as recognising a chord does.
+    /// reported as `GuideLeave { was_chorded: true, bare_tap: false }` — never
+    /// as the bare tap Steam or a `guide_tap` binding would act on — exactly as
+    /// recognising a chord does.
     ///
     /// For the things the engine cannot see as chords — a pad *touch* is not
     /// chordable ([`Self::chordable`] excludes both pads, because a thumb rests
     /// on one), so a hold spent on the pads would otherwise end in
-    /// `GuideLeave { was_chorded: false }`. The daemon calls this:
+    /// a bare leave. The daemon calls this:
     ///
     /// * when the right pad moves the cursor under a held guide (`h.cursor {
     ///   guide_in = … }`);
     /// * on the first detent of a caret scrub, when circling the left pad has
     ///   started tapping the arrow keys (`h.scrub`, `run::drive_scrub`) — a
     ///   caret fix is a *long* hold by chord standards, and it must not end
-    ///   with Steam acting on the release.
+    ///   with Steam — or the launcher on `guide_tap` — acting on the release.
     ///
     /// The decision is the daemon's, not the engine's, because on a mode where
     /// the pads do nothing under the guide a thumb resting on one must *not*
@@ -425,7 +445,7 @@ mod tests {
         // Released well under the hold threshold, nothing pressed meanwhile.
         assert_eq!(
             g.update(&frame(&[]), t + ms(120)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
         assert!(!g.guide_active());
     }
@@ -458,7 +478,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             g.update(&frame(&[]), t + ms(60)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
     }
 
@@ -507,7 +527,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
     }
 
@@ -688,7 +708,7 @@ mod tests {
         // A bare long hold is still not a chord.
         assert_eq!(
             g.update(&frame(&[]), t + ms(2300)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: false }]
         );
     }
 
@@ -708,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             g.update(&frame(&[]), t + ms(400)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
     }
 
@@ -758,7 +778,7 @@ mod tests {
         // The hold was chorded, so its end is not a bare tap.
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
     }
 
@@ -795,7 +815,7 @@ mod tests {
         assert!(g.update(&frame(&[Button::Steam]), t + ms(8)).is_empty());
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: false }]
         );
     }
 
@@ -810,7 +830,7 @@ mod tests {
         // release is reported — the consumer releases everything on the leave.
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
         // And the chord is forgotten with the hold: the next hold starts clean,
         // so a button still down from before it cannot report a stale release.
@@ -831,13 +851,13 @@ mod tests {
         assert!(g.update(&frame(&[Button::Steam]), t + ms(8)).is_empty());
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }]
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
         );
         // It does not carry over: the next hold is a fresh, bare one.
         g.update(&frame(&[Button::Steam]), t + ms(100));
         assert_eq!(
             g.update(&frame(&[]), t + ms(140)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
     }
 
@@ -856,7 +876,7 @@ mod tests {
         assert!(resting.update(&touching, t + ms(8)).is_empty());
         assert_eq!(
             resting.update(&frame(&[]), t + ms(400)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }],
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }],
             "a thumb that only rested there leaves the tap for Steam"
         );
 
@@ -871,7 +891,7 @@ mod tests {
         assert!(scrubbing.update(&touching, t + ms(12)).is_empty());
         assert_eq!(
             scrubbing.update(&frame(&[]), t + ms(400)),
-            vec![GestureEvent::GuideLeave { was_chorded: true }],
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }],
             "a caret fix must not end as a guide tap"
         );
     }
@@ -886,7 +906,7 @@ mod tests {
         g.update(&frame(&[Button::Steam]), t + ms(4));
         assert_eq!(
             g.update(&frame(&[]), t + ms(40)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
     }
 
@@ -904,7 +924,7 @@ mod tests {
         assert!(!g.guide_tap(), "the press alone is not a tap; Steam acts on release");
         assert_eq!(
             g.update(&frame(&[]), t + ms(120)),
-            vec![GestureEvent::GuideLeave { was_chorded: false }]
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
         );
         assert!(g.guide_tap(), "a 116 ms bare hold is the tap");
         // One frame's worth of signal, and no more.

@@ -250,7 +250,9 @@ ANDed, so `guide_in` alone suffices under a held guide and `only_in` is ignored
 there. Default is nowhere. Scroll has only the ambient guard. Either handler
 gated off does not merely skip: it drops its filter state, so re-entry never
 jumps. And a hold spent on pointing is **consumed**, so releasing the guide
-afterwards is not handed to Steam as a bare guide tap.
+afterwards is neither handed to Steam as a bare guide tap nor resolved as the
+`guide_tap` binding — the two consumers of a bare tap, and the narrow decision
+in `GestureEngine::guide_tap` rules out both at once.
 
 ---
 

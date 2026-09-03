@@ -3705,7 +3705,10 @@ mod tests {
                 out.push(GestureEvent::GuideStickFlick { stick, dir });
             }
         }
-        out.push(GestureEvent::GuideLeave { was_chorded: false });
+        // The bare tap, in the one shape that binds anything: `bare_tap` is
+        // what `GestureKey::Tap` resolves against, so a broad unchorded leave
+        // here would compare two `Action::None`s and prove nothing.
+        out.push(GestureEvent::GuideLeave { was_chorded: false, bare_tap: true });
         out.push(GestureEvent::GuideHold);
         out
     }
