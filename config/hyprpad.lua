@@ -221,6 +221,8 @@ h.button("r1", "Interrupt (ctrl+c)", h.key "ctrl+c"):only_in("agent")
 -- selection (ctrl+shift+c) — a no-op with nothing highlighted, so a stray press is harmless.
 h.button("l1",   "Paste clipboard",    h.key "ctrl+shift+v"):only_in("agent")
 h.button("view", "Copy selection",     h.key "ctrl+shift+c"):only_in("agent")
+-- Menu expands the transcript (Claude Code's ctrl+o); a view toggle, harmless elsewhere.
+h.button("menu", "Expand transcript",  h.key "ctrl+o"):only_in("agent")
 
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
