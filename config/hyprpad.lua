@@ -212,6 +212,11 @@ h.button("b", h.key "backspace"):only_in("desktop", "browser", "agent") -- B = B
 
 -- In an agent terminal, X clears the line (readline's ctrl+u); B is still Backspace.
 h.button("x", "Clear line", h.key "ctrl+u"):only_in("agent")
+-- Y is Escape: the interrupt in Claude Code, Codex and OpenCode, and the way
+-- out of any prompt. R1 is the hard interrupt (ctrl+c) for the shells and
+-- tools that want it — a bumper, so a squeeze can't kill a running command.
+h.button("y",  "Escape / interrupt", h.key "escape"):only_in("agent")
+h.button("r1", "Interrupt (ctrl+c)", h.key "ctrl+c"):only_in("agent")
 
 -- The mouse buttons. These were hardwired once; now they are bindings like
 -- any other, so the sheet shows them and a mode can take them away. Guarded
