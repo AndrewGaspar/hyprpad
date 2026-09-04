@@ -1,6 +1,6 @@
 # Artwork provenance
 
-Three sources, on purpose. The rule is simple: **nothing that hyprpad cannot
+Four sources, on purpose. The rule is simple: **nothing that hyprpad cannot
 redistribute is ever copied into this repo.**
 
 ## Bundled — `kenney/` (glyphs)
@@ -78,34 +78,94 @@ view omits, which gives the L1/R1/L2/R2 callouts something real to point at.
 
 ## Bundled — `xbox-elite-2.svg` (the second controller)
 
-hyprpad's own schematic of the Xbox Elite Wireless Controller Series 2, drawn
-from scratch for this repo like the controller's and covered by the repo's licence.
-It is authored in the same `456 x 320` viewBox, so both layouts scale
-identically in the panel.
+**Two provenances in one file.** The pad is Xelu's, CC0; the back-view paddle
+inset under it is ours.
 
-There is **no** referenced-from-Steam counterpart for this one, and the reason
-is worth writing down: Steam does ship an Elite diagram, at
+### The pad — Xelu's Xbox Series X diagram, CC0
+
+> Body outline derived from "Free Keyboard and Controllers Prompts" by
+> Nicolae (Xelu) Berbece, <https://thoseawesomeguys.com/prompts/>, released
+> under CC0 1.0. Vector source via
+> <https://github.com/haaldor/Xelu_prompts_SVG>.
+
+The prompts page states: "All the assets are in the public domain license
+under Creative Commons 0 (CC0) completely free to use in any personal or
+commercial project". The official pack is PNG; `haaldor/Xelu_prompts_SVG`
+carries the vector master (`Vector Source.svg`) under a CC0-1.0 `LICENSE`
+file. CC0 requires no attribution — we give it anyway.
+
+It is an Xbox **Series X** diagram and this layout is an Xbox **Elite Series
+2**. That is deliberate, and it is not a compromise: **no openly licensed
+drawing of an Elite Series 2 exists** — `docs/research/controller-art.md`
+surveyed for one, and its single hit (`lemonxah/xbelite2`) ships no LICENSE —
+and the Elite's *front face is a Series pad*: same ABXY diamond, same
+staggered stick and d-pad, same View / Xbox / Menu, same bumpers and triggers.
+Seen from the front the two shells differ in exactly one control, and we
+redrew that one.
+
+**Modifications**, all reproducible from the upstream file with the recipe in
+`docs/research/controller-art.md` §7:
+
+* extracted the `Xbox_Series` diagram group from the 2.7 MB combined vector;
+* split each compound path into its subpaths — keeping every original curve
+  command, rebasing only each subpath's `moveto` — so pieces could be removed
+  without touching a single control point. Verified by rendering the rebuilt
+  paths against the original: identical bar 43 antialiasing pixels in 547k;
+* renormalised into a `456 x 436` viewBox at one uniform scale (no stretch),
+  the pad occupying `x 14..442, y 6..286`;
+* `#ffffff` → `white`, so `Callouts.recolor()` themes it exactly as it themes
+  the Steam Controller's drawing;
+* **removed the Xbox nexus** inside the guide button, drawing a plain ring in
+  its place. A CC0 *copyright* dedication grants no *trademark* rights, and
+  the nexus was in any case the one solid mass in an otherwise stroke-only
+  drawing and dominated the page;
+* **removed the Series X Share button** and drew the Elite's round **Profile**
+  button at the same spot — the one control the two faces do not share, and
+  worth drawing because in profile slots 1-3 the firmware mutes the paddles.
+
+Nothing else was moved, so the drawing's control centres are still Xelu's, and
+the layout's anchors were **generated rather than eyeballed**: the eight paths
+decompose into 60 subpaths, and each subpath's bounding-box centre is a
+control. See `layouts/xbox-elite-2.json`.
+
+### The inset — ours
+
+The shell's lower 114 units, repeated below the pad at 1:1 and in line with
+it, with the four paddles drawn on it. Ours, CC0 / own work, under the repo's
+licence; its contour is traced from Xelu's own silhouette so the two halves of
+the file cannot drift apart. The paddles are the reason this controller exists
+and a front view physically cannot show them, which is the whole argument for
+the inset.
+
+### Why not Steam's own Elite drawing
+
+Steam does ship one, at
 
     $STEAM_ROOT/steamui/images/controller/controller_config_controller_xboxelite.png
 
 but it is a **raster**. The widget themes a drawing by recolouring SVG strokes
-(`Callouts.recolor()`), so a PNG could not follow the theme. The `art` list for
-this layout therefore has one entry, not two.
+(`Callouts.recolor()`), so a PNG could not follow the theme — and it is
+proprietary besides. The `art` list for this layout therefore has one entry,
+not two.
 
-**No new glyphs were needed**, which was a pleasant surprise and is worth
-recording so the next controller's author checks before drawing anything:
-Kenney's vendored Steam set is already right for an Xbox pad. `steam_lb.svg`
-and `steam_lt.svg` literally draw the strings "LB" and "LT" — Xbox's own
-naming; the A/B/X/Y chips are lettered circles and the Elite's face diamond
-carries the same four letters in the same four positions; and the d-pad, stick
-and grip chips have no platform in them at all.
+**No new glyphs were needed**, which is worth recording so the next
+controller's author checks before drawing anything: Kenney's vendored Steam
+set is already right for an Xbox pad. `steam_lb.svg` and `steam_lt.svg`
+literally draw the strings "LB" and "LT" — Xbox's own naming; the A/B/X/Y
+chips are lettered circles and the Elite's face diamond carries the same four
+letters in the same four positions; and the d-pad, stick and grip chips have
+no platform in them at all.
 
 ## Adding another controller
 
 Drop a `layouts/<id>.json` in beside the existing one:
 
 * `art` — an ordered list of drawings. Point it at a bundled SVG you have the
-  right to ship. (Kenney's pictograms will not do; see above.)
+  right to ship. (Kenney's pictograms will not do; see above.) Look before you
+  draw: `docs/research/controller-art.md` surveys every openly licensed
+  controller vector that exists, with each one's licence and an adaptation
+  recipe. A found CC0 drawing beat a careful hand-drawn one here, and it was
+  not close.
 * `viewBox` — the coordinate space that drawing is authored in.
 * `controls` — hyprpad's control ids mapped to `{x, y, side}` in that space.
 * `glyphs` — the same ids mapped to `art/kenney/<platform>_<control>.svg`,
