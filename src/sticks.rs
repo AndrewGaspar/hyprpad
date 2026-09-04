@@ -234,81 +234,6 @@ impl StickIntegrator {
     }
 }
 
-/// A normalised `[-1, 1]` position driven by a stick — one OSK cursor.
-///
-/// Phase 1 of the on-screen keyboard on a padless controller (option (i) of
-/// `docs/research/xbox-elite.md` §3.5): each stick integrates into a per-hand
-/// position and the daemon sends it over the **existing** `cursor L|R` wire, so
-/// the OSK child is completely unchanged. Phase 2's snap navigation is a
-/// change to `osk/`, not to this.
-#[derive(Clone, Copy, Debug)]
-pub struct StickCursor {
-    integrator: StickIntegrator,
-    pos: (f64, f64),
-    /// The last position actually put on the wire, at the wire's own
-    /// precision. See [`should_send`](Self::should_send).
-    last_sent: Option<(f32, f32)>,
-}
-
-impl Default for StickCursor {
-    fn default() -> StickCursor {
-        StickCursor::new()
-    }
-}
-
-impl StickCursor {
-    /// A cursor parked at the centre.
-    pub fn new() -> StickCursor {
-        StickCursor { integrator: StickIntegrator::new(), pos: (0.0, 0.0), last_sent: None }
-    }
-
-    /// Recentre and forget the velocity — a fresh keyboard starts in the
-    /// middle rather than wherever the last one was left.
-    pub fn reset(&mut self) {
-        self.integrator.reset();
-        self.pos = (0.0, 0.0);
-        self.last_sent = None;
-    }
-
-    /// Whether `rounded` is somewhere this cursor has not already been sent to,
-    /// remembering it if so.
-    ///
-    /// The OSK's `cursor` command serialises at four decimals, so a cursor
-    /// clamped against an edge — a stick held hard over — stops re-sending
-    /// instead of writing the same line into the child's stdin every step.
-    /// Exactly what the pad router's `last_sent` does, for exactly the same
-    /// reason.
-    pub fn should_send(&mut self, rounded: (f32, f32)) -> bool {
-        if self.last_sent == Some(rounded) {
-            return false;
-        }
-        self.last_sent = Some(rounded);
-        true
-    }
-
-    /// Integrate one step and return the new position, clamped to the
-    /// keyboard's `[-1, 1]` box.
-    pub fn step(
-        &mut self,
-        stick: (f64, f64),
-        cfg: &StickAxisConfig,
-        now: Instant,
-    ) -> (f64, f64) {
-        let (dx, dy) = self.integrator.step(stick, cfg, now);
-        self.pos.0 = (self.pos.0 + dx).clamp(-1.0, 1.0);
-        self.pos.1 = (self.pos.1 + dy).clamp(-1.0, 1.0);
-        self.pos
-    }
-
-    pub fn position(&self) -> (f64, f64) {
-        self.pos
-    }
-
-    pub fn settling(&self) -> bool {
-        self.integrator.settling()
-    }
-}
-
 /// Both sticks' normalised deflection, as last seen on a frame.
 ///
 /// `+y` is **up**, the controller's convention, which [`crate::evdev`] has already
@@ -353,9 +278,20 @@ pub struct StickDrive {
     /// Sub-notch scroll travel, for the detent haptic. Carried, not reset per
     /// step, so a slow scroll still ticks once per notch.
     pub scroll_detent: f64,
-    /// The OSK's two cursors, one per hand.
-    pub osk_left: StickCursor,
-    pub osk_right: StickCursor,
+    /// The OSK's two snap-navigation inputs, one per stick.
+    ///
+    /// The keyboard on a padless controller is steered by a **highlight**, not
+    /// by a cursor (`docs/research/xbox-elite.md` §3.5 option (ii)): a stick
+    /// thrown past [`crate::osk::NAV_THROW_OUT`] steps the highlight one key
+    /// and then repeats while it is held, which is what every console does and
+    /// what a spring-loaded stick can actually do accurately. The left stick is
+    /// the primary; the right one nudges the same highlight rather than
+    /// carrying a second cursor, because there is only ever one highlight.
+    ///
+    /// Like the shuttle below, the repeat has to come off the deadline: a
+    /// gamepad reports only on change, so a stick held over says nothing.
+    pub osk_left: crate::osk::NavRepeat,
+    pub osk_right: crate::osk::NavRepeat,
     /// Whether the caret shuttle is holding the left stick over
     /// ([`crate::filter::ShuttlePacer`]). Set per frame by the daemon, because
     /// this is the one consumer whose deadzone and gate live somewhere else
@@ -382,8 +318,8 @@ impl StickDrive {
             cursor: StickIntegrator::new(),
             scroll: StickIntegrator::new(),
             scroll_detent: 0.0,
-            osk_left: StickCursor::new(),
-            osk_right: StickCursor::new(),
+            osk_left: crate::osk::NavRepeat::default(),
+            osk_right: crate::osk::NavRepeat::default(),
             shuttle: false,
             due: None,
         }
@@ -455,8 +391,13 @@ impl StickDrive {
             || Shape::of(&cfg.osk).engaged(self.sticks.right)
             || self.cursor.settling()
             || self.scroll.settling()
-            || self.osk_left.settling()
-            || self.osk_right.settling()
+            // A navigation throw has no settling tail — a highlight is where it
+            // is the instant the stick is let go — but it still needs one more
+            // tick to be *told* so, or a stick snapping from thrown to centred
+            // between two ticks would leave the throw held and the next one
+            // would repeat at 8/s instead of waiting out its delay.
+            || self.osk_left.holding()
+            || self.osk_right.holding()
     }
 
     /// When the loop must next wake for the integrators — `None` while
@@ -621,48 +562,6 @@ mod tests {
         assert!(total > 0, "a sub-pixel rate must still move the cursor");
     }
 
-    // --- the OSK cursor ----------------------------------------------------
-
-    #[test]
-    fn an_osk_cursor_integrates_into_the_normalised_box_and_clamps() {
-        let mut c = cfg();
-        c.osk.smoothing_ms = 0.0;
-        let mut cur = StickCursor::new();
-        cur.step((1.0, 0.0), &c.osk, at(0));
-        for k in 1..500 {
-            cur.step((1.0, 0.0), &c.osk, at(k * 4));
-        }
-        assert!((cur.position().0 - 1.0).abs() < 1e-9, "clamped at the right edge");
-        assert_eq!(cur.position().1, 0.0);
-        cur.reset();
-        assert_eq!(cur.position(), (0.0, 0.0), "a fresh keyboard starts centred");
-    }
-
-    /// A cursor clamped against an edge stops re-sending: the deadline is
-    /// still armed (the stick is held over) but there is nothing new to say,
-    /// and writing the same line into the OSK child's stdin 250 times a second
-    /// would be a busy loop by another name.
-    #[test]
-    fn an_osk_cursor_stops_re_sending_once_it_stops_moving() {
-        let mut c = cfg();
-        c.osk.smoothing_ms = 0.0;
-        let mut cur = StickCursor::new();
-        let mut sent = 0;
-        for k in 0..500 {
-            let p = cur.step((1.0, 0.0), &c.osk, at(k * 4));
-            let rounded = (((p.0 * 10_000.0).round() / 10_000.0) as f32, p.1 as f32);
-            if cur.should_send(rounded) {
-                sent += 1;
-            }
-        }
-        assert!(sent > 10, "it moved, so it was sent while it moved ({sent})");
-        assert!(sent < 400, "and stopped once clamped at the edge ({sent})");
-        // A reset forgets where it was, so the next show re-sends the centre.
-        cur.reset();
-        assert!(cur.should_send((0.0, 0.0)));
-        assert!(!cur.should_send((0.0, 0.0)));
-    }
-
     // --- the arm / disarm decision table -----------------------------------
 
     fn evdev_frame(left: (i16, i16), right: (i16, i16)) -> crate::report::Frame {
@@ -784,13 +683,16 @@ mod tests {
         d.observe(&evdev_frame((0, 0), (30_000, 0)), &c, at(0));
         d.cursor.step((1.0, 0.0), &c.cursor, at(0));
         d.cursor.step((1.0, 0.0), &c.cursor, at(4));
-        d.osk_left.step((1.0, 0.0), &c.osk, at(0));
+        assert_eq!(d.osk_left.stick((1.0, 0.0), at(0)), Some(crate::osk::OskNav::Right));
         d.release();
         assert_eq!(d.deadline(), None);
         assert_eq!(d.sticks, Deflection::default());
-        assert_eq!(d.osk_left.position(), (0.0, 0.0));
+        // The throw is forgotten too, so the next keyboard's first step is a
+        // fresh one rather than a repeat of the last one's.
+        assert!(!d.osk_left.holding());
         assert!(!d.cursor.settling());
         assert!(!d.armed(&c));
+        assert_eq!(d.osk_left.stick((1.0, 0.0), at(8)), Some(crate::osk::OskNav::Right));
     }
 
     #[test]

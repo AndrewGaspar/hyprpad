@@ -18,6 +18,8 @@
 //! hide                             # DESTROY the surface(s) — never just unmap
 //! cursor <L|R> <nx> <ny>           # pad absolute position, each axis in [-1,1]
 //! commit <L|R>                     # commit the key under that pad's cursor (click-down)
+//! nav <left|right|up|down|home|end># move the snap-navigation highlight one key
+//!                                  # (the padless modality; the first `nav` arms it)
 //! shift <off|oneshot|stuck|on>     # set the latched shift/caps state (on = stuck/caps)
 //! shift <down|up>                  # hold / release a physical Shift (momentary; the latch is untouched)
 //! layer <base|symbols|toggle>      # switch the base QWERTY ↔ numeric/symbols page
@@ -42,7 +44,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use crate::layout::{Layer, LayoutMode, Pad, ShiftState};
+use crate::layout::{Layer, LayoutMode, NavDir, Pad, ShiftState};
 
 /// A parsed control command.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +59,13 @@ pub enum Command {
     Cursor { pad: Pad, nx: f32, ny: f32 },
     /// Commit the key currently under `pad`'s cursor (trackpad click-down).
     Commit { pad: Pad },
+    /// Move the snap-navigation highlight one key — the **padless** modality
+    /// (`docs/research/xbox-elite.md` §3.5 option (ii)). A controller with no
+    /// trackpads cannot point, so instead of a cursor it moves a single
+    /// highlight from key to key, and `commit` takes whatever it is on. The
+    /// first `nav` of a session arms the highlight without moving it, so the
+    /// daemon can raise the keyboard and light up a starting key in one burst.
+    Nav { dir: NavDir },
     /// Set the latched shift/caps state directly so the daemon can drive it.
     Shift { state: ShiftState },
     /// Hold (`down`) or release (`up`) a physical Shift: the daemon's held
@@ -139,6 +148,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Cursor { pad, nx, ny })
         }
         "commit" => Ok(Command::Commit { pad: parse_pad(rest.split_whitespace().next())? }),
+        // `focus` is the spelling `docs/research/xbox-elite.md` §3.5 sketched
+        // this verb under; both are accepted so neither doc reads stale.
+        "nav" | "focus" => Ok(Command::Nav { dir: parse_nav(rest.split_whitespace().next())? }),
         "shift" => {
             let state = match rest.split_whitespace().next() {
                 Some("off") | None => ShiftState::Off,
@@ -223,6 +235,19 @@ fn parse_pad(tok: Option<&str>) -> Result<Pad, String> {
         Some("R") | Some("r") | Some("right") => Ok(Pad::Right),
         Some(other) => Err(format!("bad pad '{other}' (want L|R)")),
         None => Err("missing pad (L|R)".into()),
+    }
+}
+
+fn parse_nav(tok: Option<&str>) -> Result<NavDir, String> {
+    match tok {
+        Some("left") | Some("l") | Some("west") => Ok(NavDir::Left),
+        Some("right") | Some("r") | Some("east") => Ok(NavDir::Right),
+        Some("up") | Some("u") | Some("north") => Ok(NavDir::Up),
+        Some("down") | Some("d") | Some("south") => Ok(NavDir::Down),
+        Some("home") | Some("start") => Ok(NavDir::Home),
+        Some("end") => Ok(NavDir::End),
+        Some(other) => Err(format!("bad nav '{other}' (want left|right|up|down|home|end)")),
+        None => Err("nav needs a direction: left|right|up|down|home|end".into()),
     }
 }
 
@@ -478,6 +503,29 @@ mod tests {
         assert_eq!(parse("commit L"), Ok(Command::Commit { pad: Pad::Left }));
         assert_eq!(parse("commit R"), Ok(Command::Commit { pad: Pad::Right }));
         assert!(parse("cursor X 0 0").is_err());
+    }
+
+    #[test]
+    fn parses_the_padless_show_and_the_snap_navigation_vocabulary() {
+        // The padless presentation: the FULL keyboard from the bottom edge,
+        // with an exclusive zone so workspace content is displaced rather than
+        // covered. This is the exact line the daemon sends for a controller
+        // with no trackpads.
+        assert_eq!(
+            parse("show bottom reflow"),
+            Ok(Command::Show { mode: LayoutMode::BottomDeck, reflow: true })
+        );
+
+        assert_eq!(parse("nav left"), Ok(Command::Nav { dir: NavDir::Left }));
+        assert_eq!(parse("nav right"), Ok(Command::Nav { dir: NavDir::Right }));
+        assert_eq!(parse("nav up"), Ok(Command::Nav { dir: NavDir::Up }));
+        assert_eq!(parse("nav down"), Ok(Command::Nav { dir: NavDir::Down }));
+        assert_eq!(parse("nav home"), Ok(Command::Nav { dir: NavDir::Home }));
+        assert_eq!(parse("nav end"), Ok(Command::Nav { dir: NavDir::End }));
+        // The research doc spelled this verb `focus`; both are accepted.
+        assert_eq!(parse("focus up"), Ok(Command::Nav { dir: NavDir::Up }));
+        assert!(parse("nav sideways").unwrap_err().contains("bad nav"));
+        assert!(parse("nav").unwrap_err().contains("needs a direction"));
     }
 
     #[test]

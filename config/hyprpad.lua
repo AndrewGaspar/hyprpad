@@ -330,6 +330,11 @@ h.bind("guide+menu",        "Omarchy menu",        h.exec "omarchy-menu")
 h.bind("guide_tap",         "App launcher",        h.exec "omarchy launcher toggle"):not_in("game")
 h.bind("guide+l2",          "Previous tab",        h.dispatch "hl.dsp.group.prev()")
 h.bind("guide+r2",          "Next tab",            h.dispatch "hl.dsp.group.next()")
+-- `split` is what a controller WITH trackpads gets: two edge columns, one per
+-- thumb, floating over the desktop. On one without, the same line raises the
+-- full keyboard from the bottom edge with an exclusive zone, so content is
+-- displaced rather than covered, and the D-pad/sticks move a highlight that A
+-- types. Add `padless = { mode = …, reflow = … }` to say otherwise.
 h.bind("guide+y",           "On-screen keyboard",  h.keyboard { mode = "split" })
 
 -- The one guarded chord here, and the other half of `guide_in` above: with the

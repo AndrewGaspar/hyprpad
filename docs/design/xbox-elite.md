@@ -1,11 +1,13 @@
 # Design: a second input backend — driving hyprpad from an Xbox Elite Series 2
 
-*Implements phase 1 of `docs/research/xbox-elite.md`. Code: `src/evdev.rs`
-(the backend), `src/sticks.rs` (rate control), `src/report.rs`
-(`Source`), plus the loop plumbing in `src/run.rs`, the `[sticks]` / `[device]`
-sections in `src/config.rs` + `src/lua_config.rs`, `"sources"` / `"layout"` in
-`src/status.rs`, and `shell/hyprpad.cheatsheet/layouts/xbox-elite-2.json`.
-Phase 2 is §8.*
+*Implements phase 1 of `docs/research/xbox-elite.md`, plus phase 2's on-screen
+keyboard (§10, option (ii)). Code: `src/evdev.rs` (the backend), `src/sticks.rs`
+(rate control), `src/report.rs` (`Source`), plus the loop plumbing in
+`src/run.rs`, the `[sticks]` / `[device]` sections in `src/config.rs` +
+`src/lua_config.rs`, `"sources"` / `"layout"` in `src/status.rs`, and
+`shell/hyprpad.cheatsheet/layouts/xbox-elite-2.json`. The keyboard adds
+`src/osk.rs` (`OskPresentation`, `OskNav`, `NavRepeat`) and `osk/src/layout.rs`
++ `osk/src/app.rs` in the child. Phase 2's remainder is §8.*
 
 ## What it is
 
@@ -154,7 +156,7 @@ carry between steps, so a slow deliberate nudge still moves the pointer.
 |---|---|---|
 | right stick | the desktop pointer | 1500 px/s |
 | left stick | scrolling | 180 `wl_pointer.axis` units/s = 12 notches/s |
-| both sticks | the OSK's two cursors | 2.4 normalised units/s ≈ 1.2 keyboard widths/s |
+| both sticks | the OSK's snap-navigation highlight (§10.2) | one key per throw, then 8/s while held |
 
 Deadzone 0.12, outer 0.95, curve 2.0 (quadratic — a gentler low end, which is
 the precision a desktop pointer wants), and a 15 ms EMA on the velocity. All of
@@ -206,6 +208,8 @@ h.sticks {
   cursor = { deadzone = 0.12, outer = 0.95, curve = 2.0,
              max_px_s = 1500, smoothing_ms = 15 },
   scroll = { max_units_s = 180 },   -- 15 units = one wheel notch
+  -- `osk` is now only the gate that keeps the stick deadline armed while a
+  -- stick is thrown at the keyboard; the highlight it moves is not a rate (§10.2).
   osk    = { max_units_s = 2.4 },
 }
 h.device {
@@ -315,38 +319,83 @@ rest stay source-agnostic.
 
 Game rumble (`drive_rumble`) is untouched: it already only reaches the controller.
 
-## 10. The on-screen keyboard — phase 1, option (i)
+## 10. The on-screen keyboard — phase 2 as built, option (ii)
 
-While the keyboard is up it owns **both sticks**, as it owns both pads on the
-controller. Each stick integrates into a per-hand position in the OSK's own
-`[-1, 1]` box, and the daemon sends it over the **existing** `cursor L|R` wire.
+Phase 1 shipped option (i): both sticks integrated into two per-hand positions
+sent over the existing `cursor L|R` wire, the OSK child untouched. It worked
+and it exercised the whole pipeline, and the first live session found what
+§3.5 predicted it would — *"the cursor thing is weird with the analog sticks"*.
+A stick-driven free cursor drifts, and steering one is not something a
+spring-loaded stick does well. Phase 2 replaces it with **option (ii)**, which
+is what every console keyboard does, and adds the other half of the answer:
+where the keyboard goes.
 
-**The OSK child is completely unchanged.** Commits come from the same
-`[osk_buttons]` map every config already has, and the built-in Deck map already
-suits this pad almost exactly: L2 Shift, R2 Enter, Y Space, X Backspace,
-B/Menu dismiss are all buttons an Elite has. The **only** thing missing is the
-commit, which the built-ins put on the two pad *clicks*. Give it a home:
+### 10.1 Presentation is per-source, not per-binding
+
+A keyboard binding says what it wants on a controller **with** trackpads. On
+one without, `Action::ToggleKeyboard`'s `mode`/`reflow` are overridden by
+`osk::presentation_for` with `OskPresentation::PADLESS` — **`bottom` +
+`reflow`**, the full layout from the bottom edge with an exclusive zone. Both
+halves are forced and for the same reason:
+
+- `split` exists because two trackpads are two thumbs on two physical sides of
+  the screen. With one highlight and no thumbs there is nothing to divide, so
+  the split is half a keyboard on each edge for nothing.
+- `overlay` floats the keyboard *over* the window being typed into. On a pad
+  that is fine — you are looking at your thumbs. Reading the field and the
+  keyboard at once, it is not, and we cannot know where the caret is. The
+  exclusive zone makes the question moot: Hyprland shrinks the tiled area and
+  moves the field out of the way rather than us guessing.
+
+A binding overrides it per-binding — `h.keyboard { mode = "split", padless = {
+mode = "bottom", reflow = false } }`, or `keyboard split
+padless:bottom,overlay` in TOML — and the `padless:` word only spells out what
+it changes. The owner's `h.bind("guide+y", h.keyboard { mode = "split" })`
+needs no edit: it stays the split overlay on the Steam Controller and becomes the
+displacing bottom deck on the Elite.
+
+### 10.2 Snap navigation replaces the two stick cursors
+
+The OSK child grows one command, `nav <left|right|up|down|home|end>`, and one
+piece of state: a single highlighted key, drawn in the `Focus` colour
+`HighlightKind` has had room for since the kickoff. Left/right step along the
+row and wrap **row to row** the way a text cursor does; up/down move to the
+adjacent row and land on the key nearest the remembered column, which is the
+Deck's `MAINTAIN_X`. The **first** `nav` arms the highlight at `g`/`h` rather
+than moving, so `toggle_keyboard` sends one `nav home` after a padless `show`
+and a starting key is lit before the user has pushed anything.
+
+The daemon feeds it from three places, all through one `osk::NavRepeat` clock —
+one step on the edge, then nothing for 350 ms, then eight a second while held:
+
+| control | where | note |
+|---|---|---|
+| D-pad | `OskRoute::step`, per frame | the console answer; gated on `!source.has_pads()`, so the Steam Controller's D-pad under the keyboard still does nothing |
+| left stick | `drive_sticks`, off the stick deadline | thrown past `NAV_THROW_OUT` = 0.6, released inside `NAV_THROW_IN` = 0.35 (hysteresis, the shape the guide flicks use) |
+| right stick | same | nudges the **same** highlight — there is only ever one — rather than carrying a second cursor |
+
+`commit` is unchanged on the wire and in the child falls through to the
+highlight **only when the committing pad has no cursor**. A pad source always
+has one once a thumb has touched down; a padless source never sends a `cursor`
+line, so its `A` — which reads the right-hand cursor like the rest of the face
+cluster — finds nothing and types the highlight. That is why the commit needed
+no new verb.
+
+The one thing the Deck map is missing here is still the commit itself, which
+the built-ins put on the two pad *clicks*. Rather than change what `A` means on
+the Steam Controller, `config::padless_osk_builtins()` gives it a padless-only home, laid
+under any config entry exactly as the built-in map is:
 
 ```lua
-h.osk_button("a",  h.osk "commit")   -- commits under the RIGHT cursor
-h.osk_button("l3", h.osk "commit")   -- left stick click -> the left cursor
-h.osk_button("r3", h.osk "commit")   -- right stick click -> the right cursor
+h.osk_button("a", h.osk "commit")   -- optional now; this is the default there
 ```
 
-```toml
-[osk_buttons]
-a  = "osk commit"
-l3 = "osk commit"
-r3 = "osk commit"
-```
+Everything else is untouched: `B`/`Menu` dismiss, `L2` Shift, `R2` Enter, `Y`
+Space, `X` Backspace, `R1`/`L1` the suggestions.
 
-The stick clicks are the natural home because `commit_pad` reads the cursor
-under the **same hand** as the button, so each thumb commits its own cursor —
-which is what the split layout was designed for. `a` reads the right cursor,
-like the rest of the face cluster.
-
-Phase 2's snap navigation (a focus model in `osk/`) is a change to the child,
-not to this.
+`sticks::StickCursor` — phase 1's integrator — is gone with the mechanism it
+existed for. `SticksConfig.osk` stays: it is what keeps the stick deadline
+armed while a stick is held over, which is where the repeat clock is read.
 
 ## 11. The cheat sheet
 
@@ -362,6 +411,14 @@ stick's own top speed rather than the pad's `sens`, and the caret scrub is
 dropped — a jog wheel needs a surface to circle. Everything that is a *binding*
 is identical, which is the point of one vocabulary.
 
+The keyboard's own tab is the exception, because there the padless answer is a
+different sentence rather than the same one with a different noun (§10.2):
+`Sheet::reaim_keyboard` drops the two pad-cursor rows and the two pad-click
+commits outright — neither exists here and no stick does what they did — and
+puts the highlight's controls in their place: `D-pad`, `Left stick` and `Right
+stick` all "Move the highlight", and `A` types it. A config entry on any of
+those still replaces the row rather than doubling it.
+
 The drawing is hyprpad's own schematic (`art/xbox-elite-2.svg`): Steam ships an
 Elite diagram but it is a PNG, and the widget themes a drawing by recolouring
 SVG strokes. No new glyphs were needed — see `art/LICENSES.md`.
@@ -372,7 +429,7 @@ SVG strokes. No new glyphs were needed — see `art/LICENSES.md`.
 |---|---|
 | **hidraw sidecar for `045e:0b22`** | four paddles over Bluetooth with *nothing installed*, plus the profile slot (byte 17) so the daemon can mute them itself and warn. A `Frame::decode_xbox_ble` beside `Frame::decode` over the pad's own hidraw node; the evdev fd then stays open for the grab alone. The hook is `evdev::PADDLE_HOOK`. |
 | **Rumble taps** | `FF_RUMBLE` via `EVIOCSFF` on the grabbed fd (wired), or report 3 on the hidraw node (BT). Only `Gesture` and `Commit` are worth mapping — 30–40 ms at ~30 % — and `Crossing`, `Scroll`, `Button` and `CursorMove` stay dropped. The hook is the one `if` in `haptic_for`; opening the evdev node `O_RDWR` is the other line. |
-| **OSK snap navigation** | option (ii): a focus model in `osk/`, `focus <dir>` and `press` on the control wire, `MAINTAIN_X` column memory. It changes what the OSK cheat-sheet tab says, so it lands with the tab. |
+| ~~**OSK snap navigation**~~ | **Done** — see §10, which this section now describes as built. `nav <dir>` on the wire (`focus` is an accepted alias), `MAINTAIN_X` column memory, and the per-source presentation that came with it. |
 | **inotify hotplug** | the 1.5 s rescan is fine; `inotify` on `/dev/input` is the refinement. A udev monitor is not worth the dependency. |
 | **DualSense / Switch Pro** | the backend is already generic. What is missing is each pad's own paddle/extra-button story and a layout file. |
 

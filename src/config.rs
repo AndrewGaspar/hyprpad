@@ -249,7 +249,18 @@ pub enum Action {
     /// keyboard over the desktop; `true` claims an exclusive zone so workspace
     /// content is displaced around it. Driven by [`crate::osk::OskHandle`], not
     /// a Hyprland dispatch.
-    ToggleKeyboard { mode: crate::osk::OskMode, reflow: bool },
+    ///
+    /// `mode`/`reflow` are what the binding means on a controller **with
+    /// trackpads**. On one without, the keyboard is raised as
+    /// [`crate::osk::OskPresentation::PADLESS`] — the full layout from the
+    /// bottom edge, displacing content — because a split, floating keyboard was
+    /// designed around two thumbs pointing at it. `padless` overrides that for
+    /// this binding (`keyboard split padless:bottom,reflow`).
+    ToggleKeyboard {
+        mode: crate::osk::OskMode,
+        reflow: bool,
+        padless: Option<crate::osk::OskPresentation>,
+    },
     /// Emit a raw evdev code. Bound to a *bare* controller button in the
     /// `[buttons]` section (e.g. D-pad up -> `KEY_UP`); pressed while the
     /// button is held and released when it lifts, so the kernel auto-repeats.
@@ -374,7 +385,16 @@ impl Action {
                 // default presentation, matching the OSK's own default.
                 let mut mode = crate::osk::OskMode::Bottom;
                 let mut reflow = false;
+                let mut padless = None;
                 for word in rest.to_ascii_lowercase().split_whitespace() {
+                    // `padless:<options>` carries a whole second presentation
+                    // in one word — the same two vocabularies, comma-separated
+                    // — so the grammar stays a flat list of words and a
+                    // binding reads as one line.
+                    if let Some(spec) = word.strip_prefix("padless:") {
+                        padless = Some(parse_presentation(spec)?);
+                        continue;
+                    }
                     match word {
                         "bottom" | "deck" => mode = crate::osk::OskMode::Bottom,
                         "split" | "side" => mode = crate::osk::OskMode::Split,
@@ -382,12 +402,13 @@ impl Action {
                         "reflow" | "displace" | "push" => reflow = true,
                         other => {
                             return Err(format!(
-                                "unknown keyboard option '{other}' (want bottom|split, overlay|reflow)"
+                                "unknown keyboard option '{other}' \
+                                 (want bottom|split, overlay|reflow, padless:<bottom|split>[,reflow|overlay])"
                             ))
                         }
                     }
                 }
-                Ok(Action::ToggleKeyboard { mode, reflow })
+                Ok(Action::ToggleKeyboard { mode, reflow, padless })
             }
             "key" => {
                 if rest.is_empty() {
@@ -603,6 +624,32 @@ impl OskAction {
 }
 
 /// The keyboard's own verbs by their config word (`osk <word>`).
+/// Parse the comma-separated option list of a `padless:` word into the
+/// presentation it names. Same two vocabularies as the bare keyboard options,
+/// so `padless:bottom,reflow` and `keyboard bottom reflow` say the same thing
+/// about two different controllers.
+///
+/// The defaults are [`crate::osk::OskPresentation::PADLESS`]'s, so
+/// `padless:split` is "the split layout, still displacing" and a binding only
+/// spells out what it is changing.
+fn parse_presentation(spec: &str) -> Result<crate::osk::OskPresentation, String> {
+    let mut p = crate::osk::OskPresentation::PADLESS;
+    for word in spec.split(',').filter(|w| !w.is_empty()) {
+        match word {
+            "bottom" | "deck" => p.mode = crate::osk::OskMode::Bottom,
+            "split" | "side" => p.mode = crate::osk::OskMode::Split,
+            "overlay" | "float" => p.reflow = false,
+            "reflow" | "displace" | "push" => p.reflow = true,
+            other => {
+                return Err(format!(
+                    "unknown padless option '{other}' (want bottom|split, overlay|reflow)"
+                ))
+            }
+        }
+    }
+    Ok(p)
+}
+
 fn osk_verb(word: &str) -> Option<OskAction> {
     match word.trim().to_ascii_lowercase().as_str() {
         "commit" | "type" => Some(OskAction::Commit),
@@ -656,6 +703,24 @@ pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'stat
         (Menu, OskAction::Dismiss, "Close the keyboard"),
     ]
     .into_iter()
+}
+
+/// The extra keyboard built-ins a controller with **no trackpads** gets, on top
+/// of [`osk_builtins`] and under any config entry.
+///
+/// [`osk_builtins`] puts the commit on the two pad *clicks*, which this
+/// controller does not have — so out of the box its keyboard would have a
+/// snap-navigation highlight and no way to type it. `A` is where every console
+/// keyboard puts "select"; it already reads the right-hand cursor like the rest
+/// of the face cluster, and with no cursor there the keyboard commits the
+/// highlight instead ([`crate::run`]'s `padless_osk_default`, and the OSK
+/// child's own `commit` fallback).
+///
+/// Deliberately *not* folded into [`osk_builtins`]: the Steam Controller's `A`
+/// under the keyboard does nothing today, and giving it a meaning is a change
+/// to a controller this feature is not about.
+pub fn padless_osk_builtins() -> impl Iterator<Item = (report::Button, OskAction)> {
+    [(report::Button::A, OskAction::Commit)].into_iter()
 }
 
 /// The normalized binding key a gesture event resolves against.
@@ -3286,7 +3351,7 @@ mod tests {
         // floating over the desktop (overlay).
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false, padless: None }
         );
     }
 
@@ -3303,25 +3368,66 @@ mod tests {
         let c = Config::from_toml_str(toml).expect("parse");
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false, padless: None }
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::A)),
-            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false }
+            Action::ToggleKeyboard { mode: OskMode::Bottom, reflow: false, padless: None }
         );
         // Presentation defaults to overlay (float); `reflow` opts in.
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::B)),
-            Action::ToggleKeyboard { mode: OskMode::Split, reflow: false }
+            Action::ToggleKeyboard { mode: OskMode::Split, reflow: false, padless: None }
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::X)),
-            Action::ToggleKeyboard { mode: OskMode::Split, reflow: true }
+            Action::ToggleKeyboard { mode: OskMode::Split, reflow: true, padless: None }
         );
         // An unknown option is a reported error, not a silent default.
         assert!(Config::from_toml_str("[bindings]\n\"guide+y\" = \"keyboard sideways\"\n")
             .unwrap_err()
             .contains("unknown keyboard option"));
+    }
+
+    #[test]
+    fn parses_the_padless_override() {
+        use crate::osk::{OskMode, OskPresentation};
+        let toml = r#"
+[bindings]
+"guide+y" = "keyboard split padless:bottom,reflow"
+"guide+a" = "keyboard split padless:split"
+"guide+b" = "keyboard split padless:split,overlay"
+"guide+x" = "keyboard split"
+"#;
+        let c = Config::from_toml_str(toml).expect("parse");
+        let got = |b| match c.resolve(&GestureEvent::GuideChord(b)) {
+            Action::ToggleKeyboard { mode, reflow, padless } => (mode, reflow, padless),
+            other => panic!("not a keyboard action: {other:?}"),
+        };
+        // The pad presentation is untouched by the override.
+        assert_eq!(
+            got(Button::Y),
+            (OskMode::Split, false, Some(OskPresentation::new(OskMode::Bottom, true)))
+        );
+        // A `padless:` word only spells out what it changes; the rest is
+        // `OskPresentation::PADLESS`, which displaces.
+        assert_eq!(
+            got(Button::A),
+            (OskMode::Split, false, Some(OskPresentation::new(OskMode::Split, true)))
+        );
+        assert_eq!(
+            got(Button::B),
+            (OskMode::Split, false, Some(OskPresentation::new(OskMode::Split, false)))
+        );
+        // No override: `None`, and the daemon supplies the default.
+        assert_eq!(got(Button::X), (OskMode::Split, false, None));
+
+        // A typo inside the word is reported, not silently dropped.
+        let e = Config::from_toml_str(
+            "[bindings]\n\"guide+y\" = \"keyboard padless:sideways\"\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("unknown padless option"), "{e}");
     }
 
     #[test]
@@ -3909,11 +4015,11 @@ mod tests {
         // `osk` alone still toggles the keyboard, and takes its layout words…
         assert_eq!(
             Action::parse("osk"),
-            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: false })
+            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: false, padless: None })
         );
         assert_eq!(
             Action::parse("osk split reflow"),
-            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: true })
+            Ok(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: true, padless: None })
         );
         // …but its own verbs are bindings for [osk_buttons], and the error
         // says where they go instead of calling `commit` a bad layout.
@@ -4034,7 +4140,7 @@ r5 = "dispatch hl.dsp.window.close()"
         assert_eq!(b.get(&Button::X), Some(&Hold(BTN_LEFT.into())));
         assert_eq!(
             b.get(&Button::B),
-            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false }))
+            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false, padless: None }))
         );
         assert_eq!(
             b.get(&Button::BumperR1),
@@ -4073,7 +4179,7 @@ r5 = "dispatch hl.dsp.window.close()"
             Action::Workspace(WorkspaceTarget::Number(3)),
             Action::MoveWindowToWorkspace(WorkspaceTarget::Relative(-1)),
             Action::ToggleFullscreen,
-            Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true },
+            Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true, padless: None },
             Action::SetMode("game".into()),
             Action::ClearMode,
         ] {
