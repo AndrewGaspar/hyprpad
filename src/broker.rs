@@ -3,11 +3,12 @@
 //! # The problem
 //!
 //! `/dev/uhid` is `crw------- root root`, and once
-//! `packaging/udev/72-hyprpad-puck.rules` is installed the real puck's hidraw
-//! nodes are `crw------- root root` too. The daemon must be able to open both;
-//! Steam — running as the *same user* — must not be able to open the puck. No
-//! group and no ACL can separate two processes with the same uid, so the
-//! privilege has to live somewhere else.
+//! `packaging/udev/72-hyprpad-puck.rules` is installed the real controller's
+//! hidraw nodes are `crw------- root root` too — the puck's five over USB, and
+//! the controller's own node over Bluetooth. The daemon must be able to open
+//! both; Steam — running as the *same user* — must not be able to open the
+//! controller. No group and no ACL can separate two processes with the same uid,
+//! so the privilege has to live somewhere else.
 //!
 //! It lives here, in about as little code as the job admits.
 //!
@@ -20,7 +21,10 @@
 //!
 //! ```text
 //! ->  "uhid\n"          <-  "ok 1\n"   + 1 fd   (/dev/uhid,  O_RDWR|O_CLOEXEC)
-//! ->  "puck\n"          <-  "ok 5\n"   + 5 fds  (every 28de:1304 hidraw node)
+//! ->  "controller\n"    <-  "ok 6\n"   + 6 fds  (every 28de:1304 and 28de:1303
+//!                                                hidraw node that exists)
+//! ->  "puck\n"          <-  the same thing: the pre-Bluetooth spelling, still
+//!                            accepted so an old daemon keeps working
 //! ->  anything else     <-  "err unknown request\n"        + 0 fds
 //! ```
 //!
@@ -29,9 +33,19 @@
 //! hard-coded verbs runs. It never reads from, writes to or ioctls a device — it
 //! opens and hands over, nothing else.
 //!
-//! `puck` **rescans `/sys/class/hidraw` on every request** and caches nothing, so
-//! hotplug needs no special handling anywhere: the puck sleeping and coming back
-//! on different node numbers is just a later request returning different fds.
+//! **The two spellings of the second verb are a version-skew accommodation, not
+//! a feature.** The broker is a root binary under `/usr/local/bin`, replaced only
+//! by a deliberate `sudo install`, so a daemon and a broker on one machine are
+//! routinely different vintages. Each half therefore understands both: the
+//! broker accepts `puck` as an alias ([`parse_request`]), and the client sends
+//! `controller` and retries once with `puck` if the broker does not know it
+//! ([`request_at`]).
+//!
+//! `controller` **rescans `/sys/class/hidraw` on every request** and caches
+//! nothing, so hotplug needs no special handling anywhere: the controller
+//! sleeping and coming back on different node numbers — which Bluetooth does on
+//! *every* reconnect, since BlueZ destroys and recreates the device — is just a
+//! later request returning different fds.
 //!
 //! # Why passing fds works at all
 //!
@@ -78,8 +92,9 @@ pub const UID_ENV: &str = "HYPRPAD_UID";
 /// approaching this is a client that has lost its mind, or is not a client.
 const MAX_REQUEST: usize = 32;
 
-/// Ceiling on descriptors in one reply. The puck has five interfaces today; the
-/// cap exists so a malfunctioning `/sys` cannot make either side allocate an
+/// Ceiling on descriptors in one reply. The puck has five interfaces and the
+/// Bluetooth link one, so six is the most a healthy machine produces; the cap
+/// exists so a malfunctioning `/sys` cannot make either side allocate an
 /// unbounded control buffer.
 pub const MAX_FDS: usize = 16;
 
@@ -97,17 +112,35 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum Request {
     /// `/dev/uhid`, opened `O_RDWR | O_CLOEXEC`. Exactly one descriptor.
     Uhid,
-    /// Every hidraw node belonging to a `28de:1304` puck, opened with
-    /// [`hidraw::OPEN_FLAGS`]. One or more descriptors, freshly enumerated.
-    Puck,
+    /// Every hidraw node belonging to the Steam Controller — the puck's five
+    /// (USB `28de:1304`) and the controller's own Bluetooth node
+    /// (`28de:1303`) — opened with [`hidraw::OPEN_FLAGS`]. One or more
+    /// descriptors, freshly enumerated.
+    ///
+    /// Spelled `controller` on the wire, with `puck` accepted as an alias: the
+    /// verb named the transport before the controller had two of them, and a
+    /// broker binary installed under the old name is still running on machines
+    /// this daemon has to talk to ([`Request::as_str`]).
+    Controller,
 }
+
+/// The wire spelling [`Request::Controller`] used before the controller had two
+/// transports, still accepted by [`parse_request`] and still sent as a fallback
+/// by [`request_at`].
+///
+/// It has to stay for as long as an old broker binary may be installed: the
+/// broker is a root program under `/usr/local/bin`, updated by a deliberate
+/// `sudo install`, so a freshly built daemon routinely talks to a months-old
+/// broker. A broker that predates the rename answers `err unknown request` to
+/// `controller` and serves `puck` perfectly well.
+pub const LEGACY_CONTROLLER_VERB: &str = "puck";
 
 impl Request {
     /// The wire spelling, without the newline.
     pub fn as_str(self) -> &'static str {
         match self {
             Request::Uhid => "uhid",
-            Request::Puck => "puck",
+            Request::Controller => "controller",
         }
     }
 
@@ -115,15 +148,31 @@ impl Request {
     pub fn line(self) -> String {
         format!("{}\n", self.as_str())
     }
+
+    /// The older spelling to retry with when a broker refuses [`as_str`], or
+    /// `None` for a verb that has only ever had one name.
+    ///
+    /// [`as_str`]: Request::as_str
+    pub fn legacy_line(self) -> Option<String> {
+        match self {
+            Request::Uhid => None,
+            Request::Controller => Some(format!("{LEGACY_CONTROLLER_VERB}\n")),
+        }
+    }
 }
 
 /// Parse one request line.
 ///
-/// Deliberately strict — an allowlist of two exact words. A trailing `\n` (and a
-/// `\r` before it, for a client that came through something line-oriented) is
-/// the only slack. Leading or trailing spaces, a different case, extra
-/// arguments, an embedded NUL, an empty line: all refused, with the reason that
-/// goes back on the wire.
+/// Deliberately strict — an allowlist of three exact words, two of which name
+/// the same thing. A trailing `\n` (and a `\r` before it, for a client that came
+/// through something line-oriented) is the only slack. Leading or trailing
+/// spaces, a different case, extra arguments, an embedded NUL, an empty line:
+/// all refused, with the reason that goes back on the wire.
+///
+/// `puck` is [`Request::Controller`] under its old name. The alias is on the
+/// *server* side for the mirror of the reason [`Request::legacy_line`] exists on
+/// the client side: a broker binary is updated separately from the daemon, so
+/// each half has to understand both vintages of the other.
 pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
     if raw.len() > MAX_REQUEST {
         return Err("request too long".to_string());
@@ -135,7 +184,8 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
     }
     match line {
         b"uhid" => Ok(Request::Uhid),
-        b"puck" => Ok(Request::Puck),
+        b"controller" => Ok(Request::Controller),
+        b"puck" => Ok(Request::Controller), // the pre-Bluetooth spelling
         _ => Err("unknown request".to_string()),
     }
 }
@@ -390,11 +440,40 @@ pub fn request(verb: Request) -> io::Result<Vec<OwnedFd>> {
 }
 
 /// [`request`], against an explicit socket path.
+///
+/// Sends the current spelling of `verb` and, if the broker does not recognise
+/// it, retries once with [`Request::legacy_line`]. That single retry is what
+/// lets a freshly built daemon work against a broker binary installed before the
+/// verb was renamed — the broker lives under `/usr/local/bin` and is only
+/// replaced by a deliberate `sudo install`, so the two halves of this program
+/// are routinely different vintages.
+///
+/// The retry is narrow on purpose: it fires only on the broker's own
+/// `unknown request` refusal, and only for a verb that *has* an older name. A
+/// missing socket, a permission error, a short read or any other refusal is
+/// returned as it stands, so nothing else is retried and no failure is masked.
 pub fn request_at(path: &Path, verb: Request) -> io::Result<Vec<OwnedFd>> {
+    match request_line(path, &verb.line()) {
+        Err(e) if is_unknown_request(&e) => match verb.legacy_line() {
+            Some(legacy) => request_line(path, &legacy),
+            None => Err(e),
+        },
+        other => other,
+    }
+}
+
+/// Whether an error is the broker saying it does not know the verb — as opposed
+/// to any of the other ways a request can fail.
+fn is_unknown_request(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string().contains("unknown request")
+}
+
+/// One request/response exchange with the broker, for one exact wire line.
+fn request_line(path: &Path, line: &str) -> io::Result<Vec<OwnedFd>> {
     let sock = UnixStream::connect(path)?;
     sock.set_read_timeout(Some(IO_TIMEOUT))?;
     sock.set_write_timeout(Some(IO_TIMEOUT))?;
-    (&sock).write_all(verb.line().as_bytes())?;
+    (&sock).write_all(line.as_bytes())?;
     // Half-close so the broker's read sees EOF and never waits for more.
     sock.shutdown(std::net::Shutdown::Write)?;
 
@@ -706,12 +785,12 @@ fn refuse(sock: &UnixStream, reason: &str) -> io::Result<()> {
 fn open_for(verb: Request) -> io::Result<Vec<OwnedFd>> {
     match verb {
         Request::Uhid => Ok(vec![open_uhid()?]),
-        Request::Puck => {
-            let nodes = hidraw::puck_nodes()?;
+        Request::Controller => {
+            let nodes = hidraw::controller_nodes()?;
             if nodes.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "no Steam Controller puck present (28de:1304)",
+                    "no Steam Controller present (28de:1304 puck or 28de:1303 Bluetooth)",
                 ));
             }
             let mut fds = Vec::new();
@@ -724,7 +803,7 @@ fn open_for(verb: Request) -> io::Result<Vec<OwnedFd>> {
             }
             if fds.is_empty() {
                 return Err(io::Error::other(format!(
-                    "no puck node could be opened ({})",
+                    "no controller node could be opened ({})",
                     errors.join("; ")
                 )));
             }
@@ -751,16 +830,57 @@ mod tests {
     #[test]
     fn the_two_verbs_parse() {
         assert_eq!(parse_request(b"uhid\n"), Ok(Request::Uhid));
-        assert_eq!(parse_request(b"puck\n"), Ok(Request::Puck));
+        assert_eq!(parse_request(b"controller\n"), Ok(Request::Controller));
         // A bare word with no newline is still a request: a client that shuts
         // down its write half instead of sending "\n" is well-behaved.
         assert_eq!(parse_request(b"uhid"), Ok(Request::Uhid));
-        assert_eq!(parse_request(b"puck\r\n"), Ok(Request::Puck));
+        assert_eq!(parse_request(b"controller\r\n"), Ok(Request::Controller));
+    }
+
+    /// **`puck` must keep working forever**, or a broker built from this tree
+    /// stops serving a daemon that has not been rebuilt yet. The broker is
+    /// installed by hand under `/usr/local/bin`; the daemon is not.
+    #[test]
+    fn the_pre_bluetooth_spelling_is_still_accepted() {
+        assert_eq!(parse_request(b"puck\n"), Ok(Request::Controller));
+        assert_eq!(parse_request(b"puck"), Ok(Request::Controller));
+        assert_eq!(parse_request(b"puck\r\n"), Ok(Request::Controller));
+        // Same verb, so the same descriptors: the alias is a spelling, not a
+        // second request with its own behaviour.
+        assert_eq!(parse_request(b"puck\n"), parse_request(b"controller\n"));
+        assert_eq!(LEGACY_CONTROLLER_VERB, "puck");
+    }
+
+    /// And the client half of the same accommodation: `controller` is what goes
+    /// out, `puck` is what it falls back to, and only that verb has a fallback.
+    #[test]
+    fn the_client_sends_the_new_spelling_and_can_retry_the_old_one() {
+        assert_eq!(Request::Controller.as_str(), "controller");
+        assert_eq!(Request::Controller.line(), "controller\n");
+        assert_eq!(Request::Controller.legacy_line().as_deref(), Some("puck\n"));
+        // A broker of either vintage understands whichever of the two arrives.
+        let legacy = Request::Controller.legacy_line().unwrap();
+        assert_eq!(parse_request(legacy.as_bytes()), Ok(Request::Controller));
+
+        // `uhid` never had another name, so it must not retry anything — a
+        // second request on a genuine refusal would just be noise.
+        assert_eq!(Request::Uhid.legacy_line(), None);
+    }
+
+    /// The retry fires on the broker's `unknown request` and on nothing else,
+    /// so no other failure is silently attempted twice or masked.
+    #[test]
+    fn only_an_unknown_request_triggers_the_legacy_retry() {
+        assert!(is_unknown_request(&io::Error::other("broker refused: unknown request")));
+        assert!(!is_unknown_request(&io::Error::other("broker refused: not permitted")));
+        assert!(!is_unknown_request(&io::Error::other("broker promised 5 descriptor(s) and sent 0")));
+        assert!(!is_unknown_request(&io::Error::new(io::ErrorKind::NotFound, "unknown request")));
+        assert!(!is_unknown_request(&io::Error::from(io::ErrorKind::PermissionDenied)));
     }
 
     #[test]
     fn a_verb_round_trips_through_its_wire_form() {
-        for verb in [Request::Uhid, Request::Puck] {
+        for verb in [Request::Uhid, Request::Controller] {
             assert_eq!(parse_request(verb.line().as_bytes()), Ok(verb));
         }
     }
@@ -1121,6 +1241,83 @@ mod tests {
         assert_eq!(parse_reply(&buf[..n]), Err("unknown request".to_string()));
     }
 
+    /// **Version skew, end to end.** A broker built before the rename knows
+    /// only `puck`; a daemon built after it sends `controller`. This stands up
+    /// exactly that pairing over a real socket and shows the daemon still gets
+    /// its descriptors — which is the whole point of the alias, and the failure
+    /// it prevents is "hyprpad silently stops using the broker and falls back to
+    /// direct opens", i.e. Steam seeing the real controller again.
+    #[test]
+    fn a_new_client_still_reaches_a_broker_that_only_knows_the_old_verb() {
+        let path = std::env::temp_dir()
+            .join(format!("hyprpad-legacy-broker-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        // The old broker: `puck` is served, everything else is unknown.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heard = std::sync::Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().expect("accept");
+                sock.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+                let mut buf = [0u8; MAX_REQUEST];
+                let n = (&sock).read(&mut buf).unwrap_or(0);
+                let verb = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                heard.lock().unwrap().push(verb.clone());
+                if verb == "puck" {
+                    // `ok 0` and no descriptors: a real hand-over needs a real
+                    // device, and this test is about the verb, not the fds.
+                    send_with_fds(&sock, ok_line(0).as_bytes(), &[]).unwrap();
+                } else {
+                    refuse(&sock, "unknown request").unwrap();
+                }
+            }
+        });
+
+        let fds = request_at(&path, Request::Controller).expect("the retry must succeed");
+        assert!(fds.is_empty(), "this stub hands over nothing");
+
+        server.join().unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["controller".to_string(), "puck".to_string()],
+            "the new spelling goes first, and the old one is the retry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The retry is exactly one attempt, and a broker that knows neither verb
+    /// is reported as a failure rather than tried forever.
+    #[test]
+    fn a_broker_that_knows_neither_verb_fails_after_one_retry() {
+        let path = std::env::temp_dir()
+            .join(format!("hyprpad-deaf-broker-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&count);
+        let server = std::thread::spawn(move || {
+            // Three accepts offered, so an over-eager client would be visible;
+            // the third simply never arrives and the loop ends with the listener.
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().expect("accept");
+                sock.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+                let mut buf = [0u8; MAX_REQUEST];
+                let _ = (&sock).read(&mut buf);
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                refuse(&sock, "unknown request").unwrap();
+            }
+        });
+
+        let err = request_at(&path, Request::Controller).expect_err("nothing is served");
+        assert!(err.to_string().contains("unknown request"), "{err}");
+        server.join().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2, "one try, one retry");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn request_at_a_missing_socket_is_an_ordinary_error() {
         let path = std::env::temp_dir().join("hyprpad-there-is-no-broker-here.sock");
@@ -1150,7 +1347,7 @@ mod tests {
                 serve(&sock, UidPolicy::Only(not_me));
             }
         });
-        let err = request_at(&path, Request::Puck).expect_err("the policy excludes us");
+        let err = request_at(&path, Request::Controller).expect_err("the policy excludes us");
         assert!(err.to_string().contains("not permitted"), "{err}");
         handle.join().unwrap();
         let _ = std::fs::remove_file(&path);

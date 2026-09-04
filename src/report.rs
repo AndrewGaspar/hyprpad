@@ -189,10 +189,46 @@ pub struct Pad {
     pub force: u16, // 0..~12550, spikes on physical click
 }
 
+/// The dongle's vendor input report: id `0x42`, 54 bytes on the wire
+/// (`REPORT_ID_INPUT`, `hid-steam.c:323`).
+pub const REPORT_ID_INPUT: u8 = 0x42;
+/// Wire length of [`REPORT_ID_INPUT`] — 53 payload bytes plus the id.
+pub const REPORT_LEN_INPUT: usize = 54;
+
+/// The Bluetooth link's vendor input report: id `0x45`, 46 bytes on the wire
+/// (`REPORT_ID_INPUT2`, `hid-steam.c:325`).
+pub const REPORT_ID_INPUT_BLE: u8 = 0x45;
+/// Wire length of [`REPORT_ID_INPUT_BLE`] — 45 payload bytes plus the id.
+pub const REPORT_LEN_INPUT_BLE: usize = 46;
+
 impl Frame {
-    /// Decode a raw hidraw report. Returns None unless it is a 54-byte 0x42.
+    /// Decode a raw hidraw report. Returns `None` for anything that is not one
+    /// of the controller's two vendor input reports.
+    ///
+    /// # Why two ids decode identically
+    ///
+    /// `0x45` is `0x42` with the trailing quaternion cut off, and **nothing
+    /// else**: the kernel's own layout table (`hid-steam.c:2325-2355`)
+    /// documents `0x42` as `0x45` plus bytes 46–53, and dispatches both ids
+    /// into the same handler at the same fixed offsets (`:2552`, `:2571`). SDL
+    /// says it the same way — its `TritonMTUFull_t` is `TritonMTUNoQuat_t` plus
+    /// the quaternion, and both ids land in one arm of its dispatch.
+    ///
+    /// The deepest byte this function reads is **29** (the right pad's force),
+    /// and `0x45` carries bytes 1–45 at identical offsets. So the short report
+    /// costs the decoder nothing at all: every field below is present either
+    /// way, and this is a length/id guard rather than a second decoder. Only
+    /// [`crate::uhid::translate::puck_to_triton`], which forwards raw bytes to a
+    /// fake device whose descriptor declares `0x42` at 54, has to re-frame.
+    ///
+    /// The controller's other reports — `0x40` (the lizard mouse, 6 bytes),
+    /// `0x41` (lizard keyboard), `0x43` (battery, 15 bytes), `0x44`, `0x79`,
+    /// `0x7b` — are refused here and dropped by the reader
+    /// ([`crate::run`] logs `0x43` once under `HYPRSC_DEBUG`).
     pub fn decode(raw: &[u8]) -> Option<Frame> {
-        if raw.len() != 54 || raw[0] != 0x42 {
+        let is_input = (raw.len() == REPORT_LEN_INPUT && raw[0] == REPORT_ID_INPUT)
+            || (raw.len() == REPORT_LEN_INPUT_BLE && raw[0] == REPORT_ID_INPUT_BLE);
+        if !is_input {
             return None;
         }
         let i16le = |i: usize| i16::from_le_bytes([raw[i], raw[i + 1]]);
@@ -303,5 +339,144 @@ impl Frame {
             .enumerate()
             .filter(move |(i, _)| changed & (1 << i) != 0)
             .map(|(_, &(_, _, b))| b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reports captured read-only from the live Bluetooth node — see the file's
+    /// own header for the method, the rate and what the bytes are.
+    const BT_FIXTURE: &str = include_str!("../tests/data/bt-0x45.hex");
+
+    /// One named report from [`BT_FIXTURE`].
+    fn fixture(name: &str) -> Vec<u8> {
+        let hex = BT_FIXTURE
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty())
+            .find_map(|l| Some(l.strip_prefix(name)?.trim().to_string()))
+            .unwrap_or_else(|| panic!("no report named {name} in tests/data/bt-0x45.hex"));
+        assert!(hex.len() % 2 == 0, "{name}: odd number of hex digits");
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// The 54-byte `0x42` a dongle would have produced from the same state:
+    /// the id swapped and the quaternion tail appended as zeros. Exactly the
+    /// inverse of the re-frame `crate::uhid::translate::puck_to_triton` does on
+    /// the way out to Steam.
+    fn as_0x42(bt: &[u8]) -> Vec<u8> {
+        assert_eq!(bt.len(), REPORT_LEN_INPUT_BLE);
+        let mut out = vec![0u8; REPORT_LEN_INPUT];
+        out[0] = REPORT_ID_INPUT;
+        out[1..REPORT_LEN_INPUT_BLE].copy_from_slice(&bt[1..]);
+        out
+    }
+
+    /// **The whole of phase 1's decode claim.** `0x45`/46 and `0x42`/54 carry
+    /// the same fields at the same offsets, so the same bytes must produce the
+    /// same `Frame` whichever id fronts them. If this ever fails, `0x45` needs a
+    /// decoder of its own rather than a length guard.
+    #[test]
+    fn a_bluetooth_0x45_decodes_to_the_same_frame_as_the_equivalent_0x42() {
+        for name in ["idle", "in-hand", "idle-later"] {
+            let bt = fixture(name);
+            assert_eq!(bt.len(), REPORT_LEN_INPUT_BLE, "{name}");
+            assert_eq!(bt[0], REPORT_ID_INPUT_BLE, "{name}");
+
+            let over_bt = Frame::decode(&bt).unwrap_or_else(|| panic!("{name} must decode"));
+            let over_dongle = Frame::decode(&as_0x42(&bt)).expect("the 0x42 form must decode too");
+            assert_eq!(over_bt, over_dongle, "{name}: the transport must not change the frame");
+            assert_eq!(over_bt.source, Source::Puck, "{name}: one controller, one source");
+        }
+    }
+
+    /// And the fields are real, not merely equal: the idle capture is a
+    /// resting controller, which is the state every other test in the daemon
+    /// spells `is_neutral`.
+    #[test]
+    fn the_idle_bluetooth_capture_decodes_to_a_resting_controller() {
+        let f = Frame::decode(&fixture("idle")).expect("decodes");
+        assert_eq!(f.counter, 0xa1);
+        assert_eq!(f.buttons, 0, "nothing pressed and nothing touched");
+        assert_eq!((f.l2, f.r2), (0, 0));
+        // The small idle offset `Frame`'s own docs describe, well inside the
+        // gesture deadzone.
+        assert_eq!(f.left_stick, (318, 345));
+        assert_eq!(f.right_stick, (-353, 378));
+        assert_eq!(f.left_pad, Pad::default(), "no finger on the left pad");
+        assert_eq!(f.right_pad, Pad::default());
+        assert!(f.is_neutral(), "a controller lying on a desk is neutral");
+    }
+
+    /// The in-hand capture is *not* neutral, so the fixture actually exercises
+    /// the bitfield rather than pinning three copies of zero.
+    #[test]
+    fn the_in_hand_bluetooth_capture_carries_bits_the_idle_one_does_not() {
+        let held = Frame::decode(&fixture("in-hand")).expect("decodes");
+        let idle = Frame::decode(&fixture("idle")).expect("decodes");
+        assert_ne!(held.buttons, 0, "bytes 4-5 carried the hand-contact cluster");
+        assert_ne!(held.buttons, idle.buttons);
+        // Whatever those bits mean, they survive the transport identically —
+        // which is the claim, and the reason this file does not assert which
+        // `Button` each one is.
+        assert_eq!(Frame::decode(&as_0x42(&fixture("in-hand"))).unwrap(), held);
+    }
+
+    /// Everything that is not one of the two input reports is refused here and
+    /// dropped by the reader. Over Bluetooth that matters more than it did over
+    /// the dongle: lizard mode starts ON, so `0x40` really does stream until
+    /// `src/lizard.rs` turns it off.
+    #[test]
+    fn the_controllers_other_reports_are_refused() {
+        assert_eq!(Frame::decode(&fixture("battery-0x43")), None, "0x43 battery");
+        assert_eq!(Frame::decode(&fixture("lizard-mouse-0x40")), None, "0x40 lizard mouse");
+        assert_eq!(Frame::decode(&[]), None, "an empty read");
+        assert_eq!(Frame::decode(&[0x45]), None, "the id alone");
+    }
+
+    /// The guard is a *pair* of (id, length) rows, not two independent tests —
+    /// a right id at the wrong length is not a report this decoder understands,
+    /// and reading one would run off the end of the buffer.
+    #[test]
+    fn each_input_id_is_accepted_only_at_its_own_length() {
+        let bt = fixture("idle");
+        let usb = as_0x42(&bt);
+
+        assert!(Frame::decode(&bt).is_some());
+        assert!(Frame::decode(&usb).is_some());
+
+        // Right length, wrong id.
+        let mut wrong_id = bt.clone();
+        wrong_id[0] = REPORT_ID_INPUT;
+        assert_eq!(Frame::decode(&wrong_id), None, "0x42 is never 46 bytes");
+        let mut wrong_id = usb.clone();
+        wrong_id[0] = REPORT_ID_INPUT_BLE;
+        assert_eq!(Frame::decode(&wrong_id), None, "0x45 is never 54 bytes");
+
+        // Right id, wrong length — including one byte either side of each.
+        for n in [45, 47, 53, 54] {
+            let mut short = bt.clone();
+            short.resize(n, 0);
+            assert_eq!(Frame::decode(&short), None, "0x45 at {n} bytes");
+        }
+        for n in [46, 53, 55] {
+            let mut short = usb.clone();
+            short.resize(n, 0);
+            assert_eq!(Frame::decode(&short), None, "0x42 at {n} bytes");
+        }
+    }
+
+    /// The constants are the contract shared with the relay's re-framing and
+    /// with the report descriptor's own table.
+    #[test]
+    fn the_input_report_shapes_are_the_ones_the_descriptor_declares() {
+        assert_eq!((REPORT_ID_INPUT, REPORT_LEN_INPUT), (0x42, 54));
+        assert_eq!((REPORT_ID_INPUT_BLE, REPORT_LEN_INPUT_BLE), (0x45, 46));
+        // 0x45 is 0x42 minus the 8-byte quaternion tail, and nothing else.
+        assert_eq!(REPORT_LEN_INPUT - REPORT_LEN_INPUT_BLE, 8);
     }
 }

@@ -737,7 +737,7 @@ fn attr(dir: &Path, name: &str) -> Option<String> {
 ///
 /// Reads `/sys` only — "is a pad plugged in" and "may I open it" are different
 /// questions and this one answers the first, exactly as
-/// [`crate::hidraw::puck_nodes`] does for the puck.
+/// [`crate::hidraw::controller_nodes`] does for the puck.
 pub fn gamepad_nodes() -> io::Result<Vec<Node>> {
     let mut found: Vec<(u32, Node)> = Vec::new();
     for entry in fs::read_dir("/sys/class/input")? {

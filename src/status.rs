@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::mode::{BUILTIN_DESKTOP, BUILTIN_GAME};
 
 /// Reported as the controller's name when its sysfs `HID_NAME` cannot be read —
-/// which is the ordinary case while the puck is away.
+/// which is the ordinary case while the controller is away.
 pub const DEFAULT_CONTROLLER: &str = "Steam Controller";
 
 /// The daemon's runtime directory, `$XDG_RUNTIME_DIR/hyprpad`. `None` when
@@ -77,13 +77,14 @@ impl RelayKind {
     }
 }
 
-/// Where the daemon got the puck's descriptors — the `"source"` field of
+/// Where the daemon got the controller's descriptors — the `"source"` field of
 /// `status.json`.
 ///
 /// Not a question about the *controller*, which is what `"connected"` answers,
 /// but about hyprpad's own plumbing: `"broker"` means the root fd broker handed
 /// the descriptors over, which is the only arrangement in which Steam cannot
-/// also see the real puck. `"direct"` means hyprpad opened the nodes itself, and
+/// also see the real controller. `"direct"` means hyprpad opened the nodes
+/// itself, and
 /// so could anything else running as you.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Source {
@@ -104,8 +105,8 @@ impl Source {
         }
     }
 
-    /// The source a [`crate::hidraw::PuckSource`] generation represents.
-    pub fn of(source: &crate::hidraw::PuckSource) -> Source {
+    /// The source a [`crate::hidraw::ControllerSource`] generation represents.
+    pub fn of(source: &crate::hidraw::ControllerSource) -> Source {
         if source.is_broker() {
             Source::Broker
         } else {
@@ -118,7 +119,7 @@ impl Source {
 /// object rather than a field at a time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
-    /// Whether the puck is present *right now*. False during the startup wait
+    /// Whether the controller is present *right now*. False during the startup wait
     /// and during the reconnect wait, both of which the daemon sits through
     /// rather than exiting.
     pub connected: bool,
@@ -132,6 +133,20 @@ pub struct Status {
     /// How hyprpad got hold of the real controller: through the root fd broker,
     /// or by opening the nodes itself.
     pub source: Source,
+    /// Which link the controller is streaming over right now — `"dongle"` or
+    /// `"bluetooth"` ([`crate::hidraw::Transport`]).
+    ///
+    /// A different question from [`source`](Self::source), which is about
+    /// hyprpad's own plumbing, and from [`connected`](Self::connected), which is
+    /// about whether there is a controller at all. With two transports
+    /// registered at once this is what tells "the controller is off" from "the
+    /// controller is on the other machine": the dongle stays plugged in and
+    /// enumerated either way, so its mere presence says nothing.
+    ///
+    /// `None` until the first frame arrives. A transport is a fact about
+    /// traffic, and before any has arrived there is no honest answer — so the
+    /// field is simply absent from the JSON rather than guessing the dongle.
+    pub transport: Option<crate::hidraw::Transport>,
     /// The daemon's pid, so a reader can tell a live file from one a killed
     /// daemon left behind.
     pub pid: u32,
@@ -166,6 +181,10 @@ impl Status {
         push_str(&mut o, self.relay.as_str());
         o.push_str(", \"source\": ");
         push_str(&mut o, self.source.as_str());
+        if let Some(t) = self.transport {
+            o.push_str(", \"transport\": ");
+            push_str(&mut o, t.as_str());
+        }
         o.push_str(", \"layout\": ");
         push_str(&mut o, &self.layout);
         let _ = write!(o, ", \"pid\": {}, \"modes\": ", self.pid);
@@ -254,6 +273,8 @@ impl StatusWriter {
                 controller: DEFAULT_CONTROLLER.to_string(),
                 relay: RelayKind::None,
                 source: Source::default(),
+                // No frame has arrived, so there is no transport to name yet.
+                transport: None,
                 pid: std::process::id(),
                 modes: Vec::new(),
                 sources: Vec::new(),
@@ -272,7 +293,7 @@ impl StatusWriter {
         &self.status
     }
 
-    /// Record whether the puck is present. Publishes only on a real change, so
+    /// Record whether the controller is present. Publishes only on a real change, so
     /// the reconnect scan's repeated "still gone" costs nothing.
     ///
     /// A transition to *connected* also refreshes the controller's name: the
@@ -355,6 +376,25 @@ impl StatusWriter {
         self.publish();
     }
 
+    /// Record which link the controller is streaming over.
+    ///
+    /// Driven by [`crate::hidraw::ActiveTransport`], which only moves on a
+    /// decoded frame, so this is already called once per genuine change rather
+    /// than once per report — but it re-checks anyway, because publishing is a
+    /// file write and this is the field most likely to acquire a chattier
+    /// caller later.
+    ///
+    /// Deliberately **not** cleared on disconnect: "the last link it was on" is
+    /// still the useful answer while a controller is away, and it is corrected
+    /// by the first frame after it returns.
+    pub fn set_transport(&mut self, transport: crate::hidraw::Transport) {
+        if self.status.transport == Some(transport) {
+            return;
+        }
+        self.status.transport = Some(transport);
+        self.publish();
+    }
+
     /// Record the set of modes that can become active. Changes only at startup
     /// and on a config reload.
     pub fn set_modes(&mut self, modes: Vec<String>) {
@@ -418,7 +458,7 @@ impl Drop for StatusWriter {
 }
 
 /// The cheat-sheet layout id of the controller currently in the user's hands,
-/// as the running daemon last published it — or the puck's when no daemon is
+/// as the running daemon last published it — or the controller's when no daemon is
 /// running, which is also the only honest answer then.
 ///
 /// Deliberately a *string scrape* rather than a JSON parse: this file has no
@@ -447,16 +487,17 @@ fn read_string_field(text: &str, name: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-/// A human name for the puck, from the `HID_NAME` its hidraw node advertises in
-/// sysfs (`Valve Software Steam Controller Puck`), or [`DEFAULT_CONTROLLER`]
+/// A human name for the controller, from the `HID_NAME` its hidraw node
+/// advertises in sysfs — `Valve Software Steam Controller Puck` over the dongle,
+/// `Steam Ctrl (BT) FXA…` over Bluetooth — or [`DEFAULT_CONTROLLER`]
 /// when it cannot be read — normally because the controller is not here.
 pub fn controller_name() -> String {
-    let Ok(nodes) = crate::hidraw::puck_nodes() else {
+    let Ok(nodes) = crate::hidraw::controller_nodes() else {
         return DEFAULT_CONTROLLER.to_string();
     };
     for node in nodes {
         // `/dev/hidrawN` -> `/sys/class/hidraw/hidrawN/device/uevent`, the same
-        // file `puck_nodes` matched the vendor and product against.
+        // file `controller_nodes` matched the vendor and product against.
         let Some(name) = node.file_name() else { continue };
         let uevent = Path::new("/sys/class/hidraw").join(name).join("device/uevent");
         let Ok(text) = std::fs::read_to_string(uevent) else { continue };
@@ -564,6 +605,7 @@ mod tests {
             controller: "Steam Controller Puck".to_string(),
             relay: RelayKind::Xbox,
             source: Source::Direct,
+            transport: Some(crate::hidraw::Transport::Dongle),
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
             sources: vec!["puck".to_string()],
@@ -578,12 +620,64 @@ mod tests {
             sample().to_json(),
             "{\"connected\": true, \"mode\": \"desktop\", \
              \"controller\": \"Steam Controller Puck\", \"relay\": \"xbox\", \
-             \"source\": \"direct\", \"layout\": \"steam-controller-2026\", \
+             \"source\": \"direct\", \"transport\": \"dongle\", \
+             \"layout\": \"steam-controller-2026\", \
              \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
              \"sources\": [\"puck\"], \
              \"updated\": 1725230000}\n"
         );
+    }
+
+    /// The `"transport"` field: which wire the controller is on.
+    ///
+    /// Absent rather than guessed before the first frame — a reader that sees
+    /// no `"transport"` key knows the daemon has not heard the controller yet,
+    /// which is a different and more useful thing than being told "dongle" by
+    /// default.
+    #[test]
+    fn json_carries_the_live_transport_only_once_it_is_known() {
+        use crate::hidraw::Transport;
+
+        let mut s = sample();
+        assert!(s.to_json().contains(r#""transport": "dongle""#), "{}", s.to_json());
+        s.transport = Some(Transport::Bluetooth);
+        assert!(s.to_json().contains(r#""transport": "bluetooth""#), "{}", s.to_json());
+
+        s.transport = None;
+        assert!(!s.to_json().contains("transport"), "no frame yet, no claim: {}", s.to_json());
+        // …and the object is still well-formed with the key missing.
+        assert!(s.to_json().contains(r#""source": "direct", "layout""#), "{}", s.to_json());
+    }
+
+    /// A transport change publishes exactly once, the way every other setter
+    /// does — this one is called from a 134 Hz stream, so it matters most here.
+    #[test]
+    fn set_transport_publishes_once_per_real_change() {
+        use crate::hidraw::Transport;
+
+        let dir = TempDir::new("transport");
+        let file = dir.path().join("status.json");
+        let mut w = StatusWriter::in_dir(dir.path());
+        assert_eq!(w.status().transport, None, "no frame has arrived yet");
+
+        w.set_transport(Transport::Bluetooth);
+        let json = std::fs::read_to_string(&file).unwrap();
+        assert!(json.contains(r#""transport": "bluetooth""#), "{json}");
+
+        // A second of Bluetooth at the measured 133.5 Hz.
+        let before = std::fs::read_to_string(&file).unwrap();
+        for _ in 0..134 {
+            w.set_transport(Transport::Bluetooth);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "a steady stream rewrites nothing"
+        );
+
+        w.set_transport(Transport::Dongle);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""transport": "dongle""#));
     }
 
     /// The `"source"` field: which half of the host integration is live.
@@ -600,14 +694,14 @@ mod tests {
     /// `Source::of` is the one mapping from a live generation to the wire value.
     #[test]
     fn a_generation_maps_to_its_source() {
-        use crate::hidraw::PuckSource;
+        use crate::hidraw::ControllerSource;
         assert_eq!(
-            Source::of(&PuckSource::Paths(vec![std::path::PathBuf::from("/dev/hidraw7")])),
+            Source::of(&ControllerSource::Paths(vec![std::path::PathBuf::from("/dev/hidraw7")])),
             Source::Direct
         );
         let (_r, w) = std::io::pipe().unwrap();
         assert_eq!(
-            Source::of(&PuckSource::Fds(vec![std::os::fd::OwnedFd::from(w)])),
+            Source::of(&ControllerSource::Fds(vec![std::os::fd::OwnedFd::from(w)])),
             Source::Broker
         );
     }

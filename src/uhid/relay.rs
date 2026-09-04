@@ -67,6 +67,28 @@ pub const STREAM_PERIOD: Duration = Duration::from_millis(4);
 ///
 /// Generous relative to the puck's ~250 Hz: this is a "the controller is gone"
 /// timer, not a jitter budget.
+///
+/// # It is generous on Bluetooth too
+///
+/// `docs/research/bluetooth.md` §3 row 11 flagged this as the one relay
+/// constant Bluetooth might invalidate, on the assumption that Linux's default
+/// 30–50 ms LE connection interval would apply — 200 ms would then be only 4–6
+/// frames of headroom against a link measured at σ 20.6 ms of jitter, and a
+/// stall could drop a game to neutral mid-input.
+///
+/// **Measured, that assumption was wrong.** The controller negotiates the BLE
+/// floor rather than accepting the host default: 133.5 Hz over 8 s, median
+/// inter-arrival **7.583 ms**, p90 8.45 ms, worst 15.3 ms. So 200 ms is ~26×
+/// the interval and ~13× the worst gap seen — the same order of headroom the
+/// 4 ms dongle gets, and comfortably still a gone-away timer. It is therefore
+/// left alone, and deliberately **not** made transport-dependent: one constant
+/// that is correct on both links is better than two that have to be kept in
+/// step.
+///
+/// The input rate difference costs nothing else either. [`STREAM_PERIOD`] is
+/// the relay's own clock and repeats the held frame, so a 133 Hz input is
+/// upsampled to Steam's 250 Hz for free; what upsampling cannot fix is that the
+/// frames arrive *older*, which is §4 of that note and not a constant here.
 pub const STALE_AFTER: Duration = Duration::from_millis(200);
 
 /// How many streamed ticks carry the synthesized guide press of
@@ -429,6 +451,49 @@ mod tests {
     fn the_stream_period_is_the_reference_implementations_250_hz() {
         assert_eq!(STREAM_PERIOD, Duration::from_millis(4));
         assert!(STALE_AFTER > STREAM_PERIOD * 10, "a gone-away timer, not a jitter budget");
+    }
+
+    /// The same headroom claim against the *slower* transport, since that is
+    /// the one that could invalidate it. Measured Bluetooth inter-arrival:
+    /// median 7.583 ms, worst 15.264 ms over 8 s (`tests/data/bt-0x45.hex`).
+    #[test]
+    fn stale_after_still_has_headroom_at_the_bluetooth_frame_rate() {
+        // The BLE connection interval the controller negotiates: the Core-spec
+        // floor of 7.5 ms, not the 30-50 ms Linux would have defaulted to.
+        let ble_interval = Duration::from_micros(7_500);
+        assert!(
+            STALE_AFTER > ble_interval * 20,
+            "200 ms must stay many BLE frames wide, not a handful"
+        );
+        // And against the worst single gap observed, not just the median.
+        let worst_observed_gap = Duration::from_micros(15_264);
+        assert!(STALE_AFTER > worst_observed_gap * 10);
+    }
+
+    /// A Bluetooth frame reaches the streamer as the fake's own 54-byte `0x42`,
+    /// so the tick holds one report shape whichever wire fed it — the property
+    /// `tick_report` depends on, since it repeats the stored bytes verbatim
+    /// against a descriptor that declares exactly one input length.
+    #[test]
+    fn a_forwarded_bluetooth_frame_streams_as_a_54_byte_0x42() {
+        let mut bt = vec![0u8; crate::report::REPORT_LEN_INPUT_BLE];
+        bt[0] = crate::report::REPORT_ID_INPUT_BLE;
+        bt[1] = 0x5a; // counter
+        bt[2] = 0x01; // A down
+
+        let relayed = translate::puck_to_triton(&bt, StripMask::none()).expect("forwardable");
+        let held = live(&relayed, Instant::now());
+        let out = tick_report(profile::triton(), held, 0, Instant::now());
+
+        assert_eq!(out.len(), TRITON_REPORT_LEN, "Steam's descriptor declares 54");
+        assert_eq!(out[0], 0x42, "…under the id it declares");
+        assert_eq!(out[1], 0x5a, "the Bluetooth counter is relayed untouched");
+        assert_ne!(out[2] & 0x01, 0, "and the press survived the re-frame");
+        assert!(out[46..].iter().all(|&b| b == 0), "with a zero quaternion tail");
+
+        // A 133 Hz input needs no resampling: the streamer repeats the held
+        // frame on its own 4 ms clock, so a second tick is the same bytes.
+        assert_eq!(tick_report(profile::triton(), held, 1, Instant::now()), out);
     }
 
     /// The relay's `forward` chooses a path by profile; check both land the

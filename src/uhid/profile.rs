@@ -649,6 +649,103 @@ mod tests {
         assert_eq!(TRITON_DESCRIPTOR.as_slice(), want.as_slice());
     }
 
+    /// The report descriptor read off the live Bluetooth node
+    /// (`/sys/class/hidraw/hidraw13/device/report_descriptor`, `0005:28DE:1303`,
+    /// 2026-09-03, read-only) is **byte-identical to the wired `1302`'s**.
+    ///
+    /// That is a much stronger result than phase 1 needed, and it is the reason
+    /// the port is a length guard rather than a second protocol. The controller
+    /// publishes one HID interface description regardless of the wire it is on:
+    /// same two lizard collections, same vendor collection, same report ids at
+    /// the same sizes, same feature and output channels. The link changes which
+    /// of those reports the firmware chooses to *send* — `0x45` over BLE where
+    /// the dongle sends `0x42` — and nothing else.
+    ///
+    /// Two consequences worth stating, because both are load-bearing:
+    ///
+    /// * the fake hyprpad publishes to Steam is already a faithful description
+    ///   of a Bluetooth controller, so the relay needs no second profile;
+    /// * `src/lizard.rs`'s feature channel (`0x01`) and `src/haptics.rs`'s
+    ///   output channels (`0x80`/`0x81`) are declared identically on both, which
+    ///   is the descriptor-level half of research §2.3's "unchanged and
+    ///   unchunked".
+    #[test]
+    fn the_bluetooth_descriptor_is_the_same_device_description_as_the_wired_one() {
+        let bt = std::fs::read(repo("docs/research/assets/triton-bt-1303-report-descriptor.bin"))
+            .expect("the Bluetooth capture is committed");
+        assert_eq!(bt.len(), 372, "same length as the wired capture");
+        assert_eq!(
+            bt.as_slice(),
+            TRITON_DESCRIPTOR.as_slice(),
+            "the controller describes itself identically on both transports"
+        );
+    }
+
+    /// **The Bluetooth report table, pinned on its own.**
+    ///
+    /// Deliberately not folded into the equality test above: if a future
+    /// firmware or kernel ever makes the two descriptors diverge, this must
+    /// still say what the Bluetooth link declares — and in particular that
+    /// `0x45` is 45 payload bytes, i.e. the 46 on the wire that
+    /// `report::Frame::decode` accepts and `translate::puck_to_triton`
+    /// re-frames.
+    #[test]
+    fn the_bluetooth_descriptor_declares_the_0x45_report_at_46_bytes_on_the_wire() {
+        let bt = std::fs::read(repo("docs/research/assets/triton-bt-1303-report-descriptor.bin"))
+            .expect("the Bluetooth capture is committed");
+        let items = report_items(&bt);
+
+        // The report the link actually streams, measured at 133.5 Hz.
+        let input_45 = items
+            .iter()
+            .find(|i| i.main == 0x81 && i.report_id == 0x45)
+            .expect("an input report 0x45");
+        assert_eq!(input_45.payload_bytes, 45);
+        assert_eq!(input_45.payload_bytes + 1, crate::report::REPORT_LEN_INPUT_BLE);
+
+        // And the long form, which is what the fake re-frames into.
+        let input_42 = items
+            .iter()
+            .find(|i| i.main == 0x81 && i.report_id == 0x42)
+            .expect("an input report 0x42");
+        assert_eq!(input_42.payload_bytes, 53);
+        assert_eq!(input_42.payload_bytes + 1, crate::report::REPORT_LEN_INPUT);
+        // The whole re-framing claim in one line: 0x42 is 0x45 plus the
+        // quaternion, so the difference is exactly eight bytes.
+        assert_eq!(input_42.payload_bytes - input_45.payload_bytes, 8);
+
+        // The battery report the reader drops, at the length it was captured.
+        let input_43 = items
+            .iter()
+            .find(|i| i.main == 0x81 && i.report_id == 0x43)
+            .expect("an input report 0x43");
+        assert_eq!(input_43.payload_bytes + 1, 15, "matches tests/data/bt-0x45.hex");
+
+        // The lizard mouse, which is ON over Bluetooth until src/lizard.rs
+        // turns it off — 6 bytes on the wire, and dropped by the decoder.
+        let input_40 = items
+            .iter()
+            .find(|i| i.main == 0x81 && i.report_id == 0x40)
+            .expect("an input report 0x40");
+        assert_eq!(input_40.payload_bytes + 1, 6);
+
+        // The write channels lizard mode and haptics use, declared exactly as
+        // they are over USB — research §2.3, at descriptor level.
+        let feat_1 = items
+            .iter()
+            .find(|i| i.main == 0xb1 && i.report_id == 0x01)
+            .expect("feature 0x01 — the Valve control channel");
+        assert_eq!(feat_1.payload_bytes, 63, "the 64-byte frame src/lizard.rs sends");
+        let out_80 = items.iter().find(|i| i.main == 0x91 && i.report_id == 0x80).expect("0x80");
+        assert_eq!(out_80.payload_bytes + 1, 10, "rumble");
+        let out_81 = items.iter().find(|i| i.main == 0x91 && i.report_id == 0x81).expect("0x81");
+        assert_eq!(out_81.payload_bytes + 1, 8, "haptic pulse");
+
+        // Whole-table equality with the wired capture, so a diverging future
+        // firmware fails loudly rather than in one row nobody checked.
+        assert_eq!(table(&bt), table(&TRITON_DESCRIPTOR));
+    }
+
     /// Walk the captured descriptor and confirm the single fact the whole
     /// triton design rests on: its vendor input report `0x42` is 53 payload
     /// bytes, i.e. 54 on the wire — identical to what the puck streams and

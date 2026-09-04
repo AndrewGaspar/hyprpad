@@ -141,8 +141,10 @@ fn monitor() {
     // Through the daemon's own acquire path, so `monitor` keeps working once the
     // udev rule has made the nodes root-only: with a broker installed the
     // descriptors come from it, without one they are direct opens as before.
-    let Some(source) = hidraw::PuckSource::acquire() else {
-        eprintln!("no Steam Controller puck found (28de:1304)");
+    let Some(source) = hidraw::ControllerSource::acquire() else {
+        eprintln!(
+            "no Steam Controller found (28de:1304 puck, or 28de:1303 over Bluetooth)"
+        );
         std::process::exit(1);
     };
     eprintln!("monitoring {} node(s), {} (passive tap)", source.len(), source.label());
@@ -150,10 +152,19 @@ fn monitor() {
     let mut prev = Frame::default();
     let t0 = Instant::now();
     let mut frames: u64 = 0;
+    // The same last-frame-wins rule the daemon publishes as `"transport"`. It
+    // earns its place here because `monitor` is the tool used to answer "is the
+    // controller on Bluetooth, and at what rate" — and the rate line below is
+    // meaningless without knowing which link produced it (~250 Hz over the
+    // dongle, ~134 Hz over BLE).
+    let mut transport = hidraw::ActiveTransport::new();
     for report in rx {
         let Some(frame) = Frame::decode(&report.data) else { continue };
         frames += 1;
         let t = t0.elapsed().as_secs_f64();
+        if let Some(now_on) = transport.note(report.transport) {
+            eprintln!("[{t:9.3}] transport: {} ({})", now_on.as_str(), report.node.display());
+        }
         for b in frame.edges_down(&prev) {
             println!("{t:9.3}  DOWN {b:?}");
         }
