@@ -1030,3 +1030,20 @@ read in this session.
 * `strings /usr/lib/libSDL3.so.0.4.14` — Valve GUIDs in SDL 3.4.14's database
 * `/etc/bluetooth/main.conf` (all defaults; `:237-238` connection interval,
   `:382-392` reconnect policy), `/etc/bluetooth/input.conf`
+
+## Live results (2026-09-03, owner's laptop, kernel 7.1.9, BlueZ)
+
+- Paired with the documented chord (B + R1 + Steam past the second chime); advertised as
+  `Steam Ctrl (BT) FXA9961402A6C`; bonded + trusted.
+- Linux sees `0005:000028DE:00001303`, ONE hidraw node (0660 root + a uaccess ACL for the
+  user, so Steam grabbed it until Steam was quit), plus evdev Mouse/Keyboard nodes that
+  Hyprland adopted (lizard mode is on over BT until hyprpad disables it there).
+- Stream: `0x45` 46 B at ~134 Hz + `0x40` 6 B (lizard mouse) at the same cadence, one `0x43`;
+  pairs arrive back-to-back, max gap 15 ms → connection interval ≈ 7.5 ms. Far better than the
+  20–33 Hz assumed in §2.
+- The report descriptor (372 B, `assets/triton-bt-1303-report-descriptor.bin`) is the wired
+  1302 table byte-for-byte.
+- The dongle's five nodes stay enumerated and emit nothing while the controller is on BT.
+- **Reconnect (§7 step 2): PASSES.** Power-off at 21:19:47 (disconnected, node gone); power-on
+  → reconnected at 21:20:01 with the node back, no bond deletion, no re-pair.
+  steam-for-linux#13383 does not reproduce here.
