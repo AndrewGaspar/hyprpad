@@ -193,7 +193,20 @@ enum Input {
     Osk(OskEvent),
     /// Every puck reader thread has exited — the controller went away. The loop
     /// enters its reconnect wait instead of terminating.
+    ///
+    /// **Every** reader, not any: with the dongle plugged in and a Bluetooth
+    /// bond live, both node sets are open at once and only one is streaming, so
+    /// the silent set's readers are still blocked in `read()` and hold the
+    /// channel open. A transport switch therefore never reaches this arm — the
+    /// frames simply start arriving on a different descriptor
+    /// ([`crate::hidraw::read_all`]).
     ReadersEnded,
+    /// The controller started streaming on a different link — the first frame of
+    /// a generation, or a genuine switch between the dongle and Bluetooth.
+    /// Published as `status.json`'s `"transport"` and logged; nothing else in
+    /// the daemon branches on it, because one controller behaves the same way
+    /// down either wire.
+    Transport(hidraw::Transport),
     /// SIGHUP (or `hyprpad reload`) asked us to re-read the config and apply it
     /// live. Delivered by the SIGHUP self-pipe's waiter thread (see
     /// [`install_reload_signal`]) so the async-signal-safe handler only ever
@@ -247,7 +260,7 @@ pub fn run() -> std::io::Result<()> {
     // "leave it running" has to include "start it before the controller".
     //
     // The puck half polls exactly what the reconnect wait polls —
-    // `PuckSource::acquire` — so both paths ask the broker first and fall back
+    // `ControllerSource::acquire` — so both paths ask the broker first and fall back
     // to opening the nodes directly, and neither can be satisfied by a puck
     // that is listed in `/sys` but not actually openable.
     //
@@ -258,7 +271,7 @@ pub fn run() -> std::io::Result<()> {
     // reconnect wait already handles — so the loop below begins in it and picks
     // the puck up on its next scan if it ever arrives.
     let source = {
-        let mut source = hidraw::PuckSource::acquire();
+        let mut source = hidraw::ControllerSource::acquire();
         if source.is_none() {
             // Distinguish the ways this can fail, because they need different
             // things from the user. A puck that is *listed* in `/sys` but not
@@ -266,7 +279,7 @@ pub fn run() -> std::io::Result<()> {
             // the nodes away and no broker is handing them back — and "waiting
             // for a controller" would be a misleading thing to say about a
             // controller that is plugged in.
-            let listed = hidraw::puck_nodes().map(|n| n.len()).unwrap_or(0);
+            let listed = hidraw::controller_nodes().map(|n| n.len()).unwrap_or(0);
             if listed > 0 {
                 eprintln!(
                     "hyprpad: the puck is present ({listed} node(s)) but none can be \
@@ -274,11 +287,14 @@ pub fn run() -> std::io::Result<()> {
                      reachable. Run `hyprpad setup --check`. Waiting…"
                 );
             } else {
-                eprintln!("hyprpad: no Steam Controller puck found (28de:1304); waiting for one…");
+                eprintln!(
+                    "hyprpad: no Steam Controller found — neither the puck (28de:1304) nor a \
+                     Bluetooth link (28de:1303); waiting for one…"
+                );
             }
             while source.is_none() && !gamepad_present(&config) {
                 std::thread::sleep(RECONNECT_SCAN_INTERVAL);
-                source = hidraw::PuckSource::acquire();
+                source = hidraw::ControllerSource::acquire();
             }
         }
         match &source {
@@ -292,7 +308,7 @@ pub fn run() -> std::io::Result<()> {
         }
         source
     };
-    let node_count = source.as_ref().map_or(0, hidraw::PuckSource::len);
+    let node_count = source.as_ref().map_or(0, hidraw::ControllerSource::len);
     if let Some(s) = &source {
         status.set_source(status::Source::of(s));
         status.set_connected(true);
@@ -349,7 +365,9 @@ pub fn run() -> std::io::Result<()> {
     eprintln!("hyprpad: {node_count} controller node(s), Hyprland IPC connected");
 
     if own_lizard {
-        eprintln!("hyprpad: lizard-mode ownership on; taking over the puck's firmware kbd/mouse");
+        eprintln!(
+            "hyprpad: lizard-mode ownership on; taking over the controller's firmware kbd/mouse"
+        );
         std::thread::spawn(crate::lizard::own_lizard_loop);
     }
 
@@ -756,7 +774,7 @@ pub fn run() -> std::io::Result<()> {
                 Ok(input) => input,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if waiting && Instant::now() >= next_scan {
-                        if let Some(source) = hidraw::PuckSource::acquire() {
+                        if let Some(source) = hidraw::ControllerSource::acquire() {
                             eprintln!(
                                 "hyprpad: controller reconnected ({} node(s), {})",
                                 source.len(),
@@ -791,6 +809,12 @@ pub fn run() -> std::io::Result<()> {
         };
 
         match input {
+            Input::Transport(t) => {
+                // Publish only. A transport switch is not a connect, not a
+                // disconnect and not a config change: the same controller is
+                // still there and every layer above the reader keeps its state.
+                status.set_transport(t);
+            }
             Input::ReadersEnded => {
                 eprintln!("hyprpad: controller disconnected, waiting for it to return…");
                 status.set_connected(false);
@@ -1264,10 +1288,10 @@ pub fn run() -> std::io::Result<()> {
 /// reports into the main loop's channel. Used for both the initial connect and
 /// every reconnect, so the two paths are identical.
 ///
-/// Takes the [`hidraw::PuckSource`] by value because a brokered generation *is*
+/// Takes the [`hidraw::ControllerSource`] by value because a brokered generation *is*
 /// the descriptors — there is nothing to re-open from, and handing them on is
 /// the only way to use them.
-fn spawn_reader_pipeline(source: hidraw::PuckSource, tx: &mpsc::Sender<Input>) {
+fn spawn_reader_pipeline(source: hidraw::ControllerSource, tx: &mpsc::Sender<Input>) {
     let reports = hidraw::read_all(source);
     let tx = tx.clone();
     std::thread::spawn(move || forward_reports(reports, tx));
@@ -1278,14 +1302,53 @@ fn spawn_reader_pipeline(source: hidraw::PuckSource, tx: &mpsc::Sender<Input>) {
 /// single [`Input::ReadersEnded`] so the loop enters its reconnect wait instead
 /// of going silently idle. Split out from [`spawn_reader_pipeline`] so the
 /// sentinel behaviour is unit-testable without hardware.
+///
 /// The decode runs **here**, in the reader thread, rather than in the loop: the
 /// evdev backend builds its frames in its own thread too, so doing the same for
 /// the puck is what makes [`Input::Frame`] mean one thing whichever controller
-/// produced it. A report that does not decode (the puck's other report ids) is
-/// dropped exactly as the loop used to drop it.
+/// produced it. A report that does not decode — the controller's other report
+/// ids, listed in [`report::Frame::decode`] — is dropped exactly as the loop
+/// used to drop it.
+///
+/// # Two transports arrive here as one stream
+///
+/// `read_all` merges every node of the generation, the dongle's and Bluetooth's
+/// alike, so this function sees them in arrival order and is the natural place
+/// for the active-transport rule ([`hidraw::ActiveTransport`]): last decoded
+/// frame wins, and only a change is announced. It is deliberately driven by
+/// *decoded* frames rather than by any report, so the lizard mouse chattering on
+/// a link the user is not using could never claim the transport.
 fn forward_reports(reports: mpsc::Receiver<hidraw::Report>, tx: mpsc::Sender<Input>) {
+    let debug = std::env::var_os("HYPRSC_DEBUG").is_some();
+    let mut active = hidraw::ActiveTransport::new();
+    let mut logged_battery = false;
     for r in reports {
-        let Some(frame) = report::Frame::decode(&r.data) else { continue };
+        let Some(frame) = report::Frame::decode(&r.data) else {
+            // The battery report is the one dropped id worth seeing once: it is
+            // the only other thing the controller sends unprompted over
+            // Bluetooth (measured at ~0.3 Hz), and `hid-steam.c:1409-1411`
+            // builds a whole power_supply out of it, so a future phase that
+            // wants a battery reading starts by reading this line.
+            if debug && !logged_battery && r.data.first() == Some(&0x43) {
+                logged_battery = true;
+                let hex: String =
+                    r.data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
+                eprintln!(
+                    "hyprpad: dropping report 0x43 ({} bytes, battery/charge state) from {} \
+                     [{}]: {hex} — this line appears once per generation",
+                    r.data.len(),
+                    r.node.display(),
+                    r.transport.as_str(),
+                );
+            }
+            continue;
+        };
+        if let Some(t) = active.note(r.transport) {
+            eprintln!("hyprpad: controller streaming over {} ({})", t.as_str(), r.node.display());
+            if tx.send(Input::Transport(t)).is_err() {
+                return;
+            }
+        }
         if tx.send(Input::Frame { frame, raw: Some(r.data) }).is_err() {
             return; // main loop gone; nothing to announce to.
         }
@@ -4418,7 +4481,25 @@ mod tests {
     }
 
     fn report(data: Vec<u8>) -> hidraw::Report {
-        hidraw::Report { node: PathBuf::from("/dev/hidraw0"), data }
+        report_from(hidraw::Transport::Dongle, data)
+    }
+
+    fn report_from(transport: hidraw::Transport, data: Vec<u8>) -> hidraw::Report {
+        let node = match transport {
+            hidraw::Transport::Dongle => "/dev/hidraw0",
+            hidraw::Transport::Bluetooth => "/dev/hidraw13",
+        };
+        hidraw::Report { node: PathBuf::from(node), transport, data }
+    }
+
+    /// The 46-byte `0x45` the Bluetooth link streams, with the same `A` press
+    /// as [`raw_report_with_a`], so the two transports can be compared.
+    fn raw_bt_report_with_a() -> Vec<u8> {
+        let mut raw = vec![0u8; 46];
+        raw[0] = 0x45;
+        raw[1] = 0x07;
+        raw[2] = 0x01;
+        raw
     }
 
     /// A raw 54-byte `0x42` with `A` down, so the forwarder — which now
@@ -4430,6 +4511,97 @@ mod tests {
         raw[1] = 0x07; // counter
         raw[2] = 0x01; // byte 2 bit 0 = A
         raw
+    }
+
+    /// The two-transport machine, end to end through the forwarder: the dongle
+    /// streams, the controller switches to Bluetooth, and it switches back.
+    ///
+    /// Three things are pinned. The transport is announced **once** per change
+    /// and not once per frame — 134 reports a second on a link would otherwise
+    /// rewrite `status.json` 134 times a second. A `0x45` decodes to the same
+    /// frame as the `0x42` around it, so nothing above the reader can tell which
+    /// wire it came off. And **no `ReadersEnded`** is emitted anywhere in the
+    /// middle: a transport switch is not a disconnect, and if it produced one
+    /// the daemon would drop every held key and reset the cursor mid-use.
+    #[test]
+    fn a_transport_switch_is_announced_once_and_is_not_a_reconnect() {
+        use hidraw::Transport::{Bluetooth, Dongle};
+
+        let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        for _ in 0..3 {
+            rtx.send(report_from(Dongle, raw_report_with_a())).unwrap();
+        }
+        // The controller moved to Bluetooth: the dongle's nodes are still open
+        // and simply stop producing.
+        for _ in 0..3 {
+            rtx.send(report_from(Bluetooth, raw_bt_report_with_a())).unwrap();
+        }
+        // …and back to the dongle.
+        rtx.send(report_from(Dongle, raw_report_with_a())).unwrap();
+        drop(rtx);
+        forward_reports(rrx, itx);
+
+        let got: Vec<Input> = irx.into_iter().collect();
+
+        // Exactly three announcements, in order, and no more.
+        let switches: Vec<hidraw::Transport> = got
+            .iter()
+            .filter_map(|i| match i {
+                Input::Transport(t) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(switches, vec![Dongle, Bluetooth, Dongle], "one line per change, not per frame");
+
+        // Every frame arrived, and the Bluetooth ones are indistinguishable
+        // from the dongle's once decoded.
+        let frames: Vec<&report::Frame> = got
+            .iter()
+            .filter_map(|i| match i {
+                Input::Frame { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames.len(), 7);
+        assert!(frames.iter().all(|f| f.pressed(report::Button::A) && f.counter == 0x07));
+        assert!(frames.windows(2).all(|w| w[0] == w[1]), "the wire does not change the frame");
+
+        // The relay still gets the original bytes, short report and all — it is
+        // `puck_to_triton`'s job, not the reader's, to re-frame them.
+        let raws: Vec<usize> = got
+            .iter()
+            .filter_map(|i| match i {
+                Input::Frame { raw, .. } => Some(raw.as_ref()?.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raws, vec![54, 54, 54, 46, 46, 46, 54]);
+
+        // The disconnect is announced once, at the end, and nowhere else.
+        let ended = got.iter().filter(|i| matches!(i, Input::ReadersEnded)).count();
+        assert_eq!(ended, 1, "a switch of transport is never a disconnect");
+        assert!(matches!(got.last(), Some(Input::ReadersEnded)));
+    }
+
+    /// A generation that only ever sees Bluetooth — the laptop with no dongle,
+    /// which is the setup this whole phase is for.
+    #[test]
+    fn a_bluetooth_only_generation_announces_bluetooth() {
+        let (rtx, rrx) = mpsc::channel::<hidraw::Report>();
+        let (itx, irx) = mpsc::channel::<Input>();
+        rtx.send(report_from(hidraw::Transport::Bluetooth, raw_bt_report_with_a())).unwrap();
+        // The battery report the controller sends unprompted: dropped, and it
+        // must not be mistaken for a frame or claim the transport.
+        rtx.send(report_from(hidraw::Transport::Bluetooth, vec![0x43; 15])).unwrap();
+        drop(rtx);
+        forward_reports(rrx, itx);
+
+        let got: Vec<Input> = irx.into_iter().collect();
+        assert!(matches!(got[0], Input::Transport(hidraw::Transport::Bluetooth)));
+        assert!(matches!(got[1], Input::Frame { .. }));
+        assert!(matches!(got[2], Input::ReadersEnded));
+        assert_eq!(got.len(), 3, "the 0x43 produced nothing");
     }
 
     #[test]
@@ -4447,6 +4619,13 @@ mod tests {
         // buffered reports and then announces the readers ended.
         forward_reports(rrx, itx);
 
+        // The first decoded frame of a generation names its transport, ahead of
+        // the frame itself: `status.json` must never describe a frame it has
+        // not yet said the transport of.
+        assert!(
+            matches!(irx.recv(), Ok(Input::Transport(hidraw::Transport::Dongle))),
+            "the first frame announces its transport"
+        );
         let got = irx.recv().expect("a frame");
         let Input::Frame { frame, raw } = got else { panic!("wanted a frame") };
         assert_eq!(frame.source, report::Source::Puck);
@@ -4455,6 +4634,9 @@ mod tests {
         assert_eq!(raw.as_deref(), Some(raw_report_with_a().as_slice()), "the relay's bytes");
         assert!(matches!(irx.recv(), Ok(Input::ReadersEnded)), "the undecodable one was dropped");
         // The forwarder dropped its sender, so the loop's channel is now closed.
+        //
+        // (see `a_transport_switch_is_announced_once_and_is_not_a_reconnect`
+        // below for the two-transport half of this contract)
         assert!(irx.recv().is_err());
     }
 

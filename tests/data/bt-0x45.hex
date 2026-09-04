@@ -1,0 +1,66 @@
+# Captured from the 2026 Steam Controller over Bluetooth, 2026-09-03.
+#
+# Node   /dev/hidraw13, HID_ID=0005:000028DE:00001303,
+#        HID_NAME="Steam Ctrl (BT) FXA9961402A6C"
+# How    opened O_RDONLY, one os.read() per report, nothing written to the
+#        device and no ioctl but the report-descriptor read. The controller was
+#        paired and connected; hyprpad was not running.
+# Rate   1067 reports of 0x45 in 8.00 s = 133.5 Hz, median inter-arrival
+#        7.583 ms, p90 8.450 ms, max 15.264 ms. That is the BLE connection
+#        interval sitting on the Core-spec floor of 7.5 ms, NOT the 30-50 ms
+#        Linux default `docs/research/bluetooth.md` §2.5 feared.
+#
+# Format: `<name> <hex>`, one report per line; `#` starts a comment.
+#
+# On the two bytes worth naming before you read the frames:
+#
+#   byte 1      sequence counter, free-running, wraps at 256.
+#   bytes 2-5   the button/touch bitfield. `idle` below has it all-zero (the
+#               controller lay untouched on a desk). `in-hand` was captured
+#               while the unit was being held: byte 4 = 0x11 and byte 5 = 0x30,
+#               i.e. the capacitive hand-contact cluster (Cap0/Cap2/Cap3 in
+#               `Button`) plus bit 0 of byte 4. `src/report.rs` maps that bit to
+#               `Button::Steam` and its own comment calls the capacitive-row
+#               assignment tentative, so this file does not assert what those
+#               two bytes MEAN. The tests assert only that they mean the SAME
+#               thing on both transports, which is the property phase 1 rests
+#               on and is true whatever the bits turn out to be.
+#   bytes 30-45 IMU timestamp then accel x3 / gyro x3, streaming unprompted over
+#               Bluetooth. `Frame::decode` reads no byte past 29 and never
+#               touches these; they are kept so the fixture is the real report
+#               rather than a truncation of one.
+#
+# No serial, bdaddr or other identifier appears anywhere in an input report —
+# the controller's identity lives in HID_UNIQ/HID_NAME, not on this channel.
+
+# An untouched controller: no buttons, no pad contact, both sticks showing
+# their small idle offset (left 318,345; right -353,378 — well inside the
+# gesture deadzone, so `Frame::is_neutral` is true).
+idle 45a100000000000000003e0159019ffe7a01000000000000000000000000c8b6db14630143f3013f000000000100
+
+# The same report with the hand-contact bits set (see above).
+in-hand 45e700001130000000002801bc016ffe33010000000000000000000000005dbc120179021e0dab3d0e001400d1ff
+
+# A second idle frame, ~4 s later in the same capture: a different counter and
+# different IMU noise, everything `decode` reads unchanged. Pins that the decoder
+# is not accidentally sensitive to the tail.
+idle-later 453c00000000000000001301590187fe3301000000000000000000000000184f6113be001df4113f010001000000
+
+# Not an input report, and must be DROPPED rather than decoded.
+#
+# 0x43, 15 bytes on the wire (14 payload, matching the report descriptor) —
+# the battery report, arriving at roughly 0.3 Hz. `hid-steam.c:1409-1411`
+# registers a power_supply from it for exactly the quirk set that includes the
+# BLE entry. hyprpad does not decode it; `src/run.rs` logs the first one under
+# HYPRSC_DEBUG and drops every one after that.
+battery-0x43 43015e05102c10000000000000ca60
+
+# 0x40, 6 bytes on the wire (5 payload) — the firmware "lizard" mouse. This one
+# is SHAPE ONLY, not a capture: the controller was untouched for the whole
+# capture window and the lizard mouse only reports on pad motion, so no real
+# 0x40 was seen. The shape is read off the report descriptor
+# (`docs/research/assets/triton-bt-1303-report-descriptor.bin`, which pins
+# ("input", 0x40, 5)), and it is here to pin that `decode` refuses the id — the
+# only thing hyprpad ever does with it. Lizard mode is ON over Bluetooth until
+# `src/lizard.rs` turns it off, so these DO arrive on a controller in use.
+lizard-mouse-0x40 400000000000

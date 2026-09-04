@@ -22,6 +22,14 @@ is still prediction; everything about the *protocol* is now read from source.
 
 ## 0. Verdict
 
+> **Update, 2026-09-03: phase 1 is built and the link was measured.** Three
+> things in this note turned out better than it predicted — the connection
+> interval is the 7.5 ms floor rather than Linux's 30–50 ms default, the report
+> descriptor is byte-identical on both transports, and lizard/haptics needed no
+> routing work at all. **§8a has the measurements, the corrections and what is
+> still unverified**, and supersedes this section wherever they disagree.
+
+
 **The pairing chord is documented by Valve, and the 2015 chords do not carry
 over.** Power the controller off, then hold **B + R1 + Steam** and *keep holding
 past the second chime* until the LED double-pulses blue. It advertises as
@@ -939,6 +947,124 @@ read in this session.
 
 ---
 
+## 8a. Phase 1 as built — 2026-09-03
+
+*Written after implementing §5's phase 1 against the live link. Everything below
+was **measured on this machine**, read-only except where noted; it supersedes the
+estimates above wherever the two disagree, and it disagrees in three places that
+matter.*
+
+### What the live link actually did
+
+| | §2's expectation | Measured |
+|---|---|---|
+| Identity | `0005:000028DE:00001303` | **confirmed**, `HID_NAME=Steam Ctrl (BT) FXA9961402A6C` |
+| hidraw nodes | 1 | **1** (`/dev/hidraw13`) |
+| Input report | `0x45`, 46 bytes | **`0x45`, 46 bytes** — not `0x47` (§8 row 3 closed) |
+| Rate | 20–33 Hz feared, 133 Hz ceiling | **133.5 Hz** |
+| Connection interval | 30–50 ms feared (Linux default) | **7.583 ms median**, p90 8.45, max 15.26 |
+| Report descriptor | unknown | **byte-identical to the wired `1302`** |
+
+Method: 1067 `0x45` reports over 8.00 s, read with one `os.read()` per report
+from a descriptor opened `O_RDONLY`. Nothing was written to the device; the only
+ioctl was the report-descriptor read. The captures are committed as
+`tests/data/bt-0x45.hex` (with the method in its own header) and
+`docs/research/assets/triton-bt-1303-report-descriptor.bin`.
+
+**Three corrections to the body of this note:**
+
+1. **§2.5's connection-interval worry does not apply.** The controller requests
+   the BLE floor and Linux honours it, so the 30–50 ms default never takes
+   effect. This was flagged as *"the single most important number §7
+   measures"*, and the answer is the good one.
+2. **§3 row 11 is therefore wrong, and `STALE_AFTER` stays at 200 ms.** At
+   7.5 ms that is ~26 intervals and ~13× the worst gap observed — the same order
+   of headroom the dongle gets. It is deliberately **not** made
+   transport-dependent: one constant correct on both links beats two that must
+   be kept in step. Pinned by a test.
+3. **The report descriptor is the same on both transports, byte for byte.** This
+   was not predicted anywhere above and is stronger than §2.3's source-read
+   conclusion: the controller publishes one HID interface description regardless
+   of wire — same lizard collections, same vendor collection, same ids at the
+   same sizes, same feature (`0x01`) and output (`0x80`/`0x81`) channels. Only
+   which report the firmware *chooses to send* differs. Consequences: the relay
+   needs no second profile, and §2.3's "feature reports and haptics unchanged"
+   is now confirmed at descriptor level and not only in kernel source.
+
+Also observed, and not in §2: the controller streams `0x43` (battery, 15 bytes)
+at roughly **0.3 Hz** unprompted over BLE, and its IMU (bytes 30–45) streams
+with no enable feature-report sent. Lizard mode is **ON** over Bluetooth until
+something turns it off, and its `0x40` mouse report is what moves the cursor
+until the daemon does.
+
+### What phase 1 built, against §5's plan
+
+Structurally as §5 described, with the transport question answered differently.
+
+* **Discovery** (§5.1a). `HID_ID` is now *parsed* rather than substring-searched,
+  into a strict two-row allow-list — `0003:28DE:1304` and `0005:28DE:1303`. Both
+  are returned by one function when both are present, and **both are opened at
+  once**. That last part is the design decision §5 left open: rather than
+  choosing a transport, hyprpad opens every node the controller has and lets the
+  traffic decide. Which one is live is `ActiveTransport` — last decoded frame
+  wins, silence changes nothing — published as `status.json`'s `"transport"` and
+  logged on each change.
+* **Decode** (§5.1b). Exactly the two-line guard predicted. Pinned by a test
+  asserting a captured `0x45` and the equivalent `0x42` decode to the *same*
+  `Frame`.
+* **Relay** (§5.1c). `puck_to_triton` re-frames 46→54 with a zero quaternion
+  tail, byte-exact and tested.
+* **The udev rule** (§5.1d, §3.1). Exactly the `KERNELS=="0005:28DE:1303.*"`
+  clause §3.1 derived, and the reasoning there holds up against
+  `udevadm info -a` on the live node: no `HID_ID` on the hidraw node, no USB
+  parent, `KERNELS=="0005:28DE:1303.000E"` on the parent hid device. The
+  instance suffix **must** be globbed — BlueZ recreates the device on every
+  disconnect. `setup --check` grew a `bt node root-only` row.
+* **Lizard and haptics** (§5.1e, §3 rows 8–9). **No routing work was needed**,
+  which §5 did not anticipate. Both writers already enumerate every node and
+  keep whichever answers — a rule written for the puck's pairing slots, since
+  only one slot has a controller behind it. Adding the Bluetooth node to that
+  set carries settings and pulses to the live link with no transport logic at
+  all. The one change made was to stop retrying `ENODEV`/`EINVAL` twelve times
+  per node: with more nodes open, a node that cannot serve a feature report is
+  an ordinary member of the set, not a fault.
+
+### Phase 2 is smaller than §5 thought
+
+§5.2 called rate discipline "not optional", on the 20–33 Hz assumption.
+
+* **2a, haptic coalescing — still worth doing, but not urgent.** The budget is
+  one output report per connection interval, and the interval is 7.5 ms rather
+  than 30–50 ms, so the un-coalesced OSK pulse rate is ~6× less exposed than
+  feared. Left as it is for now, and unverified in use.
+* **2b, `STALE_AFTER` — not needed.** See correction 2.
+* **2c, feature-report callers — unchanged**, as predicted.
+
+### What is still UNVERIFIED after phase 1
+
+* **Writes over Bluetooth.** Nothing in this work wrote to the device: no
+  feature report, no output report, no lizard disable, no haptic pulse. The
+  code paths are unchanged from the ones that work over USB and the descriptor
+  declares the same channels — but "declares" is not "accepts", and §8 row 6 is
+  still open. The first daemon restart with the controller on Bluetooth is the
+  test.
+* **Reconnect** (§8 row 1, #13383). Not exercised. The owner is testing it
+  separately.
+* **One known gap, on a machine with both transports at once.** If the
+  Bluetooth node disappears while the dongle's nodes remain open, the daemon
+  correctly does *not* report a disconnect — the surviving readers hold the
+  channel open and the dongle picks the controller up if it switches there. But
+  nothing re-enumerates to find a *new* Bluetooth node in that state, so a
+  controller that leaves and returns on Bluetooth while a dongle is also
+  plugged in will not be picked up until the daemon restarts. On a
+  Bluetooth-only machine — the laptop this is for — the sole reader ends, the
+  existing reconnect wait runs, and it recovers normally. The proper fix is
+  §6.2's suggestion: decode the dongle's `0x79 REPORT_ID_WIRELESS_EVENT`, which
+  says outright whether a controller is attached, rather than inferring it from
+  silence.
+
+---
+
 ## 9. Sources
 
 **Valve**
@@ -998,6 +1124,15 @@ read in this session.
   <https://steamcommunity.com/app/4165870/discussions/0/832746831844852850/>
 * `COMMUNITY` — AI-hallucinated pairing chords:
   <https://steamcommunity.com/discussions/forum/11/576047170584609677/>
+
+**Captured in this repo (`LOCAL`, read-only, 2026-09-03)**
+
+* `docs/research/assets/triton-bt-1303-report-descriptor.bin` / `.hex` — the
+  report descriptor read from `/sys/class/hidraw/hidraw13/device/report_descriptor`
+  on the live Bluetooth node. Byte-identical to the wired `1302` capture beside it
+* `tests/data/bt-0x45.hex` — `0x45` and `0x43` reports captured from the same
+  node, with the method, the measured rate and the inter-arrival distribution in
+  the file's own header
 
 **This repo**
 

@@ -1,4 +1,5 @@
-//! Lizard-mode ownership: disable the puck's firmware keyboard/mouse emulation.
+//! Lizard-mode ownership: disable the controller's firmware keyboard/mouse
+//! emulation, on whichever transport it is reachable over.
 //!
 //! The 2026 Steam Controller runs "lizard mode" in firmware: without a host
 //! driver it maps the dpad to arrow keys, A/B to Enter/Esc, the right pad to a
@@ -559,12 +560,32 @@ enum SendErr {
     /// attached to this slot to receive the settings (asleep/unpaired), or the
     /// link stalled longer than our retry budget.
     Stall,
+    /// The node is there but will not take this report — `ENODEV` (it went away
+    /// between the open and the ioctl) or `EINVAL` (it does not implement this
+    /// feature channel).
+    ///
+    /// Kept apart from [`SendErr::Other`], and **not** retried, because with two
+    /// transports open at once a node that cannot serve a feature report is an
+    /// ordinary member of the set rather than a fault: `apply_to_controller`
+    /// sends to every node the controller has, and only the live one is expected
+    /// to answer. Retrying `EINVAL` twelve times at 20 ms per node would spend a
+    /// quarter-second per node learning what the first attempt already said.
+    Refused(String),
     /// Any other failure (could not open the node, or an unexpected errno).
     Other(String),
 }
 
 /// Send one feature report on an open hidraw fd via `HIDIOCSFEATURE`, retrying
 /// a STALL (`EPIPE`) a bounded number of times as the kernel driver does.
+///
+/// The errno split is the whole of this function's judgement:
+///
+/// * `EPIPE` — the endpoint stalled. Retried, because on a controller that *is*
+///   attached this is transient, and it is what the mainline driver does.
+/// * `ENODEV` / `EINVAL` — a definite no. Returned immediately as
+///   [`SendErr::Refused`]; see that variant for why it is soft rather than fatal.
+/// * anything else — [`SendErr::Other`], which is the only kind that can make
+///   the whole call fail.
 fn send_feature_report(fd: RawFd, report: &[u8]) -> Result<(), SendErr> {
     let request = hidiocsfeature(report.len());
     let mut attempts = EPIPE_RETRIES;
@@ -578,19 +599,24 @@ fn send_feature_report(fd: RawFd, report: &[u8]) -> Result<(), SendErr> {
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EPIPE) {
-            attempts -= 1;
-            if attempts == 0 {
-                return Err(SendErr::Stall);
+        match err.raw_os_error() {
+            Some(libc::EPIPE) => {
+                attempts -= 1;
+                if attempts == 0 {
+                    return Err(SendErr::Stall);
+                }
+                std::thread::sleep(EPIPE_RETRY_DELAY);
+                continue;
             }
-            std::thread::sleep(EPIPE_RETRY_DELAY);
-            continue;
+            Some(libc::ENODEV) | Some(libc::EINVAL) => {
+                return Err(SendErr::Refused(format!("HIDIOCSFEATURE: {err}")));
+            }
+            _ => return Err(SendErr::Other(format!("HIDIOCSFEATURE: {err}"))),
         }
-        return Err(SendErr::Other(format!("HIDIOCSFEATURE: {err}")));
     }
 }
 
-/// Send the whole sequence to one already-open puck node.
+/// Send the whole sequence to one already-open controller node.
 ///
 /// The descriptor is writable by construction: [`crate::hidraw::OPEN_FLAGS`] is
 /// `O_RDWR` precisely because `HIDIOCSFEATURE` is a write to the device, and the
@@ -602,62 +628,89 @@ fn send_sequence(fd: RawFd, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr> {
     Ok(())
 }
 
-/// Send one feature sequence to every puck node, succeeding if *any* node
-/// accepts the full sequence.
+/// Send one feature sequence to every node the controller has, succeeding if
+/// *any* of them accepts the full sequence.
 ///
-/// Finds the puck's hidraw nodes and sends `reports` to each. hidraw is not
-/// exclusive, so this succeeds while Steam also holds the nodes. The puck
-/// exposes one interface per pairing slot plus a dongle-control interface; only
-/// the slot with the connected controller (and the controller feature report)
-/// will accept the reports, and the active slot can change on replug — so we try
-/// every node and treat the call as successful if *any* node accepted the full
-/// sequence.
+/// hidraw is not exclusive, so this succeeds while Steam also holds the nodes.
 ///
-/// Returns `Err` only if no node could be found or none accepted the reports;
-/// per-node failures (e.g. the dongle-control interface, which has no controller
-/// feature report) are expected and folded into the error only when they are
-/// total.
-fn apply_to_puck(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
+/// # "Try every node, any success wins" is also what makes Bluetooth work
+///
+/// The rule was written for the puck: it exposes one interface per pairing slot
+/// plus a dongle-control interface, only the slot with the connected controller
+/// accepts a controller feature report, and the active slot can change on
+/// replug — so trying all of them and accepting one success was already the
+/// honest way to address "wherever the controller actually is".
+///
+/// `ControllerSource::acquire` now returns the Bluetooth node alongside the
+/// dongle's when both exist, and that same rule carries settings to it with **no
+/// transport logic here at all**. Whichever link the controller is on is the one
+/// that answers; the rest refuse, exactly as an empty pairing slot always did.
+///
+/// The reports themselves need no change: report id `1`, 64 bytes,
+/// `ID_SET_SETTINGS_VALUES = 0x87`, unchanged over BLE — `STEAM_QUIRK_BLE`
+/// touches no report layer and there is no BLE chunking for this controller
+/// (`docs/research/bluetooth.md` §2.3), which the identical report descriptors
+/// on the two transports independently confirm. What *does* change is the cost:
+/// a `HIDIOCSFEATURE` over BLE is an ATT round trip rather than a USB control
+/// transfer. [`RESEND_INTERVAL`] is 30 s and this sends two frames, so that is
+/// invisible — but it is the reason no chattier caller should be added.
+///
+/// # What counts as a failure
+///
+/// Returns `Err` only if no node could be found or none accepted the reports.
+/// Per-node failures are *expected* — the dongle-control interface has no
+/// controller feature report, an empty pairing slot stalls, and a node on the
+/// transport the controller is not using does one or the other — so they are
+/// folded into the error only when they are total, and a total soft failure
+/// (every node stalled or refused) is reported as "no controller to configure"
+/// rather than as a fault. The re-send loop simply tries again in 30 s.
+fn apply_to_controller(reports: &[[u8; WIRE_LEN]]) -> Result<(), String> {
     // Through the same acquire path everything else uses, so lizard ownership
     // survives `packaging/udev/72-hyprpad-puck.rules` making the nodes root-only:
     // with a broker installed these descriptors come from it, without one they
     // are direct opens exactly as before.
-    let opened = crate::hidraw::PuckSource::acquire()
-        .ok_or_else(|| "no Steam Controller puck found (28de:1304)".to_string())?
+    let opened = crate::hidraw::ControllerSource::acquire()
+        .ok_or_else(|| {
+            "no Steam Controller found (28de:1304 puck or 28de:1303 Bluetooth)".to_string()
+        })?
         .into_open();
     if opened.is_empty() {
-        return Err("no Steam Controller puck node could be opened".to_string());
+        return Err("no Steam Controller node could be opened".to_string());
     }
     let mut accepted = 0usize;
-    let mut stalls = 0usize;
+    let mut soft = 0usize;
     let mut hard_errors = Vec::new();
     for (node, fd) in &opened {
         match send_sequence(fd.as_raw_fd(), reports) {
             Ok(()) => accepted += 1,
-            Err(SendErr::Stall) => stalls += 1,
+            // Both of these mean "not this node" rather than "something is
+            // wrong": a stalled endpoint has no controller behind it, and a
+            // refusal is a node that does not serve this channel.
+            Err(SendErr::Stall) | Err(SendErr::Refused(_)) => soft += 1,
             Err(SendErr::Other(e)) => hard_errors.push(format!("{}: {e}", node.display())),
         }
     }
     if accepted > 0 {
         Ok(())
     } else if hard_errors.is_empty() {
-        // Every node STALLed: the puck is there but has no controller to
-        // configure right now (asleep or unpaired). Not a hard failure — the
-        // re-send loop will catch it once the controller wakes.
+        // Every node declined: the controller is present in `/sys` but is not
+        // reachable on any of its links right now (asleep, unpaired, or on the
+        // other machine). Not a hard failure — the re-send loop will catch it
+        // once it wakes.
         Err(format!(
-            "no controller to configure: all {stalls} puck node(s) STALLed \
-             (controller asleep or disconnected)"
+            "no controller to configure: all {soft} node(s) stalled or refused \
+             (controller asleep, or connected elsewhere)"
         ))
     } else {
         Err(hard_errors.join("; "))
     }
 }
 
-/// Disable lizard mode on the attached puck (clear the digital mappings, then
+/// Disable lizard mode on the attached controller (clear the digital mappings, then
 /// turn `SETTING_LIZARD_MODE` and the revert-watchdog off), carrying whatever
 /// [`PowerSettings`] the config installed in the same settings write.
 pub fn disable_lizard_mode() -> Result<(), String> {
-    apply_to_puck(&disable_sequence(power_settings(), imu_hold()))
+    apply_to_controller(&disable_sequence(power_settings(), imu_hold()))
 }
 
 /// Build the `ID_TURN_OFF_CONTROLLER` feature frame.
@@ -688,28 +741,28 @@ fn turn_off_report() -> [u8; WIRE_LEN] {
 /// still have a way to put the puck to sleep.
 ///
 /// Best-effort against a possibly-absent controller, like every other write
-/// here: a puck whose controller is asleep STALLs every node and this returns
+/// here: a controller that is asleep STALLs every node and this returns
 /// `Err`, which for "turn it off" is a harmless no-op — it already is.
 ///
 /// sc-controller refuses `0x9F` on a *wired* controller
 /// (`scc/drivers/sc_by_cable.py:102`); hyprpad does not special-case that
 /// because it only ever talks to the puck (`28de:1304`).
 pub fn turn_off_controller() -> Result<(), String> {
-    apply_to_puck(&[turn_off_report()])
+    apply_to_controller(&[turn_off_report()])
 }
 
-/// Re-enable lizard mode on the attached puck — the inverse of
+/// Re-enable lizard mode on the attached controller — the inverse of
 /// [`disable_lizard_mode`]: restore the default digital mappings, then turn
 /// `SETTING_LIZARD_MODE` and `SETTING_STEAM_WATCHDOG_ENABLE` back on. Called on
 /// exit so the firmware keyboard/mouse comes back and the user is not left
 /// without a pointer.
 ///
 /// Like disable, this is best-effort against a possibly-absent controller: if
-/// the puck is asleep/unpaired every node STALLs and this returns `Err`. That is
+/// the controller is asleep/unpaired every node STALLs and this returns `Err`. That is
 /// fine on exit — the firmware powers up in lizard mode by default, so the next
 /// wake restores it anyway.
 pub fn enable_lizard_mode() -> Result<(), String> {
-    apply_to_puck(&enable_sequence(imu_hold()))
+    apply_to_controller(&enable_sequence(imu_hold()))
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +910,7 @@ pub fn read_settings<D: FeatureDevice>(
 /// A real hidraw descriptor as a [`FeatureDevice`].
 ///
 /// Borrows the fd rather than owning it: the descriptors come from
-/// [`crate::hidraw::PuckSource`], which owns them for the length of the query.
+/// [`crate::hidraw::ControllerSource`], which owns them for the length of the query.
 pub struct HidrawDevice {
     fd: RawFd,
 }
@@ -874,6 +927,11 @@ impl FeatureDevice for HidrawDevice {
         match send_feature_report(self.fd, report) {
             Ok(()) => Ok(()),
             Err(SendErr::Stall) => Err("STALL (no controller attached to this slot)".to_string()),
+            // `read_puck_settings` tries every node in turn and reports the
+            // first that answers, so a refusal here is just "not this node" —
+            // the same shape as a stall, and it needs the same wording rather
+            // than a bare errno the user cannot act on.
+            Err(SendErr::Refused(e)) => Err(format!("{e} (this node does not serve settings)")),
             Err(SendErr::Other(e)) => Err(e),
         }
     }
@@ -935,13 +993,14 @@ fn settings_table(
         .collect()
 }
 
-/// Ask the attached puck for the current value, maximum and default of each
-/// setting in `ids`.
+/// Ask the attached controller for the current value, maximum and default of
+/// each setting in `ids`.
 ///
-/// Goes through [`crate::hidraw::PuckSource::acquire`], exactly as the daemon
+/// Goes through [`crate::hidraw::ControllerSource::acquire`], exactly as the daemon
 /// and `hyprpad monitor` do, so it works whether the nodes are opened directly
-/// or handed over by the root broker. Only *one* of the puck's nodes has a
-/// controller behind it, so this tries each in turn and returns the first that
+/// or handed over by the root broker. Only *one* node has the controller behind
+/// it — one of the puck's five pairing slots, or the single Bluetooth node —
+/// so this tries each in turn and returns the first that
 /// answers the current-values query; the max and default queries then go to the
 /// same node, and a failure of either leaves those columns empty rather than
 /// failing the whole read.
@@ -952,11 +1011,13 @@ pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
     if ids.is_empty() {
         return Err("no setting ids given".to_string());
     }
-    let opened = crate::hidraw::PuckSource::acquire()
-        .ok_or_else(|| "no Steam Controller puck found (28de:1304)".to_string())?
+    let opened = crate::hidraw::ControllerSource::acquire()
+        .ok_or_else(|| {
+            "no Steam Controller found (28de:1304 puck or 28de:1303 Bluetooth)".to_string()
+        })?
         .into_open();
     if opened.is_empty() {
-        return Err("no Steam Controller puck node could be opened".to_string());
+        return Err("no Steam Controller node could be opened".to_string());
     }
     let mut errors = Vec::new();
     for (node, fd) in &opened {
@@ -972,7 +1033,7 @@ pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
         }
     }
     Err(format!(
-        "no puck node answered the settings query (the controller is probably asleep \
+        "no controller node answered the settings query (the controller is probably asleep \
          — press the Steam button and try again): {}",
         errors.join("; ")
     ))
@@ -986,7 +1047,7 @@ pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
 /// and named so the choice can be tested without a controller in the room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitAction {
-    /// Hand the puck back to its firmware: re-enable the keyboard/mouse
+    /// Hand the controller back to its firmware: re-enable the keyboard/mouse
     /// emulation so a stopped daemon never leaves the controller inert. The
     /// default, and every release before the knob existed.
     Restore,

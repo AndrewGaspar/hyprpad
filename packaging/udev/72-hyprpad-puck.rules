@@ -1,4 +1,6 @@
-# hyprpad — make the REAL Steam Controller puck (28de:1304) invisible to Steam.
+# hyprpad — make the REAL Steam Controller invisible to Steam, on either
+# transport: the puck/dongle (USB 28de:1304) and the controller's own Bluetooth
+# radio (BLE 28de:1303).
 #
 # WHY
 # ---
@@ -18,12 +20,48 @@
 #      daemon over a unix socket with SCM_RIGHTS.
 #
 # Valve's own /usr/lib/udev/rules.d/60-steam-input.rules hands `uaccess` to every
-# 28de hidraw node by vendor id, which is what makes the puck reachable today —
-# and, helpfully, it is also what makes hyprpad's *virtual* 28de:1302 / 28de:12f0
-# node reachable with no rule of our own. This file must therefore undo Valve's
-# grant for 1304 ONLY, and leave the fake alone. It does: the match below pins
-# idProduct to 1304, and the virtual device has no USB parent at all so
-# ATTRS{idVendor} never matches it (research §2).
+# 28de hidraw node — line 11 matches KERNELS=="000[356]:28DE:*", so it covers the
+# Bluetooth controller (bus 0005) just as it covers the USB dongle. That is what
+# makes the real controller reachable today on both transports — and, helpfully,
+# it is also what makes hyprpad's *virtual* 28de:1302 / 28de:12f0 node reachable
+# with no rule of our own. This file must therefore undo Valve's grant for the
+# two REAL identities only, and leave the fake alone. It does: the matches below
+# pin 1304 (USB) and 1303 (Bluetooth), and the virtual device is neither.
+#
+# BOTH TRANSPORTS, AND WHY EACH IS MATCHED DIFFERENTLY
+# ----------------------------------------------------
+# The dongle is a USB device, so ATTRS{idVendor}/ATTRS{idProduct} walk up to its
+# USB parent and one rule covers all five of its hidraw nodes.
+#
+# The Bluetooth controller has no USB parent to walk to. A BlueZ-created HID
+# device is parented to /devices/virtual/misc/uhid (drivers/hid/uhid.c), so there
+# is no bluetooth device in the chain either and no ATTRS{address} anywhere.
+# `ENV{HID_ID}` is not an option: a hidraw node carries NO HID_* properties of
+# its own. Verified read-only on this machine —
+#
+#     $ udevadm info /dev/hidraw13
+#     P: /devices/virtual/misc/uhid/0005:28DE:1303.000E/hidraw/hidraw13
+#     E: SUBSYSTEM=hidraw
+#     E: TAGS=:uaccess:seat:          <- Valve's line 11, the thing to undo
+#     (no HID_ID, no HID_NAME, no ID_VENDOR_ID)
+#
+#     $ udevadm info -a -n /dev/hidraw13
+#       looking at parent device '…/0005:28DE:1303.000E':
+#         KERNELS=="0005:28DE:1303.000E"
+#         SUBSYSTEMS=="hid"
+#
+# So the hook is the parent HID device's kernel name, which the kernel formats as
+#   dev_set_name(&hdev->dev, "%04X:%04X:%04X.%04X", bus, vendor, product, id)
+# (hid-core.c:3061) — bus 0005 = BUS_BLUETOOTH, 1303 =
+# USB_DEVICE_ID_STEAM_CONTROLLER_IBEX_BLE (hid-ids.h:1390). The trailing .%04X is
+# an instance counter that only ever increases, and BlueZ destroys and recreates
+# the device on every disconnect (src/shared/uhid.c:546-563), so it MUST be
+# globbed — the node comes back as .000F, .0010, … and the hidrawN number can
+# change too.
+#
+# This is the same shape Valve's own line 11 uses, which is also the proof it
+# reaches uhid-created nodes at all: hyprpad's fake (0003:28DE:1302.NNNN, no USB
+# parent) picks up its ACL from that line and nothing else.
 #
 # WHY THE NUMBER IS 72  (this is the load-bearing detail)
 # ------------------------------------------------------
@@ -54,11 +92,32 @@
 #
 # WHAT IS DELIBERATELY NOT MATCHED
 # --------------------------------
-# The puck's `input`/`event` nodes. hyprpad reads the controller over hidraw and
-# only over hidraw; the evdev side is left exactly as the system configures it.
-# (On this machine the puck's vendor-collection descriptor produces no evdev node
-# at all, so there is normally nothing there to hide — but if a future firmware
-# grows one, hiding it is a separate decision and not this file's business.)
+# The controller's `input`/`event` nodes, on EITHER transport. hyprpad reads the
+# controller over hidraw and only over hidraw; the evdev side is left exactly as
+# the system configures it.
+#
+# Over the dongle there is normally nothing there to hide: the puck's
+# vendor-collection descriptor produces no evdev node at all on this machine.
+#
+# Over Bluetooth there IS something there — the descriptor's two lizard
+# collections (report 0x40 Mouse, 0x41 Keyboard) produce
+# "Steam Ctrl (BT) … Mouse" and "… Keyboard" evdev nodes, and Valve's
+# 60-steam-input.rules line 14 exposes them. They are still left alone, on
+# purpose:
+#
+#   * the daemon DISABLES lizard mode (src/lizard.rs) within a second of
+#     starting, after which those nodes exist but emit nothing — the firmware is
+#     no longer generating the reports behind them. Hiding a node that produces
+#     no events buys nothing;
+#   * they are not what Steam binds a controller from. Steam reads the vendor
+#     hidraw channel, which is what the clauses below take away;
+#   * and a udev rule cannot be undone as cheaply as a feature report can. If
+#     hyprpad is not running, those nodes are the ONLY thing making the
+#     controller usable at all — leaving them alone is what keeps a machine with
+#     a stopped daemon merely lizard-y rather than inert.
+#
+# If a future firmware grows an evdev node that matters, hiding it is a separate
+# decision and not this file's business.
 #
 # `MODE`/`OWNER`/`GROUP` use the `:=` final-assignment operator so no later rule
 # can widen them back.
@@ -70,13 +129,20 @@
 #     sudo udevadm trigger --subsystem-match=hidraw
 #
 # VERIFY
-#     # which nodes are the puck's, and what udev thinks their parents are
+#     # which nodes are the controller's, and what udev thinks their parents are
 #     udevadm info -a -n /dev/hidraw7 | grep -E 'idVendor|idProduct|KERNELS'
-#     # the puck's nodes must be root-only, with NO '+' (no ACL)
+#     # or, for every one of them at once, whichever transport they are on:
+#     grep -l 'HID_ID=000[35]:000028DE:0000130[34]' /sys/class/hidraw/*/device/uevent
+#     # the controller's nodes must be root-only, with NO '+' (no ACL)
 #     ls -l /dev/hidraw*
 #     getfacl /dev/hidraw7          # expect only user::rw- / group::--- / other::---
 #     # and the fake must still carry an ACL for you
 #     getfacl /dev/hidrawN          # the 28de:1302 or 28de:12f0 node
+#     # hyprpad's own summary of all of the above, including the BT node:
+#     hyprpad setup --check
+#
+#     # syntax, without installing anything:
+#     udevadm verify packaging/udev/72-hyprpad-puck.rules
 #
 # REVERT
 #     sudo rm /etc/udev/rules.d/72-hyprpad-puck.rules
@@ -85,12 +151,27 @@
 ACTION=="remove", GOTO="hyprpad_puck_end"
 SUBSYSTEM!="hidraw", GOTO="hyprpad_puck_end"
 
-# The puck's hidraw nodes: matched exactly the way src/hidraw.rs matches them —
-# the vendor and product of the USB device the hidraw node hangs off. The puck
-# publishes one interface per pairing slot plus a dongle-control interface, and
-# ATTRS{} walks up to the shared USB parent, so a single rule covers all of them
-# however many there are and whatever they are numbered this boot.
+# 1. THE DONGLE — USB 28de:1304.
+#
+# Matched the way src/hidraw.rs matches it: the vendor and product of the USB
+# device the hidraw node hangs off. The puck publishes one interface per pairing
+# slot plus a dongle-control interface, and ATTRS{} walks up to the shared USB
+# parent, so a single rule covers all five however they are numbered this boot.
 ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", \
+    TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
+
+# 2. BLUETOOTH — BLE 28de:1303, the 2026 controller's own radio.
+#
+# Matched on the parent HID device's kernel name, because there is no USB parent
+# and no HID_ID property to match on — see "BOTH TRANSPORTS" above for the
+# udevadm output this is read off. Exactly ONE hidraw node exists here, not five
+# ("There is only one BLE HID interface", hid-steam.c:1618-1621).
+#
+# The id is exact rather than a glob: 0x1303 is pinned in mainline, so there is
+# no reason to leave 13?? open. It deliberately does NOT match 1302 (the wired
+# controller, which is also hyprpad's own fake identity) or 0005:28DE:11??
+# (the 2015 controller). Only the instance suffix is globbed, and it has to be.
+KERNELS=="0005:28DE:1303.*", \
     TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600"
 
 LABEL="hyprpad_puck_end"

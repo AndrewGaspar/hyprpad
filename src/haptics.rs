@@ -1,4 +1,5 @@
-//! Haptic pulses on the puck (`28de:1304`, IBEX/Proteus).
+//! Haptic pulses on the controller, over either transport (the puck,
+//! `28de:1304` IBEX/Proteus; or Bluetooth, `28de:1303`).
 //!
 //! The controller has an actuator behind each trackpad. Firing a short pulse on
 //! the pad a thumb is resting on is what makes the on-screen keyboard feel like
@@ -37,7 +38,7 @@
 //! a different report on the same wire — `REPORT_ID_HAPTIC_RUMBLE` (`0x80`), 10
 //! bytes, `struct steam_ibex_haptic_rumble` — driven through [`Haptics::rumble`]
 //! by the virtual-gamepad bridge ([`crate::gamepad`]). Both share this module's
-//! one writer thread and node set, so the two never open the puck twice.
+//! one writer thread and node set, so the two never open the controller twice.
 //!
 //! Rumble is rate-limited by its caller, not here: `hid-steam` throttles to
 //! 20 Hz and re-sends every 50 ms while active, because the controller restarts
@@ -65,7 +66,7 @@
 //! The fd set is refreshed periodically so the pulse follows the controller to a
 //! new slot after a re-pair, and re-opened whenever every write fails (the
 //! controller went away). A failure is logged **once**, never per tick and never
-//! fatally: a puck with no haptics, no writable node, or no controller at all
+//! fatally: a controller with no haptics, no writable node, or no controller at all
 //! degrades to a silent no-op.
 //!
 //! Device writes run on their own thread behind a small bounded queue
@@ -106,7 +107,7 @@ const MAX_REPORT_LEN: usize = RUMBLE_LEN;
 /// backlog of stale pulses to fire late.
 const QUEUE_DEPTH: usize = 8;
 
-/// Minimum gap between attempts to (re)open the puck's nodes after a failure.
+/// Minimum gap between attempts to (re)open the controller's nodes after a failure.
 /// Without it a sleeping controller — every write failing — would re-scan
 /// `/sys/class/hidraw` at the tick rate.
 const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
@@ -118,7 +119,7 @@ const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
 /// probe is invisible in normal use.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How long the probe waits for a puck node to report input before giving up and
+/// How long the probe waits for a node to report input before giving up and
 /// treating every node as a candidate. `poll` returns as soon as the live slot
 /// speaks — ~4 ms at the controller's ~250 Hz — so this ceiling is only ever
 /// paid when nothing is streaming at all.
@@ -268,7 +269,7 @@ fn scale_on_us(on_us: u16, intensity: f64) -> u16 {
     scaled.round().clamp(0.0, f64::from(ON_US_MAX)) as u16
 }
 
-/// A live handle to the puck's haptics.
+/// A live handle to the controller's haptics.
 ///
 /// Construct once, up front — nothing is opened until the first pulse, so a
 /// config with `[haptics] enabled = false` never touches the device. Every
@@ -331,7 +332,7 @@ impl Haptics {
         self.queue(build_pulse(pad, on_us, off_us, count));
     }
 
-    /// Drive the puck's **force-feedback rumble** (`0x80`) — the game-facing
+    /// Drive the controller's **force-feedback rumble** (`0x80`) — the game-facing
     /// channel, distinct from the discrete UI pulses above.
     ///
     /// `left_speed` is the `FF_RUMBLE` `strong_magnitude` and `right_speed` the
@@ -365,9 +366,9 @@ impl Default for Haptics {
 }
 
 /// The device-writer thread: drain queued pulse reports and write each one to
-/// the puck. Ends when the last [`Haptics`] handle drops (daemon exit).
+/// the controller. Ends when the last [`Haptics`] handle drops (daemon exit).
 fn writer_loop(rx: &mpsc::Receiver<OutReport>) {
-    let mut dev = PuckWriter::new();
+    let mut dev = ControllerWriter::new();
     for report in rx {
         dev.write_report(report.as_slice());
     }
@@ -400,7 +401,7 @@ fn live_indices(fds: &[File]) -> Vec<usize> {
 
 /// The writable puck nodes, opened lazily, narrowed to the live pairing slot,
 /// and re-opened after failure or once the set goes stale.
-struct PuckWriter {
+struct ControllerWriter {
     /// Nodes the pulse is written to. Empty until the first open, and again
     /// after the controller went away.
     fds: Vec<File>,
@@ -414,9 +415,9 @@ struct PuckWriter {
     announced: bool,
 }
 
-impl PuckWriter {
-    fn new() -> PuckWriter {
-        PuckWriter { fds: Vec::new(), last_open: None, warned: false, announced: false }
+impl ControllerWriter {
+    fn new() -> ControllerWriter {
+        ControllerWriter { fds: Vec::new(), last_open: None, warned: false, announced: false }
     }
 
     /// Write one output report (8 bytes for a pulse, 10 for a rumble) to every
@@ -438,7 +439,7 @@ impl PuckWriter {
         });
         if delivered > 0 {
             if !self.announced {
-                eprintln!("hyprpad: haptics live on {delivered} puck node(s)");
+                eprintln!("hyprpad: haptics live on {delivered} controller node(s)");
                 self.announced = true;
             }
             if self.warned {
@@ -446,7 +447,7 @@ impl PuckWriter {
                 self.warned = false;
             }
         } else {
-            self.fail_once("every puck node rejected the pulse (controller asleep?)");
+            self.fail_once("every controller node rejected the pulse (controller asleep?)");
             self.announced = false;
         }
     }
@@ -459,15 +460,34 @@ impl PuckWriter {
             // Working and fresh: use it.
             Some(t) if !self.fds.is_empty() && t.elapsed() < REFRESH_INTERVAL => return true,
             // Nothing open and we only just tried: stay quiet rather than
-            // re-scan `/sys/class/hidraw` on every pulse against an absent puck.
+            // re-scan `/sys/class/hidraw` on every pulse against an absent
+            // controller.
             Some(t) if self.fds.is_empty() && t.elapsed() < REOPEN_INTERVAL => return false,
             _ => {}
         }
         self.reopen()
     }
 
-    /// Re-enumerate the puck, open every node read-write, and narrow to the slot
-    /// that is streaming input. Returns whether anything is open afterwards.
+    /// Re-enumerate the controller, open every node read-write, and narrow to
+    /// the one that is streaming input. Returns whether anything is open
+    /// afterwards.
+    ///
+    /// # This is also what routes haptics to the live transport
+    ///
+    /// The narrowing was written for the puck's pairing slots — only one of the
+    /// five has a controller behind it — and it turns out to be exactly the rule
+    /// Bluetooth needs, for exactly the same reason. `ControllerSource::acquire`
+    /// now hands over the dongle's nodes *and* the Bluetooth node when both
+    /// exist, and only one of them is streaming, because the controller holds
+    /// one link at a time. [`live_indices`] polls them all and keeps whichever
+    /// produced a report, so a pulse goes to the link the controller is actually
+    /// on with no transport logic here at all.
+    ///
+    /// [`REFRESH_INTERVAL`] is what makes it follow a switch: the set is
+    /// re-probed periodically, so moving between the dongle and Bluetooth
+    /// re-narrows to the new link within one refresh rather than needing an
+    /// explicit signal. A pulse in the gap goes to a node that ignores it, which
+    /// is the pre-existing behaviour for a slot whose controller has slept.
     fn reopen(&mut self) -> bool {
         self.last_open = Some(Instant::now());
         // Through the same acquire path the readers use, so haptics keep working
@@ -476,13 +496,15 @@ impl PuckWriter {
         // `hidraw::OPEN_FLAGS`, which is read-write because of exactly this —
         // an output report is a write to the device — and read access is what
         // lets the probe below see which slot is live.
-        let opened: Vec<File> = match crate::hidraw::PuckSource::acquire() {
+        let opened: Vec<File> = match crate::hidraw::ControllerSource::acquire() {
             Some(source) => source.into_fds().into_iter().map(File::from).collect(),
             None => Vec::new(),
         };
         if opened.is_empty() {
             self.fds.clear();
-            self.fail_once("no writable Steam Controller puck node (28de:1304)");
+            self.fail_once(
+                "no writable Steam Controller node (28de:1304 puck or 28de:1303 Bluetooth)",
+            );
             return false;
         }
         // Fresh fds have empty read buffers, so the probe reflects what is

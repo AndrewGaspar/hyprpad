@@ -521,9 +521,15 @@ pub trait HostView {
     fn socket_path(&self) -> PathBuf;
     /// Ask the broker for `verb`; `Ok(n)` is how many descriptors came back.
     fn broker(&self, verb: broker::Request) -> Result<usize, String>;
-    /// The puck's hidraw nodes and what `stat` says about each. An empty vec
-    /// means the puck is not plugged in.
-    fn puck_nodes(&self) -> Vec<(PathBuf, Option<NodeStat>)>;
+    /// The controller's hidraw nodes and what `stat` says about each, labelled
+    /// with the transport each arrived on. An empty vec means no controller is
+    /// present on either link.
+    ///
+    /// Both transports can be listed at once — the dongle stays plugged in and
+    /// enumerated while the controller talks over Bluetooth — and the check
+    /// reports on them separately, because the two are hidden by two different
+    /// clauses of the udev rule and either can be installed without the other.
+    fn controller_nodes(&self) -> Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)>;
 
     /// Where the user unit lives when it is installed:
     /// `$XDG_CONFIG_HOME/systemd/user/hyprpad.service`.
@@ -724,9 +730,16 @@ pub fn check_items(view: &dyn HostView) -> Vec<Check> {
     //    check that talks to anything, and it is the part that catches the
     //    failure a file listing cannot: installed, enabled, and still refusing
     //    you because your shell predates `usermod -aG hyprpad`.
+    //
+    //    Note what this row does *not* distinguish: a broker binary older than
+    //    the Bluetooth work answers this perfectly well (the client falls back
+    //    to the pre-rename verb) but hands over only the dongle's nodes, because
+    //    its own enumeration predates `28de:1303`. The `bt node root-only` row
+    //    below is what makes that visible — an old broker plus a paired
+    //    controller shows `ok` here and a BT node hyprpad cannot reach.
     for (verb, label, want) in [
         (broker::Request::Uhid, "broker: uhid", 1usize),
-        (broker::Request::Puck, "broker: puck", 1usize),
+        (broker::Request::Controller, "broker: controller", 1usize),
     ] {
         items.push(if !socket {
             Check::new(Verdict::Unknown, label, "no socket to ask")
@@ -743,45 +756,75 @@ pub fn check_items(view: &dyn HostView) -> Vec<Check> {
         });
     }
 
-    // 6. Are the puck's nodes actually closed to us? The rule being *installed*
-    //    is not the same as the rule having been *applied*: udev only re-runs on
-    //    a trigger or a replug.
-    let nodes = view.puck_nodes();
-    items.push(if nodes.is_empty() {
-        Check::new(
-            Verdict::Unknown,
-            "puck nodes root-only",
-            "no 28de:1304 puck present — plug it in and re-run",
-        )
-    } else {
-        let open: Vec<String> = nodes
-            .iter()
-            .filter(|(_, st)| !st.is_some_and(NodeStat::root_only))
-            .map(|(p, st)| match st {
-                Some(s) => format!("{} ({:04o} uid {})", p.display(), s.mode, s.uid),
-                None => format!("{} (cannot stat)", p.display()),
-            })
-            .collect();
-        if open.is_empty() {
-            Check::new(
-                Verdict::Ok,
-                "puck nodes root-only",
-                format!("{} node(s), all 0600 root:root", nodes.len()),
-            )
-        } else {
-            Check::new(
-                Verdict::Bad,
-                "puck nodes root-only",
-                format!(
-                    "still reachable: {} — run `sudo udevadm control --reload && \
-                     sudo udevadm trigger --subsystem-match=hidraw`, or replug",
-                    open.join(", ")
-                ),
-            )
-        }
-    });
+    // 6. Are the controller's nodes actually closed to us? The rule being
+    //    *installed* is not the same as the rule having been *applied*: udev
+    //    only re-runs on a trigger or a replug.
+    //
+    //    Reported per transport, because they are two clauses of one rule and
+    //    either can be in force without the other — a machine that installed
+    //    the rule before Bluetooth support existed has the USB clause and not
+    //    the BLE one, and its symptom (Steam sees the real controller, every
+    //    press doubled) would otherwise be invisible here.
+    let nodes = view.controller_nodes();
+    items.push(node_check(
+        &nodes,
+        crate::hidraw::Transport::Dongle,
+        "puck nodes root-only",
+        "no 28de:1304 puck present — plug it in and re-run",
+    ));
+    // The Bluetooth row is only shown when there is something to say about it.
+    // A tower with no bond has no BLE node and never will; printing a permanent
+    // "unknown" there would be noise, and the pairing chord is a README matter
+    // rather than a setup step.
+    if nodes.iter().any(|(_, t, _)| *t == crate::hidraw::Transport::Bluetooth) {
+        items.push(node_check(
+            &nodes,
+            crate::hidraw::Transport::Bluetooth,
+            "bt node root-only",
+            "no 28de:1303 controller paired over Bluetooth",
+        ));
+    }
 
     items
+}
+
+/// One "are these nodes closed to us" row, for the nodes of a single transport.
+///
+/// Split out so the two transports are checked by identical logic rather than by
+/// two copies of it: the question, the remedy and the failure mode are the same
+/// on both, and only the label and the "nothing here" wording differ.
+fn node_check(
+    nodes: &[(PathBuf, crate::hidraw::Transport, Option<NodeStat>)],
+    transport: crate::hidraw::Transport,
+    label: &'static str,
+    absent: &'static str,
+) -> Check {
+    let mine: Vec<&(PathBuf, crate::hidraw::Transport, Option<NodeStat>)> =
+        nodes.iter().filter(|(_, t, _)| *t == transport).collect();
+    if mine.is_empty() {
+        return Check::new(Verdict::Unknown, label, absent);
+    }
+    let open: Vec<String> = mine
+        .iter()
+        .filter(|(_, _, st)| !st.is_some_and(NodeStat::root_only))
+        .map(|(p, _, st)| match st {
+            Some(s) => format!("{} ({:04o} uid {})", p.display(), s.mode, s.uid),
+            None => format!("{} (cannot stat)", p.display()),
+        })
+        .collect();
+    if open.is_empty() {
+        Check::new(Verdict::Ok, label, format!("{} node(s), all 0600 root:root", mine.len()))
+    } else {
+        Check::new(
+            Verdict::Bad,
+            label,
+            format!(
+                "still reachable: {} — run `sudo udevadm control --reload && \
+                 sudo udevadm trigger --subsystem-match=hidraw`, or replug",
+                open.join(", ")
+            ),
+        )
+    }
 }
 
 /// The "running at login" checks. Deliberately a **separate** list from
@@ -975,16 +1018,16 @@ impl HostView for LiveHost {
         broker::request(verb).map(|fds| fds.len()).map_err(|e| e.to_string())
     }
 
-    fn puck_nodes(&self) -> Vec<(PathBuf, Option<NodeStat>)> {
+    fn controller_nodes(&self) -> Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)> {
         use std::os::unix::fs::MetadataExt;
-        crate::hidraw::puck_nodes()
+        crate::hidraw::controller_nodes_by_transport()
             .unwrap_or_default()
             .into_iter()
-            .map(|p| {
+            .map(|(p, t)| {
                 let st = fs::metadata(&p)
                     .ok()
                     .map(|m| NodeStat { mode: m.mode() & 0o7777, uid: m.uid(), gid: m.gid() });
-                (p, st)
+                (p, t, st)
             })
             .collect()
     }
@@ -1218,7 +1261,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
         socket: bool,
         uhid: Result<usize, String>,
         puck: Result<usize, String>,
-        nodes: Vec<(PathBuf, Option<NodeStat>)>,
+        nodes: Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)>,
         /// Paths that exist for [`HostView::path_exists`] — the unit file and
         /// its enable symlink.
         present: Vec<PathBuf>,
@@ -1261,6 +1304,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                     .map(|n| {
                         (
                             PathBuf::from(format!("/dev/hidraw{n}")),
+                            crate::hidraw::Transport::Dongle,
                             Some(NodeStat { mode: 0o600, uid: 0, gid: 0 }),
                         )
                     })
@@ -1288,6 +1332,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                     .map(|n| {
                         (
                             PathBuf::from(format!("/dev/hidraw{n}")),
+                            crate::hidraw::Transport::Dongle,
                             // 0660 root:root with a uaccess ACL — the group bits
                             // are the ACL mask, which is why `stat` can see it.
                             Some(NodeStat { mode: 0o660, uid: 0, gid: 0 }),
@@ -1320,10 +1365,10 @@ Exec=/usr/bin/steam steam://open/bigpicture
         fn broker(&self, verb: crate::broker::Request) -> Result<usize, String> {
             match verb {
                 crate::broker::Request::Uhid => self.uhid.clone(),
-                crate::broker::Request::Puck => self.puck.clone(),
+                crate::broker::Request::Controller => self.puck.clone(),
             }
         }
-        fn puck_nodes(&self) -> Vec<(PathBuf, Option<NodeStat>)> {
+        fn controller_nodes(&self) -> Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)> {
             self.nodes.clone()
         }
         fn user_unit_file(&self) -> PathBuf {
@@ -1360,11 +1405,36 @@ Exec=/usr/bin/steam steam://open/bigpicture
                     "hyprpad udev rule",
                     "broker socket",
                     "broker: uhid",
-                    "broker: puck",
+                    "broker: controller",
                     "puck nodes root-only",
                 ]
             );
         }
+    }
+
+    /// The seventh row is conditional and always last, so the six above keep
+    /// their positions and anything parsing the report by order still works.
+    #[test]
+    fn the_bluetooth_row_is_appended_and_never_reorders_the_others() {
+        let mut host = FakeHost::ready();
+        host.nodes.push((
+            PathBuf::from("/dev/hidraw13"),
+            crate::hidraw::Transport::Bluetooth,
+            Some(NodeStat { mode: 0o600, uid: 0, gid: 0 }),
+        ));
+        let labels: Vec<&str> = check_items(&host).iter().map(|c| c.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Valve's udev rule",
+                "hyprpad udev rule",
+                "broker socket",
+                "broker: uhid",
+                "broker: controller",
+                "puck nodes root-only",
+                "bt node root-only",
+            ]
+        );
     }
 
     #[test]
@@ -1420,7 +1490,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
     #[test]
     fn an_unapplied_rule_is_caught_by_the_node_permissions() {
         let mut host = FakeHost::ready();
-        host.nodes[2].1 = Some(NodeStat { mode: 0o660, uid: 0, gid: 0 });
+        host.nodes[2].2 = Some(NodeStat { mode: 0o660, uid: 0, gid: 0 });
         let items = check_items(&host);
         let nodes = items.last().unwrap();
         assert_eq!(nodes.verdict, Verdict::Bad);
@@ -1490,11 +1560,154 @@ Exec=/usr/bin/steam steam://open/bigpicture
         assert!(!NodeStat { mode: 0o600, uid: 1000, gid: 0 }.root_only());
     }
 
+    // -----------------------------------------------------------------------
+    // The Bluetooth clause
+    // -----------------------------------------------------------------------
+
+    /// A path to a file shipped in this repo, so the tests below check the
+    /// artefact that is actually installed rather than a transcription of it.
+    fn repo_file(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    /// The shipped rules file must be syntactically valid — this is the one
+    /// artefact in the repo that is consumed by another program's parser, and a
+    /// typo in it is silent (udev logs and moves on, the node stays reachable,
+    /// Steam sees two controllers).
+    ///
+    /// Read-only and installs nothing. Skipped where `udevadm` is not present
+    /// rather than failed: it is a check on the file, not on the host.
+    #[test]
+    fn the_shipped_udev_rules_file_is_valid() {
+        let path = repo_file("packaging/udev/72-hyprpad-puck.rules");
+        let Ok(out) = std::process::Command::new("udevadm").arg("verify").arg(&path).output()
+        else {
+            eprintln!("skipping: no udevadm on this machine");
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "udevadm verify rejected {}:\n{}{}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Both transports are hidden, and the fake is not.
+    ///
+    /// The rule is what stops Steam seeing the real controller alongside
+    /// hyprpad's relay; a missing clause is not a degraded mode but a doubled
+    /// input on every press, so each identity is pinned by hand.
+    #[test]
+    fn the_udev_rule_hides_both_transports_and_neither_more() {
+        let text = std::fs::read_to_string(repo_file("packaging/udev/72-hyprpad-puck.rules"))
+            .expect("the rule ships in the repo");
+        // Only the rules themselves, not the file's (extensive) commentary —
+        // the comments name every id under discussion, including the ones that
+        // must *not* be matched.
+        let rules: String = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The dongle, matched on its USB parent.
+        assert!(
+            rules.contains(r#"ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304""#),
+            "the USB clause"
+        );
+        // Bluetooth, matched on the parent HID device's kernel name — there is
+        // no USB parent and a hidraw node carries no HID_ID of its own.
+        assert!(rules.contains(r#"KERNELS=="0005:28DE:1303.*""#), "the Bluetooth clause");
+
+        // Both clauses do the same four things, so neither can be half-applied.
+        let acted = rules.matches(r#"TAG-="uaccess", OWNER:="root", GROUP:="root", MODE:="0600""#);
+        assert_eq!(acted.count(), 2, "one action per transport");
+
+        // The relay's own fake is 0003:28DE:1302 and must keep the ACL Valve's
+        // rule grants it — if a *rule* here ever mentions 1302, the daemon has
+        // hidden its own output device from Steam.
+        assert!(!rules.contains("1302"), "the fake must stay visible to Steam");
+        assert!(!rules.contains("12f0"), "…and so must the other fake identity");
+        // …and the glob must not be widened to catch it either.
+        assert!(!rules.contains("130?") && !rules.contains("13??"), "the ids are exact");
+        assert!(!rules.contains(r#"ATTRS{idProduct}=="*""#), "no vendor-only match");
+
+        // The instance suffix must stay globbed: BlueZ destroys and recreates
+        // the device on every disconnect, so the number always changes.
+        assert!(!rules.contains("1303.0000"), "the instance suffix is never pinned");
+        // And the whole file stays behind the two guards that make it cheap.
+        assert!(rules.contains(r#"ACTION=="remove", GOTO="hyprpad_puck_end""#));
+        assert!(rules.contains(r#"SUBSYSTEM!="hidraw", GOTO="hyprpad_puck_end""#));
+    }
+
+    /// The Bluetooth row appears in `--check` when there is a BLE node, and
+    /// stays out of the way when there is not.
+    #[test]
+    fn the_check_reports_the_bluetooth_node_only_when_one_is_paired() {
+        use crate::hidraw::Transport;
+
+        // A tower: dongle only. No BT row at all — a permanent "unknown" there
+        // would be noise on a machine that will never have a bond.
+        let dongle_only = FakeHost::ready();
+        let labels: Vec<&str> =
+            check_items(&dongle_only).iter().map(|i| i.label).collect::<Vec<_>>();
+        assert!(labels.contains(&"puck nodes root-only"));
+        assert!(!labels.contains(&"bt node root-only"), "{labels:?}");
+
+        // A laptop with the controller on Bluetooth: the dongle is still
+        // plugged in and enumerated, and both rows are reported.
+        let mut both = FakeHost::ready();
+        both.nodes.push((
+            PathBuf::from("/dev/hidraw13"),
+            Transport::Bluetooth,
+            Some(NodeStat { mode: 0o600, uid: 0, gid: 0 }),
+        ));
+        let items = check_items(&both);
+        let bt = items.iter().find(|i| i.label == "bt node root-only").expect("a BT row");
+        assert_eq!(bt.verdict, Verdict::Ok);
+        assert!(bt.detail.contains("1 node(s)"), "exactly one BLE interface: {}", bt.detail);
+        // The dongle's row is unaffected by the BT node's presence.
+        let usb = items.iter().find(|i| i.label == "puck nodes root-only").unwrap();
+        assert_eq!(usb.verdict, Verdict::Ok);
+        assert!(usb.detail.contains("5 node(s)"), "{}", usb.detail);
+    }
+
+    /// The failure this row exists to catch: the rule was installed before the
+    /// Bluetooth clause existed, so the dongle is hidden and the controller is
+    /// not. Steam would see the real controller and hyprpad's fake at once.
+    #[test]
+    fn a_reachable_bluetooth_node_fails_its_own_row_and_not_the_dongles() {
+        use crate::hidraw::Transport;
+
+        let mut host = FakeHost::ready();
+        host.nodes.push((
+            PathBuf::from("/dev/hidraw13"),
+            Transport::Bluetooth,
+            // 0660 root:root with a uaccess ACL — exactly what Valve's
+            // 60-steam-input.rules leaves behind when our clause is missing.
+            Some(NodeStat { mode: 0o660, uid: 0, gid: 0 }),
+        ));
+        let items = check_items(&host);
+
+        let bt = items.iter().find(|i| i.label == "bt node root-only").unwrap();
+        assert_eq!(bt.verdict, Verdict::Bad);
+        assert!(bt.detail.contains("/dev/hidraw13"), "{}", bt.detail);
+        assert!(bt.detail.contains("udevadm"), "the remedy is in the line: {}", bt.detail);
+
+        // And the dongle's row still passes, so the report says which half is
+        // wrong rather than just that something is.
+        let usb = items.iter().find(|i| i.label == "puck nodes root-only").unwrap();
+        assert_eq!(usb.verdict, Verdict::Ok);
+    }
+
     /// A node we cannot even stat is not evidence of success.
     #[test]
     fn an_unstattable_node_fails_the_check() {
         let host = FakeHost {
-            nodes: vec![(PathBuf::from("/dev/hidraw7"), None)],
+            nodes: vec![(PathBuf::from("/dev/hidraw7"), crate::hidraw::Transport::Dongle, None)],
             ..FakeHost::ready()
         };
         let items = check_items(&host);

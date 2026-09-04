@@ -36,8 +36,17 @@ pub const TRITON_REPORT_LEN: usize = 54;
 /// descriptor has no `REPORT_ID` items, so nothing is prefixed.
 pub const DECK_REPORT_LEN: usize = 64;
 
-/// The puck's vendor input report id.
-pub const REPORT_ID_INPUT: u8 = 0x42;
+/// The controller's vendor input report id over the dongle, and the only id
+/// the triton fake's descriptor declares at [`TRITON_REPORT_LEN`].
+pub const REPORT_ID_INPUT: u8 = crate::report::REPORT_ID_INPUT;
+
+/// The controller's vendor input report id over Bluetooth: the same layout with
+/// the quaternion tail cut off ([`crate::report::Frame::decode`]).
+pub const REPORT_ID_INPUT_BLE: u8 = crate::report::REPORT_ID_INPUT_BLE;
+
+/// Wire length of [`REPORT_ID_INPUT_BLE`], eight bytes shorter than
+/// [`TRITON_REPORT_LEN`] — the quaternion at bytes 46..54.
+pub const BLE_REPORT_LEN: usize = crate::report::REPORT_LEN_INPUT_BLE;
 
 /// One triton-profile input report, ready for `UHID_INPUT2`.
 pub type TritonReport = [u8; TRITON_REPORT_LEN];
@@ -80,21 +89,52 @@ const RAW_STEAM: (usize, u8) = (4, 0x01);
 /// Byte 2, bit 4 — Quick Access (`Button::QuickAccess`).
 const RAW_QUICK_ACCESS: (usize, u8) = (2, 0x10);
 
-/// Relay one raw puck report as the wired `1302`'s own input report.
+/// Relay one raw controller report as the wired `1302`'s own input report.
 ///
-/// Returns `None` for anything that is not a 54-byte `0x42` — the puck also
-/// streams `0x43` battery, `0x44`, `0x45`, `0x79` and `0x7b`, which this build
-/// does not forward (see the module docs of `relay`).
+/// Accepts the controller's **two** vendor input reports and emits one shape:
+///
+/// | in | | out |
+/// |---|---|---|
+/// | `0x42`, 54 bytes | the dongle | copied verbatim |
+/// | `0x45`, 46 bytes | Bluetooth | re-framed to `0x42`/54, tail zeroed |
+///
+/// Returns `None` for anything else — the controller also streams `0x40`/`0x41`
+/// (the lizard mouse and keyboard), `0x43` battery, `0x44`, `0x79` and `0x7b`,
+/// which this build does not forward (see the module docs of `relay`).
+///
+/// # Why the Bluetooth report has to be re-framed
+///
+/// The fake's descriptor is the captured `1302` one, which declares input
+/// `0x42` at 53 payload bytes and nothing else of that shape. A 46-byte `0x45`
+/// cannot be handed to `UHID_INPUT2` against it: the kernel would either
+/// truncate or reject, and Steam would see a malformed device.
+///
+/// The re-frame is a memcpy and eight zero bytes, because `0x45` *is* `0x42`
+/// minus its trailing quaternion (`hid-steam.c:2325-2355`) — bytes 1–45 carry
+/// identical fields at identical offsets. Steam therefore loses exactly one
+/// thing, the orientation quaternion at bytes 46–53, and gets zeros for it.
+/// Nothing hyprpad exposes reads it; the same research note records a 2026-05
+/// firmware that reportedly emits the no-quaternion report on *every* transport
+/// anyway, so a zero tail is a state Steam already has to tolerate.
 ///
 /// The sequence counter at byte 1 is **relayed untouched**: §4.4 is explicit
 /// that renumbering risks desync with the IMU timestamp path and that Steam
-/// tolerates gaps.
+/// tolerates gaps. That applies across a transport switch too — the counters of
+/// the two links are unrelated, and the gap they produce is the same gap §4.4
+/// already permits.
 pub fn puck_to_triton(raw: &[u8], strip: StripMask) -> Option<TritonReport> {
-    if raw.len() != TRITON_REPORT_LEN || raw[0] != REPORT_ID_INPUT {
-        return None;
-    }
     let mut out: TritonReport = [0u8; TRITON_REPORT_LEN];
-    out.copy_from_slice(raw);
+    match (raw.first(), raw.len()) {
+        (Some(&REPORT_ID_INPUT), TRITON_REPORT_LEN) => out.copy_from_slice(raw),
+        (Some(&REPORT_ID_INPUT_BLE), BLE_REPORT_LEN) => {
+            // The id the fake declares, then the payload the two ids share.
+            // `out` starts zeroed, so bytes 46..54 — the quaternion — are
+            // already the zeros this is documented to send.
+            out[0] = REPORT_ID_INPUT;
+            out[1..BLE_REPORT_LEN].copy_from_slice(&raw[1..]);
+        }
+        _ => return None,
+    }
     if strip.guide {
         out[RAW_STEAM.0] &= !RAW_STEAM.1;
     }
@@ -394,16 +434,107 @@ mod tests {
     }
 
     #[test]
-    fn triton_refuses_anything_that_is_not_a_54_byte_0x42() {
+    fn triton_refuses_anything_that_is_not_one_of_the_two_input_reports() {
         assert!(puck_to_triton(&[], StripMask::none()).is_none());
-        // The battery report the puck also streams.
+        // The battery report the controller also streams.
         let mut battery = vec![0u8; 15];
         battery[0] = 0x43;
         assert!(puck_to_triton(&battery, StripMask::none()).is_none());
-        // Right id, wrong length.
+        // The lizard mouse, which really does stream over Bluetooth until
+        // `src/lizard.rs` turns it off.
+        assert!(puck_to_triton(&[0x40, 0, 0, 0, 0, 0], StripMask::none()).is_none());
+        // Right id, wrong length — both ids, both directions.
         let mut short = vec![0u8; 53];
         short[0] = 0x42;
         assert!(puck_to_triton(&short, StripMask::none()).is_none());
+        let mut long = vec![0u8; 54];
+        long[0] = 0x45;
+        assert!(puck_to_triton(&long, StripMask::none()).is_none(), "0x45 is never 54 bytes");
+        let mut bt_short = vec![0u8; 45];
+        bt_short[0] = 0x45;
+        assert!(puck_to_triton(&bt_short, StripMask::none()).is_none());
+        let mut swapped = vec![0u8; 46];
+        swapped[0] = 0x42;
+        assert!(puck_to_triton(&swapped, StripMask::none()).is_none(), "0x42 is never 46 bytes");
+    }
+
+    /// A 46-byte `0x45` from Bluetooth becomes a 54-byte `0x42`, **byte-exact**:
+    /// the id the fake's descriptor declares, the shared payload copied
+    /// straight across, and a zero quaternion tail.
+    ///
+    /// This is the one place a Bluetooth frame is not simply passed through, so
+    /// it is pinned byte by byte rather than by round-tripping through the
+    /// decoder — a decoder-based check would pass even if the tail carried
+    /// garbage, because `Frame::decode` never reads past byte 29.
+    #[test]
+    fn a_bluetooth_0x45_is_reframed_into_the_fakes_own_0x42() {
+        // A 46-byte report whose every payload byte is distinguishable, so a
+        // copy that lost, shifted or duplicated one would be visible.
+        let mut bt = vec![0u8; BLE_REPORT_LEN];
+        bt[0] = REPORT_ID_INPUT_BLE;
+        for (i, b) in bt.iter_mut().enumerate().skip(1) {
+            *b = i as u8;
+        }
+
+        let out = puck_to_triton(&bt, StripMask::none()).expect("a 0x45 is forwardable");
+
+        assert_eq!(out.len(), TRITON_REPORT_LEN, "the fake's descriptor declares 54");
+        assert_eq!(out[0], REPORT_ID_INPUT, "re-framed under the id Steam expects");
+        assert_eq!(&out[1..BLE_REPORT_LEN], &bt[1..], "the shared payload is copied verbatim");
+        assert!(out[BLE_REPORT_LEN..].iter().all(|&b| b == 0), "the quaternion tail is zeroed");
+        assert_eq!(out.len() - BLE_REPORT_LEN, 8, "…and it is exactly the 8-byte quaternion");
+    }
+
+    /// The two transports produce the *same* relayed bytes for the same
+    /// controller state — which is what makes a transport switch invisible to a
+    /// game mid-input.
+    #[test]
+    fn the_two_transports_relay_identically_apart_from_the_quaternion() {
+        let mut bt = vec![0u8; BLE_REPORT_LEN];
+        bt[0] = REPORT_ID_INPUT_BLE;
+        bt[1] = 0x5a; // counter
+        bt[2] = 0x01; // A down
+        bt[10] = 0x34; // some stick travel
+        bt[11] = 0x12;
+
+        // What the dongle would have sent for the same state: the same payload
+        // under 0x42, plus a real quaternion.
+        let mut usb = vec![0u8; TRITON_REPORT_LEN];
+        usb[0] = REPORT_ID_INPUT;
+        usb[1..BLE_REPORT_LEN].copy_from_slice(&bt[1..]);
+        usb[46..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+        let from_bt = puck_to_triton(&bt, StripMask::guide_only()).unwrap();
+        let from_usb = puck_to_triton(&usb, StripMask::guide_only()).unwrap();
+
+        assert_eq!(from_bt[..46], from_usb[..46], "everything Steam acts on is identical");
+        assert_eq!(&from_usb[46..], &usb[46..], "the dongle's quaternion is relayed untouched");
+        assert!(from_bt[46..].iter().all(|&b| b == 0), "Bluetooth has none to relay");
+
+        // And both decode to the same frame, so the daemon's own view agrees.
+        assert_eq!(Frame::decode(&from_bt), Frame::decode(&from_usb));
+    }
+
+    /// The strip mask is applied to a re-framed report exactly as to a
+    /// pass-through one: the guide bit lives at byte 4 either way, because the
+    /// payload offsets are shared.
+    #[test]
+    fn stripping_works_on_a_reframed_bluetooth_report() {
+        let mut bt = vec![0u8; BLE_REPORT_LEN];
+        bt[0] = REPORT_ID_INPUT_BLE;
+        bt[4] = 0x01; // Steam / guide
+        bt[2] = 0x10; // Quick Access
+        bt[3] = 0xff; // an untouched neighbour, to prove the mask is narrow
+
+        let kept = puck_to_triton(&bt, StripMask::none()).unwrap();
+        assert_eq!(kept[4] & 0x01, 0x01);
+        assert_eq!(kept[2] & 0x10, 0x10);
+
+        let stripped =
+            puck_to_triton(&bt, StripMask { guide: true, quick_access: true }).unwrap();
+        assert_eq!(stripped[4] & 0x01, 0, "the guide bit is withheld");
+        assert_eq!(stripped[2] & 0x10, 0, "and so is Quick Access");
+        assert_eq!(stripped[3], 0xff, "nothing else was touched");
     }
 
     #[test]
