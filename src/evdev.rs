@@ -1427,7 +1427,7 @@ mod tests {
             );
         }
         for n in &nodes {
-            assert!(n.path.starts_with("/dev/input/event"));
+            assert!(n.path.to_str().is_some_and(|s| s.starts_with("/dev/input/event")));
             let real = fs::canonicalize(
                 Path::new("/sys/class/input").join(n.path.file_name().unwrap()),
             );
