@@ -778,7 +778,9 @@ This repository (commit `e2ddad0`):
 second backend (`docs/research/xbox-elite.md`) and the owner asked the obvious
 question: "how do I scrub with the Xbox controller, without the trackpad?" This
 section supersedes §3.4's sketch for that case; nothing above changes for the
-puck, whose left pad is still the jog wheel §3.1 describes.*
+Steam Controller, whose left pad is still the jog wheel §3.1 describes. It is
+written in the vocabulary of `chore-controller-vocabulary`, so where the body
+above says "the puck" about the thing you hold, read "the controller".*
 
 **The answer is the other half of §0's own distinction.** Jog is *position*
 (one detent, one step, the rate follows the hand) and shuttle is *velocity*
@@ -851,5 +853,5 @@ caret jumping rows nobody asked for.
 - **No vertical shuttle**, per above.
 - **No haptics in practice.** The pulses are fired (`Haptic::Scroll` /
   `ScrubWord`), but every padless source so far has rumble motors rather than
-  the puck's actuators, and `HapticCtx::fire` drops them at the one gate that
-  already exists for that.
+  the Steam Controller's actuators, and `HapticCtx::fire` drops them at the one
+  gate that already exists for that.

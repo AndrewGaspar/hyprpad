@@ -1,17 +1,17 @@
 <!--
   hyprpad's own schematic of the Xbox Elite Wireless Controller Series 2.
 
-  Drawn from scratch for this repo (CC0 / own work, like the puck's), so it
-  ships and redistributes under the repo's licence. Unlike the puck, there is
+  Drawn from scratch for this repo (CC0 / own work, like the controller's), so it
+  ships and redistributes under the repo's licence. Unlike the controller, there is
   no Valve SVG to prefer here: Steam's own Elite drawing
   (`steamui/images/controller/controller_config_controller_xboxelite.png`) is a
   RASTER file, and the widget recolours SVG strokes (`Callouts.recolor()`), so
   it could not be themed. See ../LICENSES.md.
 
-  The viewBox is 456 x 320, the same as the puck's, so the two layouts scale
+  The viewBox is 456 x 320, the same as the controller's, so the two layouts scale
   identically in the panel and one set of callout geometry serves both.
 
-  Strokes are `white`, exactly as the puck's file draws them, so ONE recolour
+  Strokes are `white`, exactly as the controller's file draws them, so ONE recolour
   path in the widget themes either drawing.
 
   Every control centre here is duplicated in layouts/xbox-elite-2.json; the
@@ -32,7 +32,7 @@
   <path d="M382 48 q-4 -22 -22 -30" stroke-width="2" stroke-dasharray="4 4"/>
 
   <!-- Body: the Elite's silhouette — a narrow waist, two long grips, and the
-       asymmetric stick placement that is the whole difference from the puck. -->
+       asymmetric stick placement that is the whole difference from the controller. -->
   <path d="M228 52
            C 262 52 292 55 318 60
            C 342 65 358 74 370 92
@@ -68,7 +68,7 @@
            a4 4 0 0 0 4 -4 v-8 a4 4 0 0 1 4 -4 z"/>
 
   <!-- FACE BUTTONS: Y (352,96) X (322,126) B (382,126) A (352,156).
-       Same diamond, same letters and same positions as the puck's — which is
+       Same diamond, same letters and same positions as the controller's — which is
        why the vendored Kenney A/B/X/Y glyphs serve both layouts. -->
   <circle cx="352" cy="96" r="14"/>
   <circle cx="322" cy="126" r="14"/>

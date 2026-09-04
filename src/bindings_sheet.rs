@@ -204,7 +204,7 @@ pub struct Sheet {
     /// Which controller drawing the sheet should use — the id of a file in
     /// `shell/hyprpad.cheatsheet/layouts/`.
     ///
-    /// [`Sheet::build`] always fills in the puck's, because this module reads
+    /// [`Sheet::build`] always fills in the controller's, because this module reads
     /// only the config and must not depend on a running daemon. The `bindings`
     /// subcommand then overwrites it from `status.json`
     /// ([`crate::status::active_layout`]) when a daemon is publishing one, so
@@ -287,7 +287,7 @@ impl Sheet {
 
         // The trackpads' ambient behaviour. Not a binding you press, but the
         // diagram has two pads on it and a sheet that leaves them blank is
-        // lying about the biggest two controls on the puck.
+        // lying about the biggest two controls on the controller.
         let cursor_action = format!("cursor sens {:.2}", c.cursor().sens);
         entries.push(ambient(
             Section::Ambient,
@@ -486,7 +486,7 @@ impl Sheet {
             entries,
             modes,
             default_mode,
-            layout: crate::report::LAYOUT_PUCK.to_string(),
+            layout: crate::report::LAYOUT_STEAM_CONTROLLER.to_string(),
         }
     }
 
@@ -2487,7 +2487,7 @@ mod tests {
     }
 
     /// The layout id is which controller drawing to show. `build` cannot know
-    /// — it reads only the config — so it names the puck, and the `bindings`
+    /// — it reads only the config — so it names the controller, and the `bindings`
     /// subcommand overwrites it from what the daemon published.
     #[test]
     fn the_json_names_the_controller_drawing_to_use() {
@@ -2508,7 +2508,7 @@ mod tests {
     fn a_padless_layout_retargets_the_ambient_rows_onto_the_sticks() {
         let src = "[bindings]\n\"guide+r1\" = \"workspace +1\"\n[scrub]\ndetent_deg = 15\n";
         let c = Config::from_toml_str(src).unwrap();
-        let puck = sheet_from_toml(src);
+        let controller = sheet_from_toml(src);
         let cursor = |s: &Sheet| {
             s.entries
                 .iter()
@@ -2516,9 +2516,9 @@ mod tests {
                 .expect("an ambient cursor row")
                 .clone()
         };
-        assert_eq!(cursor(&puck).control, "rpad");
-        assert_eq!(cursor(&puck).control_label, "Right trackpad");
-        assert!(puck.entries.iter().any(|e| e.action.starts_with("scrub")));
+        assert_eq!(cursor(&controller).control, "rpad");
+        assert_eq!(cursor(&controller).control_label, "Right trackpad");
+        assert!(controller.entries.iter().any(|e| e.action.starts_with("scrub")));
 
         let mut xbox = sheet_from_toml(src);
         xbox.set_layout("xbox-elite-2", &c);
@@ -2599,8 +2599,8 @@ mod tests {
                 .map(|e| (e.chord.clone(), e.action.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(bound(&puck), bound(&xbox));
-        // And an unknown layout id is read as the puck, so a config written
+        assert_eq!(bound(&controller), bound(&xbox));
+        // And an unknown layout id is read as the controller, so a config written
         // against it is never silently rewritten.
         let mut unknown = sheet_from_toml(src);
         unknown.set_layout("some-future-pad", &c);
@@ -2674,7 +2674,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, 2, "the puck's layout and the Xbox one");
+        assert_eq!(seen, 2, "the controller's layout and the Xbox one");
     }
 
     /// Pull the object keys out of one top-level block of a layout file.

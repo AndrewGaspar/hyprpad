@@ -485,7 +485,7 @@ function laneWidth(items) {
 
 // Recolour a white-on-transparent SVG to `color`.
 //
-// Both drawings the puck layout can use — Valve's and ours — stroke in plain
+// Both drawings the controller layout can use — Valve's and ours — stroke in plain
 // `white`, and Kenney's glyphs fill in `#FFFFFF`, so one substitution themes
 // every piece of art the widget draws. Anything that is not white is left
 // alone, which is what keeps a future full-colour layout from being wrecked.

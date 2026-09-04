@@ -1,6 +1,6 @@
 //! The second input backend: an ordinary Linux gamepad read over **evdev**.
 //!
-//! The puck is read from hidraw ([`crate::hidraw`]) because it is a Valve
+//! The controller is read from hidraw ([`crate::hidraw`]) because it is a Valve
 //! device with a vendor report the kernel does not decode. An Xbox Elite
 //! Series 2 is the opposite case: `xpad` (USB) and `hid-microsoft` (Bluetooth)
 //! already decode it, so the cheapest correct tap is `/dev/input/event*`. This
@@ -173,7 +173,7 @@ pub const ELITE_2_PRODUCTS: [u16; 3] = [0x0b00, 0x0b05, 0x0b22];
 const PID_XBOX360: u16 = 0x028e;
 
 /// How often the watcher re-scans for a pad when it has none. Deliberately the
-/// same cadence as the puck's reconnect scan ([`crate::run`]'s
+/// same cadence as the controller's reconnect scan ([`crate::run`]'s
 /// `RECONNECT_SCAN_INTERVAL`), so both controllers come back on the same
 /// rhythm.
 pub const SCAN_INTERVAL: Duration = Duration::from_millis(1500);
@@ -449,13 +449,13 @@ impl AxisMap {
 // Frame building
 // ---------------------------------------------------------------------------
 
-/// Analog full scale on the wire: the puck reports its triggers `0..=32767`
+/// Analog full scale on the wire: the controller reports its triggers `0..=32767`
 /// and its sticks `±32767`, and the whole daemon is written against that, so
 /// this backend scales into it rather than adding a second convention.
 const FULL_SCALE: f64 = 32767.0;
 
 /// Fraction of a trigger's travel at which the synthesised full-pull button
-/// goes **down**. The puck's `TriggerL2Full`/`TriggerR2Full` are a firmware
+/// goes **down**. The controller's `TriggerL2Full`/`TriggerR2Full` are a firmware
 /// click at the end of the throw; an Xbox trigger has no click, so it is a
 /// threshold — with hysteresis, because the gesture engine's chords are
 /// edge-triggered and a trigger resting at the threshold must not re-chord.
@@ -496,7 +496,7 @@ impl FrameBuilder {
     }
 
     /// Apply one event. Returns `Some(frame)` on a `SYN_REPORT` — one published
-    /// frame per kernel report, exactly as the puck's decoder produces one per
+    /// frame per kernel report, exactly as the controller's decoder produces one per
     /// hidraw read — and `None` for everything else.
     pub fn apply(&mut self, ev: &InputEvent) -> Option<report::Frame> {
         match ev.kind {
@@ -564,9 +564,9 @@ impl FrameBuilder {
         let Some((axis, range)) = self.axes.role(code) else { return };
         match axis {
             // Stick Y is inverted on the way in: evdev's +Y is *down* (both
-            // `xpad` and the HID convention), the puck's is *up*, and the whole
+            // `xpad` and the HID convention), the controller's is *up*, and the whole
             // daemon — flicks, the OSK wire, the virtual pad — is written to
-            // the puck's.
+            // the controller's.
             Axis::LeftX => self.frame.left_stick.0 = scale_stick(range.bipolar(value)),
             Axis::LeftY => self.frame.left_stick.1 = scale_stick(-range.bipolar(value)),
             Axis::RightX => self.frame.right_stick.0 = scale_stick(range.bipolar(value)),
@@ -598,12 +598,12 @@ impl FrameBuilder {
     }
 }
 
-/// `[-1, 1]` to the puck's `±32767`.
+/// `[-1, 1]` to the controller's `±32767`.
 fn scale_stick(n: f64) -> i16 {
     (n.clamp(-1.0, 1.0) * FULL_SCALE).round() as i16
 }
 
-/// `[0, 1]` to the puck's `0..=32767`.
+/// `[0, 1]` to the controller's `0..=32767`.
 fn scale_trigger(n: f64) -> u16 {
     (n.clamp(0.0, 1.0) * FULL_SCALE).round() as u16
 }
@@ -737,7 +737,7 @@ fn attr(dir: &Path, name: &str) -> Option<String> {
 ///
 /// Reads `/sys` only — "is a pad plugged in" and "may I open it" are different
 /// questions and this one answers the first, exactly as
-/// [`crate::hidraw::controller_nodes`] does for the puck.
+/// [`crate::hidraw::controller_nodes`] does for the controller.
 pub fn gamepad_nodes() -> io::Result<Vec<Node>> {
     let mut found: Vec<(u32, Node)> = Vec::new();
     for entry in fs::read_dir("/sys/class/input")? {
@@ -945,7 +945,7 @@ pub enum Event {
 /// Start the evdev backend: one thread that finds a pad, reads it until it goes
 /// away, and looks for the next one.
 ///
-/// Hotplug is the same periodic scan the puck's reconnect wait uses
+/// Hotplug is the same periodic scan the controller's reconnect wait uses
 /// ([`SCAN_INTERVAL`]) plus an immediate re-scan on any read error — no udev
 /// monitor, no inotify, no new dependency. The whole state machine lives here
 /// rather than in the loop, which is why `run.rs` gains three match arms and
@@ -1097,7 +1097,7 @@ mod tests {
 
     /// The two live bitmaps from this machine, and the discovery answer for
     /// each. `qualifies` is the whole filter, so both transports have to pass
-    /// it and the puck's own firmware keyboard has to fail it.
+    /// it and the controller's own firmware keyboard has to fail it.
     #[test]
     fn discovery_accepts_both_transports_and_rejects_a_keyboard() {
         // BLE Elite 2 (VERIFIED local): ABS=30627 — X, Y, Z, RZ, GAS, BRAKE,
@@ -1113,7 +1113,7 @@ mod tests {
         let usb_abs = Caps::parse("3003f");
         assert!(qualifies(&Caps::parse("20000b"), &key, &usb_abs));
 
-        // The puck's firmware keyboard node: keys but no axes.
+        // The controller's firmware keyboard node: keys but no axes.
         let kbd = Caps::parse("120013");
         assert!(!qualifies(&kbd, &key, &Caps::parse("")));
 
@@ -1195,7 +1195,7 @@ mod tests {
     }
 
     /// A frame is published on `SYN_REPORT` and only then — the same
-    /// one-frame-per-report contract the puck's decoder has.
+    /// one-frame-per-report contract the controller's decoder has.
     #[test]
     fn events_accumulate_and_a_syn_publishes() {
         let mut b = usb_builder();
@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     fn stick_y_is_inverted_and_x_is_not() {
         let mut b = usb_builder();
-        // evdev +Y is DOWN; the puck's +Y is UP.
+        // evdev +Y is DOWN; the controller's +Y is UP.
         b.apply(&ev(EV_ABS, ABS_Y, 32767));
         b.apply(&ev(EV_ABS, ABS_X, 32767));
         b.apply(&ev(EV_ABS, ABS_RY, -32767));
@@ -1317,7 +1317,7 @@ mod tests {
         b.apply(&ev(EV_ABS, ABS_Z, 859));
         let f = b.apply(&ev(EV_SYN, SYN_REPORT, 0)).unwrap();
         assert!(!f.pressed(Button::TriggerL2Full));
-        assert!(f.l2 > 27_000 && f.l2 < 28_000, "analog value scaled to the puck's range");
+        assert!(f.l2 > 27_000 && f.l2 < 28_000, "analog value scaled to the controller's range");
         b.apply(&ev(EV_ABS, ABS_Z, 879));
         let f = b.apply(&ev(EV_SYN, SYN_REPORT, 0)).unwrap();
         assert!(f.pressed(Button::TriggerL2Full));
@@ -1427,7 +1427,7 @@ mod tests {
             );
         }
         for n in &nodes {
-            assert!(n.path.starts_with("/dev/input/event"));
+            assert!(n.path.to_str().is_some_and(|s| s.starts_with("/dev/input/event")));
             let real = fs::canonicalize(
                 Path::new("/sys/class/input").join(n.path.file_name().unwrap()),
             );

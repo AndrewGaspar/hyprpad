@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | VID:PID | `28de:1302` — the *wired* single-interface Steam Controller | `28de:12f0` — InputPlumber's `ProductId::Generic` |
 //! | Descriptor | the real 372-byte capture, `docs/research/assets/` | InputPlumber's 38-byte vendor-only blob |
-//! | Input report | **the puck's own `0x42`, passed through** — 54 bytes | a translated 64-byte Deck report |
+//! | Input report | **the controller's own `0x42`, passed through** — 54 bytes | a translated 64-byte Deck report |
 //! | Report IDs | yes, on all three types (`dev_flags` `0b111`) | none at all (`dev_flags` `0`) |
 //! | `GET_REPORT` answer | **65 bytes**: report number + a 64-byte Valve message | 64 bytes, the proven probe's |
 //! | Steam adoption | **unproven** — awaits the owner's live test | **PROVEN on-device 2026-09-01** |
@@ -20,7 +20,7 @@
 //! Because it is the *least translation*. hyprpad owns a real Triton, and the
 //! wired `1302`'s vendor collection declares input report `0x42` with a 53-byte
 //! payload — byte-for-byte the same report `src/report.rs` already decodes off
-//! the puck. So the input path is a **pass-through**: no transcoding, and the
+//! the controller. So the input path is a **pass-through**: no transcoding, and the
 //! IMU bytes (30+) and every field the decoder does not model ride along for
 //! free the moment Steam sends its own enable. Steam's own log shows it drives a
 //! wired `1302` with no dongle/pairing work items at all
@@ -31,11 +31,11 @@
 //! Q-u1). If it does not, `identity = "deck"` is one line away and is the recipe
 //! SteamOS ships.
 //!
-//! # Why not `28de:1304`, the puck's own PID
+//! # Why not `28de:1304`, the controller's own PID
 //!
 //! Steam derives the controller *slot index* from `bInterfaceNumber` for the
 //! dongle PIDs, and SDL gates `0x1304` on `interface_number` being 2..=5. A uhid
-//! device reports `-1`. Cloning the real puck therefore cannot work — §3.2, and
+//! device reports `-1`. Cloning the real controller therefore cannot work — §3.2, and
 //! InputPlumber's own comment for the analogous Deck case.
 
 use crate::uhid::BUS_USB;
@@ -99,7 +99,7 @@ impl Identity {
 /// How a profile's input reports are shaped on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportKind {
-    /// The puck's own vendor report `0x42`: 54 bytes, **report-id prefixed**
+    /// The controller's own vendor report `0x42`: 54 bytes, **report-id prefixed**
     /// (the `1302` descriptor numbers every report type, so all three
     /// `UHID_START` `dev_flags` bits are set and the prefix is required in both
     /// directions). Built by `translate::triton_report`.
@@ -394,7 +394,7 @@ const DECK_CHIP_ID: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
 /// # Why this string
 ///
 /// Not the real unit's serial. `FXA9961402A6C` is the wireless controller's own
-/// and `FXB99614031B4` is the puck's, and baking either into the source would
+/// and `FXB99614031B4` is the controller's, and baking either into the source would
 /// ship one machine's hardware identity to everyone who builds hyprpad — and
 /// would make the `deck` and `triton` identities collide on one Steam config
 /// key, so a Deck-shaped binding set would be applied to a Triton-shaped device.
@@ -479,7 +479,7 @@ pub fn deck() -> &'static Profile {
 /// Its three top-level collections are the lizard Mouse (`0x40`), the lizard
 /// Keyboard (`0x41`), and the vendor page `0xFF00` carrying the Steam protocol —
 /// including **input `0x42` with a 53-byte payload**, which is exactly the report
-/// `src/report.rs` decodes off the puck. That identity is what makes the triton
+/// `src/report.rs` decodes off the controller. That identity is what makes the triton
 /// input path a pass-through.
 pub const TRITON_DESCRIPTOR: [u8; 372] =
     *include_bytes!("../../docs/research/assets/triton-wired-1302-report-descriptor.bin");
@@ -687,7 +687,7 @@ mod tests {
     /// firmware or kernel ever makes the two descriptors diverge, this must
     /// still say what the Bluetooth link declares — and in particular that
     /// `0x45` is 45 payload bytes, i.e. the 46 on the wire that
-    /// `report::Frame::decode` accepts and `translate::puck_to_triton`
+    /// `report::Frame::decode` accepts and `translate::controller_to_triton`
     /// re-frames.
     #[test]
     fn the_bluetooth_descriptor_declares_the_0x45_report_at_46_bytes_on_the_wire() {
@@ -748,11 +748,11 @@ mod tests {
 
     /// Walk the captured descriptor and confirm the single fact the whole
     /// triton design rests on: its vendor input report `0x42` is 53 payload
-    /// bytes, i.e. 54 on the wire — identical to what the puck streams and
+    /// bytes, i.e. 54 on the wire — identical to what the controller streams and
     /// `report::Frame::decode` accepts. If this ever fails, the pass-through is
     /// no longer a pass-through.
     #[test]
-    fn the_triton_descriptor_declares_the_pucks_own_0x42_report() {
+    fn the_triton_descriptor_declares_the_controllers_own_0x42_report() {
         let items = report_items(&TRITON_DESCRIPTOR);
         let input_42 = items
             .iter()
@@ -999,7 +999,7 @@ mod tests {
         assert!(!d.uniq.is_empty(), "an empty uniq is what Steam called an invalid unit serial");
         assert_eq!(t.vid_pid(), "28de:1302");
         assert_eq!(d.vid_pid(), "28de:12f0");
-        // Never the puck's own PID: the bInterfaceNumber slot gate (§3.2).
+        // Never the controller's own PID: the bInterfaceNumber slot gate (§3.2).
         assert_ne!(t.product, 0x1304);
         assert_ne!(d.product, 0x1304);
     }

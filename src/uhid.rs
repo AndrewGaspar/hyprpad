@@ -1,5 +1,5 @@
 //! A daemon-owned **virtual Valve controller** on `/dev/uhid`, so Steam sees a
-//! real Steam Controller while hyprpad keeps owning the physical puck.
+//! real Steam Controller while hyprpad keeps owning the physical controller.
 //!
 //! # Why this exists
 //!
@@ -16,9 +16,9 @@
 //! # What this module is, and is not
 //!
 //! This is the **device-independent core**. It never opens a device node. Both
-//! file descriptors it needs — the `/dev/uhid` one, and (later) the puck's — are
+//! file descriptors it needs — the `/dev/uhid` one, and (later) the controller's — are
 //! handed in as already-open [`OwnedFd`]s by the caller, so the privileged half
-//! (how the daemon comes by a writable `/dev/uhid`, and how the real puck is
+//! (how the daemon comes by a writable `/dev/uhid`, and how the real controller is
 //! hidden from Steam) is a separate, swappable concern. [`acquire_uhid`] is the
 //! one-line placeholder for it.
 //!
@@ -28,7 +28,7 @@
 //!   [`UhidDevice`], which owns the fd and runs the read/reply loop on a thread;
 //! * [`profile`] — the two identities hyprpad can present (`triton`, `deck`),
 //!   as **data**: descriptor, VID/PID, canned `GET_REPORT` answers;
-//! * [`translate`] — pure puck-frame → wire-report conversion for both profiles;
+//! * [`translate`] — pure controller-frame → wire-report conversion for both profiles;
 //! * [`settings`] — decoding what Steam writes *back* (`0x87 SetSettingsValues`,
 //!   rumble, haptics) and deciding what hyprpad does about it;
 //! * [`relay`] — the running thing: a 250 Hz stream and a write-interpretation
@@ -1230,20 +1230,20 @@ mod tests {
         use crate::uhid::translate::{self, StripMask};
         let f = profile::triton().framing;
 
-        // A captured-shape puck report: id 0x42, counter, A pressed.
+        // A captured-shape controller report: id 0x42, counter, A pressed.
         let mut raw = vec![0u8; f.input_len];
         raw[0] = 0x42;
         raw[1] = 0x5a;
         raw[2] = 0x01;
-        let report = translate::puck_to_triton(&raw, StripMask::guide_only()).expect("a 0x42");
+        let report = translate::controller_to_triton(&raw, StripMask::guide_only()).expect("a 0x42");
         let ev = input2_event(&report);
         assert_eq!(le_u16(&ev, O_INPUT2_SIZE), Some(54));
         assert_eq!(usize::from(le_u16(&ev, O_INPUT2_SIZE).unwrap()), f.input_len);
         assert_eq!(ev[O_INPUT2_DATA], f.input_report_id.unwrap(), "byte 0 is the report id");
-        assert_eq!(ev[O_INPUT2_DATA + 1], 0x5a, "the puck's own counter, relayed");
+        assert_eq!(ev[O_INPUT2_DATA + 1], 0x5a, "the controller's own counter, relayed");
         assert_eq!(ev.len(), O_INPUT2_DATA + 54);
 
-        // Neutral is the same shape — a silent puck must not change the framing.
+        // Neutral is the same shape — a silent controller must not change the framing.
         let ev = input2_event(&translate::triton_neutral(3));
         assert_eq!(le_u16(&ev, O_INPUT2_SIZE), Some(54));
         assert_eq!(ev[O_INPUT2_DATA], 0x42);

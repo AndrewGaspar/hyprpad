@@ -10,7 +10,7 @@
 //! # The policy, and why it is not "relay everything"
 //!
 //! `docs/research/uhid-steam-controller.md` §4.3 sketches a relay policy —
-//! forward Steam's feature writes straight to the real puck — and §5.1/§5.2 then
+//! forward Steam's feature writes straight to the real controller — and §5.1/§5.2 then
 //! spend two sections on the arbitration that would require. This build takes
 //! the other, smaller road, the one InputPlumber's proven implementation takes
 //! (A.4): **decode the ones hyprpad can act on, acknowledge the rest.** Two
@@ -25,9 +25,9 @@
 //!    They are therefore **acknowledged and ignored** — Steam's heartbeat is
 //!    already satisfied by the state hyprpad maintains.
 //! 2. **hyprpad already owns the actuators, through one writer.** `haptics.rs`
-//!    runs a single writer thread over the puck's only writable fd. §5.2 is
+//!    runs a single writer thread over the controller's only writable fd. §5.2 is
 //!    explicit that the relay must go through it and "never open a second
-//!    writable fd on the puck", so rumble and haptics are *translated into that
+//!    writable fd on the controller", so rumble and haptics are *translated into that
 //!    path* rather than forwarded as raw bytes.
 //!
 //! 3. **The queries are already answered by the time the daemon sees them.** A
@@ -41,11 +41,11 @@
 //! # The one exception: `SETTING_IMU_MODE`, and why it is relayed
 //!
 //! The policy above has exactly one hole, and it was gap G5 of
-//! `docs/design/uhid-relay.md`: **only the real puck can turn its own IMU on.**
+//! `docs/design/uhid-relay.md`: **only the real controller can turn its own IMU on.**
 //! Steam's gyro request is not something hyprpad can satisfy on its own behalf
 //! the way it satisfies the lizard-mode writes, and it is not an actuator
 //! command that can be translated into `haptics.rs` — it is a firmware setting
-//! that has to reach the hardware or the gyro bytes never appear in the puck's
+//! that has to reach the hardware or the gyro bytes never appear in the controller's
 //! `0x42` at all.
 //!
 //! So [`setting::IMU_MODE`] (48) is **relayed**, and it is the only setting that
@@ -64,7 +64,7 @@
 //! * `SETTING_*` numbers — SDL `controller_constants.h`, as catalogued in
 //!   `docs/research/guide-hold-poweroff.md`.
 //! * `0xEB` rumble — InputPlumber's `PackedRumbleReport`, field for field.
-//! * `0x81` / `0x80` — `src/haptics.rs`, which writes both to the real puck.
+//! * `0x81` / `0x80` — `src/haptics.rs`, which writes both to the real controller.
 //! * `0x8F` — the kernel's `steam_haptic_pulse` (`drivers/hid/hid-steam.c`).
 
 use crate::haptics::Pad;
@@ -95,9 +95,9 @@ pub mod cmd {
     pub const TRIGGER_HAPTIC_COMMAND: u8 = 0xEA;
     /// `TriggerRumbleCommand` — the Deck-era rumble.
     pub const TRIGGER_RUMBLE_COMMAND: u8 = 0xEB;
-    /// The puck's `0x80` force-feedback **output** report (`haptics.rs`).
+    /// The controller's `0x80` force-feedback **output** report (`haptics.rs`).
     pub const OUT_RUMBLE: u8 = 0x80;
-    /// The puck's `0x81` haptic-pulse **output** report (`haptics.rs`).
+    /// The controller's `0x81` haptic-pulse **output** report (`haptics.rs`).
     pub const OUT_PULSE: u8 = 0x81;
 
     /// The queries `profile::Profile::canned_reply` has a real answer for.
@@ -340,7 +340,7 @@ pub const SETTING_NAMES: [&str; 82] = [
 /// ```
 ///
 /// The flags choose *what the controller puts in its input report*, which is
-/// why this is the switch that makes the puck's `0x42` carry IMU data at all.
+/// why this is the switch that makes the controller's `0x42` carry IMU data at all.
 pub mod gyro_mode {
     /// `SETTING_GYRO_MODE_OFF` — no IMU data in the input report.
     pub const OFF: u16 = 0x0000;
@@ -358,7 +358,7 @@ pub mod gyro_mode {
     /// What SDL itself turns on for a game that asked for sensors:
     /// `SETTING_GYRO_MODE_SEND_RAW_ACCEL | SETTING_GYRO_MODE_SEND_RAW_GYRO`
     /// (`HIDAPI_DriverSteam_SetSensorsEnabled`, `SDL_hidapi_steam.c`). This is
-    /// hyprpad's own value for `h.gamepad { gyro = true }`, so the puck is
+    /// hyprpad's own value for `h.gamepad { gyro = true }`, so the controller is
     /// configured the way the reference client configures it and not some
     /// third thing.
     pub const SENSORS_ON: u16 = SEND_RAW_ACCEL | SEND_RAW_GYRO;
@@ -416,7 +416,7 @@ impl Setting {
 ///
 /// Deliberately **not** [`setting::IMU_MODE`]: the gyro is the one setting
 /// Steam asks for that hyprpad cannot satisfy on its own behalf, because only
-/// the real puck can turn its IMU on. That one is *relayed*, through
+/// the real controller can turn its IMU on. That one is *relayed*, through
 /// `src/lizard.rs`'s frame builder — see [`imu_mode`].
 fn owned_by_hyprpad(id: u8) -> bool {
     matches!(id, setting::LIZARD_MODE | setting::STEAM_WATCHDOG_ENABLE)
@@ -467,14 +467,14 @@ pub fn parse_set_settings_values(cmd: &[u8]) -> Vec<Setting> {
 /// What the daemon should do about one write from Steam.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Drive the puck's force-feedback rumble. `strong`/`weak` are the
+    /// Drive the controller's force-feedback rumble. `strong`/`weak` are the
     /// `FF_RUMBLE` magnitudes `haptics::Haptics::rumble` takes directly.
     Rumble { strong: u16, weak: u16 },
     /// Fire a haptic pulse train on one actuator —
     /// `haptics::Haptics::pulse`'s four arguments.
     Haptic { pad: Pad, on_us: u16, off_us: u16, count: u16 },
     /// A decoded `SetSettingsValues`. Informational: hyprpad maintains lizard
-    /// mode itself and does not forward settings to the puck.
+    /// mode itself and does not forward settings to the controller.
     Settings(Vec<Setting>),
     /// A **query**, already answered by the relay's canned data.
     ///
@@ -540,7 +540,7 @@ pub fn classify(write: &HostWrite) -> Action {
         cmd::TRIGGER_RUMBLE_COMMAND => parse_deck_rumble(cmd),
         cmd::TRIGGER_HAPTIC_COMMAND => parse_deck_haptic(cmd),
         cmd::TRIGGER_HAPTIC_PULSE => parse_haptic_pulse(cmd),
-        // The puck's own output reports, which the triton profile's descriptor
+        // The controller's own output reports, which the triton profile's descriptor
         // declares and Steam can therefore write directly. Same fields
         // `src/haptics.rs` builds, read back.
         cmd::OUT_RUMBLE if write.is_output() => parse_native_rumble(cmd),
@@ -575,7 +575,7 @@ pub fn classify(write: &HostWrite) -> Action {
 /// ```
 ///
 /// `left_speed`/`right_speed` are the same `FF_RUMBLE` strong/weak magnitudes
-/// `haptics::Haptics::rumble` forwards to the puck's `0x80`, so the translation
+/// `haptics::Haptics::rumble` forwards to the controller's `0x80`, so the translation
 /// is a straight hand-off.
 fn parse_deck_rumble(cmd: &[u8]) -> Action {
     let (Some(strong), Some(weak)) = (le_u16(cmd, 5), le_u16(cmd, 7)) else {
@@ -619,7 +619,7 @@ fn parse_deck_haptic(cmd: &[u8]) -> Action {
 /// byte 9    gain (dB, -24..=+6)
 /// ```
 ///
-/// The gain is dropped: the puck's IBEX `0x81` pulse struct has no gain field
+/// The gain is dropped: the controller's IBEX `0x81` pulse struct has no gain field
 /// (`src/haptics.rs`), so there is nowhere to put it.
 fn parse_haptic_pulse(cmd: &[u8]) -> Action {
     let Some(&wire) = cmd.get(2) else { return Action::Malformed };
@@ -630,7 +630,7 @@ fn parse_haptic_pulse(cmd: &[u8]) -> Action {
     Action::Haptic { pad: unwire_side(wire), on_us, off_us, count }
 }
 
-/// The puck's own `0x80` rumble output report, read back with the field layout
+/// The controller's own `0x80` rumble output report, read back with the field layout
 /// `haptics::build_rumble` writes:
 /// `[0x80, type, intensity:le16, left_speed:le16, left_gain, right_speed:le16,
 /// right_gain]`. Only reachable on the triton profile, whose descriptor
@@ -642,7 +642,7 @@ fn parse_native_rumble(cmd: &[u8]) -> Action {
     Action::Rumble { strong, weak }
 }
 
-/// The puck's own `0x81` pulse output report, read back with the field layout
+/// The controller's own `0x81` pulse output report, read back with the field layout
 /// `haptics::build_pulse` writes:
 /// `[0x81, wire_side, on_us:le16, off_us:le16, count:le16]`.
 fn parse_native_pulse(cmd: &[u8]) -> Action {
@@ -805,9 +805,9 @@ mod tests {
     }
 
     /// The round trip that matters: what `src/haptics.rs` writes to the real
-    /// puck must decode back to the same request when Steam writes it to us.
+    /// controller must decode back to the same request when Steam writes it to us.
     #[test]
-    fn the_pucks_own_output_reports_decode_back_to_what_haptics_rs_builds() {
+    fn the_controllers_own_output_reports_decode_back_to_what_haptics_rs_builds() {
         // build_pulse(Pad::Left, 400, 0, 1) -> [0x81, wire_side(Left)=1, …]
         let w = output(&[0x81, 1, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00]);
         assert_eq!(
@@ -1038,7 +1038,7 @@ mod tests {
     }
 
     /// A settings write with no gyro pair asks for nothing — the common case,
-    /// and the one that must not nudge the puck.
+    /// and the one that must not nudge the controller.
     #[test]
     fn a_settings_write_without_the_gyro_pair_asks_for_nothing() {
         // The lizard-disable frame hyprpad itself sends.

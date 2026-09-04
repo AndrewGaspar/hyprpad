@@ -184,8 +184,8 @@ impl GestureEngine {
     /// and a config that binds both (the sample's focus-left/right) would
     /// otherwise move the window focus on every scrub. Vertical flicks are
     /// untouched — the shuttle reads one axis, so `guide+lstick_up/down` keep
-    /// working — and on the puck this is never set, because there the left PAD
-    /// is the jog wheel and the sticks are flicks and nothing else.
+    /// working — and on a controller with pads this is never set, because there
+    /// the left PAD is the jog wheel and the sticks are flicks and nothing else.
     pub fn set_shuttle_left(&mut self, on: bool) {
         self.shuttle_left = on;
     }
@@ -740,7 +740,7 @@ mod tests {
             vec![GestureEvent::GuideStickFlick { stick: Stick::Right, dir: StickDir::Right }]
         );
 
-        // And with the shuttle off — every puck frame, and every padless one
+        // And with the shuttle off — every padded frame, and every padless one
         // where the scrub is not live in this mode — the flick is a flick.
         let mut g = GestureEngine::new();
         g.update(&frame(&[]), t);

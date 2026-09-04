@@ -1,5 +1,10 @@
 # Research: presenting a *real* Steam Controller to Steam from userspace via `/dev/uhid`
 
+> **Vocabulary note (added 2026-09-03):** in this document "puck" often means
+> the *controller* itself, which the project no longer calls that. The puck is
+> the USB dongle (`28de:1304`); the controller is the device with the pads. The
+> prose below is left as it was written — see README §Vocabulary.
+
 *Produced 2026-08-31. Question: hyprpad owns the 2026 Steam Controller puck
 (`28de:1304`, Triton/IBEX) exclusively and currently gives Steam a uinput
 **Xbox-360 pad** (`src/gamepad.rs`). That discards trackpads-as-trackpads, gyro,

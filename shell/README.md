@@ -158,7 +158,7 @@ The keys are hyprpad's own control ids — the `control` field of every
 `hyprpad bindings --json` entry — so adding Xbox, PlayStation, Switch Pro or
 the Steam Deck is a new file in `layouts/`, not a code change. A Nintendo
 layout swaps A and B by pointing the glyph map elsewhere; a pad with a hat
-switch groups it the same way the puck groups its d-pad. `Panel.qml` names no
+switch groups it the same way the controller groups its d-pad. `Panel.qml` names no
 controller anywhere; the layout is chosen by `layoutId`, overridable per
 summon:
 
@@ -179,14 +179,14 @@ of one vocabulary.
 Glyphs come from Kenney's CC0 "Input Prompts", which covers every mainstream
 pad with one naming convention. The *diagram* is the part that varies: see
 `art/LICENSES.md` for why Kenney's own `controller_*.svg` files cannot serve as
-one, and how the 2026 puck's diagram is sourced.
+one, and how the 2026 controller's diagram is sourced.
 
 ## Laying out multi-row callouts
 
 A callout is now a box as tall as its rows and as wide as its widest line
 (measured with `TextMetrics`, so nothing is ever clipped and a lane of terse
 labels reserves no room it will not use). That makes the columns much taller
-than they were, and the puck is lopsided: the face cluster, Menu, the right
+than they were, and the controller is lopsided: the face cluster, Menu, the right
 stick, the right pad and the grips all want the right-hand side.
 
 So a side is not a column, it is **one or two lanes**, decided from the data:
@@ -313,7 +313,7 @@ A bar item for hardware that is usually absent should not sit there saying
 "absent". Three conditions must all hold before the widget takes any space:
 
 1. the status file parses,
-2. it says `connected: true` — the puck is here *now*. This is not the same as
+2. it says `connected: true` — the controller is here *now*. This is not the same as
    "the daemon is up": the daemon deliberately outlives its controller, sitting
    through the startup wait and the reconnect wait rather than exiting, and
    publishes `connected: false` throughout both, and
@@ -523,7 +523,7 @@ anything else opens the sheet. That is the *deliberate* power-off which replaces
 the firmware's guide-hold one (README, "Powering the controller off") — and
 choosing the other mouse button is the whole confirmation, on purpose: the owner
 asked for no menu. `hyprpad off` signals the running daemon rather than touching
-the puck, so the widget needs no access to the device; the widget then vanishes
+the controller, so the widget needs no access to the device; the widget then vanishes
 by itself, because the daemon publishes `connected: false` as soon as the stream
 stops. The tooltip says both.
 
