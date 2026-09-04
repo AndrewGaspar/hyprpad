@@ -37,6 +37,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::config::KeyChord;
 
@@ -115,6 +116,206 @@ fn parse_event(line: &str) -> Option<OskEvent> {
 /// Normalize a raw pad axis to the OSK's `[-1, 1]` range.
 ///
 /// The trackpad reports absolute `i16` touch coordinates spanning roughly
+/// How the keyboard is put on screen: which layout, and whether it displaces
+/// workspace content or floats over it. The pair travels together because on a
+/// controller with no trackpads *both* answers change at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OskPresentation {
+    pub mode: OskMode,
+    pub reflow: bool,
+}
+
+impl OskPresentation {
+    /// What a keyboard binding means on a controller with **no trackpads**,
+    /// unless the binding says otherwise: the FULL keyboard from the bottom
+    /// edge, claiming an exclusive zone.
+    ///
+    /// Both halves are forced, and for the same reason. `split` exists because
+    /// two trackpads are two thumbs on two physical sides of the screen — with
+    /// no pads there is one highlight and no hands to divide, so the split is
+    /// half a keyboard on each edge for nothing. And `overlay` floats the
+    /// keyboard *over* the window being typed into, which on a pad is fine
+    /// because you are looking at your thumbs — but with snap navigation you
+    /// are reading the field and the keyboard at once, and we cannot know where
+    /// the caret is. `reflow` makes the question moot: the exclusive zone
+    /// shrinks the tiled area, so the compositor moves the field out of the
+    /// way rather than us guessing.
+    pub const PADLESS: OskPresentation =
+        OskPresentation { mode: OskMode::Bottom, reflow: true };
+
+    pub const fn new(mode: OskMode, reflow: bool) -> OskPresentation {
+        OskPresentation { mode, reflow }
+    }
+}
+
+/// A step of the keyboard's snap-navigation highlight — the padless modality
+/// (`docs/research/xbox-elite.md` §3.5 option (ii)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OskNav {
+    Left,
+    Right,
+    Up,
+    Down,
+    /// The first key of the current row.
+    Home,
+    /// The last key of the current row.
+    End,
+}
+
+impl OskNav {
+    /// The wire token used in a `nav` command.
+    fn wire(self) -> &'static str {
+        match self {
+            OskNav::Left => "left",
+            OskNav::Right => "right",
+            OskNav::Up => "up",
+            OskNav::Down => "down",
+            OskNav::Home => "home",
+            OskNav::End => "end",
+        }
+    }
+}
+
+/// Which presentation a keyboard binding resolves to on `source`.
+///
+/// A binding says what it wants on a controller *with* pads, and — optionally —
+/// what it wants without them. With no `padless` override a padless controller
+/// gets [`OskPresentation::PADLESS`] whatever the binding's own mode and reflow
+/// say, because those two answers were chosen for thumbs on trackpads and are
+/// simply wrong here. Pure, so the rule is one testable line rather than a
+/// branch inside the toggle.
+pub fn presentation_for(
+    source: crate::report::Source,
+    mode: OskMode,
+    reflow: bool,
+    padless: Option<OskPresentation>,
+) -> OskPresentation {
+    if source.has_pads() {
+        OskPresentation::new(mode, reflow)
+    } else {
+        padless.unwrap_or(OskPresentation::PADLESS)
+    }
+}
+
+/// How long a held direction waits before the highlight starts repeating. The
+/// Deck uses 450 ms before its Backspace repeat and the research doc sketched
+/// 250 ms for the stick; this sits between them, long enough that a deliberate
+/// single step never doubles.
+pub const NAV_REPEAT_DELAY: Duration = Duration::from_millis(350);
+
+/// The repeat interval once it starts: eight keys a second, which crosses the
+/// QWERTY grid's widest row in under two seconds.
+pub const NAV_REPEAT_INTERVAL: Duration = Duration::from_millis(125);
+
+/// The normalized deflection a stick must reach to throw the highlight. Held
+/// past it, the throw repeats.
+pub const NAV_THROW_OUT: f64 = 0.6;
+
+/// ...and the deflection it must fall back inside before it counts as released.
+/// The gap is hysteresis: a stick resting just past the throw point must not
+/// chatter between "held" and "let go" (the same shape as the guide flicks'
+/// [`crate::gesture::RECENTER_THRESHOLD`]).
+pub const NAV_THROW_IN: f64 = 0.35;
+
+/// The auto-repeat clock behind one navigation input — a D-pad, or a stick
+/// thrown far enough to count as one.
+///
+/// One step lands the instant a direction is taken, then nothing until
+/// [`NAV_REPEAT_DELAY`] has passed, then one every [`NAV_REPEAT_INTERVAL`] for
+/// as long as it is held. Changing direction restarts the whole thing, so
+/// swinging a stick from left to right steps once and waits, rather than
+/// running away at the rate it had built up.
+///
+/// Pure: it is fed a direction and an [`Instant`] and answers with the step to
+/// send, so the repeat timing is a unit test rather than a stopwatch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NavRepeat {
+    /// The direction currently held, if any.
+    held: Option<OskNav>,
+    /// When the next repeat is due.
+    next: Option<Instant>,
+}
+
+impl NavRepeat {
+    /// Forget the held direction and the clock. The keyboard going down, or a
+    /// source with no sticks to read.
+    pub fn reset(&mut self) {
+        self.held = None;
+        self.next = None;
+    }
+
+    /// Whether a direction is currently held. [`crate::sticks::StickDrive`]'s
+    /// arming rule reads it so a stick that snaps from thrown to centred
+    /// between two ticks still gets the tick that lets it go — the same reason
+    /// a settling integrator keeps the deadline alive.
+    pub fn holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Feed the direction currently held — a D-pad's pressed arrow, or `None`
+    /// for neutral — and get back the step to send this tick.
+    pub fn held(&mut self, dir: Option<OskNav>, now: Instant) -> Option<OskNav> {
+        match dir {
+            None => {
+                self.reset();
+                None
+            }
+            Some(d) if self.held != Some(d) => {
+                // A fresh direction: step at once, then wait out the delay.
+                self.held = Some(d);
+                self.next = Some(now + NAV_REPEAT_DELAY);
+                Some(d)
+            }
+            Some(d) => {
+                if self.next.is_some_and(|at| now >= at) {
+                    self.next = Some(now + NAV_REPEAT_INTERVAL);
+                    Some(d)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Feed a stick's normalized deflection (`+y` up, as [`crate::sticks`]
+    /// reports it) and get back the step to send this tick. The dominant axis
+    /// wins, so a diagonal throw is still one direction.
+    pub fn stick(&mut self, xy: (f64, f64), now: Instant) -> Option<OskNav> {
+        let dir = self.throw(xy);
+        self.held(dir, now)
+    }
+
+    /// Which way this deflection is thrown, given what is already held: it must
+    /// reach [`NAV_THROW_OUT`] to engage, and fall back inside [`NAV_THROW_IN`]
+    /// along its own axis to release.
+    fn throw(&self, (x, y): (f64, f64)) -> Option<OskNav> {
+        if let Some(d) = self.held {
+            let along = match d {
+                OskNav::Left => -x,
+                OskNav::Right => x,
+                OskNav::Up => y,
+                OskNav::Down => -y,
+                // Never thrown from a stick; releasing is the honest answer.
+                OskNav::Home | OskNav::End => f64::NEG_INFINITY,
+            };
+            if along >= NAV_THROW_IN {
+                return Some(d);
+            }
+        }
+        let (ax, ay) = (x.abs(), y.abs());
+        if ax.max(ay) < NAV_THROW_OUT {
+            return None;
+        }
+        Some(if ax >= ay {
+            if x >= 0.0 { OskNav::Right } else { OskNav::Left }
+        } else if y >= 0.0 {
+            OskNav::Up
+        } else {
+            OskNav::Down
+        })
+    }
+}
+
 /// ±32767 across its surface (0 when untouched). The OSK wants each axis in
 /// `[-1, 1]`, and — crucially — the pad's `+Y` is up, which is exactly the
 /// OSK's `+ny` convention, so the value passes straight through with no flip.
@@ -138,6 +339,15 @@ fn cursor_cmd(pad: OskPad, nx: f32, ny: f32) -> String {
 /// Format a `commit` command line.
 fn commit_cmd(pad: OskPad) -> String {
     format!("commit {}", pad.wire())
+}
+
+/// Format a `nav` command line: one step of the snap-navigation highlight. The
+/// first one of a session arms the highlight where it starts rather than
+/// moving, which is why the daemon sends `nav home` straight after a padless
+/// `show` — a keyboard whose highlight only appears once you have already
+/// pushed a direction has no visible starting point.
+fn nav_cmd(dir: OskNav) -> String {
+    format!("nav {}", dir.wire())
 }
 
 /// Format a `shift down` / `shift up` command line: the OSK holds a momentary
@@ -334,6 +544,16 @@ impl OskHandle {
             return;
         }
         self.send(&commit_cmd(pad));
+    }
+
+    /// Move the snap-navigation highlight one key. Ignored unless the keyboard
+    /// is shown. The **padless** cursor: with no trackpad to point with, the
+    /// D-pad and the sticks step a single highlight and `commit` takes it.
+    pub fn nav(&mut self, dir: OskNav) {
+        if !self.active {
+            return;
+        }
+        self.send(&nav_cmd(dir));
     }
 
     /// Hold (`true`) or release (`false`) the keyboard's momentary Shift — the
@@ -623,6 +843,122 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::hypr::HyprEvent;
+
+    // --- the padless presentation and its snap navigation -------------------
+
+    #[test]
+    fn a_padless_source_gets_the_full_keyboard_from_the_bottom_displacing() {
+        use crate::report::Source;
+        // The binding says `split`, floating. On the puck that is exactly what
+        // it means.
+        let p = presentation_for(Source::Puck, OskMode::Split, false, None);
+        assert_eq!(p, OskPresentation::new(OskMode::Split, false));
+        // On a controller with no trackpads the same binding raises the FULL
+        // keyboard from the bottom edge, with an exclusive zone: there is no
+        // thumb to point with, so the two per-hand columns buy nothing, and
+        // floating over the field is exactly what we cannot do when the user
+        // is reading the field and the keyboard at once.
+        let p = presentation_for(Source::Evdev, OskMode::Split, false, None);
+        assert_eq!(p, OskPresentation::PADLESS);
+        assert_eq!(p, OskPresentation::new(OskMode::Bottom, true));
+        // Even a binding that asked for bottom-overlay is overridden.
+        assert_eq!(
+            presentation_for(Source::Evdev, OskMode::Bottom, false, None),
+            OskPresentation::PADLESS
+        );
+
+        // Unless the binding says what it wants there, in which case it is
+        // taken literally — including asking for the pad presentation back.
+        let want = OskPresentation::new(OskMode::Split, false);
+        assert_eq!(presentation_for(Source::Evdev, OskMode::Bottom, true, Some(want)), want);
+        // …and the override never touches a controller that has pads.
+        assert_eq!(
+            presentation_for(Source::Puck, OskMode::Bottom, true, Some(want)),
+            OskPresentation::new(OskMode::Bottom, true)
+        );
+    }
+
+    #[test]
+    fn the_show_line_for_a_padless_source_is_the_displacing_bottom_deck() {
+        let p = OskPresentation::PADLESS;
+        assert_eq!(show_cmd(p.mode, p.reflow), "show bottom reflow");
+    }
+
+    #[test]
+    fn nav_lines_name_every_direction() {
+        assert_eq!(nav_cmd(OskNav::Left), "nav left");
+        assert_eq!(nav_cmd(OskNav::Right), "nav right");
+        assert_eq!(nav_cmd(OskNav::Up), "nav up");
+        assert_eq!(nav_cmd(OskNav::Down), "nav down");
+        assert_eq!(nav_cmd(OskNav::Home), "nav home");
+        assert_eq!(nav_cmd(OskNav::End), "nav end");
+    }
+
+    /// `t0 + ms`.
+    fn at(ms: u64) -> Instant {
+        *T0.get_or_init(Instant::now) + Duration::from_millis(ms)
+    }
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+    #[test]
+    fn a_held_direction_steps_once_then_waits_then_repeats() {
+        let mut r = NavRepeat::default();
+        // The press edge steps immediately.
+        assert_eq!(r.held(Some(OskNav::Right), at(0)), Some(OskNav::Right));
+        // Then nothing until the delay is out — a deliberate single step must
+        // never double.
+        for ms in [1, 100, 200, 349] {
+            assert_eq!(r.held(Some(OskNav::Right), at(ms)), None, "at {ms} ms");
+        }
+        assert_eq!(r.held(Some(OskNav::Right), at(350)), Some(OskNav::Right));
+        // Then one every 125 ms — eight a second.
+        assert_eq!(r.held(Some(OskNav::Right), at(400)), None);
+        assert_eq!(r.held(Some(OskNav::Right), at(475)), Some(OskNav::Right));
+        assert_eq!(r.held(Some(OskNav::Right), at(599)), None);
+        assert_eq!(r.held(Some(OskNav::Right), at(600)), Some(OskNav::Right));
+
+        // Letting go stops it, and the next press starts the whole clock over
+        // rather than resuming at the rate it had built up.
+        assert_eq!(r.held(None, at(601)), None);
+        assert_eq!(r.held(Some(OskNav::Right), at(602)), Some(OskNav::Right));
+        assert_eq!(r.held(Some(OskNav::Right), at(700)), None);
+    }
+
+    #[test]
+    fn changing_direction_restarts_the_clock() {
+        let mut r = NavRepeat::default();
+        assert_eq!(r.held(Some(OskNav::Left), at(0)), Some(OskNav::Left));
+        assert_eq!(r.held(Some(OskNav::Left), at(400)), Some(OskNav::Left), "repeating");
+        // Swinging to the other direction steps once and waits out the full
+        // delay again, so a stick swept across its gate does not run away.
+        assert_eq!(r.held(Some(OskNav::Right), at(410)), Some(OskNav::Right));
+        assert_eq!(r.held(Some(OskNav::Right), at(500)), None);
+        assert_eq!(r.held(Some(OskNav::Right), at(760)), Some(OskNav::Right));
+    }
+
+    #[test]
+    fn a_stick_throws_past_point_six_and_releases_inside_point_three_five() {
+        let mut r = NavRepeat::default();
+        // Inside the gate: nothing, however long it is held there.
+        assert_eq!(r.stick((0.5, 0.0), at(0)), None);
+        assert_eq!(r.stick((0.59, 0.0), at(4)), None);
+        // Past it: one step.
+        assert_eq!(r.stick((0.61, 0.0), at(8)), Some(OskNav::Right));
+        // Falling back to 0.4 is still "held" — the hysteresis band — so it
+        // keeps repeating rather than chattering between held and let go.
+        assert_eq!(r.stick((0.4, 0.0), at(358)), Some(OskNav::Right));
+        // Inside 0.35 it is released, and coming back out is a fresh throw.
+        assert_eq!(r.stick((0.3, 0.0), at(400)), None);
+        assert_eq!(r.stick((0.7, 0.0), at(404)), Some(OskNav::Right));
+
+        // The dominant axis wins, so a diagonal is one direction. `+y` is up.
+        let mut r = NavRepeat::default();
+        assert_eq!(r.stick((0.4, 0.9), at(0)), Some(OskNav::Up));
+        let mut r = NavRepeat::default();
+        assert_eq!(r.stick((-0.2, -0.8), at(0)), Some(OskNav::Down));
+        let mut r = NavRepeat::default();
+        assert_eq!(r.stick((-0.95, 0.1), at(0)), Some(OskNav::Left));
+    }
 
     #[test]
     fn normalize_maps_full_scale_to_unit() {

@@ -147,7 +147,7 @@ use crate::haptics::{Feel, Haptics, Pad as HapticPad};
 use crate::hypr::{Hypr, HyprEvent};
 use crate::keyboard::VirtualKeyboard;
 use crate::mode::ModeEngine;
-use crate::osk::{OskEvent, OskHandle, OskMode, OskPad};
+use crate::osk::{self, NavRepeat, OskEvent, OskHandle, OskNav, OskPad, OskPresentation};
 use crate::output::{PointerButton, VirtualPointer};
 use crate::status::{RelayKind, StatusWriter};
 use crate::uhid::settings::{self, Action as RelayAction};
@@ -1032,6 +1032,7 @@ pub fn run() -> std::io::Result<()> {
                         &config,
                         &mut modes,
                         &mut osk,
+                        active_source,
                         &mut hx,
                         &mut chord_keys,
                         &mut keyboard,
@@ -1868,24 +1869,23 @@ fn drive_sticks(
     now: Instant,
 ) {
     if gates.osk {
-        // Phase 1 of the keyboard on a padless controller: each stick
-        // integrates into a per-hand position and goes out over the SAME
-        // `cursor L|R` wire the pads use, so the OSK child is untouched. The
-        // commits are ordinary `[osk_buttons]` bindings — `a` and the triggers
-        // rather than the pad clicks, which do not exist here.
-        // The wire's `+ny` is up and the frame's `+y` is up too, so both axes
-        // pass straight through — the same no-flip the pad path relies on —
-        // and each is deduped at the wire's own precision, so a stick held
-        // hard against an edge stops re-sending.
-        let l = st.osk_left.step(st.sticks.left, &cfg.osk, now);
-        let l = (round_wire(l.0), round_wire(l.1));
-        if st.osk_left.should_send(l) {
-            osk.cursor(OskPad::Left, l.0, l.1);
-        }
-        let r = st.osk_right.step(st.sticks.right, &cfg.osk, now);
-        let r = (round_wire(r.0), round_wire(r.1));
-        if st.osk_right.should_send(r) {
-            osk.cursor(OskPad::Right, r.0, r.1);
+        // The keyboard on a padless controller owns both sticks, as it owns
+        // both pads on the puck — but what they drive is the **highlight**,
+        // not a cursor (`docs/research/xbox-elite.md` §3.5 option (ii); phase 1
+        // sent two integrated `cursor L|R` positions here instead). A stick
+        // thrown past [`osk::NAV_THROW_OUT`] steps the highlight one key and
+        // then repeats while it is held, which is what a spring-loaded stick
+        // can do accurately and what every console keyboard does.
+        //
+        // The left stick is the primary. The right stick nudges the *same*
+        // highlight rather than carrying a second one, because there is only
+        // ever one: the split layout's two per-hand cursors need two thumbs on
+        // two surfaces, and this controller has neither.
+        for dir in [st.osk_left.stick(st.sticks.left, now), st.osk_right.stick(st.sticks.right, now)]
+            .into_iter()
+            .flatten()
+        {
+            osk.nav(dir);
         }
         // Nothing else runs while the keyboard is up.
         st.cursor.reset();
@@ -2674,6 +2674,7 @@ fn fire_buttons(
             config,
             modes,
             osk,
+            frame.source,
             keyboard,
             pointer.as_deref_mut(),
             &action,
@@ -3832,6 +3833,9 @@ fn handle_gesture(
     config: &Config,
     modes: &mut ModeEngine,
     osk: &mut OskHandle,
+    // Which controller is driving. Read only by the keyboard toggle, which
+    // means something different on a pad with no trackpads ([`osk::presentation_for`]).
+    source: report::Source,
     hx: &mut HapticCtx,
     chords: &mut ChordKeys,
     keyboard: &mut Option<VirtualKeyboard>,
@@ -3913,7 +3917,7 @@ fn handle_gesture(
     // gives — nothing else about a chord is visible or audible.
     hx.fire(Haptic::Gesture, HapticPad::Both);
 
-    perform_action(hypr, config, modes, osk, keyboard, pointer, &action)
+    perform_action(hypr, config, modes, osk, source, keyboard, pointer, &action)
 }
 
 /// Perform one resolved action: the tail every binding shares once its own
@@ -3922,11 +3926,14 @@ fn handle_gesture(
 /// function, so the two can never mean subtly different things. Returns
 /// whether it moved the active mode (via [`Action::SetMode`] /
 /// [`Action::ClearMode`]), which the caller answers with the mode handoff.
+#[allow(clippy::too_many_arguments)]
 fn perform_action(
     hypr: &Hypr,
     config: &Config,
     modes: &mut ModeEngine,
     osk: &mut OskHandle,
+    // Which controller is driving; see [`handle_gesture`].
+    source: report::Source,
     keyboard: &mut Option<VirtualKeyboard>,
     mut pointer: Option<&mut VirtualPointer>,
     action: &Action,
@@ -3952,6 +3959,7 @@ fn perform_action(
                     config,
                     modes,
                     osk,
+                    source,
                     keyboard,
                     pointer.as_deref_mut(),
                     other,
@@ -3962,8 +3970,8 @@ fn perform_action(
     }
 
     // The keyboard toggle drives the OSK child, not Hyprland: flip show/hide.
-    if let Action::ToggleKeyboard { mode, reflow } = action {
-        toggle_keyboard(osk, *mode, *reflow);
+    if let Action::ToggleKeyboard { mode, reflow, padless } = action {
+        toggle_keyboard(osk, source, osk::presentation_for(source, *mode, *reflow, *padless));
         return false;
     }
 
@@ -3987,11 +3995,20 @@ fn perform_action(
 /// Flip the on-screen keyboard: show it (in `mode`, with the binding's chosen
 /// presentation — overlay floats over the desktop, reflow displaces content)
 /// when hidden, hide it when shown.
-fn toggle_keyboard(osk: &mut OskHandle, mode: OskMode, reflow: bool) {
+fn toggle_keyboard(osk: &mut OskHandle, source: report::Source, present: OskPresentation) {
     if osk.is_active() {
         osk.hide();
     } else {
-        osk.show(mode, reflow);
+        osk.show(present.mode, present.reflow);
+        if !source.has_pads() {
+            // This keyboard will be driven by a highlight rather than a
+            // cursor, so arm it: a starting key is lit before the user has
+            // pushed anything. A `nav` sent to a keyboard that has not been
+            // navigated yet lands on its start key without moving, which is
+            // exactly what arming means. A pad source sends none of this and
+            // its keyboard comes up with no highlight, as it always has.
+            osk.nav(OskNav::Home);
+        }
     }
 }
 
@@ -4010,6 +4027,18 @@ struct OskRoute {
     /// The buttons currently holding Shift (`osk shift`), in press order:
     /// Shift goes down with the first and comes up with the last.
     shift_holders: Vec<report::Button>,
+    /// The D-pad's snap-navigation clock. Only ever fed on a controller with no
+    /// trackpads: there, the keyboard is steered by a highlight and the D-pad
+    /// is what moves it. On the puck the D-pad under the keyboard does what it
+    /// always did — nothing, unless a config binds it.
+    ///
+    /// Unlike the sticks', this one is paced by the controller's **own report
+    /// stream** rather than by the loop's stick deadline, because a D-pad
+    /// direction is frame state and this is the frame path. The press edge
+    /// therefore always steps; the repeat runs for as long as frames keep
+    /// arriving, and a pad that goes quiet with a direction held simply steps
+    /// once — the console minimum, and what the sticks are there for.
+    dpad_nav: NavRepeat,
 }
 
 /// One OSK pad's routing state: its smoothing damper and the last position sent
@@ -4030,6 +4059,8 @@ enum OskOp {
     Key(KeyChord, HapticPad),
     /// Type the key under this pad's cursor.
     Commit(OskPad),
+    /// Move the snap-navigation highlight one key (the padless modality).
+    Nav(OskNav),
     /// The first Shift-bound button went down.
     ShiftDown,
     /// The last Shift-bound button came up (or the keyboard is closing).
@@ -4049,6 +4080,7 @@ impl OskRoute {
             right: OskPadState::new(cfg),
             live: false,
             shift_holders: Vec::new(),
+            dpad_nav: NavRepeat::default(),
         }
     }
 
@@ -4070,6 +4102,7 @@ impl OskRoute {
         self.reset();
         self.live = false;
         self.shift_holders.clear();
+        self.dpad_nav.reset();
     }
 
     /// Decide one frame of the keyboard's button layer. Pure: what to send,
@@ -4088,6 +4121,7 @@ impl OskRoute {
         frame: &report::Frame,
         prev: &report::Frame,
         bindings: &HashMap<report::Button, OskAction>,
+        now: Instant,
     ) -> Vec<OskOp> {
         let mut ops = Vec::new();
         let settled = self.live;
@@ -4102,9 +4136,22 @@ impl OskRoute {
             return ops;
         }
 
+        // Snap navigation, on a controller with no trackpads only. The D-pad
+        // moves the highlight — it is the one control every console keyboard
+        // uses for exactly this — with the same repeat clock the sticks get, so
+        // holding a direction walks the grid. On a pad source none of this
+        // runs: the D-pad keeps doing what it did (nothing, unless bound), and
+        // the two cursors keep being the way to point at a key.
+        if !frame.source.has_pads() {
+            if let Some(dir) = self.dpad_nav.held(dpad_direction(frame), now) {
+                ops.push(OskOp::Nav(dir));
+            }
+        }
+
         for b in frame.edges_down(prev) {
-            match bindings.get(&b) {
-                Some(OskAction::Key(chord)) => ops.push(OskOp::Key(*chord, button_pad(b))),
+            // A config entry, else the padless default for this button.
+            match bindings.get(&b).copied().or_else(|| padless_osk_default(frame.source, b)) {
+                Some(OskAction::Key(chord)) => ops.push(OskOp::Key(chord, button_pad(b))),
                 Some(OskAction::Commit) => ops.push(OskOp::Commit(commit_pad(b))),
                 Some(OskAction::Shift) => {
                     if self.shift_holders.is_empty() {
@@ -4127,6 +4174,42 @@ impl OskRoute {
         }
         ops
     }
+}
+
+/// The snap-navigation direction the D-pad is currently asking for, or `None`
+/// when it is neutral. A diagonal resolves to one direction (the first of
+/// up/down/left/right that is down) rather than two, so a hat rolling through a
+/// corner steps once per direction rather than lurching diagonally.
+fn dpad_direction(frame: &report::Frame) -> Option<OskNav> {
+    use report::Button::*;
+    for (btn, dir) in [
+        (DpadUp, OskNav::Up),
+        (DpadDown, OskNav::Down),
+        (DpadLeft, OskNav::Left),
+        (DpadRight, OskNav::Right),
+    ] {
+        if frame.pressed(btn) {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// What a button does under the keyboard on a controller with **no trackpads**,
+/// when no config entry claims it.
+///
+/// The built-in map ([`crate::config::osk_builtins`]) puts the commit on the two
+/// pad *clicks*, which this controller does not have — so out of the box its
+/// keyboard would have a highlight and no way to type it. `A` is where every
+/// console puts "select", and it reads the right-hand cursor like the rest of
+/// the face cluster ([`commit_pad`]); with no pad cursor to read, the keyboard
+/// commits the highlight instead. A config entry on `A` still wins, and a pad
+/// source never reaches here at all.
+fn padless_osk_default(source: report::Source, b: report::Button) -> Option<OskAction> {
+    if source.has_pads() {
+        return None;
+    }
+    crate::config::padless_osk_builtins().find(|(btn, _)| *btn == b).map(|(_, what)| what)
 }
 
 /// Which pad's cursor an `osk commit` on `b` types under: the pad on the same
@@ -4180,7 +4263,7 @@ fn route_osk(
     route_pad(osk, OskPad::Right, frame.pressed(PadRightTouch), frame.right_pad, &mut st.right, now);
 
     // Commit on click-down (the Deck commits on click, not release).
-    for op in st.step(frame, prev, osk_buttons) {
+    for op in st.step(frame, prev, osk_buttons, now) {
         match op {
             OskOp::Key(chord, hand) => {
                 osk.key(&chord);
@@ -4190,6 +4273,12 @@ fn route_osk(
                 osk.commit(pad);
                 hx.fire(Haptic::Commit, haptic_pad(pad));
             }
+            // No pulse: a highlight moving between keys is the padless
+            // equivalent of a cursor crossing one, and the keyboard's own
+            // `event crossed` is what the crossing tick is wired to. Every
+            // controller that navigates by highlight has rumble motors rather
+            // than actuators, where `haptic_for` drops the pulse anyway.
+            OskOp::Nav(dir) => osk.nav(dir),
             OskOp::ShiftDown => osk.hold_shift(true),
             OskOp::ShiftUp => osk.hold_shift(false),
             // Accepting a suggestion types a whole word, so it earns the same
@@ -5081,8 +5170,8 @@ mod tests {
         macro_rules! gesture {
             ($ge:expr) => {
                 handle_gesture(
-                    &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None,
-                    false, $ge,
+                    &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx,
+                    &mut chords, &mut kbd, None, false, $ge,
                 )
             };
         }
@@ -5282,6 +5371,143 @@ mod tests {
         assert!(fire_edges(&fired, &down, &down, true).is_empty());
     }
 
+    /// A fixed instant for the keyboard layer's repeat clock. The puck frames
+    /// these tests use never feed it (snap navigation is padless-only), so one
+    /// frozen `now` is all they need; the padless tests below step it by hand.
+    fn t0() -> Instant {
+        *T0.get_or_init(Instant::now)
+    }
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+    // --- snap navigation: the padless keyboard ------------------------------
+
+    /// The same button set as [`frame_of`], on a controller with no trackpads.
+    fn padless_frame(buttons: &[report::Button]) -> report::Frame {
+        report::Frame { source: report::Source::Evdev, ..frame_of(buttons) }
+    }
+
+    /// `t0 + ms`, for the repeat clock.
+    fn ms(n: u64) -> Instant {
+        t0() + Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_dpad_moves_the_highlight_on_a_padless_controller_and_repeats() {
+        use report::Button::*;
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = padless_frame(&[]);
+        // Settle the layer (the frame the keyboard came up on acts on nothing).
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+
+        // A held direction steps at once, waits out the delay, then repeats at
+        // eight a second — the same clock the sticks use.
+        let right = padless_frame(&[DpadRight]);
+        assert_eq!(st.step(&right, &idle, &bindings, ms(4)), vec![OskOp::Nav(OskNav::Right)]);
+        assert!(st.step(&right, &right, &bindings, ms(200)).is_empty(), "still inside the delay");
+        assert_eq!(
+            st.step(&right, &right, &bindings, ms(354)),
+            vec![OskOp::Nav(OskNav::Right)],
+            "the repeat has started"
+        );
+        assert!(st.step(&right, &right, &bindings, ms(400)).is_empty());
+        assert_eq!(st.step(&right, &right, &bindings, ms(479)), vec![OskOp::Nav(OskNav::Right)]);
+
+        // Every direction, and letting go stops it.
+        let up = padless_frame(&[DpadUp]);
+        assert_eq!(st.step(&up, &right, &bindings, ms(500)), vec![OskOp::Nav(OskNav::Up)]);
+        let down = padless_frame(&[DpadDown]);
+        assert_eq!(st.step(&down, &up, &bindings, ms(504)), vec![OskOp::Nav(OskNav::Down)]);
+        let left = padless_frame(&[DpadLeft]);
+        assert_eq!(st.step(&left, &down, &bindings, ms(508)), vec![OskOp::Nav(OskNav::Left)]);
+        assert!(st.step(&idle, &left, &bindings, ms(512)).is_empty());
+        assert!(st.step(&idle, &idle, &bindings, ms(900)).is_empty(), "nothing repeats when neutral");
+    }
+
+    #[test]
+    fn a_stick_thrown_past_the_gate_walks_the_highlight() {
+        // What `drive_sticks` does with the two sticks while the keyboard is
+        // up: the decision is `NavRepeat`'s, so it is testable without a
+        // keyboard child or a device.
+        let mut left = crate::osk::NavRepeat::default();
+        assert_eq!(left.stick((0.0, -0.9), ms(0)), Some(OskNav::Down), "a throw steps at once");
+        assert_eq!(left.stick((0.0, -0.9), ms(100)), None, "and waits out the delay");
+        assert_eq!(left.stick((0.0, -0.9), ms(360)), Some(OskNav::Down));
+        // Half-way out is inside the gate: a stick being rested on does not
+        // move the highlight at all.
+        let mut right = crate::osk::NavRepeat::default();
+        assert_eq!(right.stick((0.5, 0.0), ms(0)), None);
+        assert_eq!(right.stick((0.5, 0.0), ms(500)), None);
+    }
+
+    #[test]
+    fn a_padless_controller_commits_the_highlight_with_a() {
+        use report::Button::*;
+        // Out of the box the commit is on the two pad *clicks*, which this
+        // controller does not have. `A` takes its place — and the keyboard,
+        // finding no cursor under the right hand, types the highlighted key.
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = padless_frame(&[]);
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+        assert_eq!(
+            st.step(&padless_frame(&[A]), &idle, &bindings, ms(4)),
+            vec![OskOp::Commit(OskPad::Right)]
+        );
+
+        // The rest of the Deck map is unchanged here: B closes it, X is
+        // Backspace, Y is Space, the triggers are Shift and Enter.
+        let mut st = OskRoute::new(&CursorConfig::default());
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+        assert_eq!(
+            st.step(&padless_frame(&[Y]), &idle, &bindings, ms(4)),
+            vec![OskOp::Key(KeyChord::plain(57), HapticPad::Right)]
+        );
+        let mut st = OskRoute::new(&CursorConfig::default());
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+        assert_eq!(st.step(&padless_frame(&[B]), &idle, &bindings, ms(4)), vec![OskOp::Dismiss]);
+    }
+
+    #[test]
+    fn a_config_entry_on_a_still_wins_over_the_padless_commit() {
+        use report::Button::*;
+        // The padless default is a *default*: it fills a button in only when
+        // nothing else claims it, exactly like the built-in map.
+        let mut bindings = deck_map();
+        bindings.insert(A, OskAction::Dismiss);
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = padless_frame(&[]);
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+        assert_eq!(st.step(&padless_frame(&[A]), &idle, &bindings, ms(4)), vec![OskOp::Dismiss]);
+    }
+
+    #[test]
+    fn the_puck_keyboard_is_untouched_by_snap_navigation() {
+        use report::Button::*;
+        // Neither the D-pad nor `A` means anything under the keyboard on a
+        // controller that has trackpads: the two cursors are how you point at a
+        // key there, and giving those buttons a meaning would be a change to a
+        // controller this feature is not about.
+        let bindings = deck_map();
+        let mut st = OskRoute::new(&CursorConfig::default());
+        let idle = report::Frame::default();
+        assert!(st.step(&idle, &idle, &bindings, ms(0)).is_empty());
+        for held in [DpadUp, DpadDown, DpadLeft, DpadRight, A] {
+            let f = frame_of(&[held]);
+            assert!(
+                st.step(&f, &idle, &bindings, ms(4)).is_empty(),
+                "{held:?} must do nothing on the puck"
+            );
+            assert!(st.step(&f, &f, &bindings, ms(500)).is_empty(), "and never start repeating");
+            assert!(st.step(&idle, &f, &bindings, ms(504)).is_empty());
+        }
+        // The pad clicks still commit under their own cursor, as always.
+        assert_eq!(
+            st.step(&frame_of(&[PadRightClick]), &idle, &bindings, ms(600)),
+            vec![OskOp::Commit(OskPad::Right)]
+        );
+    }
+
     /// The Deck map as the keyboard's layer sees it: the built-ins with the
     /// default config's (identical) `y`/`x` over them.
     fn deck_map() -> HashMap<report::Button, OskAction> {
@@ -5300,17 +5526,17 @@ mod tests {
         let guide = frame_of(&[Steam]);
         let chord = frame_of(&[Steam, Y]);
         // The frame the chord landed on: the keyboard is up, routing starts.
-        assert!(st.step(&chord, &guide, &bindings).is_empty(), "the raising press must not type");
-        assert!(st.step(&chord, &chord, &bindings).is_empty());
+        assert!(st.step(&chord, &guide, &bindings, t0()).is_empty(), "the raising press must not type");
+        assert!(st.step(&chord, &chord, &bindings, t0()).is_empty());
         // Guide let go, Y still down; then Y let go.
         let y = frame_of(&[Y]);
-        assert!(st.step(&y, &chord, &bindings).is_empty());
+        assert!(st.step(&y, &chord, &bindings, t0()).is_empty());
         let idle = report::Frame::default();
-        assert!(st.step(&idle, &y, &bindings).is_empty());
+        assert!(st.step(&idle, &y, &bindings, t0()).is_empty());
         // A fresh press: Space, clicked under the right hand.
         let space = vec![OskOp::Key(KeyChord::plain(57), HapticPad::Right)];
-        assert_eq!(st.step(&y, &idle, &bindings), space);
-        assert!(st.step(&y, &y, &bindings).is_empty(), "held: no repeat");
+        assert_eq!(st.step(&y, &idle, &bindings, t0()), space);
+        assert!(st.step(&y, &y, &bindings, t0()).is_empty(), "held: no repeat");
     }
 
     #[test]
@@ -5319,18 +5545,18 @@ mod tests {
         let bindings = deck_map();
         let mut st = OskRoute::new(&CursorConfig::default());
         let idle = report::Frame::default();
-        assert!(st.step(&idle, &idle, &bindings).is_empty(), "the first frame settles the layer");
+        assert!(st.step(&idle, &idle, &bindings, t0()).is_empty(), "the first frame settles the layer");
 
         // Pad clicks commit under their own pad; X is Backspace, under the
         // right hand; R2 is Enter, not a commit.
         let lclick = frame_of(&[PadLeftClick]);
         let rclick = frame_of(&[PadRightClick]);
-        assert_eq!(st.step(&lclick, &idle, &bindings), vec![OskOp::Commit(OskPad::Left)]);
-        assert_eq!(st.step(&rclick, &lclick, &bindings), vec![OskOp::Commit(OskPad::Right)]);
+        assert_eq!(st.step(&lclick, &idle, &bindings, t0()), vec![OskOp::Commit(OskPad::Left)]);
+        assert_eq!(st.step(&rclick, &lclick, &bindings, t0()), vec![OskOp::Commit(OskPad::Right)]);
         let backspace = vec![OskOp::Key(KeyChord::plain(14), HapticPad::Right)];
-        assert_eq!(st.step(&frame_of(&[X]), &rclick, &bindings), backspace);
+        assert_eq!(st.step(&frame_of(&[X]), &rclick, &bindings, t0()), backspace);
         assert_eq!(
-            st.step(&frame_of(&[TriggerR2Full]), &idle, &bindings),
+            st.step(&frame_of(&[TriggerR2Full]), &idle, &bindings, t0()),
             vec![OskOp::Key(KeyChord::plain(28), HapticPad::Right)]
         );
 
@@ -5338,27 +5564,27 @@ mod tests {
         // release. A commit in between is just a commit — the keyboard applies
         // the shift.
         let l2 = frame_of(&[TriggerL2Full]);
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
-        assert!(st.step(&l2, &l2, &bindings).is_empty());
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
+        assert!(st.step(&l2, &l2, &bindings, t0()).is_empty());
         let l2_click = frame_of(&[TriggerL2Full, PadRightClick]);
-        assert_eq!(st.step(&l2_click, &l2, &bindings), vec![OskOp::Commit(OskPad::Right)]);
-        assert!(st.step(&l2, &l2_click, &bindings).is_empty());
-        assert_eq!(st.step(&idle, &l2, &bindings), vec![OskOp::ShiftUp]);
+        assert_eq!(st.step(&l2_click, &l2, &bindings, t0()), vec![OskOp::Commit(OskPad::Right)]);
+        assert!(st.step(&l2, &l2_click, &bindings, t0()).is_empty());
+        assert_eq!(st.step(&idle, &l2, &bindings, t0()), vec![OskOp::ShiftUp]);
 
         // B closes it — releasing a held Shift first — and disarms the layer.
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
         let l2_b = frame_of(&[TriggerL2Full, B]);
-        assert_eq!(st.step(&l2_b, &l2, &bindings), vec![OskOp::ShiftUp, OskOp::Dismiss]);
+        assert_eq!(st.step(&l2_b, &l2, &bindings, t0()), vec![OskOp::ShiftUp, OskOp::Dismiss]);
         assert!(!st.live && st.shift_holders.is_empty());
         // Shown again with L2 still pulled: the first frame acts on nothing,
         // and L2 is not remembered as holding Shift.
-        assert!(st.step(&l2, &l2_b, &bindings).is_empty());
-        assert!(st.step(&l2, &l2, &bindings).is_empty());
-        assert!(st.step(&idle, &l2, &bindings).is_empty(), "nothing to release");
+        assert!(st.step(&l2, &l2_b, &bindings, t0()).is_empty());
+        assert!(st.step(&l2, &l2, &bindings, t0()).is_empty());
+        assert!(st.step(&idle, &l2, &bindings, t0()).is_empty(), "nothing to release");
         // Menu closes it too; an unbound button (a grip) does nothing.
-        assert_eq!(st.step(&frame_of(&[Menu]), &idle, &bindings), vec![OskOp::Dismiss]);
-        st.step(&idle, &idle, &bindings);
-        assert!(st.step(&frame_of(&[GripL5]), &idle, &bindings).is_empty());
+        assert_eq!(st.step(&frame_of(&[Menu]), &idle, &bindings, t0()), vec![OskOp::Dismiss]);
+        st.step(&idle, &idle, &bindings, t0());
+        assert!(st.step(&frame_of(&[GripL5]), &idle, &bindings, t0()).is_empty());
     }
 
     #[test]
@@ -5373,17 +5599,17 @@ mod tests {
         ]);
         let mut st = OskRoute::new(&CursorConfig::default());
         let idle = report::Frame::default();
-        st.step(&idle, &idle, &bindings);
+        st.step(&idle, &idle, &bindings, t0());
         let l2 = frame_of(&[TriggerL2Full]);
         let both = frame_of(&[TriggerL2Full, TriggerR2Full]);
         let r2 = frame_of(&[TriggerR2Full]);
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
-        assert!(st.step(&both, &l2, &bindings).is_empty());
-        assert!(st.step(&r2, &both, &bindings).is_empty(), "one holder left");
-        assert_eq!(st.step(&idle, &r2, &bindings), vec![OskOp::ShiftUp]);
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
+        assert!(st.step(&both, &l2, &bindings, t0()).is_empty());
+        assert!(st.step(&r2, &both, &bindings, t0()).is_empty(), "one holder left");
+        assert_eq!(st.step(&idle, &r2, &bindings, t0()), vec![OskOp::ShiftUp]);
         // Swapping holders within one frame: up for the old, down for the new.
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
-        assert_eq!(st.step(&r2, &l2, &bindings), vec![OskOp::ShiftUp, OskOp::ShiftDown]);
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
+        assert_eq!(st.step(&r2, &l2, &bindings, t0()), vec![OskOp::ShiftUp, OskOp::ShiftDown]);
     }
 
     #[test]
@@ -5396,15 +5622,15 @@ mod tests {
         let mut st = OskRoute::new(&CursorConfig::default());
         let idle = report::Frame::default();
         let l2 = frame_of(&[TriggerL2Full]);
-        st.step(&idle, &idle, &bindings);
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        st.step(&idle, &idle, &bindings, t0());
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
         st.reset();
         assert!(st.live && st.shift_holders == vec![TriggerL2Full]);
-        assert_eq!(st.step(&idle, &l2, &bindings), vec![OskOp::ShiftUp], "the release is still seen");
-        assert_eq!(st.step(&l2, &idle, &bindings), vec![OskOp::ShiftDown]);
+        assert_eq!(st.step(&idle, &l2, &bindings, t0()), vec![OskOp::ShiftUp], "the release is still seen");
+        assert_eq!(st.step(&l2, &idle, &bindings, t0()), vec![OskOp::ShiftDown]);
         st.disarm();
         assert!(!st.live && st.shift_holders.is_empty());
-        assert!(st.step(&idle, &l2, &bindings).is_empty());
+        assert!(st.step(&idle, &l2, &bindings, t0()).is_empty());
     }
 
     #[test]
@@ -5453,18 +5679,19 @@ mod tests {
         let cfg = Config::load_default();
         let mut modes = ModeEngine::new(&cfg);
         let mut osk = OskHandle::new();
+        let src = report::Source::Puck;
         assert_eq!(modes.active(), BUILTIN_DESKTOP);
 
         // Forcing game mode from the desktop is a change; forcing it again is not.
         let force_game = Action::SetMode(BUILTIN_GAME.into());
-        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &force_game));
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, src, &mut None, None, &force_game));
         assert_eq!(modes.active(), BUILTIN_GAME);
-        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &force_game));
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, src, &mut None, None, &force_game));
         // Clearing it hands the decision back to the rules (nothing focused:
         // desktop); clearing an override that is not there changes nothing.
-        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &Action::ClearMode));
+        assert!(perform_action(&hypr, &cfg, &mut modes, &mut osk, src, &mut None, None, &Action::ClearMode));
         assert_eq!(modes.active(), BUILTIN_DESKTOP);
-        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &Action::ClearMode));
+        assert!(!perform_action(&hypr, &cfg, &mut modes, &mut osk, src, &mut None, None, &Action::ClearMode));
     }
 
     #[test]
@@ -5476,7 +5703,16 @@ mod tests {
         let mut osk = OskHandle::new();
         macro_rules! perform {
             ($a:expr) => {
-                perform_action(&hypr, &cfg, &mut modes, &mut osk, &mut None, None, &$a)
+                perform_action(
+                    &hypr,
+                    &cfg,
+                    &mut modes,
+                    &mut osk,
+                    report::Source::Puck,
+                    &mut None,
+                    None,
+                    &$a,
+                )
             };
         }
 
@@ -5539,14 +5775,16 @@ mod tests {
         // Recognition performs the whole sequence and reports the mode move,
         // so the caller runs the handoff.
         assert!(handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, false,
+            &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx, &mut chords,
+            &mut kbd, None, false,
             GestureEvent::GuideChord(GripL4),
         ));
         assert_eq!(modes.active(), "hints");
         assert!(chords.held.is_empty(), "a sequence holds nothing: its key was tapped");
         // The chord's release therefore has nothing to let go of.
         assert!(!handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, &mut hx, &mut chords, &mut kbd, None, false,
+            &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx, &mut chords,
+            &mut kbd, None, false,
             GestureEvent::GuideChordRelease(GripL4),
         ));
         assert_eq!(modes.active(), "hints");
@@ -6857,6 +7095,7 @@ mod tests {
                     &cfg,
                     &mut modes,
                     &mut osk,
+                    report::Source::Puck,
                     &mut hx,
                     &mut chords,
                     &mut kbd,

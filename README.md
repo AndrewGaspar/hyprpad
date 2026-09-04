@@ -178,6 +178,24 @@ in TOML) — and `h.none()` takes a built-in away
 (`h.osk_button("menu", h.none())`). `h.osk` means nothing on a chord or a bare
 button. The cheat sheet's `osk` tab shows the map as it ends up.
 
+On a controller with **no trackpads** the same binding raises a different
+keyboard, because the one above was designed around two thumbs pointing at it.
+`h.keyboard { mode = "split" }` there means the **full** layout from the bottom
+edge with an exclusive zone, so the compositor displaces workspace content
+around it rather than the keyboard covering the field you are typing into — we
+cannot know where the caret is, and displacing makes the question moot. And
+there is no cursor to steer: the D-pad and either stick move a single
+**highlight** from key to key, wrapping row to row and remembering its column
+down and back up, with `A` typing whatever it is on. A held direction steps
+once, waits 350 ms, then repeats eight times a second; a stick counts as held
+once it is thrown past 0.6 of its travel. Everything else is unchanged — `B`
+closes it, `L2` holds Shift, `R2` is Enter, `Y` Space, `X` Backspace, `R1`/`L1`
+the suggestions — which is the point of one vocabulary. A binding that wants
+something else there says so: `h.keyboard { mode = "split", padless = { mode =
+"bottom", reflow = false } }` (`keyboard split padless:bottom,overlay` in
+TOML); `padless` only spells out what it changes. The split, floating keyboard
+stays what a trackpad controller gets, and its two cursors are untouched.
+
 A button still held when the controller changes hands never leaks into the
 new layer: B closes the keyboard without typing the desktop's Backspace, the Y
 of the `guide+Y` that raised it does not type a Space, a chord's button

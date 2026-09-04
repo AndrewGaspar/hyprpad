@@ -1910,6 +1910,13 @@ fn action_nullary(lua: &Lua, verb: &'static str) -> mlua::Result<Function> {
 
 /// `h.keyboard { mode = "split", reflow = false }`, `h.keyboard "split"`, or
 /// bare `h.keyboard()`.
+///
+/// `padless = { mode = …, reflow = … }` is a whole second presentation for a
+/// controller with **no trackpads**, where the split layout and the floating
+/// overlay are both the wrong answer (see
+/// [`crate::osk::OskPresentation::PADLESS`], which is what you get without
+/// one). It lowers to the TOML grammar's `padless:<mode>,<presentation>` word,
+/// like everything else here.
 fn keyboard_ctor(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(move |lua, v: Option<Value>| {
         let mut words = String::new();
@@ -1928,8 +1935,16 @@ fn keyboard_ctor(lua: &Lua) -> mlua::Result<Function> {
                             words.push(' ');
                             words.push_str(if as_bool(&val, &k)? { "reflow" } else { "overlay" });
                         }
+                        "padless" => {
+                            words.push(' ');
+                            words.push_str(&padless_words(&val)?);
+                        }
                         other => {
-                            return Err(unknown_key("h.keyboard", other, &["mode", "reflow"]))
+                            return Err(unknown_key(
+                                "h.keyboard",
+                                other,
+                                &["mode", "reflow", "padless"],
+                            ))
                         }
                     }
                 }
@@ -1946,6 +1961,38 @@ fn keyboard_ctor(lua: &Lua) -> mlua::Result<Function> {
         t.set("arg", words.trim().to_string())?;
         Ok(t)
     })
+}
+
+/// Lower `h.keyboard`'s `padless = …` into the single `padless:a,b` word the
+/// TOML grammar reads, so both front-ends go through one parser and cannot
+/// drift on what a presentation means. Accepts the same table shape as the
+/// binding itself, or a bare string (`padless = "bottom"`).
+fn padless_words(v: &Value) -> mlua::Result<String> {
+    let mut opts: Vec<String> = Vec::new();
+    match v {
+        Value::String(s) => opts.push(s.to_str()?.to_string()),
+        Value::Table(t) => {
+            for pair in t.pairs::<String, Value>() {
+                let (k, val) = pair?;
+                match k.as_str() {
+                    "mode" => opts.push(as_string(&val, &k)?),
+                    "reflow" => {
+                        opts.push(if as_bool(&val, &k)? { "reflow" } else { "overlay" }.to_string())
+                    }
+                    other => return Err(unknown_key("h.keyboard padless", other, &["mode", "reflow"])),
+                }
+            }
+        }
+        other => {
+            return Err(err(format!(
+                "'padless' must be a table or a string, got {}",
+                other.type_name()
+            )))
+        }
+    }
+    // An empty table still means "override with the defaults", which is what a
+    // bare `padless:` word says.
+    Ok(format!("padless:{}", opts.join(",")))
 }
 
 /// The field marking a table as one of hyprpad's action constructors.
@@ -2257,6 +2304,47 @@ mod tests {
     }
 
     #[test]
+    fn a_keyboard_binding_carries_its_padless_presentation() {
+        use crate::osk::{OskMode, OskPresentation};
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.bind("guide+y", h.keyboard { mode = "split", padless = { mode = "bottom", reflow = true } })
+            h.bind("guide+a", h.keyboard { mode = "split", padless = "split" })
+            h.bind("guide+b", h.keyboard { mode = "split" })
+            "#,
+        );
+        let got = |b| match c.resolve(&GestureEvent::GuideChord(b)) {
+            Action::ToggleKeyboard { mode, reflow, padless } => (mode, reflow, padless),
+            other => panic!("not a keyboard action: {other:?}"),
+        };
+        assert_eq!(
+            got(Button::Y),
+            (OskMode::Split, false, Some(OskPresentation::new(OskMode::Bottom, true)))
+        );
+        // A bare string is the mode; the presentation defaults to displacing.
+        assert_eq!(
+            got(Button::A),
+            (OskMode::Split, false, Some(OskPresentation::new(OskMode::Split, true)))
+        );
+        assert_eq!(got(Button::B), (OskMode::Split, false, None));
+
+        // A typo is a reported error in either half of the table.
+        let e = load_str(
+            r#"hyprpad.bind("guide+y", hyprpad.keyboard { padles = { } })"#,
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("unknown h.keyboard key"), "{e}");
+        let e = load_str(
+            r#"hyprpad.bind("guide+y", hyprpad.keyboard { padless = { reflw = true } })"#,
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("unknown h.keyboard padless key"), "{e}");
+    }
+
+    #[test]
     fn keyboard_config_sets_the_learn_deny_list() {
         // Not given: the shipped default list, same as TOML.
         let c = load("local h = hyprpad\nh.daemon { own_lizard = true }\n");
@@ -2318,7 +2406,7 @@ mod tests {
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Y)),
-            Action::ToggleKeyboard { mode: OskMode::Split, reflow: false }
+            Action::ToggleKeyboard { mode: OskMode::Split, reflow: false, padless: None }
         );
         assert_eq!(
             c.resolve(&GestureEvent::GuideChord(Button::Menu)),
@@ -2469,7 +2557,7 @@ mod tests {
         assert_eq!(b.get(&Button::Y), Some(&Fire(Action::Exec("foo".into()))));
         assert_eq!(
             b.get(&Button::X),
-            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false }))
+            Some(&Fire(Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false, padless: None }))
         );
         assert_eq!(
             b.get(&Button::A),

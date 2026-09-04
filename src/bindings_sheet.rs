@@ -505,6 +505,7 @@ impl Sheet {
         // The caret scrub is a jog wheel: a thumb circling an absolute
         // surface. There is nothing on this controller that does it.
         self.entries.retain(|e| !e.action.starts_with("scrub"));
+        self.reaim_keyboard(c);
         let sticks = c.sticks();
         if !sticks.enabled {
             // Nothing drives the pointer at all here. Saying nothing is more
@@ -532,6 +533,77 @@ impl Sheet {
                 e.action = format!("scroll {:.0} units/s", sticks.scroll.max);
             }
         }
+    }
+
+    /// Re-aim the keyboard's own tab for a controller with no trackpads.
+    ///
+    /// Every other row on the sheet is a binding and reads the same on every
+    /// controller. The keyboard's tab is the exception twice over: its
+    /// hardwired rows name the two pads, and its *commit* is a pad click.
+    /// Neither exists here, and neither has a stick equivalent — a padless
+    /// keyboard is steered by a snap-navigation **highlight** rather than by
+    /// cursors ([`crate::run`]'s `route_osk` and `drive_sticks`), which is a
+    /// different sentence, not the same one with a different noun.
+    ///
+    /// So: drop the pad rows and the pad-click commits, and put the highlight's
+    /// own controls in their place — the D-pad and both sticks move it, `A`
+    /// takes it ([`crate::config::osk_builtins`]'s pad-click commit, rehomed by
+    /// `padless_osk_default`). A config binding on any of those buttons still
+    /// wins, exactly as it does over a built-in.
+    fn reaim_keyboard(&mut self, c: &Config) {
+        // The pads and their clicks: gone, not renamed.
+        self.entries.retain(|e| {
+            e.section != Section::OskButton
+                || !matches!(e.control.as_str(), "lpad" | "rpad" | "lpad_click" | "rpad_click")
+        });
+        let claimed = |chord: &str| {
+            self.entries.iter().any(|e| e.section == Section::OskButton && e.chord == chord)
+        };
+        let mut rows = Vec::new();
+        // The D-pad moves the highlight off the frame path, so it works
+        // whatever the stick layer is doing. The sticks move it off the stick
+        // *deadline*, which `h.sticks { enabled = false }` switches off — so
+        // with the layer off, saying they move it would be a lie.
+        let sticks = c.sticks().enabled;
+        for (control, control_label, rank) in [
+            ("dpad", "D-pad", RANK_DPAD),
+            ("lstick", "Left stick", RANK_STICK),
+            ("rstick", "Right stick", RANK_STICK + 1),
+        ] {
+            if control != "dpad" && !sticks {
+                continue;
+            }
+            if !claimed(control) {
+                rows.push(osk_builtin(
+                    control,
+                    control_label.to_string(),
+                    "Move the highlight",
+                    "osk nav",
+                    rank,
+                ));
+            }
+        }
+        // The commit. `A` is where every console puts it, and the daemon
+        // hardwires it here for exactly the buttons a config has not taken.
+        for (btn, what) in crate::config::padless_osk_builtins() {
+            let name = button_name(btn).to_string();
+            if !claimed(&name) {
+                rows.push(osk_entry(
+                    btn,
+                    what,
+                    Some(&"Type the highlighted key".to_string()),
+                    Guard::OnlyIn(vec![OSK_MODE.to_string()]),
+                ));
+            }
+        }
+        self.entries.extend(rows);
+        self.entries.sort_by(|a, b| {
+            (section_rank(a.section), a.rank, &a.chord).cmp(&(
+                section_rank(b.section),
+                b.rank,
+                &b.chord,
+            ))
+        });
     }
 
     /// The rows of one section, in layout order.
@@ -849,6 +921,15 @@ fn arrow(d: StickDir) -> char {
 // Action rendering
 // ---------------------------------------------------------------------------
 
+/// The config word for an OSK layout, shared by the action's canonical
+/// spelling and its label so the two cannot drift.
+fn osk_mode_word(mode: crate::osk::OskMode) -> &'static str {
+    match mode {
+        crate::osk::OskMode::Bottom => "bottom",
+        crate::osk::OskMode::Split => "split",
+    }
+}
+
 /// The action in canonical config spelling — what you would write in a
 /// `config.toml`, and what [`Action::parse`] reads back.
 pub fn action_string(a: &Action) -> String {
@@ -858,16 +939,19 @@ pub fn action_string(a: &Action) -> String {
         Action::ToggleFullscreen => "fullscreen".to_string(),
         Action::Exec(c) => format!("exec {c}"),
         Action::Dispatch(p) => format!("dispatch {p}"),
-        Action::ToggleKeyboard { mode, reflow } => {
-            let m = match mode {
-                crate::osk::OskMode::Bottom => "bottom",
-                crate::osk::OskMode::Split => "split",
-            };
+        Action::ToggleKeyboard { mode, reflow, padless } => {
+            let mut out = format!("keyboard {}", osk_mode_word(*mode));
             if *reflow {
-                format!("keyboard {m} reflow")
-            } else {
-                format!("keyboard {m}")
+                out.push_str(" reflow");
             }
+            if let Some(p) = padless {
+                out.push_str(&format!(
+                    " padless:{},{}",
+                    osk_mode_word(p.mode),
+                    if p.reflow { "reflow" } else { "overlay" }
+                ));
+            }
+            out
         }
         // A mouse button is a `Key` in evdev's code space; spell it back the
         // way a config would write it, so the round trip lands on `mouse`.
@@ -1169,11 +1253,11 @@ pub fn derive_label(a: &Action) -> String {
         Action::ToggleFullscreen => "Toggle fullscreen".to_string(),
         Action::Exec(cmd) => humanize_command(cmd),
         Action::Dispatch(p) => humanize_dispatch(p),
-        Action::ToggleKeyboard { mode, reflow } => {
-            let m = match mode {
-                crate::osk::OskMode::Bottom => "bottom",
-                crate::osk::OskMode::Split => "split",
-            };
+        Action::ToggleKeyboard { mode, reflow, .. } => {
+            // The padless override is deliberately not in the label: the label
+            // names what this binding does on the controller in the reader's
+            // hands, and the sheet already knows which one that is.
+            let m = osk_mode_word(*mode);
             if *reflow {
                 format!("On-screen keyboard ({m}, reflow)")
             } else {
@@ -1874,8 +1958,8 @@ mod tests {
             Action::ToggleFullscreen,
             Action::Exec("omarchy-menu".into()),
             Action::Dispatch("hl.dsp.window.close()".into()),
-            Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false },
-            Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true },
+            Action::ToggleKeyboard { mode: crate::osk::OskMode::Split, reflow: false, padless: None },
+            Action::ToggleKeyboard { mode: crate::osk::OskMode::Bottom, reflow: true, padless: None },
             Action::Key(103.into()),
             Action::Key(0x110.into()),
             Action::Key(0x112.into()),
@@ -2468,6 +2552,93 @@ mod tests {
     /// the point of one vocabulary — but the two rows that name a physical
     /// pad have to name the stick that stands in for it, and the caret scrub
     /// goes away because nothing on this pad does it.
+    #[test]
+    fn a_padless_layouts_keyboard_tab_shows_the_highlight_not_the_pads() {
+        let src = "[bindings]\n\"guide+y\" = \"keyboard split\"\n";
+        let c = Config::from_toml_str(src).unwrap();
+        let osk_rows = |s: &Sheet| {
+            s.entries
+                .iter()
+                .filter(|e| e.section == Section::OskButton)
+                .map(|e| (e.chord.clone(), e.label.clone(), e.action.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // The puck: two trackpad cursors and two pad clicks that commit under
+        // them, exactly as before.
+        let puck = sheet_from_toml(src);
+        let rows = osk_rows(&puck);
+        assert!(rows.contains(&(
+            "lpad".into(),
+            "Move the keyboard's cursor".into(),
+            "osk cursor".into()
+        )));
+        assert!(rows.contains(&(
+            "rpad".into(),
+            "Move the keyboard's cursor".into(),
+            "osk cursor".into()
+        )));
+        assert!(rows.iter().any(|(chord, _, a)| chord == "rpad_click" && a == "osk commit"));
+        assert!(!rows.iter().any(|(chord, ..)| chord == "dpad"), "the puck has no nav rows");
+
+        // A padless layout: the pads and their clicks are gone — they do not
+        // exist on this controller and there is no stick that does what they
+        // did — and the highlight's own controls are in their place.
+        let mut xbox = sheet_from_toml(src);
+        xbox.set_layout("xbox-elite-2", &c);
+        let rows = osk_rows(&xbox);
+        for (chord, _, _) in &rows {
+            assert!(
+                !matches!(chord.as_str(), "lpad" | "rpad" | "lpad_click" | "rpad_click"),
+                "{chord} is not on this controller"
+            );
+        }
+        for control in ["dpad", "lstick", "rstick"] {
+            assert!(
+                rows.contains(&(control.into(), "Move the highlight".into(), "osk nav".into())),
+                "no nav row for {control} in {rows:?}"
+            );
+        }
+        // And a commit: `A`, where every console puts it.
+        assert!(
+            rows.contains(&("a".into(), "Type the highlighted key".into(), "osk commit".into())),
+            "no commit row in {rows:?}"
+        );
+
+        // Everything else on the keyboard's tab is a binding and reads the
+        // same on both controllers.
+        let same = |rows: &[(String, String, String)]| {
+            rows.iter()
+                .filter(|(chord, ..)| matches!(chord.as_str(), "b" | "x" | "y" | "l2" | "r2" | "menu"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(same(&osk_rows(&puck)), same(&rows));
+
+        // A config entry on `A` replaces the padless commit rather than
+        // doubling it — one row per control, as everywhere else on the sheet.
+        let src = "[bindings]\n\"guide+y\" = \"keyboard split\"\n[osk_buttons]\na = \"osk dismiss\"\n";
+        let c = Config::from_toml_str(src).unwrap();
+        let mut xbox = sheet_from_toml(src);
+        xbox.set_layout("xbox-elite-2", &c);
+        let a: Vec<_> =
+            osk_rows(&xbox).into_iter().filter(|(chord, ..)| chord == "a").collect();
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(a[0].2, "osk dismiss");
+
+        // With the stick layer off nothing moves the highlight from a stick,
+        // so those two rows go — but the D-pad and the commit stay: they are
+        // on the frame path and have nothing to do with `[sticks]`.
+        let src = "[bindings]\n\"guide+y\" = \"keyboard split\"\n[sticks]\nenabled = false\n";
+        let off = Config::from_toml_str(src).unwrap();
+        let mut dead = sheet_from_toml(src);
+        dead.set_layout("xbox-elite-2", &off);
+        let rows = osk_rows(&dead);
+        assert!(rows.iter().any(|(chord, ..)| chord == "dpad"));
+        assert!(rows.iter().any(|(chord, ..)| chord == "a"));
+        assert!(!rows.iter().any(|(chord, ..)| chord == "lstick" || chord == "rstick"));
+    }
+
     #[test]
     fn a_padless_layout_retargets_the_ambient_rows_onto_the_sticks() {
         let src = "[bindings]\n\"guide+r1\" = \"workspace +1\"\n[scrub]\ndetent_deg = 15\n";

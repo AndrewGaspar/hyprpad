@@ -799,6 +799,156 @@ impl<'k> LayoutEngine<'k> {
     pub fn hit_test(placed: &[PlacedKey], px: f32, py: f32) -> Option<usize> {
         placed.iter().position(|p| p.rect.contains(px, py))
     }
+
+    // -----------------------------------------------------------------------
+    // Snap navigation (the padless modality)
+    // -----------------------------------------------------------------------
+
+    /// The horizontal centre of a placed key — the column coordinate snap
+    /// navigation measures everything against.
+    pub fn center_x(placed: &[PlacedKey], i: usize) -> f32 {
+        let r = placed[i].rect;
+        r.x + r.w / 2.0
+    }
+
+    /// Group a placement into navigation rows: top to bottom, each row's keys
+    /// left to right, as indices into `placed`.
+    ///
+    /// Rows are derived from the *pixel* geometry rather than [`Key::row`] so
+    /// the walk is over what is actually on screen — a panel that holds only
+    /// one hand's keys ([`PanelRole::holds`]) navigates its own sub-grid, and a
+    /// row the panel does not hold simply is not there to step into.
+    pub fn nav_rows(placed: &[PlacedKey]) -> Vec<Vec<usize>> {
+        let mut rows: Vec<(f32, Vec<usize>)> = Vec::new();
+        for (i, p) in placed.iter().enumerate() {
+            match rows.iter_mut().find(|(y, _)| (*y - p.rect.y).abs() < 0.5) {
+                Some((_, keys)) => keys.push(i),
+                None => rows.push((p.rect.y, vec![i])),
+            }
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, keys) in rows.iter_mut() {
+            keys.sort_by(|&a, &b| placed[a].rect.x.total_cmp(&placed[b].rect.x));
+        }
+        rows.into_iter().map(|(_, keys)| keys).collect()
+    }
+
+    /// Where the highlight lands when snap navigation is first armed: the middle
+    /// row's key nearest the placement's horizontal centre — `g`/`h` on the
+    /// QWERTY grid, which is where the Steam Deck starts its focus too
+    /// (osk-technology.md §4.4).
+    pub fn nav_start(placed: &[PlacedKey]) -> Option<usize> {
+        let rows = Self::nav_rows(placed);
+        if rows.is_empty() {
+            return None;
+        }
+        let left = placed.iter().map(|p| p.rect.x).fold(f32::INFINITY, f32::min);
+        let right = placed.iter().map(|p| p.rect.x + p.rect.w).fold(f32::NEG_INFINITY, f32::max);
+        let middle = &rows[rows.len() / 2];
+        Self::nearest_in_row(placed, middle, (left + right) / 2.0)
+    }
+
+    /// The key in `row` whose centre is nearest `anchor_x`; ties go to the
+    /// leftmost. This is the `MAINTAIN_X` column memory: `anchor_x` is the
+    /// column the highlight *wants*, remembered across a run of vertical moves
+    /// so walking down a row of wide keys and back up returns to where it
+    /// started (osk-technology.md §4.4).
+    fn nearest_in_row(placed: &[PlacedKey], row: &[usize], anchor_x: f32) -> Option<usize> {
+        row.iter()
+            .copied()
+            .min_by(|&a, &b| {
+                (Self::center_x(placed, a) - anchor_x)
+                    .abs()
+                    .total_cmp(&(Self::center_x(placed, b) - anchor_x).abs())
+            })
+    }
+
+    /// The placed key whose centre is nearest the panel-local point `(px, py)`.
+    ///
+    /// Snap navigation's answer to "the layout changed under the highlight":
+    /// a layer switch renumbers every key, so the highlight is re-derived from
+    /// where it *was on screen* rather than from an index that no longer means
+    /// the same thing.
+    pub fn nav_nearest(placed: &[PlacedKey], px: f32, py: f32) -> Option<usize> {
+        let d2 = |i: usize| {
+            let r = placed[i].rect;
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            (cx - px) * (cx - px) + (cy - py) * (cy - py)
+        };
+        (0..placed.len()).min_by(|&a, &b| d2(a).total_cmp(&d2(b)))
+    }
+
+    /// Move the snap-navigation highlight one step from `from` (an index into
+    /// `placed`) and return where it lands.
+    ///
+    /// * **Left/Right** step within the row and wrap **row to row**, the way a
+    ///   text cursor does: off the right end of a row is the first key of the
+    ///   next row down, off the left end is the last key of the row above, and
+    ///   the ends of the grid wrap around to each other. Every key on the
+    ///   keyboard is therefore reachable by holding one direction.
+    /// * **Up/Down** move to the adjacent row (wrapping top↔bottom) and land on
+    ///   the key nearest `anchor_x`, not nearest the current key — the column
+    ///   memory above.
+    /// * **Home/End** jump to the ends of the current row.
+    ///
+    /// Pure: no state, no I/O — [`crate::app`] owns the focus and the anchor.
+    pub fn nav_step(placed: &[PlacedKey], from: usize, dir: NavDir, anchor_x: f32) -> usize {
+        let rows = Self::nav_rows(placed);
+        let Some((r, c)) = rows.iter().enumerate().find_map(|(r, keys)| {
+            keys.iter().position(|&k| k == from).map(|c| (r, c))
+        }) else {
+            return from;
+        };
+        let n = rows.len();
+        match dir {
+            NavDir::Left => {
+                if c > 0 {
+                    rows[r][c - 1]
+                } else {
+                    let up = (r + n - 1) % n;
+                    *rows[up].last().unwrap_or(&from)
+                }
+            }
+            NavDir::Right => {
+                if c + 1 < rows[r].len() {
+                    rows[r][c + 1]
+                } else {
+                    let down = (r + 1) % n;
+                    *rows[down].first().unwrap_or(&from)
+                }
+            }
+            NavDir::Up => {
+                let up = (r + n - 1) % n;
+                Self::nearest_in_row(placed, &rows[up], anchor_x).unwrap_or(from)
+            }
+            NavDir::Down => {
+                let down = (r + 1) % n;
+                Self::nearest_in_row(placed, &rows[down], anchor_x).unwrap_or(from)
+            }
+            NavDir::Home => *rows[r].first().unwrap_or(&from),
+            NavDir::End => *rows[r].last().unwrap_or(&from),
+        }
+    }
+}
+
+/// One step of console-style snap navigation: the direction the single
+/// highlighted key moves.
+///
+/// This is the padless modality. A controller with no trackpads has no honest
+/// way to point at a key — a stick-driven free cursor drifts and has to be
+/// steered — so instead of a cursor the keyboard carries **one highlight** that
+/// snaps from key to key, exactly as every console keyboard does, and `commit`
+/// takes whatever it is on (docs/research/xbox-elite.md §3.5 option (ii)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+    /// The first key of the current row.
+    Home,
+    /// The last key of the current row.
+    End,
 }
 
 #[cfg(test)]
@@ -1136,5 +1286,159 @@ mod tests {
         assert_eq!(LayoutEngine::hit_test(&placed, cx, cy), Some(0));
         // A point in the inter-key gap hits nothing (the §4.3 "no key" gap).
         assert_eq!(LayoutEngine::hit_test(&placed, first.rect.x - 1.0, cy), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Snap navigation
+    // -----------------------------------------------------------------------
+
+    /// The bottom-deck placement plus a label lookup, which is what every
+    /// navigation test wants to read.
+    fn deck() -> (Keyboard, Vec<PlacedKey>) {
+        let kb = Keyboard::qwerty();
+        let placed = LayoutEngine::new(&kb, LayoutMode::BottomDeck).place(PanelRole::Bottom, &geom());
+        (kb, placed)
+    }
+
+    #[test]
+    fn nav_rows_are_the_grid_as_it_is_drawn() {
+        let (kb, placed) = deck();
+        let rows = LayoutEngine::nav_rows(&placed);
+        let label = |i: usize| kb.keys[placed[i].key].label;
+        assert_eq!(rows.len(), 5, "the QWERTY grid has five rows");
+        // Top to bottom, left to right — the drawn order, not the model order.
+        assert_eq!(label(rows[0][0]), "`");
+        assert_eq!(label(*rows[0].last().unwrap()), "Bksp");
+        assert_eq!(label(rows[1][1]), "q");
+        assert_eq!(label(rows[2][1]), "a");
+        assert_eq!(label(rows[3][1]), "z");
+        assert_eq!(label(rows[4][0]), "?123");
+    }
+
+    #[test]
+    fn navigation_starts_in_the_middle_of_the_home_row() {
+        let (kb, placed) = deck();
+        let start = LayoutEngine::nav_start(&placed).expect("a placed keyboard has a start key");
+        // The Deck starts its focus on `G`; the centre of the home row is that
+        // key or its neighbour, depending on the row's exact widths.
+        assert!(
+            matches!(kb.keys[placed[start].key].label, "g" | "h"),
+            "started on {:?}",
+            kb.keys[placed[start].key].label
+        );
+    }
+
+    #[test]
+    fn nav_left_and_right_walk_the_row_and_wrap_row_to_row() {
+        let (kb, placed) = deck();
+        let label = |i: usize| kb.keys[placed[i].key].label;
+        let find = |l: &str| placed.iter().position(|p| kb.keys[p.key].label == l).unwrap();
+        let step = |from: usize, dir: NavDir| LayoutEngine::nav_step(&placed, from, dir, 0.0);
+
+        // Within a row.
+        assert_eq!(label(step(find("a"), NavDir::Right)), "s");
+        assert_eq!(label(step(find("s"), NavDir::Left)), "a");
+
+        // Off the right end of the home row is the first key of the row below.
+        assert_eq!(label(step(find("Enter"), NavDir::Right)), "Shift");
+        // Off the left end of the home row is the last key of the row above.
+        assert_eq!(label(step(find("Caps"), NavDir::Left)), "\\");
+
+        // The ends of the grid wrap around to each other, so holding one
+        // direction reaches every key on the keyboard.
+        let rows = LayoutEngine::nav_rows(&placed);
+        let first = rows[0][0];
+        let last = *rows.last().unwrap().last().unwrap();
+        assert_eq!(step(first, NavDir::Left), last);
+        assert_eq!(step(last, NavDir::Right), first);
+    }
+
+    #[test]
+    fn nav_up_and_down_keep_the_column_and_wrap_top_to_bottom() {
+        let (kb, placed) = deck();
+        let label = |i: usize| kb.keys[placed[i].key].label;
+        let find = |l: &str| placed.iter().position(|p| kb.keys[p.key].label == l).unwrap();
+
+        // Straight up and down the middle of the board: the anchor is the
+        // key's own column, so each step lands on the key over/under it. (The
+        // rows are staggered by half a key, so a column is only ever a
+        // *nearest* answer — `f`/`c`/`v` is an exact tie, which the leftmost
+        // rule settles; `r`/`f` is not.)
+        let f = find("f");
+        let anchor = LayoutEngine::center_x(&placed, f);
+        assert_eq!(label(LayoutEngine::nav_step(&placed, f, NavDir::Up, anchor)), "r");
+        let r = find("r");
+        let up_anchor = LayoutEngine::center_x(&placed, r);
+        assert_eq!(label(LayoutEngine::nav_step(&placed, r, NavDir::Down, up_anchor)), "f");
+
+        // Column memory: crossing the six-unit space bar and coming back lands
+        // on the key you left, not on the space bar's own centre.
+        let v = find("v");
+        let anchor = LayoutEngine::center_x(&placed, v);
+        let space = LayoutEngine::nav_step(&placed, v, NavDir::Down, anchor);
+        assert_eq!(label(space), "Space");
+        assert_eq!(label(LayoutEngine::nav_step(&placed, space, NavDir::Up, anchor)), "v");
+
+        // Vertical wrap: up from the top row is the bottom row, and back.
+        let rows = LayoutEngine::nav_rows(&placed);
+        let top = rows[0][0];
+        let up = LayoutEngine::nav_step(&placed, top, NavDir::Up, LayoutEngine::center_x(&placed, top));
+        assert!(rows.last().unwrap().contains(&up), "up from the top row wraps to the bottom");
+        let down = LayoutEngine::nav_step(&placed, up, NavDir::Down, LayoutEngine::center_x(&placed, top));
+        assert!(rows[0].contains(&down), "and back down again");
+    }
+
+    #[test]
+    fn nav_home_and_end_are_the_ends_of_the_current_row() {
+        let (kb, placed) = deck();
+        let label = |i: usize| kb.keys[placed[i].key].label;
+        let find = |l: &str| placed.iter().position(|p| kb.keys[p.key].label == l).unwrap();
+        assert_eq!(label(LayoutEngine::nav_step(&placed, find("g"), NavDir::Home, 0.0)), "Caps");
+        assert_eq!(label(LayoutEngine::nav_step(&placed, find("g"), NavDir::End, 0.0)), "Enter");
+    }
+
+    #[test]
+    fn a_split_column_navigates_its_own_sub_grid() {
+        // Snap navigation is the padless modality and padless raises `bottom`,
+        // but the walk is over whatever is placed — so a column stays inside
+        // its own keys rather than stepping onto a surface that is not there.
+        let kb = Keyboard::qwerty();
+        let left = LayoutEngine::new(&kb, LayoutMode::SideSplit).place(PanelRole::LeftColumn, &geom());
+        let rows = LayoutEngine::nav_rows(&left);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            for &i in row {
+                assert!(matches!(kb.keys[left[i].key].hand, Hand::Left | Hand::Either));
+            }
+        }
+        // Every step from every key stays in the column.
+        for from in 0..left.len() {
+            for dir in [NavDir::Left, NavDir::Right, NavDir::Up, NavDir::Down] {
+                let to = LayoutEngine::nav_step(&left, from, dir, 0.0);
+                assert!(to < left.len());
+            }
+        }
+    }
+
+    #[test]
+    fn nav_nearest_re_derives_the_highlight_from_where_it_was_drawn() {
+        // What a layer switch does: the key set is renumbered, so the highlight
+        // is recovered from the pixel it was on.
+        let g = geom();
+        let base = Keyboard::qwerty();
+        let placed = LayoutEngine::new(&base, LayoutMode::BottomDeck).place(PanelRole::Bottom, &g);
+        let f = placed.iter().position(|p| base.keys[p.key].label == "f").unwrap();
+        let (x, y) = (
+            LayoutEngine::center_x(&placed, f),
+            placed[f].rect.y + placed[f].rect.h / 2.0,
+        );
+
+        let sym = Keyboard::symbols();
+        let sym_placed = LayoutEngine::new(&sym, LayoutMode::BottomDeck).place(PanelRole::Bottom, &g);
+        let landed = LayoutEngine::nav_nearest(&sym_placed, x, y).unwrap();
+        // Same row, same column band — `f` is the fourth key of the home row,
+        // and so is the symbols layer's `{`.
+        assert_eq!(sym_placed[landed].rect.y, placed[f].rect.y);
+        assert!((LayoutEngine::center_x(&sym_placed, landed) - x).abs() < g.key_size);
     }
 }

@@ -158,6 +158,7 @@ show <bottom|split> [reflow|overlay]   create + render the surface(s); OVERLAY i
 hide                                    DESTROY the surface(s) — never unmap
 cursor <L|R> <nx> <ny>                  pad absolute position, each axis in [-1,1]
 commit <L|R>                            commit the key under that pad's cursor (click-down)
+nav <left|right|up|down|home|end>       move the snap-navigation highlight one key
 shift <off|oneshot|stuck|on>            set the latched shift/caps state (on = stuck / caps-lock)
 shift <down|up>                         hold / release a physical Shift (momentary; the latch is untouched)
 layer <base|symbols|toggle>             switch the base QWERTY ↔ numeric/symbols page
@@ -187,6 +188,44 @@ accepted as an alias for `reflow`.
 **Overlay is the default** now: a bare `show bottom` floats over content (zero
 exclusive zone); pass `reflow` — or send `reflow on`, or press the on-screen
 `Push` key — to reserve an exclusive zone and displace/reflow the workspace.
+
+### Snap navigation — `nav`, the padless modality
+
+`cursor`/`commit` assume something you can point with. A controller with no
+trackpads has nothing: a stick-driven free cursor drifts and has to be steered,
+which is what the sticks were tried as first and what the sticks are bad at. So
+the keyboard also carries **one highlight** that snaps from key to key, exactly
+as every console keyboard does, and `commit` takes it.
+
+`nav <dir>` moves it one key. Left/right step along the row and wrap **row to
+row** the way a text cursor does — off the right end of a row is the first key
+of the row below, and the ends of the grid wrap around to each other, so
+holding one direction reaches every key. Up/down move to the adjacent row
+(wrapping top↔bottom) and land on the key nearest the remembered **column**,
+not nearest the current key: walk down over the six-unit space bar and back up
+and you return to the key you left (the Deck's `MAINTAIN_X`). `home`/`end` jump
+to the ends of the current row.
+
+The **first** `nav` of a session arms the highlight at the middle of the home
+row (`g`/`h`, where the Deck starts its focus too) rather than moving from
+nowhere — so the daemon raises the keyboard and sends one `nav home` to light a
+starting key. A `show` or a `hide` disarms it again, like the typed context; an
+internal re-show (a `reflow` or `predict` toggle recreating the surfaces) keeps
+it, like the shift latch and the layer. A layer switch renumbers every key, so
+the highlight is re-derived from the pixel it was drawn on and stays on the
+same key of the same row.
+
+`commit <L|R>` falls through to the highlight **only when that pad has no
+cursor**. A pad source always has one once a thumb has touched down, so its
+commit is exactly what it always was; a padless source never sends a `cursor`
+line at all, so its `A` — which reads the right-hand cursor, like the rest of
+the face cluster — finds nothing there and types the highlighted key. The
+highlight draws in `colors.focus`, the third [`HighlightKind`] the renderer has
+always had room for, so on the day both are live at once they are visibly
+different things.
+
+`focus <dir>` is accepted as an alias for `nav`, the spelling
+`docs/research/xbox-elite.md` §3.5 sketched this verb under.
 
 Bursts of lines written together (e.g. two `cursor` lines in one write) are all
 processed on the same wakeup on **both** transports — stdin is set non-blocking

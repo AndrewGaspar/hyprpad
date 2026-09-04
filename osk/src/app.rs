@@ -40,8 +40,8 @@ use wayland_client::{
 
 use crate::control::{CandidateCmd, Channel, Command};
 use crate::layout::{
-    Key, Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, Pad, PanelRole, PlacedKey, Rect,
-    ShiftModel, ShiftState, STRIP_SLOTS,
+    Key, Keyboard, KeyRole, Layer, LayoutEngine, LayoutMode, NavDir, Pad, PanelRole, PlacedKey,
+    Rect, ShiftModel, ShiftState, STRIP_SLOTS,
 };
 use crate::output::VirtualKeyboard;
 use crate::predict::{Candidate, CandidateKind, Context, Predictor};
@@ -152,6 +152,24 @@ pub struct Osk {
     right_norm: Option<(f32, f32)>,
     left_px: Option<(f32, f32)>,
     right_px: Option<(f32, f32)>,
+    /// The snap-navigation highlight: an index into [`Keyboard::keys`], or
+    /// `None` while navigation is unarmed. This is the **padless** cursor —
+    /// there is exactly one of it, it never sits between keys, and `commit`
+    /// takes it when the committing pad has no cursor of its own. A pad source
+    /// never arms it, so nothing about the two-cursor model changes.
+    nav_focus: Option<usize>,
+    /// The column the highlight wants, in panel-local pixels — the Deck's
+    /// `MAINTAIN_X` column memory (osk-technology.md §4.4). Set by every
+    /// horizontal move and *kept* across vertical ones, so walking down over
+    /// the space bar and back up returns to the key you left.
+    nav_anchor: f32,
+    /// Snap navigation has been asked for this session. Separate from
+    /// `nav_focus` because the daemon's arming `nav` arrives in the **same
+    /// burst** as the `show` that precedes it — before the compositor has
+    /// configured the surface and therefore before there is a placement to
+    /// land on. The intent is remembered here and honoured by
+    /// [`Self::nav_settle`] on the first configure.
+    nav_armed: bool,
     // The shift level: the {Off, OneShot, Stuck} latch the on-screen keys drive
     // plus the daemon's held (momentary) shift, osk-technology.md §4.6.
     shift: ShiftModel,
@@ -222,6 +240,16 @@ impl Edit {
             .find(|&c| crate::output::key_for(c) == Some((code, shift)))
             .map(Edit::Char)
     }
+}
+
+/// What a `commit <pad>` acts on: the pad's own cursor when it has one, else
+/// the snap-navigation highlight.
+///
+/// The pad always wins, which is what keeps a trackpad controller's commit
+/// exactly what it was; the highlight is the fallback for the padless source
+/// that never sends a `cursor` line at all.
+fn commit_target(pad: Option<Target>, nav: Option<usize>) -> Option<Target> {
+    pad.or_else(|| nav.map(Target::Key))
 }
 
 /// Which slot the strip highlights when the candidates change.
@@ -312,6 +340,9 @@ impl Osk {
             right_norm: None,
             left_px: None,
             right_px: None,
+            nav_focus: None,
+            nav_anchor: 0.0,
+            nav_armed: false,
             shift: ShiftModel::default(),
             trackpad_scale: 1.0,
             predictor,
@@ -414,16 +445,25 @@ impl Osk {
             Command::Show { mode, reflow } => {
                 self.show(mode, reflow, qh);
                 self.reset_context();
+                // A raise is a fresh session: the highlight is unarmed until
+                // the daemon sends a `nav`, which is what keeps a pad source —
+                // which never sends one — looking exactly as it always has.
+                // The *internal* re-shows below (a reflow or predict toggle
+                // recreating the surfaces) go straight to `show` and keep it,
+                // exactly as they keep the shift latch and the layer.
+                self.reset_nav();
             }
             Command::Hide => {
                 self.hide();
                 self.reset_context();
+                self.reset_nav();
                 // Flush the learned words while we are idle, rather than only at
                 // exit — which a kill would skip.
                 self.predictor.save();
             }
             Command::Cursor { pad, nx, ny } => self.update_cursor(pad, nx, ny),
             Command::Commit { pad } => self.commit(pad, qh),
+            Command::Nav { dir } => self.nav(dir),
             Command::Shift { state } => self.set_shift(state),
             Command::ShiftHeld { down } => self.set_held_shift(down),
             Command::Layer { target } => self.set_layer(target.unwrap_or_else(|| self.layer.toggled())),
@@ -694,15 +734,100 @@ impl Osk {
         }
     }
 
+    /// Disarm snap navigation. A raise and a dismiss bracket one field's worth
+    /// of typing, so the highlight is dropped at both ends — the same seam the
+    /// typed context uses, and for the same reason.
+    fn reset_nav(&mut self) {
+        self.nav_focus = None;
+        self.nav_anchor = 0.0;
+        self.nav_armed = false;
+    }
+
+    /// Land the highlight on its starting key if navigation was asked for
+    /// before there was anything placed to land on. Called from every
+    /// configure, so the daemon's `show` + `nav home` burst lights a starting
+    /// key as soon as the surface exists rather than silently doing nothing.
+    fn nav_settle(&mut self) {
+        if !self.nav_armed || self.nav_focus.is_some() {
+            return;
+        }
+        let Some(idx) = self.nav_panel() else { return };
+        let placed = &self.panels[idx].placed;
+        if let Some(start) = LayoutEngine::nav_start(placed) {
+            self.nav_focus = Some(placed[start].key);
+            self.nav_anchor = LayoutEngine::center_x(placed, start);
+        }
+    }
+
+    /// The panel snap navigation walks: the one already holding the highlight,
+    /// else the first configured panel with keys on it. In `bottom` mode — the
+    /// padless presentation — that is the single panel holding the whole grid,
+    /// which is exactly why padless raises `bottom` and not `split`.
+    fn nav_panel(&self) -> Option<usize> {
+        if let Some(k) = self.nav_focus {
+            let held = self
+                .panels
+                .iter()
+                .position(|p| p.configured && p.placed.iter().any(|pk| pk.key == k));
+            if held.is_some() {
+                return held;
+            }
+        }
+        self.panels.iter().position(|p| p.configured && !p.placed.is_empty())
+    }
+
+    /// Move the snap-navigation highlight one key (`nav <dir>`).
+    ///
+    /// The **first** `nav` of a session arms the highlight at
+    /// [`LayoutEngine::nav_start`] rather than moving from nowhere, whichever
+    /// direction it was: the daemon raises the keyboard and sends one `nav
+    /// home` to light up a starting key, and a user who instead just pushes a
+    /// direction gets the same visible starting point rather than a silent
+    /// no-op. After that every direction moves ([`LayoutEngine::nav_step`]),
+    /// and `anchor` — the column memory — is refreshed by the horizontal moves
+    /// and deliberately kept by the vertical ones.
+    fn nav(&mut self, dir: NavDir) {
+        self.nav_armed = true;
+        let Some(idx) = self.nav_panel() else { return };
+        let placed = &self.panels[idx].placed;
+        let current = self.nav_focus.and_then(|k| placed.iter().position(|p| p.key == k));
+        let (next, moved) = match current {
+            Some(c) => (LayoutEngine::nav_step(placed, c, dir, self.nav_anchor), true),
+            None => match LayoutEngine::nav_start(placed) {
+                Some(start) => (start, false),
+                None => return,
+            },
+        };
+        let key = placed[next].key;
+        let anchor = LayoutEngine::center_x(placed, next);
+        if self.nav_focus == Some(key) && moved {
+            // A wall (a one-row panel navigated vertically) — nothing to redraw.
+            return;
+        }
+        self.nav_focus = Some(key);
+        if !moved || !matches!(dir, NavDir::Up | NavDir::Down) {
+            self.nav_anchor = anchor;
+        }
+        self.rebuild_highlights();
+        self.mark_panel_dirty(idx);
+    }
+
     /// Commit whatever is under `pad`'s cursor (trackpad click-down, §4.2) — a
     /// key, or a candidate the pad is pointing at. Clicking a suggestion is the
     /// discoverable path; `R1` is the fast one (osk-prediction.md §7.2).
+    ///
+    /// A pad with **no** cursor falls through to the snap-navigation highlight.
+    /// That is the whole of the padless commit path: a controller with no
+    /// trackpads never sends a `cursor` line, so `A` — which reads the right
+    /// pad like the rest of the face cluster — finds nothing there and types
+    /// the highlighted key instead. A pad source always has a cursor once a
+    /// thumb has touched down, so nothing about its commit changes.
     fn commit(&mut self, pad: Pad, qh: &QueueHandle<Self>) {
         let focus = match pad {
             Pad::Left => self.left_focus,
             Pad::Right => self.right_focus,
         };
-        match focus {
+        match commit_target(focus, self.nav_focus) {
             Some(Target::Key(k)) => self.commit_key_index(k, qh),
             Some(Target::Candidate(i)) => self.accept_candidate(i),
             None => {}
@@ -884,6 +1009,14 @@ impl Osk {
         }
         Self::push_highlight(&mut self.panels, self.left_focus, HighlightKind::LeftPad);
         Self::push_highlight(&mut self.panels, self.right_focus, HighlightKind::RightPad);
+        // Last, so that on the (Deck-style) day both are live at once a pad
+        // resting on the same key still draws in its own colour: the draw path
+        // takes the FIRST highlight it finds for a key.
+        Self::push_highlight(
+            &mut self.panels,
+            self.nav_focus.map(Target::Key),
+            HighlightKind::Focus,
+        );
     }
 
     fn push_highlight(panels: &mut [PanelSurface], focus: Option<Target>, kind: HighlightKind) {
@@ -968,6 +1101,14 @@ impl Osk {
         if self.layer == layer {
             return;
         }
+        // Where the snap-navigation highlight is *on screen*, before the key
+        // set under it is replaced. The two layers do not have the same number
+        // of keys, so an index does not survive the switch — the pixel does.
+        let nav_at = self.nav_focus.and_then(|k| {
+            self.panels.iter().find_map(|p| {
+                p.placed.iter().find(|pk| pk.key == k).map(|pk| pk.rect.y + pk.rect.h / 2.0)
+            })
+        });
         self.layer = layer;
         self.keyboard = layer.keyboard();
         for i in 0..self.panels.len() {
@@ -983,11 +1124,18 @@ impl Osk {
             self.panels[i].strip = strip;
         }
         // Indices changed with the key set; re-derive focus/cursor from the
-        // stored pad positions.
+        // stored pad positions, and the highlight from the pixel it was on —
+        // pressing `?123` leaves it on the same key of the same row, which is
+        // what a highlight you are steering by hand has to do.
         self.left_focus = None;
         self.right_focus = None;
         self.recompute_pad(Pad::Left);
         self.recompute_pad(Pad::Right);
+        if let (Some(y), Some(idx)) = (nav_at, self.nav_panel()) {
+            let anchor = self.nav_anchor;
+            self.nav_focus = LayoutEngine::nav_nearest(&self.panels[idx].placed, anchor, y)
+                .map(|i| self.panels[idx].placed[i].key);
+        }
         self.rebuild_highlights();
         self.rebuild_cursors();
         self.mark_all_dirty();
@@ -1133,9 +1281,12 @@ impl Osk {
         self.panels[idx].strip = strip;
         self.panels[idx].configured = true;
         // A pad may already be resting over this newly-placed panel — re-derive
-        // its focus/cursor so a resize/first-configure doesn't drop it.
+        // its focus/cursor so a resize/first-configure doesn't drop it. The
+        // highlight has the same problem from the other end: the daemon's
+        // arming `nav` may have arrived before there was a placement.
         self.recompute_pad(Pad::Left);
         self.recompute_pad(Pad::Right);
+        self.nav_settle();
         self.rebuild_highlights();
         self.rebuild_cursors();
         // First configure makes the panel drawable: mark it dirty. `last_draw`
@@ -1571,6 +1722,46 @@ mod tests {
         // A code that types no character is not guessed at.
         assert_eq!(Edit::for_keycode(29, false), None, "KEY_LEFTCTRL types nothing");
         assert_eq!(Edit::for_keycode(103, false), None, "KEY_UP types nothing");
+    }
+
+    #[test]
+    fn a_commit_takes_the_snap_navigation_highlight_only_when_the_pad_has_none() {
+        // A pad source is untouched: the cursor under the thumb always wins,
+        // key or candidate.
+        assert_eq!(commit_target(Some(Target::Key(7)), Some(3)), Some(Target::Key(7)));
+        assert_eq!(
+            commit_target(Some(Target::Candidate(1)), Some(3)),
+            Some(Target::Candidate(1))
+        );
+        // A padless source never sends a `cursor` line, so `A` finds no pad
+        // cursor and types the highlighted key instead.
+        assert_eq!(commit_target(None, Some(3)), Some(Target::Key(3)));
+        // Nothing pointed at, nothing highlighted: nothing typed.
+        assert_eq!(commit_target(None, None), None);
+    }
+
+    #[test]
+    fn the_highlighted_key_is_what_a_commit_would_type() {
+        // The highlight is an index into the same key model a pad cursor
+        // resolves to, so `commit` on it goes down the identical path: the
+        // key's own evdev code, at the live shift level.
+        let kb = Keyboard::qwerty();
+        let placed = crate::layout::LayoutEngine::new(&kb, LayoutMode::BottomDeck)
+            .place(crate::layout::PanelRole::Bottom, &Theme::default().geom);
+        let start = crate::layout::LayoutEngine::nav_start(&placed).unwrap();
+        let key = &kb.keys[placed[start].key];
+        assert_eq!(keystroke_for(key, ShiftModel::default()), Some((key.keycode, false)));
+        // And a stepped highlight types the key it stepped onto, shifted when
+        // the latch says so.
+        let right = crate::layout::LayoutEngine::nav_step(
+            &placed,
+            start,
+            NavDir::Right,
+            crate::layout::LayoutEngine::center_x(&placed, start),
+        );
+        let key = &kb.keys[placed[right].key];
+        let shifted = ShiftModel::default().with_latched(ShiftState::Stuck);
+        assert_eq!(keystroke_for(key, shifted), Some((key.keycode, true)));
     }
 
     #[test]
