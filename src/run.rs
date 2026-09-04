@@ -138,7 +138,7 @@ use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, GamepadKind, GuideTap,
     HapticsConfig, KeyChord, OskAction, RumbleMode, ScrollConfig, ScrollMode, ScrubConfig,
 };
-use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper};
+use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper, ShuttlePacer};
 use crate::gamepad::{self, VirtualGamepad};
 use crate::gesture::{GestureEngine, GestureEvent};
 // `Pad` is renamed: this module already talks about `report::Pad` (a pad
@@ -756,6 +756,26 @@ pub fn run() -> std::io::Result<()> {
                 &mut hx,
                 now,
             );
+            // The caret shuttle rides this clock too, and it is the reason the
+            // clock exists for it: a stick held over emits no reports, so the
+            // taps have to come from here. The last frame is the state — its
+            // deflection and its `select` level — exactly as it is for the
+            // integrators above.
+            let scrub_active = engine.guide_active()
+                && !osk.is_active()
+                && config.scrub_enabled_in(modes.state());
+            drive_scrub(
+                &mut keyboard,
+                &mut engine,
+                &prev_frame,
+                &mut scrub,
+                config.scrub(),
+                config.cursor(),
+                scrub_active,
+                &mut hx,
+                now,
+            );
+            sticks.set_shuttle(scrub.shuttle_running(), config.sticks(), now);
             sticks.stepped(config.sticks(), now);
             continue;
         }
@@ -1008,6 +1028,18 @@ pub fn run() -> std::io::Result<()> {
                 // The one gesture threshold a config can move, read fresh so
                 // `hyprpad reload` retunes it on the very next report.
                 engine.set_guide_tap_max(config.gamepad().guide_tap_max());
+                // Who owns the LEFT stick's horizontal axis under a held guide.
+                // On a padless controller with the scrub live it is the caret
+                // shuttle's, and `guide+lstick_left/right` must not also fire —
+                // one push would otherwise walk the caret AND move the window
+                // focus. Asked before the update, because the flick is decided
+                // inside it; vertical flicks are untouched.
+                engine.set_shuttle_left(
+                    !frame.source.has_pads()
+                        && config.scrub().enabled
+                        && !osk.is_active()
+                        && config.scrub_enabled_in(modes.state()),
+                );
                 let gestures = engine.update(&frame, now);
                 // The forwarding gate, asked HERE — after the update, so the
                 // guide is already up on a release frame, and before any
@@ -1186,6 +1218,10 @@ pub fn run() -> std::io::Result<()> {
                     &mut hx,
                     now,
                 );
+                // On a padless controller the scrub is a shuttle, and a stick
+                // held over reports nothing: hand the answer to the deadline
+                // that will step it while the wire is silent.
+                sticks.set_shuttle(scrub.shuttle_running(), config.sticks(), now);
                 // Bare-button bindings that are *held* (D-pad -> arrows, pad
                 // click / triggers -> mouse clicks by default; each code goes
                 // to the device it belongs to). Gated OFF on the guide layer
@@ -2062,6 +2098,10 @@ struct ScrubState {
     angle: AngleAccumulator,
     /// Speed → step-size ladder (×1 / ×2 / ×4-or-word).
     pacer: JogPacer,
+    /// The padless twin of the wheel: deflection → *when the next tap is due*.
+    /// Only one of the two is ever live on a given frame, and which is decided
+    /// by [`report::Source::has_pads`].
+    shuttle: ShuttlePacer,
     /// Previous frame's timestamp, for the pacer's `dt`. `None` until the first
     /// scrubbing frame after a reset.
     last_t: Option<Instant>,
@@ -2083,6 +2123,12 @@ impl ScrubState {
                 cfg.slow_deg_per_s,
                 cfg.fast_min_detents,
                 cfg.word_tier,
+            ),
+            shuttle: ShuttlePacer::new(
+                cfg.shuttle.deadzone,
+                cfg.shuttle.slow_per_s,
+                cfg.shuttle.fast_per_s,
+                cfg.shuttle.word_above,
             ),
             last_t: None,
             consumed: false,
@@ -2107,8 +2153,17 @@ impl ScrubState {
         self.damper.reset();
         self.angle.reset();
         self.pacer.reset();
+        self.shuttle.reset();
         self.last_t = None;
         self.consumed = false;
+    }
+
+    /// Whether the shuttle is holding a stick over, and the loop therefore owes
+    /// it a wakeup ([`crate::sticks::StickDrive::set_shuttle`]). Always false
+    /// on a controller with trackpads, where the jog wheel resets it every
+    /// frame.
+    fn shuttle_running(&self) -> bool {
+        self.shuttle.running()
     }
 }
 
@@ -2176,13 +2231,23 @@ fn scrub_burst(ticks: i32, pacer: &mut JogPacer, select: bool) -> ScrubBurst {
     out
 }
 
-/// Drive the caret scrub from the LEFT trackpad for a single frame.
+/// Drive the caret scrub from the LEFT input for a single frame — or, on a
+/// controller with no trackpads, for a single step of the stick clock.
 ///
 /// The guide-layer twin of [`drive_scroll`]: while the guide button is held and
 /// `h.scrub`'s guard passes in the active mode (`active`, which the caller
 /// computes from [`Config::scrub_enabled_in`] and `guide_active()`), circling
 /// the left pad walks the text caret one step per detent —
 /// `docs/research/text-scrub.md` §3.1, option (a).
+///
+/// **Two gestures, one binding.** A pad is an absolute surface, so it gets the
+/// jog wheel below. A stick springs back to centre and has no position to
+/// count, so a padless source gets the other half of the video-editing pair
+/// instead — the shuttle in [`drive_shuttle`], where deflection picks a *rate*
+/// — and this function forks to it on [`report::Source::has_pads`], per frame,
+/// because a session may hold either controller and the choice belongs to the
+/// device and not to the config. Everything downstream of the gesture is shared:
+/// the taps, the select-with-Shift level, the consumed hold, the word tier.
 ///
 /// Precedence, and why it fights nothing:
 ///
@@ -2223,6 +2288,16 @@ fn drive_scrub(
         st.reset();
         return;
     }
+    // Which of the two this controller gets. A pad has an absolute position to
+    // read, so it is a jog wheel; a stick springs back, so it is a shuttle.
+    // Same binding, same guard, same taps — see [`drive_shuttle`].
+    if !frame.source.has_pads() {
+        let _ = drive_shuttle(kbd, engine, frame, st, cfg, hx, now);
+        return;
+    }
+    // The wheel from here down. Park the shuttle so the loop is never asked to
+    // keep a deadline armed for a stick this controller drives nothing with.
+    st.shuttle.reset();
     // Only while the LEFT pad is actually touched. A lift resets, so a
     // lift-and-retouch never injects the angle it jumped across.
     if !frame.pressed(report::Button::PadLeftTouch) {
@@ -2268,6 +2343,62 @@ fn drive_scrub(
     // feel that the unit changed under it.
     let feel = if burst.word { Haptic::ScrubWord } else { Haptic::Scroll };
     hx.fire(feel, HapticPad::Left);
+}
+
+/// The caret scrub on a controller with **no trackpads**: the LEFT stick's
+/// horizontal deflection as a shuttle, for a single step of the loop's clock.
+///
+/// [`drive_scrub`]'s other half, and the answer to "how do I scrub without the
+/// trackpad". A jog wheel needs an absolute surface to count position on; a
+/// stick has none, so it does the other half of the video-editing pair — rate
+/// control. Hold it over and the caret walks at a speed the deflection chooses
+/// ([`ShuttlePacer`]): `slow_per_s` at the deadzone edge, rising to
+/// `fast_per_s` at `word_above`, and past that the same tap is a `ctrl`+arrow
+/// so the caret hops word boundaries instead of characters. Everything else is
+/// the wheel's, unchanged and deliberately so — the same [`scrub_chord`] taps
+/// (press and release in the same step, never a held key), the same
+/// select-with-Shift level, the same heavier feel for a word, and the same rule
+/// that the first tap spends the guide hold.
+///
+/// Only the horizontal axis is read. Lines are the D-pad's job already, and a
+/// vertical channel here would turn every diagonal thumb into a caret jumping
+/// rows it was not asked to.
+///
+/// **Called on a clock, not only on frames.** A gamepad reports only on change,
+/// so a stick *held* over is silence on the wire; the loop's stick deadline
+/// (`crate::sticks::StickDrive`, 4 ms) is what steps this, with the last frame
+/// as the state, exactly as the rate-controlled cursor is stepped. That is why
+/// the emission is time-based and not per-frame: the taps come from the clock.
+///
+/// Returns the chord this step tapped, if any — which is what the tests read,
+/// the daemon having nowhere else to put it.
+fn drive_shuttle(
+    kbd: &mut Option<VirtualKeyboard>,
+    engine: &mut GestureEngine,
+    frame: &report::Frame,
+    st: &mut ScrubState,
+    cfg: &ScrubConfig,
+    hx: &mut HapticCtx,
+    now: Instant,
+) -> Option<KeyChord> {
+    // The same normalization the stick cursor uses, so one deadzone number
+    // means the same push on every path.
+    let x = crate::sticks::Deflection::of(frame).left.0;
+    let tap = st.shuttle.update(x, now)?;
+    // A tap is a hold spent, exactly as a detent is: the guide's release is
+    // ours, not Steam's.
+    if !st.consumed {
+        engine.consume_hold();
+        st.consumed = true;
+    }
+    let chord = scrub_chord(tap.right, tap.word, frame.pressed(cfg.select));
+    emit_chord(kbd, None, &chord, true);
+    emit_chord(kbd, None, &chord, false);
+    hx.fire(
+        if tap.word { Haptic::ScrubWord } else { Haptic::Scroll },
+        HapticPad::Left,
+    );
+    Some(chord)
 }
 
 /// Cross-frame state for the *held* bare-button bindings
@@ -6640,6 +6771,219 @@ mod tests {
             );
         }
         assert!(!idle.consumed, "an unconfigured scrub does nothing at all");
+    }
+
+    // --- the caret shuttle, for a controller with no pads ------------------
+
+    /// A frame from the padless backend with the left stick held at `x`
+    /// (normalised) and any extra buttons down. `Source::Evdev` is the whole of
+    /// "this controller has no trackpads" as far as every handler is concerned.
+    fn shuttle_frame(x: f64, extra: &[report::Button]) -> report::Frame {
+        let mut btns = vec![report::Button::Steam];
+        btns.extend_from_slice(extra);
+        report::Frame {
+            source: report::Source::Evdev,
+            left_stick: ((x * 32767.0) as i16, 0),
+            ..frame_of(&btns)
+        }
+    }
+
+    /// The scrub's world for a test: state, a null keyboard, null haptics.
+    fn shuttle_rig(cfg: &ScrubConfig) -> (ScrubState, GestureEngine, Haptics, HapticsConfig) {
+        (
+            ScrubState::new(cfg, &CursorConfig::default()),
+            GestureEngine::new(),
+            Haptics::new(),
+            HapticsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn a_padless_source_shuttles_and_a_padded_one_keeps_the_wheel() {
+        // The switch the whole feature turns on: one binding, and the *device*
+        // picks the gesture. A stick held over on an Xbox frame walks the
+        // caret; the same deflection on a puck frame does nothing at all,
+        // because there its sticks are guide flicks and its left PAD is the
+        // wheel.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+
+        // Half over to the right, for a second of the loop's 4 ms clock.
+        let right = KeyChord::parse("right").unwrap();
+        let mut taps = Vec::new();
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = shuttle_frame(0.5, &[]);
+            taps.extend(drive_shuttle(&mut kbd, &mut engine, &f, &mut st, &cfg, &mut hx, now));
+        }
+        assert!(taps.iter().all(|&c| c == right), "pushing right taps Right");
+        // The rate at half deflection: 4/s at the deadzone edge rising to 25/s
+        // at the word threshold, so ~14/s here (plus the immediate first tap).
+        assert!(
+            (14..=16).contains(&taps.len()),
+            "a second at half deflection tapped {} times",
+            taps.len()
+        );
+        assert!(st.consumed, "the first tap spends the guide hold");
+        assert!(st.shuttle_running(), "and the loop still owes it a wakeup");
+
+        // The same frame from the puck: the sticks are not the scrub's there,
+        // and the wheel wants a pad touch it is not getting.
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = report::Frame {
+                source: report::Source::Puck,
+                ..shuttle_frame(0.5, &[])
+            };
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut st, &cfg, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(!st.consumed, "a puck's left stick is not a caret shuttle");
+        assert!(!st.shuttle_running(), "and it must never hold the deadline open");
+    }
+
+    #[test]
+    fn the_shuttle_takes_shift_from_select_and_words_from_the_far_end() {
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+
+        // Held select (`l5` by default) puts Shift around the tap, exactly as
+        // it does on the wheel: the same motion selects instead of moving.
+        let f = shuttle_frame(-0.5, &[cfg.select]);
+        assert_eq!(
+            drive_shuttle(&mut kbd, &mut engine, &f, &mut st, &cfg, &mut hx, t),
+            Some(KeyChord::parse("shift+left").unwrap())
+        );
+        // Past `word_above` the unit changes and the modifier stays.
+        let far = shuttle_frame(0.95, &[cfg.select]);
+        assert_eq!(
+            drive_shuttle(
+                &mut kbd,
+                &mut engine,
+                &far,
+                &mut st,
+                &cfg,
+                &mut hx,
+                t + Duration::from_millis(4)
+            ),
+            Some(KeyChord::parse("ctrl+shift+right").unwrap()),
+            "a reversal taps at once, and the far end taps words"
+        );
+        // ...and without the button it is the bare arrow again.
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        assert_eq!(
+            drive_shuttle(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(0.95, &[]),
+                &mut st,
+                &cfg,
+                &mut hx,
+                t
+            ),
+            Some(KeyChord::parse("ctrl+right").unwrap())
+        );
+    }
+
+    #[test]
+    fn releasing_the_guide_parks_the_shuttle() {
+        // The gate is the wheel's gate, and it drops the same things: no
+        // direction, no schedule, and a fresh hold that gets to spend itself.
+        // Nothing can be stranded — the shuttle only ever taps — which is why
+        // it needs no place in `release_outputs` either.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+        for i in 0..=50 {
+            let now = t + Duration::from_millis(4 * i);
+            drive_scrub(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(0.9, &[]),
+                &mut st,
+                &cfg,
+                &cursor,
+                true,
+                &mut hx,
+                now,
+            );
+        }
+        assert!(st.consumed && st.shuttle_running());
+
+        // Guide up (or the mode's guard closing, or the keyboard taking over):
+        // `active` goes false and the run is parked.
+        let now = t + Duration::from_millis(1000);
+        drive_scrub(
+            &mut kbd,
+            &mut engine,
+            &shuttle_frame(0.9, &[]),
+            &mut st,
+            &cfg,
+            &cursor,
+            false,
+            &mut hx,
+            now,
+        );
+        assert!(!st.consumed, "a fresh hold gets to spend itself again");
+        assert!(!st.shuttle_running(), "and the loop may block again");
+
+        // A config that never asked for a scrub is inert with the gate wide
+        // open, on this controller as much as on the other one.
+        let off = ScrubConfig::default();
+        let mut idle = ScrubState::new(&off, &cursor);
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            drive_scrub(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(1.0, &[]),
+                &mut idle,
+                &off,
+                &cursor,
+                true,
+                &mut hx,
+                now,
+            );
+        }
+        assert!(!idle.consumed && !idle.shuttle_running());
+    }
+
+    #[test]
+    fn a_reload_retunes_the_shuttle_too() {
+        // The shuttle is rebuilt with the rest of the state whenever the config
+        // it was built from changes, so `hyprpad reload` retunes the curve with
+        // nothing to wire in the reload path — and a retune drops the run, so
+        // no schedule from the old rates survives into the new ones.
+        let cursor = CursorConfig::default();
+        let on = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let mut st = ScrubState::new(&on, &cursor);
+        let t = Instant::now();
+        st.shuttle.update(1.0, t);
+        assert!(st.shuttle_running());
+        let faster = ScrubConfig {
+            shuttle: crate::config::ShuttleConfig { fast_per_s: 40.0, ..on.shuttle },
+            ..on
+        };
+        st.sync(&faster, &cursor);
+        assert!(!st.shuttle_running(), "a retuned shuttle starts parked");
+        assert_eq!(st.cfg.shuttle.fast_per_s, 40.0);
     }
 
     #[test]

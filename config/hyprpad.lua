@@ -195,6 +195,11 @@ h.scrub {
   slow_deg_per_s   = 180.0,  -- and drops back below this (2:1, so it cannot chatter)
   word_tier        = true,   -- top rung is ctrl+arrow, not x4 characters
   select           = "l5",   -- hold the left grip to select as you scrub
+  -- On a controller with no pads (the Xbox Elite) the same binding is a
+  -- SHUTTLE on the left stick: hold it over and the caret walks at a rate the
+  -- deflection picks -- 4/s at the deadzone edge up to 25/s, and past 85% the
+  -- taps become ctrl+arrow so it hops whole words. Defaults, spelled out.
+  shuttle = { deadzone = 0.15, slow_per_s = 4, fast_per_s = 25, word_above = 0.85 },
   only_in          = { "desktop", "omarchy-ui", "agent" },
 }
 

@@ -151,6 +151,9 @@ pub struct GestureEngine {
     /// The cap `guide_tap` measures against; [`GUIDE_TAP_MAX`] until the daemon
     /// sets the config's value.
     guide_tap_max: Duration,
+    /// Whether the LEFT stick's horizontal axis currently belongs to the caret
+    /// shuttle ([`Self::set_shuttle_left`]).
+    shuttle_left: bool,
 }
 
 impl GestureEngine {
@@ -168,7 +171,23 @@ impl GestureEngine {
             tap_blocked: false,
             guide_tap: false,
             guide_tap_max: GUIDE_TAP_MAX,
+            shuttle_left: false,
         }
+    }
+
+    /// Say whether the LEFT stick's horizontal axis is the caret shuttle's this
+    /// frame (`h.scrub` live in this mode, on a controller with no trackpads —
+    /// [`crate::run::drive_scrub`]).
+    ///
+    /// While it is, `guide+lstick_left` / `guide+lstick_right` do **not** fire:
+    /// the same push that would flick them is a rate command walking the caret,
+    /// and a config that binds both (the sample's focus-left/right) would
+    /// otherwise move the window focus on every scrub. Vertical flicks are
+    /// untouched — the shuttle reads one axis, so `guide+lstick_up/down` keep
+    /// working — and on the puck this is never set, because there the left PAD
+    /// is the jog wheel and the sticks are flicks and nothing else.
+    pub fn set_shuttle_left(&mut self, on: bool) {
+        self.shuttle_left = on;
     }
 
     /// Set the cap a bare hold must fall under to count as a tap
@@ -230,8 +249,19 @@ impl GestureEngine {
                 (Stick::Right, frame.right_stick),
             ] {
                 if let Some(dir) = self.flick(stick, axis) {
-                    events.push(GestureEvent::GuideStickFlick { stick, dir });
-                    self.was_chorded = true;
+                    // The one flick the caret shuttle eats: its own axis, on
+                    // its own stick. The flick still *disarms* (the stick is
+                    // deflected, and re-arming needs a recenter either way);
+                    // it just does not become a chord, and does not count as
+                    // one — the shuttle spends the hold itself, on its first
+                    // tap, exactly as the jog wheel does.
+                    let shuttled = self.shuttle_left
+                        && stick == Stick::Left
+                        && matches!(dir, StickDir::Left | StickDir::Right);
+                    if !shuttled {
+                        events.push(GestureEvent::GuideStickFlick { stick, dir });
+                        self.was_chorded = true;
+                    }
                 }
             }
             if !self.hold_fired
@@ -662,6 +692,63 @@ mod tests {
         assert!(g
             .update(&frame_sticks(&[Button::Steam], (400, -350), (300, 380)), t + ms(8))
             .is_empty());
+    }
+
+    #[test]
+    fn the_caret_shuttle_eats_the_left_sticks_horizontal_flick() {
+        // On a padless controller with `h.scrub` live, holding the left stick
+        // over IS the caret shuttle. The same push must not also fire
+        // `guide+lstick_left` / `guide+lstick_right` — the sample config binds
+        // those to a focus move, and one scrub would walk the caret and
+        // rearrange the windows behind it.
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.set_shuttle_left(true);
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert!(
+            g.update(&frame_sticks(&[Button::Steam], (-30_000, 0), (0, 0)), t + ms(8))
+                .is_empty(),
+            "the shuttle's own axis is not a chord"
+        );
+        // And it did not count as one either: the hold is still bare as far as
+        // the engine knows — the shuttle spends it itself, on its first tap.
+        assert_eq!(
+            g.update(&frame(&[]), t + ms(12)),
+            vec![GestureEvent::GuideLeave { was_chorded: false, bare_tap: true }]
+        );
+
+        // The VERTICAL flick is untouched: the shuttle reads one axis, so
+        // `guide+lstick_up` and `guide+lstick_down` still work while it is live.
+        let mut g = GestureEngine::new();
+        g.set_shuttle_left(true);
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 30_000), (0, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick { stick: Stick::Left, dir: StickDir::Up }]
+        );
+
+        // So is the RIGHT stick, whichever way it goes: the shuttle is the left
+        // one's.
+        let mut g = GestureEngine::new();
+        g.set_shuttle_left(true);
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick { stick: Stick::Right, dir: StickDir::Right }]
+        );
+
+        // And with the shuttle off — every puck frame, and every padless one
+        // where the scrub is not live in this mode — the flick is a flick.
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (-30_000, 0), (0, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick { stick: Stick::Left, dir: StickDir::Left }]
+        );
     }
 
     #[test]

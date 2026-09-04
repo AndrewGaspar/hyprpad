@@ -221,7 +221,7 @@ One caveat until the uhid/udev masking work lands: while Steam runs
 Input's chord layer), so the two mice may move together. That is Steam's side
 of the device, not something this binding can switch off.
 
-#### The caret jog wheel on the left pad
+#### The caret scrub: a jog wheel on the left pad, a shuttle on the left stick
 
 `h.scrub { … }` gives the **left** pad a second job under a held guide: circling
 it steps the text caret, one arrow key per detent, which is how you fix a
@@ -243,6 +243,22 @@ alone, and the cheat sheet draws both on the same callout so a collision is
 visible. The guard is the cursor's and the scroll's (`only_in` / `not_in`), and
 it is read together with the master switch, so a scrub nobody asked for is off
 rather than live everywhere. TOML spells it `[scrub]`, same keys.
+
+On a controller with **no trackpads** the same binding is a *shuttle* on the
+left stick — rate control, the video-editing idiom a jog wheel is usually paired
+with: hold the stick over and the caret walks at a speed the deflection picks,
+`shuttle.slow_per_s` (4/s) just past `shuttle.deadzone` (0.15) rising to
+`shuttle.fast_per_s` (25/s) at `shuttle.word_above` (0.85), and past that
+threshold the taps become `ctrl+arrow` word jumps; centre the stick to stop.
+The taps come from a 4 ms clock rather than from reports, because a gamepad
+that is holding still sends nothing. Only the horizontal axis is read (the
+D-pad already walks lines), and while the shuttle is live it eats
+`guide+lstick_left` / `guide+lstick_right` so one push cannot both walk the
+caret and move the window focus — the vertical flicks are untouched. Nothing
+changes on the puck: pads win, and the wheel stays a wheel. The cheat sheet
+says which you are holding, *Scrub the caret · jog (pad)* or *· shuttle
+(stick)*. TOML spells the knobs flat: `shuttle_deadzone`, `shuttle_slow_per_s`,
+`shuttle_fast_per_s`, `shuttle_word_above`.
 
 ### Modes and guards
 

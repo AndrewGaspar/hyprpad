@@ -356,6 +356,13 @@ pub struct StickDrive {
     /// The OSK's two cursors, one per hand.
     pub osk_left: StickCursor,
     pub osk_right: StickCursor,
+    /// Whether the caret shuttle is holding the left stick over
+    /// ([`crate::filter::ShuttlePacer`]). Set per frame by the daemon, because
+    /// this is the one consumer whose deadzone and gate live somewhere else
+    /// entirely — in `[scrub]`, behind a held guide — and it needs the same
+    /// clock for the same reason: a gamepad reports only on change, so a stick
+    /// held over says nothing and the taps have to come from a deadline.
+    shuttle: bool,
     /// When the next step is due. `None` means nothing is moving and the loop
     /// may block indefinitely.
     due: Option<Instant>,
@@ -377,6 +384,7 @@ impl StickDrive {
             scroll_detent: 0.0,
             osk_left: StickCursor::new(),
             osk_right: StickCursor::new(),
+            shuttle: false,
             due: None,
         }
     }
@@ -404,7 +412,25 @@ impl StickDrive {
         self.osk_left.reset();
         self.osk_right.reset();
         self.sticks = Deflection::default();
+        self.shuttle = false;
         self.due = None;
+    }
+
+    /// Say whether the caret shuttle wants the clock, and re-arm accordingly.
+    ///
+    /// Called once per frame *and* once per step with the answer the scrub
+    /// handler just produced ([`crate::filter::ShuttlePacer::running`]), so a
+    /// stick held over keeps waking the loop and a released one lets it block
+    /// again.
+    ///
+    /// Deliberately **not** gated on `cfg.enabled`: `[sticks]` tunes the three
+    /// rate-controlled pairs (cursor, scroll, OSK) and turning it off says the
+    /// sticks do not stand in for the pads. The scrub has its own master
+    /// switch, its own deadzone and its own guard, and a config that turned
+    /// the stick *pointer* off has not said a word about the caret.
+    pub fn set_shuttle(&mut self, running: bool, cfg: &SticksConfig, now: Instant) {
+        self.shuttle = running;
+        self.rearm(cfg, now);
     }
 
     /// Whether anything is moving: a stick outside its deadzone, or a velocity
@@ -414,6 +440,12 @@ impl StickDrive {
     /// on, disarming the instant a stick centres would leave the cursor's last
     /// few pixels un-integrated and the motion would end with a visible clip.
     pub fn armed(&self, cfg: &SticksConfig) -> bool {
+        // The caret shuttle answers first and on its own terms: it is the
+        // scrub's, not the pointer's, so `[sticks] enabled = false` does not
+        // silence it (see [`set_shuttle`](Self::set_shuttle)).
+        if self.shuttle {
+            return true;
+        }
         if !self.rate || !cfg.enabled {
             return false;
         }
@@ -759,6 +791,49 @@ mod tests {
         assert_eq!(d.osk_left.position(), (0.0, 0.0));
         assert!(!d.cursor.settling());
         assert!(!d.armed(&c));
+    }
+
+    #[test]
+    fn the_caret_shuttle_arms_the_deadline_on_its_own_terms() {
+        // The scrub's shuttle is the one consumer whose gate lives elsewhere —
+        // in `[scrub]`, behind a held guide — so the daemon hands the answer in
+        // and this is what it buys: a wakeup every `tick_ms` while the stick is
+        // held over, which is the only way taps come out of a pad that reports
+        // only on change.
+        let c = cfg();
+        let mut d = StickDrive::new();
+        d.observe(&evdev_frame((0, 0), (0, 0)), &c, at(0));
+        assert_eq!(d.deadline(), None, "centred and no shuttle: block forever");
+
+        d.set_shuttle(true, &c, at(0));
+        assert!(d.armed(&c));
+        assert_eq!(d.deadline(), Some(at(4)), "one tick out, the pointer's cadence");
+        // A second frame while it is still held must not push the step away.
+        d.set_shuttle(true, &c, at(2));
+        assert_eq!(d.deadline(), Some(at(4)), "an armed deadline is not re-armed");
+        // Stepping while it is still held schedules the next one.
+        d.stepped(&c, at(4));
+        assert_eq!(d.deadline(), Some(at(8)));
+        // Let go and the loop goes back to blocking.
+        d.set_shuttle(false, &c, at(8));
+        assert_eq!(d.deadline(), None);
+
+        // `[sticks] enabled = false` says the sticks do not stand in for the
+        // pads. It says nothing about the caret, which has its own switch, its
+        // own deadzone and its own guard — so the shuttle still gets its clock.
+        let mut off = cfg();
+        off.enabled = false;
+        let mut d = StickDrive::new();
+        d.observe(&evdev_frame((0, 0), (30_000, 0)), &off, at(0));
+        assert_eq!(d.deadline(), None, "the pointer is off, as asked");
+        d.set_shuttle(true, &off, at(0));
+        assert!(d.armed(&off));
+        assert_eq!(d.deadline(), Some(at(4)));
+
+        // And a release drops the claim with everything else.
+        d.release();
+        assert!(!d.armed(&off));
+        assert_eq!(d.deadline(), None);
     }
 
     #[test]

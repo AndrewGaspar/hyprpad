@@ -769,3 +769,87 @@ This repository (commit `e2ddad0`):
 - `docs/research/pointer-damping.md` §2.2 (α table), §3 (Steam Input mouse mode)
 - `docs/research/haptics.md` — the pulse vocabulary and its device verification
 - `docs/03-hardware-findings.md` — 250 Hz reports, guide-button timing; `README.md:35-40` — Steam acts on guide release, ignores > ~3 s holds; `docs/06-recommendation.md:44` — `suppressevent activatefocus`
+
+---
+
+## 8. The shuttle as built — 2026-09-03
+
+*Written after adding the padless half of `h.scrub`, once the daemon had a
+second backend (`docs/research/xbox-elite.md`) and the owner asked the obvious
+question: "how do I scrub with the Xbox controller, without the trackpad?" This
+section supersedes §3.4's sketch for that case; nothing above changes for the
+puck, whose left pad is still the jog wheel §3.1 describes.*
+
+**The answer is the other half of §0's own distinction.** Jog is *position*
+(one detent, one step, the rate follows the hand) and shuttle is *velocity*
+(deflect to choose a speed, release to stop). A trackpad has an absolute
+position to count, so it earns the jog wheel. A stick springs back to centre and
+has none — asking a thumb to "circle" a self-centring stick would be a worse
+version of both — so on a source with no pads (`report::Source::has_pads`, the
+same tag the cursor and scroll paths switch on) the identical `h.scrub` binding
+becomes a shuttle on the **left stick's horizontal axis**. Same guard, same
+`select`-with-Shift level, same taps, same consumed hold; only the gesture
+differs, and the device picks it, not the config.
+
+Note this is *not* §3.4's option (d): that was a linear variant of the **pad**,
+reusing `PadDamper::relative` and still position control. The stick could not
+reuse it — there is no travel to accumulate — so what was built is the rate
+control §0 contrasts the jog wheel with, and the sketch's "linear pad" variant
+remains unbuilt and still available as a later `motion = "linear"` knob.
+
+### The curve
+
+Four knobs, `h.scrub { shuttle = { … } }` / `[scrub] shuttle_*`, all optional:
+
+| deflection \|x\| | tap rate | unit |
+|---|---|---|
+| ≤ `deadzone` (0.15) | — | nothing; the run is parked and the loop may block |
+| `deadzone` … `word_above` | `slow_per_s` (4/s) rising **linearly** to `fast_per_s` (25/s) | `Left`/`Right` |
+| ≥ `word_above` (0.85) | `fast_per_s` (25/s) | `ctrl`+arrow — a word, and the heavier haptic where one exists |
+
+So: ~4 characters/s just off the deadzone, ~14/s at half deflection, 25/s just
+under the word threshold, and past it the same 25/s in *words* — the top gear,
+about six times the caret speed, and the reason the ladder tops out in words
+rather than in more characters is §3.5's: a word jump lands on a boundary
+instead of somewhere inside one, which is the shape a dictation error has.
+
+The deadzone is deliberately above the pointer's `0.12` (`[sticks]`): a resting
+thumb that drifts a cursor is a nuisance, and one that types arrow keys is a
+defect in the document. Only the horizontal axis is read — the D-pad already
+walks lines (§3.1), and a vertical channel would make every diagonal thumb a
+caret jumping rows nobody asked for.
+
+### What it needed from the daemon
+
+- **`filter::ShuttlePacer`** — pure, `Instant`-driven, the [`JogPacer`] of this
+  gesture: deflection in, at most one tap out per call, and the schedule for the
+  next. First tap immediate (a flick of the stick is one character, the fine
+  adjustment); a reversal is a fresh run, never a late tap in the direction the
+  stick has left; and a step that arrives more than one interval late re-bases
+  on `now` instead of firing a burst.
+- **The clock.** A gamepad reports only on change, so a stick *held* over is
+  silence on the wire and the taps cannot come from frames. They come from the
+  4 ms conditional deadline the Elite backend already added
+  (`sticks::StickDrive`), which now takes the shuttle's "still running" answer
+  alongside the cursor's and scroll's — and, unlike them, is not gated on
+  `[sticks] enabled`, because that switch is the pointer's and the scrub has its
+  own.
+- **One suppression.** While the shuttle is live, `guide+lstick_left` /
+  `guide+lstick_right` do not fire (`GestureEngine::set_shuttle_left`). The
+  sample config binds those to a focus move, and without this every scrub would
+  also rearrange the windows behind the text. Vertical flicks are untouched.
+- **A sheet row that says which.** `Scrub the caret · jog (pad)` on a layout
+  with trackpads, `· shuttle (stick)` on one without, re-aimed by
+  `Sheet::set_layout` from the published layout id — the same mechanism the
+  ambient cursor and scroll rows use.
+
+### Not built, and why
+
+- **No momentum.** §2's note on Steam's "Spin Friction" applies double here:
+  a flicked wheel that keeps ticking is overshoot, and a shuttle's whole promise
+  is that centring the stick stops the caret at once.
+- **No vertical shuttle**, per above.
+- **No haptics in practice.** The pulses are fired (`Haptic::Scroll` /
+  `ScrubWord`), but every padless source so far has rumble motors rather than
+  the puck's actuators, and `HapticCtx::fire` drops them at the one gate that
+  already exists for that.

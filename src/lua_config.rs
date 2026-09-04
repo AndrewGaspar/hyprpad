@@ -1515,9 +1515,20 @@ fn section_scroll(
 ///   slow_deg_per_s   = 180,       -- drop back below this (the 2:1 hysteresis)
 ///   word_tier        = true,      -- the top rung is ctrl+arrow, not ×4
 ///   select           = "l5",      -- hold to select as you scrub (Shift)
+///   -- On a controller with no pads the LEFT STICK shuttles instead: hold it
+///   -- over and the caret walks at a rate the deflection chooses.
+///   shuttle = {
+///     deadzone   = 0.15,          -- below this the stick commands nothing
+///     slow_per_s = 4,             -- taps/s at the deadzone edge
+///     fast_per_s = 25,            -- taps/s at the word threshold and beyond
+///     word_above = 0.85,          -- past this a tap is ctrl+arrow, a word
+///   },
 ///   only_in          = { "desktop" },
 /// }
 /// ```
+///
+/// The shuttle knobs take the flat `shuttle_fast_per_s = 30` spelling too — the
+/// one the TOML front-end uses, since `[scrub]` has no sub-tables.
 fn section_scrub(
     lua: &Lua,
     build: &Rc<RefCell<Build>>,
@@ -1554,8 +1565,35 @@ fn section_scrub(
                     let name = as_string(&v, &k)?.trim().to_ascii_lowercase();
                     b.scrub.select = crate::config::parse_button(&name).map_err(err)?;
                 }
+                // The padless half, as a nested sub-table: `shuttle = { … }`,
+                // the shape `h.sticks` uses for its three groups.
+                "shuttle" | "stick" => {
+                    let Value::Table(sub) = &v else {
+                        return Err(err(format!(
+                            "h.scrub {{ {k} = … }} needs a table, got {}",
+                            v.type_name()
+                        )));
+                    };
+                    for entry in sub.clone().pairs::<String, Value>() {
+                        let (knob, val) = entry?;
+                        let n = as_f64(&val, &knob)?;
+                        crate::config::set_shuttle_knob(&mut b.scrub.shuttle, &knob, n)
+                            .map_err(err)?;
+                    }
+                }
                 "only_in" => inline = Some(Guard::OnlyIn(mode_list(vec![v])?)),
                 "not_in" => inline = Some(Guard::NotIn(mode_list(vec![v])?)),
+                // The flat `shuttle_<knob>` spelling, identical to TOML's, so a
+                // config can be transliterated either way.
+                other if other.starts_with("shuttle_") => {
+                    let n = as_f64(&v, &k)?;
+                    crate::config::set_shuttle_knob(
+                        &mut b.scrub.shuttle,
+                        other.trim_start_matches("shuttle_"),
+                        n,
+                    )
+                    .map_err(err)?;
+                }
                 other => {
                     return Err(unknown_key(
                         "h.scrub",
@@ -1569,6 +1607,7 @@ fn section_scrub(
                             "slow_deg_per_s",
                             "word_tier",
                             "select",
+                            "shuttle",
                             "only_in",
                             "not_in",
                         ],
@@ -2955,6 +2994,57 @@ mod tests {
     }
 
     #[test]
+    fn h_scrub_takes_the_padless_shuttle_as_a_sub_table_or_flat() {
+        use crate::config::ShuttleConfig;
+        // Untouched, it is the documented default — a config written before the
+        // shuttle existed gets the same feel on a stick that the doc describes.
+        assert_eq!(load(r#"hyprpad.scrub {}"#).scrub().shuttle, ShuttleConfig::default());
+
+        // The nested spelling, the one `h.sticks` uses for its groups.
+        let c = load(
+            r#"
+            hyprpad.scrub {
+              detent_deg = 20,
+              shuttle = {
+                deadzone   = 0.2,
+                slow_per_s = 6,
+                fast_per_s = 30,
+                word_above = 0.9,
+              },
+            }
+            "#,
+        );
+        assert_eq!(
+            c.scrub().shuttle,
+            ShuttleConfig { deadzone: 0.2, slow_per_s: 6.0, fast_per_s: 30.0, word_above: 0.9 }
+        );
+        assert_eq!(c.scrub().detent_deg, 20.0, "the jog's knobs sit beside it");
+
+        // ...and the flat one, which is TOML's, so a config transliterates
+        // either way and the two front-ends cannot drift.
+        let flat = load(
+            r#"hyprpad.scrub { shuttle_deadzone = 0.2, shuttle_slow_per_s = 6,
+                              shuttle_fast_per_s = 30, shuttle_word_above = 0.9 }"#,
+        );
+        assert_eq!(flat.scrub().shuttle, c.scrub().shuttle);
+        let toml = crate::config::Config::from_toml_str(
+            "[scrub]\nshuttle_deadzone = 0.2\nshuttle_slow_per_s = 6\n\
+             shuttle_fast_per_s = 30\nshuttle_word_above = 0.9\n",
+        )
+        .expect("the same config in the other dialect");
+        assert_eq!(toml.scrub().shuttle, c.scrub().shuttle);
+
+        // Typos name the group's keys, and a non-table is refused by name.
+        let e = load_str(r#"hyprpad.scrub { shuttle = { fastest = 30 } }"#, "t.lua").unwrap_err();
+        assert!(e.contains("unknown shuttle setting 'fastest'"), "{e}");
+        let e = load_str(r#"hyprpad.scrub { shuttle = 3 }"#, "t.lua").unwrap_err();
+        assert!(e.contains("shuttle") && e.contains("table"), "{e}");
+        // And the key is in the "did you mean" list a typo at the top level gets.
+        let e = load_str(r#"hyprpad.scrub { shutle = {} }"#, "t.lua").unwrap_err();
+        assert!(e.contains("shuttle"), "{e}");
+    }
+
+    #[test]
     fn a_when_guard_reads_its_cached_predicate_result() {
         let c = load(
             r#"
@@ -3750,6 +3840,10 @@ fast_min_detents = 2
 slow_deg_per_s = 180.0
 word_tier = true
 select = "l5"
+shuttle_deadzone = 0.15
+shuttle_slow_per_s = 4
+shuttle_fast_per_s = 25
+shuttle_word_above = 0.85
 only_in = ["desktop"]
 
 [buttons]

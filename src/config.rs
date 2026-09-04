@@ -1111,6 +1111,12 @@ impl Default for ScrollConfig {
 /// `ctrl`+arrow *word* jump when `word_tier` is on. Hold `select` while
 /// scrubbing and every tap goes out with Shift, selecting as it goes.
 ///
+/// On a controller with **no trackpads** the same binding is a *shuttle* on
+/// the left stick instead — rate control, [`ShuttleConfig`] — because there is
+/// no absolute surface for a jog wheel to read. Every knob above is the jog's;
+/// the shuttle's are in `shuttle`, and the switch between them is
+/// [`crate::report::Source::has_pads`], per frame.
+///
 /// **Off unless a config asks for it.** `enabled` defaults to `false`, so a
 /// config with no `[scrub]` / `h.scrub` block behaves exactly as it did before
 /// the scrub existed: writing the block turns it on, and `enabled = false`
@@ -1162,6 +1168,9 @@ pub struct ScrubConfig {
     /// that chord — pick a button the guide layer leaves alone (the cheat
     /// sheet shows both rows on the same callout, so a collision is visible).
     pub select: report::Button,
+    /// The same binding on a controller with no trackpads: the LEFT stick as a
+    /// **shuttle** ([`ShuttleConfig`]). Nothing on the puck reads it.
+    pub shuttle: ShuttleConfig,
 }
 
 impl Default for ScrubConfig {
@@ -1175,8 +1184,86 @@ impl Default for ScrubConfig {
             slow_deg_per_s: 180.0,
             word_tier: true,
             select: report::Button::GripL5,
+            shuttle: ShuttleConfig::default(),
         }
     }
+}
+
+/// The caret scrub on a controller with **no trackpads**: the left stick's
+/// horizontal deflection as a *shuttle* (`h.scrub { shuttle = { … } }`, TOML
+/// `[scrub] shuttle_*`).
+///
+/// Jog versus shuttle is the video-editing distinction the research doc opens
+/// with (`docs/research/text-scrub.md` §0): a **jog** wheel is *position* — one
+/// detent is one step and the rate follows the hand — and a **shuttle** is
+/// *rate* — deflect to choose a speed, release to stop. The puck's left pad is
+/// a jog wheel because a thumb on an absolute surface has a position to read;
+/// a spring-loaded stick does not, and forcing one to be a jog wheel (circle
+/// the stick, count the detents) would be a worse version of both. So the same
+/// `h.scrub` binding is a jog on a pad and a shuttle on a stick, chosen per
+/// frame by [`crate::report::Source::has_pads`], and these are the shuttle's
+/// half of the tuning.
+///
+/// The curve, all four knobs in one line: past `deadzone`, taps go out at a
+/// rate that rises linearly from `slow_per_s` to `fast_per_s` as the stick
+/// reaches `word_above`, and past `word_above` the tap becomes a *word*
+/// (`ctrl`+arrow) at `fast_per_s`. At the defaults that is 4 characters/s at
+/// the deadzone edge, ~17/s at 60 %, 25/s just under the word threshold, and 25
+/// word jumps/s beyond it — the top gear, and the reason the ladder tops out in
+/// words rather than in more characters (a word jump lands on a boundary).
+///
+/// Only the horizontal axis is read: the D-pad already walks lines, and a
+/// diagonal push that also moved the caret vertically would make every
+/// horizontal shuttle a lottery.
+///
+/// Like every other feel knob in this file these are *tunable starting points*,
+/// not measured values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShuttleConfig {
+    /// Deflection below which the stick commands nothing, as a fraction of
+    /// full scale. Default `0.15` — a little above the sticks' own `0.12`
+    /// pointer deadzone, because a caret that walks off a resting thumb is
+    /// worse than a cursor that drifts: this one types into the document.
+    pub deadzone: f64,
+    /// Taps per second at the deadzone edge. Default `4` — slow enough to
+    /// count characters by eye and stop on one.
+    pub slow_per_s: f64,
+    /// Taps per second at `word_above` and beyond. Default `25` — about a line
+    /// of prose a second, and the fastest an arrow key is worth tapping.
+    pub fast_per_s: f64,
+    /// Deflection at or past which a tap is a **word** (`ctrl`+arrow, the
+    /// heavier haptic where the device has one) instead of a character.
+    /// Default `0.85`: a deliberate push past the comfortable range, so the
+    /// unit cannot change under a thumb that only meant to go faster.
+    pub word_above: f64,
+}
+
+impl Default for ShuttleConfig {
+    fn default() -> ShuttleConfig {
+        ShuttleConfig { deadzone: 0.15, slow_per_s: 4.0, fast_per_s: 25.0, word_above: 0.85 }
+    }
+}
+
+/// Set one [`ShuttleConfig`] knob by name.
+///
+/// Shared by both front-ends so `[scrub] shuttle_fast_per_s = 30` and
+/// `h.scrub { shuttle = { fast_per_s = 30 } }` cannot drift apart, and so a
+/// typo produces the same message either way — the treatment
+/// [`set_stick_axis_knob`] gives the stick groups.
+pub(crate) fn set_shuttle_knob(s: &mut ShuttleConfig, knob: &str, v: f64) -> Result<(), String> {
+    match knob {
+        "deadzone" | "dead_zone" | "inner" => s.deadzone = v,
+        "slow_per_s" | "slow" | "min_per_s" => s.slow_per_s = v,
+        "fast_per_s" | "fast" | "max_per_s" => s.fast_per_s = v,
+        "word_above" | "word" | "words_above" => s.word_above = v,
+        other => {
+            return Err(format!(
+                "unknown shuttle setting '{other}' (want deadzone, slow_per_s, \
+                 fast_per_s, word_above)"
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// On-screen keyboard knobs (the `[keyboard]` config section / `h.keyboard_config`).
@@ -2374,6 +2461,16 @@ impl Config {
                             continue;
                         }
                         _ => {}
+                    }
+                    // The padless half, spelled flat: `shuttle_fast_per_s`, the
+                    // same `<group>_<knob>` shape `[sticks]` uses (this parser
+                    // has no sub-tables, and the Lua front-end's
+                    // `shuttle = { … }` goes through the same setter).
+                    if let Some(knob) = key.strip_prefix("shuttle_") {
+                        let n = parse_f64(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        set_shuttle_knob(&mut scrub.shuttle, knob, n)
+                            .map_err(|e| format!("line {lineno}: {e}"))?;
+                        continue;
                     }
                     match key.as_str() {
                         "enabled" | "enable" | "on" => {
@@ -4685,6 +4782,36 @@ rumble_intensity = 0.25
             .unwrap_err()
             .contains("at least one mode name"));
         assert!(Config::from_toml_str("[scrub]\nfast_min_detents = -1\n").is_err());
+    }
+
+    #[test]
+    fn the_scrub_section_carries_the_padless_shuttle_knobs() {
+        // The stick half of the same binding, spelled flat because this parser
+        // has no sub-tables — the `<group>_<knob>` shape `[sticks]` uses.
+        let c = Config::from_toml_str("[scrub]\n").expect("parse");
+        assert_eq!(c.scrub().shuttle, ShuttleConfig::default());
+        assert_eq!(c.scrub().shuttle.deadzone, 0.15);
+        assert_eq!(c.scrub().shuttle.slow_per_s, 4.0);
+        assert_eq!(c.scrub().shuttle.fast_per_s, 25.0);
+        assert_eq!(c.scrub().shuttle.word_above, 0.85);
+
+        let c = Config::from_toml_str(
+            "[scrub]\nshuttle_deadzone = 0.2\nshuttle_slow_per_s = 6\n\
+             shuttle_fast_per_s = 30\nshuttle_word_above = 0.9\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            c.scrub().shuttle,
+            ShuttleConfig { deadzone: 0.2, slow_per_s: 6.0, fast_per_s: 30.0, word_above: 0.9 }
+        );
+        // The jog's knobs are untouched beside them: two gestures, one section.
+        assert_eq!(c.scrub().detent_deg, 15.0);
+
+        // A typo inside the group names the group's own keys.
+        let e = Config::from_toml_str("[scrub]\nshuttle_fastest = 30\n").unwrap_err();
+        assert!(e.contains("unknown shuttle setting 'fastest'"), "{e}");
+        assert!(e.contains("fast_per_s"), "{e}");
+        assert!(Config::from_toml_str("[scrub]\nshuttle_deadzone = \"x\"\n").is_err());
     }
 
     #[test]
