@@ -668,11 +668,14 @@ comment header explaining what it does and how to remove it:
 
 After installing, **re-login or `newgrp hyprpad`** — group membership only
 reaches processes started after it is granted — and confirm with
-`hyprpad setup --check`, which should print six `ok` lines and `READY`.
+`hyprpad setup --check`, which should print six `ok` lines and `READY`. (A
+seventh, `bt node root-only`, appears when a controller is paired over
+Bluetooth — see [Bluetooth](#bluetooth) below.)
 
 If the broker is not installed, or is installed and refuses, **nothing breaks**:
-hyprpad opens the puck directly exactly as it always has, says so once, and runs
-with no Steam relay. `status.json`'s `source` field says which half is live.
+hyprpad opens the controller directly exactly as it always has, says so once, and
+runs with no Steam relay. `status.json`'s `source` field says which half is
+live.
 
 ### The gyro
 
@@ -693,6 +696,113 @@ h.gamepad { kind = "steam", gyro = true }   -- hold the IMU on regardless of Ste
 It tells "the gyro is not working" apart from "Steam never asked" — with it on,
 the IMU streams with no Steam in the picture at all. Leave it off otherwise: a
 gyro running for a desktop nobody is aiming with is battery spent for nothing.
+
+## Bluetooth
+
+The 2026 controller reaches the machine two ways, and hyprpad drives it over
+either: through **the puck** — the USB dongle, `28de:1304` — or over the
+controller's own **Bluetooth** radio, `28de:1303`. Nothing in the config selects
+one; both are found, both are opened, and whichever the controller is actually
+talking on is the one the daemon reads.
+
+That is what makes the two-machine setup work: leave the dongle in the tower,
+pair the laptop over Bluetooth, and move between them with a chord at power-on.
+The controller holds two puck slots and one Bluetooth bond *at the same time*,
+so switching re-pairs nothing.
+
+### Pairing
+
+The controller must be **powered off** first — hold **Steam** ~5 s until the
+chime and the LED goes out. A mode switch from a running controller does not
+work.
+
+Then hold **B + R1 + Steam**, and **keep holding past the second chime**. One
+chime means "started in Bluetooth mode"; the *second* chime, with the LED
+double-pulsing blue, means "advertising for pairing". Letting go at the first
+chime is the commonest failure.
+
+```
+bluetoothctl scan on            # "Steam Ctrl (BT) FXA…" — your serial prefix
+bluetoothctl pair  <bdaddr>
+bluetoothctl trust <bdaddr>     # required, not optional: BLE auto-reconnect is
+                                # the kernel's allowlist, and trust is what keeps
+                                # the device on it after a disconnect
+```
+
+To go back to the puck: power off, then hold **A + R1 + Steam** (right slot) or
+**A + L1 + Steam** (left slot) until the chime and a white LED.
+
+The LED says which transport you are on — **white** puck, **blue** Bluetooth,
+**green** wired — and the pattern says the state, with a rapid double pulse
+meaning "advertising for pairing".
+
+Do not reach for `bluetoothctl remove` as a troubleshooting reflex: there is no
+documented chord to clear the controller's single Bluetooth slot, and removing
+the bond at the wrong moment has been reported to leave it undiscoverable.
+
+### Hiding it from Steam
+
+**The udev rule needs reinstalling**, because the Bluetooth node is a second,
+separately-matched identity. Without it Steam sees the real controller *and*
+hyprpad's virtual one, and a game counts every press twice — the same R10 the
+USB clause exists to prevent:
+
+```
+sudo install -Dm644 packaging/udev/72-hyprpad-puck.rules \
+     /etc/udev/rules.d/72-hyprpad-puck.rules
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=hidraw
+```
+
+`hyprpad setup --check` reports the Bluetooth node on its own row (`bt node
+root-only`) whenever one is paired, so a half-installed rule is visible rather
+than silent.
+
+The controller's evdev nodes — `Steam Ctrl (BT) … Mouse` and `… Keyboard`, the
+firmware "lizard" emulation — are deliberately **left alone**. The daemon turns
+lizard mode off over Bluetooth exactly as it does over the puck, after which
+those nodes exist but emit nothing; hiding them with a rule would only make a
+machine with a stopped daemon inert instead of merely lizard-y.
+
+### What it looks like when it is working
+
+With the controller on Bluetooth and the daemon restarted:
+
+* `status.json` gains `"transport": "bluetooth"` (it reads `"dongle"` on the
+  puck), and the daemon logs `controller streaming over bluetooth` once, on the
+  first frame — and again on each switch;
+* the firmware mouse stops moving the cursor within a second or so, which is
+  lizard mode being turned off over the new transport;
+* haptics, gyro, the trackpads and the back grips all work. There is no feature
+  gating over Bluetooth: the controller publishes a **byte-identical** report
+  descriptor on both transports (`docs/research/assets/`), and the feature and
+  output channels hyprpad writes are the same on each.
+
+`hyprpad monitor` prints a `transport:` line and then the usual event stream.
+
+### What it costs
+
+Frames arrive **older and jitterier**, not sparser. Measured on this machine, the
+Bluetooth link runs at **133 Hz with a 7.5 ms connection interval** — the BLE
+floor, not the 30–50 ms Linux would have defaulted to — against the puck's
+250 Hz. The relay upsamples for free, so Steam never sees a slow device.
+
+What upsampling cannot fix is latency: an independent measurement (GamersNexus,
+499 clicks per mode) puts Bluetooth at 37.3 ms mean against the puck's 21.6 ms,
+and — the part you will actually feel — σ 20.6 ms against σ 3.1 ms. The extra
+16 ms of mean is fine for driving a window manager. The jitter lands on gesture
+thresholds and trackpad cursor motion, so a different `pointer` damping constant
+may suit the laptop better than the tower.
+
+One caveat worth knowing before you rely on it:
+[steam-for-linux#13383](https://github.com/ValveSoftware/steam-for-linux/issues/13383)
+reports that the 2026 controller pairs over Bluetooth on Linux but does not
+reconnect after being powered off. If that reproduces on your hardware, the
+blocker is Valve's firmware or BlueZ rather than hyprpad; retest after a kernel
+7.3 upgrade, which is when `hid-steam` starts binding `0x1303` itself.
+
+The full research note, with sources, is
+[docs/research/bluetooth.md](docs/research/bluetooth.md).
 
 ## Running at login
 
