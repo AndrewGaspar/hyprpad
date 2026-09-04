@@ -15,6 +15,28 @@ it — e.g. *guide + L1/R1* changes workspace. When a game is running, the game
 wins. Steam Input keeps working the rest of the time, so controller maps and
 older-game compatibility are unaffected.
 
+## Vocabulary
+
+Four words that the rest of this repository uses precisely, because the hardware
+has more than one piece and the code once called all of them "the puck":
+
+| Word | What it means |
+|---|---|
+| **the controller** | the device with the pads — the 2026 Steam Controller (Valve's codenames Triton/Ibex). It is what you hold, and what every binding, mode and gesture is about |
+| **the puck** | the small USB **dongle**, `28de:1304`, that the controller talks to wirelessly. It is a radio and a set of five hidraw pairing slots; it has no buttons |
+| **transport** | which wire the controller is reaching the machine on: `dongle` (through the puck) or `bluetooth` (the controller's own radio, `28de:1303`). `status.json` publishes it, and nothing in the config selects one |
+| **the fake** | the *virtual* Valve controller hyprpad presents to Steam on `/dev/uhid` (`28de:1302` or `28de:12f0`), fed from the real controller's frames — see [Steam sees a Steam Controller](#steam-sees-a-steam-controller-setup) |
+
+So "the puck is asleep" is wrong and "the controller is asleep" is right; the
+dongle is powered by USB and never sleeps. Where the distinction does not
+matter — a hidraw node, a feature report — the docs say *controller*, because
+that is the thing being addressed however it is reached.
+
+Two places keep the old spelling on purpose: the udev rule
+`packaging/udev/72-hyprpad-puck.rules` (a filename installed on real machines),
+and the broker's `puck` request verb, still accepted as an alias for
+`controller`. `docs/research/` records are dated and left as they were written.
+
 ## The finding that shapes everything
 
 > **`hidraw` is not exclusive. A second process can read the Steam Controller's
@@ -39,7 +61,7 @@ removable with a one-line Hyprland window rule
 (`suppressevent activatefocus, match:class steam`) or by restoring focus over
 IPC. Together these mean the passive design does not have to give anything up.
 
-Both halves were measured on the **real** puck, in the era when Steam was
+Both halves were measured on the **real** controller, in the era when Steam was
 reading it directly. That is no longer the arrangement: with the forwarding path
 live, what Steam reads is the virtual pad hyprpad synthesizes, and the guide
 button is stripped from every frame of it. The release-not-press behaviour is
@@ -239,7 +261,7 @@ One caveat until the uhid/udev masking work lands: while Steam runs
 Input's chord layer), so the two mice may move together. That is Steam's side
 of the device, not something this binding can switch off.
 
-#### The caret jog wheel on the left pad
+#### The caret scrub: a jog wheel on the left pad, a shuttle on the left stick
 
 `h.scrub { … }` gives the **left** pad a second job under a held guide: circling
 it steps the text caret, one arrow key per detent, which is how you fix a
@@ -261,6 +283,23 @@ alone, and the cheat sheet draws both on the same callout so a collision is
 visible. The guard is the cursor's and the scroll's (`only_in` / `not_in`), and
 it is read together with the master switch, so a scrub nobody asked for is off
 rather than live everywhere. TOML spells it `[scrub]`, same keys.
+
+On a controller with **no trackpads** the same binding is a *shuttle* on the
+left stick — rate control, the video-editing idiom a jog wheel is usually paired
+with: hold the stick over and the caret walks at a speed the deflection picks,
+`shuttle.slow_per_s` (4/s) just past `shuttle.deadzone` (0.15) rising to
+`shuttle.fast_per_s` (25/s) at `shuttle.word_above` (0.85), and past that
+threshold the taps become `ctrl+arrow` word jumps; centre the stick to stop.
+The taps come from a 4 ms clock rather than from reports, because a gamepad
+that is holding still sends nothing. Only the horizontal axis is read (the
+D-pad already walks lines), and while the shuttle is live it eats
+`guide+lstick_left` / `guide+lstick_right` so one push cannot both walk the
+caret and move the window focus — the vertical flicks are untouched. Nothing
+changes on a controller with pads: pads win, and the wheel stays a wheel. The
+cheat sheet
+says which you are holding, *Scrub the caret · jog (pad)* or *· shuttle
+(stick)*. TOML spells the knobs flat: `shuttle_deadzone`, `shuttle_slow_per_s`,
+`shuttle_fast_per_s`, `shuttle_word_above`.
 
 ### Modes and guards
 
@@ -455,15 +494,15 @@ for testing that reading deliberately.
 > **The units of both settings are UNVERIFIED.** Valve publishes no defaults
 > table and nothing public writes setting 25. Treat these as knobs to test, not
 > to set and forget — the recipe is in
-> [docs/design/puck-power.md](docs/design/puck-power.md).
+> [docs/design/controller-power.md](docs/design/controller-power.md).
 
-**Reading the firmware back.** `hyprpad puck-settings [id…]` asks the controller
+**Reading the firmware back.** `hyprpad controller-settings [id…]` asks the controller
 what a setting currently is, what maximum it accepts and what its factory
 default is (`0x89`/`0x8B`/`0x8C`). Read-only — it sends queries and nothing
 else — and it defaults to the two settings above:
 
 ```
-$ hyprpad puck-settings 25 50
+$ hyprpad controller-settings 25 50
   id   current       max   default  name
   25       300     65535       300  SETTING_STEAMBUTTON_POWEROFF_TIME
   50       600     65535       600  SETTING_SLEEP_INACTIVITY_TIMEOUT
@@ -487,7 +526,7 @@ Two more ways in, both ending at the same write:
 * `hyprpad off` — sends **SIGUSR1** to the running daemon (found through its
   pidfile, exactly as `hyprpad reload` sends SIGHUP). It goes through the daemon
   rather than opening the device itself, because the daemon already holds the
-  descriptors and one writer to the puck is the invariant the design rests on;
+  descriptors and one writer to the controller is the invariant the design rests on;
 * **right-click the bar widget.** Left click still opens the cheat sheet.
   Choosing the other button is the deliberation — there is no confirmation
   dialog, on purpose.
@@ -546,11 +585,11 @@ omarchy plugin enable hyprpad.cheatsheet
 
 A second, much smaller Omarchy plugin: the controller's mode, in the bar. A
 glyph and a word — `desktop`, `game`, `OSK` — that **is not there** unless the
-puck is connected and the daemon is alive, and that opens the cheat sheet on
+controller is connected and the daemon is alive, and that opens the cheat sheet on
 the mode it is showing when you click it.
 
 It reads one file and spawns nothing. The daemon publishes
-`$XDG_RUNTIME_DIR/hyprpad/status.json` whenever its state changes — the puck
+`$XDG_RUNTIME_DIR/hyprpad/status.json` whenever its state changes — the controller
 arriving or going away, and every mode transition — writing a temp file and
 renaming it over the real one so a reader woken mid-write still parses a whole
 object. The file is owned by an RAII guard, like the pidfile, so it exists for
@@ -571,7 +610,7 @@ reports the sink that *exists*, not the one the config asked for.
 
 `source` is `broker` or `direct`: how hyprpad got hold of the *real* controller.
 `broker` means the root fd helper passed the descriptors over, which is the only
-arrangement in which Steam cannot also open the puck — see the next section.
+arrangement in which Steam cannot also open the controller — see the next section.
 
 `mode` is the mode the pad is *in*, which is not always the mode engine's: while
 the on-screen keyboard owns the pads it reads `osk`, the same built-in context the
@@ -650,7 +689,7 @@ exactly what that word means.
 ## Steam sees a Steam Controller (setup)
 
 Optional, and off by default. With `[gamepad] kind = "steam"` hyprpad presents
-Steam a **virtual Valve controller** on `/dev/uhid` and streams the real puck
+Steam a **virtual Valve controller** on `/dev/uhid` and streams the real controller
 into it, so Steam Input gives you trackpads as trackpads, gyro, the four back
 grips and per-game configs — instead of the synthesized Xbox pad. The design is
 [docs/design/uhid-relay.md](docs/design/uhid-relay.md).
@@ -658,11 +697,11 @@ grips and per-game configs — instead of the synthesized Xbox pad. The design i
 Two things have to be true for that to be worth anything, and both need root:
 
 1. hyprpad must be able to open `/dev/uhid`, which is `root 0600`;
-2. Steam must **not** be able to open the real puck — otherwise it sees both
+2. Steam must **not** be able to open the real controller — otherwise it sees both
    controllers and a game counts every press twice.
 
 Steam and hyprpad run as the same user, so no group or ACL can separate them.
-The split is made by taking the puck's hidraw nodes away from *everything*
+The split is made by taking the controller's hidraw nodes away from *everything*
 unprivileged (a udev rule) and handing hyprpad its descriptors from a tiny root
 helper over a unix socket (`hyprpad broker`, socket-activated by systemd).
 
@@ -679,7 +718,7 @@ comment header explaining what it does and how to remove it:
 
 | | |
 |---|---|
-| `packaging/udev/72-hyprpad-puck.rules` | makes the real puck root-only, and strips the `uaccess` tag Valve's own rule adds. The number is load-bearing — see the design doc §6.1 |
+| `packaging/udev/72-hyprpad-puck.rules` | makes the real controller root-only, and strips the `uaccess` tag Valve's own rule adds. The number is load-bearing — see the design doc §6.1 |
 | `packaging/sysusers.d/hyprpad.conf` | the `hyprpad` group, which is who may ask the broker |
 | `packaging/systemd/hyprpad-broker.socket` | `/run/hyprpad/broker.sock`, `0660 root:hyprpad` |
 | `packaging/systemd/hyprpad-broker.service` | the broker itself, root and tightly sandboxed |
@@ -699,8 +738,8 @@ live.
 
 You should not have to do anything. When a game turns its sensors on, Steam
 writes `SETTING_IMU_MODE` to the virtual controller, and hyprpad passes that to
-the **real** puck — through the same feature-report writer that owns lizard mode,
-so there is still exactly one thing writing to the controller. The puck then puts
+the **real** controller — through the same feature-report writer that owns lizard mode,
+so there is still exactly one thing writing to the controller. The controller then puts
 its IMU data in the report hyprpad is already forwarding, and it reaches Steam
 untouched. When Steam stops asking, or lets go of the device, the IMU goes back
 off.
@@ -892,13 +931,13 @@ h.daemon { own_lizard = true, restore_lizard_on_exit = false }
 ```
 
 `restore_lizard_on_exit` defaults to **true**: on a clean exit hyprpad re-enables
-the puck's firmware keyboard/mouse emulation, so a stopped daemon never leaves
+the controller's firmware keyboard/mouse emulation, so a stopped daemon never leaves
 the controller inert. Set it **false** and exit leaves lizard mode *disabled*, so
-the puck never types arrow keys into the desktop between daemon restarts or at
+the controller never types arrow keys into the desktop between daemon restarts or at
 boot — the goal of [docs/12-lizard-free.md](docs/12-lizard-free.md).
 
 The trade is real and is the whole point: with `false`, a crashed or stopped
-daemon leaves a puck that does **nothing** on the desktop until hyprpad runs
+daemon leaves a controller that does **nothing** on the desktop until hyprpad runs
 again. That is only acceptable when something restarts it — which is exactly what
 `Restart=on-failure` in the user unit is for — and when you still have a keyboard.
 Turning the knob off without the unit is the configuration to avoid.
@@ -922,7 +961,7 @@ hyprpad never disabled lizard mode and has nothing to restore.
 | [09 — The programme](docs/09-programme.md) | **The costed attack on the vision** — work items, sizes, order, risks |
 | [12 — The lizard-free goal](docs/12-lizard-free.md) | Never boot into firmware lizard mode: the `restore_lizard_on_exit` knob and the user unit |
 | [research/](docs/research/) | Six consolidated deep-research reports the programme rests on |
-| [design/](docs/design/) | How the shipped features are built: the [uhid relay](docs/design/uhid-relay.md), the [puck's power](docs/design/puck-power.md) |
+| [design/](docs/design/) | How the shipped features are built: the [uhid relay](docs/design/uhid-relay.md), the [controller's power](docs/design/controller-power.md) |
 
 ## Status
 

@@ -138,7 +138,7 @@ use crate::config::{
     Action, ButtonAction, Config, CursorConfig, GamepadConfig, GamepadKind, GuideTap,
     HapticsConfig, KeyChord, OskAction, RumbleMode, ScrollConfig, ScrollMode, ScrubConfig,
 };
-use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper};
+use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper, ShuttlePacer};
 use crate::gamepad::{self, VirtualGamepad};
 use crate::gesture::{GestureEngine, GestureEvent};
 // `Pad` is renamed: this module already talks about `report::Pad` (a pad
@@ -163,7 +163,7 @@ use std::time::{Duration, Instant};
 
 /// How often the reconnect wait re-scans for the controller's return. Bounded so
 /// we never busy-spin (the scan sleeps between attempts) yet re-arm within a
-/// couple of seconds of the puck reappearing.
+/// couple of seconds of the controller reappearing.
 const RECONNECT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// One unit of work for the main loop: a controller report, a compositor event,
@@ -172,10 +172,10 @@ const RECONNECT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 enum Input {
     /// One decoded frame from **either** backend.
     ///
-    /// The puck's bytes are decoded in its forwarder thread rather than in the
+    /// The controller's bytes are decoded in its forwarder thread rather than in the
     /// loop, so both sources arrive in the same shape and every layer above
-    /// this one keeps its single meaning of "a frame". `raw` is the puck's
-    /// original report, kept only because the Steam relay forwards the puck's
+    /// this one keeps its single meaning of "a frame". `raw` is the controller's
+    /// original report, kept only because the Steam relay forwards the controller's
     /// own bytes unprocessed ([`drive_gamepad`]); an evdev frame has none, and
     /// the uinput pad — which re-encodes from the frame — does not want one.
     Frame { frame: report::Frame, raw: Option<Vec<u8>> },
@@ -183,16 +183,16 @@ enum Input {
     /// `status.json` needs to name it and which cheat-sheet layout it draws as.
     EvdevAdopted { label: &'static str, layout: &'static str, name: String },
     /// The adopted gamepad went away. Distinct from [`Input::ReadersEnded`],
-    /// which is the *puck* leaving: either controller may go without the other,
-    /// and only the one that left is released.
+    /// which is the *Steam Controller* leaving: either device may go without
+    /// the other, and only the one that left is released.
     EvdevGone,
     Compositor(HyprEvent),
     /// An event the on-screen keyboard child reported back over its stdout
     /// channel (see [`crate::osk`]) — currently a key crossing, which the daemon
     /// answers with a haptic tick because it, not the child, owns the device.
     Osk(OskEvent),
-    /// Every puck reader thread has exited — the controller went away. The loop
-    /// enters its reconnect wait instead of terminating.
+    /// Every Steam Controller reader thread has exited — the controller went
+    /// away. The loop enters its reconnect wait instead of terminating.
     ///
     /// **Every** reader, not any: with the dongle plugged in and a Bluetooth
     /// bond live, both node sets are open at once and only one is streaming, so
@@ -255,26 +255,26 @@ pub fn run() -> std::io::Result<()> {
 
     // Wait for *a* controller rather than exiting when there isn't one yet. The
     // loop below already survives a controller *leaving*; this makes startup
-    // symmetric, so a daemon launched at login (or restarted while the puck is
+    // symmetric, so a daemon launched at login (or restarted while the controller is
     // unplugged / asleep on a dead dongle) simply sits until one appears —
     // "leave it running" has to include "start it before the controller".
     //
-    // The puck half polls exactly what the reconnect wait polls —
+    // The controller half polls exactly what the reconnect wait polls —
     // `ControllerSource::acquire` — so both paths ask the broker first and fall back
-    // to opening the nodes directly, and neither can be satisfied by a puck
+    // to opening the nodes directly, and neither can be satisfied by a controller
     // that is listed in `/sys` but not actually openable.
     //
     // The gamepad half is why this returns an `Option`: a machine with only an
     // Xbox pad plugged in is a perfectly good hyprpad session, and waiting
     // forever for a Steam Controller that is not coming would be the wrong
-    // answer. `None` means "start with no puck", which is exactly the state the
+    // answer. `None` means "start with no controller", which is exactly the state the
     // reconnect wait already handles — so the loop below begins in it and picks
-    // the puck up on its next scan if it ever arrives.
+    // the controller up on its next scan if it ever arrives.
     let source = {
         let mut source = hidraw::ControllerSource::acquire();
         if source.is_none() {
             // Distinguish the ways this can fail, because they need different
-            // things from the user. A puck that is *listed* in `/sys` but not
+            // things from the user. A controller that is *listed* in `/sys` but not
             // obtainable is a half-finished host install — the udev rule took
             // the nodes away and no broker is handing them back — and "waiting
             // for a controller" would be a misleading thing to say about a
@@ -282,7 +282,7 @@ pub fn run() -> std::io::Result<()> {
             let listed = hidraw::controller_nodes().map(|n| n.len()).unwrap_or(0);
             if listed > 0 {
                 eprintln!(
-                    "hyprpad: the puck is present ({listed} node(s)) but none can be \
+                    "hyprpad: the controller is present ({listed} node(s)) but none can be \
                      obtained — the udev rule is installed and the fd broker is not \
                      reachable. Run `hyprpad setup --check`. Waiting…"
                 );
@@ -302,7 +302,7 @@ pub fn run() -> std::io::Result<()> {
                 eprintln!("hyprpad: controller found ({} node(s), {})", s.len(), s.label())
             }
             None => eprintln!(
-                "hyprpad: starting on a gamepad instead; the puck will be picked up if it \
+                "hyprpad: starting on a gamepad instead; the controller will be picked up if it \
                  turns up"
             ),
         }
@@ -317,7 +317,7 @@ pub fn run() -> std::io::Result<()> {
     // Lizard-mode ownership (opt-in). Off by default so we never fight an
     // unmasked Steam that is managing lizard mode itself
     // (docs/experiments/w12-device-denial.md). When enabled, a background thread
-    // disables the puck's firmware keyboard/mouse emulation and re-sends
+    // disables the controller's firmware keyboard/mouse emulation and re-sends
     // periodically to re-cover it across reconnects. It degrades gracefully:
     // failures log a warning and never take the daemon down.
     // Mutable so a live reload can react to `own_lizard` flipping in the config
@@ -383,8 +383,8 @@ pub fn run() -> std::io::Result<()> {
     // `hyprpad reload` works either way.
     install_reload_signal(&tx);
 
-    // `None` means we started on a gamepad with no puck present. That is the
-    // reconnect wait's own state, so begin in it: the loop scans for the puck
+    // `None` means we started on a gamepad with no controller present. That is the
+    // reconnect wait's own state, so begin in it: the loop scans for the controller
     // on its timer and arms a reader pipeline the moment it appears.
     let mut waiting = match source {
         Some(source) => {
@@ -512,7 +512,7 @@ pub fn run() -> std::io::Result<()> {
     // channel; a forwarder thread funnels it into this loop's single input
     // stream as `Input::Osk`, where a crossing becomes a haptic tick under that
     // thumb. Split this way because the child owns the hit-test and the daemon
-    // owns the writable puck node.
+    // owns the writable controller node.
     let (osk_tx, osk_rx) = mpsc::channel::<OskEvent>();
     {
         let tx = tx.clone();
@@ -532,8 +532,8 @@ pub fn run() -> std::io::Result<()> {
     // active is dropped unless it carries deliberate input
     // ([`report::Frame::is_neutral`]), and one that does runs the same clean
     // handoff a mode change does before taking over. A hand resting on the
-    // puck therefore keeps the puck, and picking up the Xbox pad and moving a
-    // stick switches on the spot.
+    // Steam Controller therefore keeps it, and picking up the Xbox pad and
+    // moving a stick switches on the spot.
     let mut active_source = report::Source::default();
     // The gamepad the evdev backend currently holds, if any: its `status.json`
     // name and its cheat-sheet layout id.
@@ -541,12 +541,12 @@ pub fn run() -> std::io::Result<()> {
     // The rate integrators the sticks drive on a controller with no trackpads,
     // and the owner of this loop's fourth receive deadline ([`crate::sticks`]).
     let mut sticks = crate::sticks::StickDrive::new();
-    status.set_layout(report::LAYOUT_PUCK);
+    status.set_layout(report::LAYOUT_STEAM_CONTROLLER);
     status.set_sources(source_names(!waiting, evdev_pad));
 
     // Supervisor loop. Two states: *connected*, where it blocks on `rx`; and
     // *waiting*, entered when the readers all end (controller gone), where it
-    // re-scans for the puck on a timer while still draining compositor events —
+    // re-scans for the controller on a timer while still draining compositor events —
     // and, crucially, never returns. Hyprland IPC and the virtual pointer stay
     // alive across the gap; only the hidraw reader pipeline is torn down and
     // re-armed. `recv_timeout` with a shrinking deadline guarantees the scan
@@ -714,7 +714,7 @@ pub fn run() -> std::io::Result<()> {
         }
 
         // The stick integrators' step, for a controller whose sticks stand in
-        // for the puck's trackpads. Checked HERE, before the receive, for the
+        // for the controller's trackpads. Checked HERE, before the receive, for the
         // same reason the two above are: a change-driven pad moving a stick
         // produces a busy report stream, and a deadline that were only honoured
         // on a receive *timeout* would then never fire at all.
@@ -723,7 +723,7 @@ pub fn run() -> std::io::Result<()> {
         // only while a stick is outside its deadzone or a velocity is still
         // decaying through the smoothing; centred, it is `None`, this branch is
         // dead, nothing is added to `wake`, and the loop blocks indefinitely
-        // exactly as it does today with the puck asleep.
+        // exactly as it does today with the controller asleep.
         let stick_at = sticks.deadline();
         if stick_at.is_some_and(|at| at <= Instant::now()) {
             let now = Instant::now();
@@ -756,6 +756,26 @@ pub fn run() -> std::io::Result<()> {
                 &mut hx,
                 now,
             );
+            // The caret shuttle rides this clock too, and it is the reason the
+            // clock exists for it: a stick held over emits no reports, so the
+            // taps have to come from here. The last frame is the state — its
+            // deflection and its `select` level — exactly as it is for the
+            // integrators above.
+            let scrub_active = engine.guide_active()
+                && !osk.is_active()
+                && config.scrub_enabled_in(modes.state());
+            drive_scrub(
+                &mut keyboard,
+                &mut engine,
+                &prev_frame,
+                &mut scrub,
+                config.scrub(),
+                config.cursor(),
+                scrub_active,
+                &mut hx,
+                now,
+            );
+            sticks.set_shuttle(scrub.shuttle_running(), config.sticks(), now);
             sticks.stepped(config.sticks(), now);
             continue;
         }
@@ -838,11 +858,11 @@ pub fn run() -> std::io::Result<()> {
                 // leave the virtual pad holding its last frame, or a rumble
                 // running with nothing left to stop it.
                 gamepad.release(&mut haptics);
-                // The puck's rate integrators are always idle (its pads drive
-                // the cursor), but if the Xbox pad was driving and the puck is
+                // The controller's rate integrators are always idle (its pads drive
+                // the cursor), but if the Xbox pad was driving and the controller is
                 // what left, this is still the right place to drop any claim
                 // held for a source that is now gone.
-                if active_source == report::Source::Puck {
+                if active_source == report::Source::SteamController {
                     sticks.release();
                 }
                 waiting = true;
@@ -921,7 +941,7 @@ pub fn run() -> std::io::Result<()> {
             }
             Input::Osk(OskEvent::Crossed(pad)) => {
                 // The child hit-tested a crossing onto a NEW key; we hold the
-                // writable puck node, so the tick is fired here. Gating and
+                // writable controller node, so the tick is fired here. Gating and
                 // intensity come off the live config, so a reload retunes it.
                 let mut hx =
                     HapticCtx { dev: &mut haptics, cfg: config.haptics(), source: active_source };
@@ -937,12 +957,12 @@ pub fn run() -> std::io::Result<()> {
                 status.set_sources(source_names(!waiting, evdev_pad));
                 // Only the pad that left is released. If it was the one
                 // driving, everything it was holding goes with it — exactly
-                // what `Input::ReadersEnded` does for the puck — and the
-                // active source falls back to the puck, whose own presence is
+                // what `Input::ReadersEnded` does for the controller — and the
+                // active source falls back to the controller, whose own presence is
                 // `waiting`'s business.
                 if active_source == report::Source::Evdev {
-                    active_source = report::Source::Puck;
-                    status.set_layout(report::LAYOUT_PUCK);
+                    active_source = report::Source::SteamController;
+                    status.set_layout(report::LAYOUT_STEAM_CONTROLLER);
                     sticks.release();
                     reset_frame_state(
                         &mut engine,
@@ -972,7 +992,7 @@ pub fn run() -> std::io::Result<()> {
                     active_source = frame.source;
                     status.set_layout(match (frame.source, evdev_pad) {
                         (report::Source::Evdev, Some((_, layout))) => layout,
-                        _ => report::LAYOUT_PUCK,
+                        _ => report::LAYOUT_STEAM_CONTROLLER,
                     });
                     sticks.release();
                     // The outgoing source's edge state is meaningless to the
@@ -993,7 +1013,7 @@ pub fn run() -> std::io::Result<()> {
                 }
                 let now = Instant::now();
                 // Record the sticks for the rate integrators and arm (or drop)
-                // their deadline. A puck frame parks them: its pads drive the
+                // their deadline. A controller frame parks them: its pads drive the
                 // cursor and its sticks are for guide flicks, so nothing here
                 // must ever hold the deadline open for it.
                 sticks.observe(&frame, config.sticks(), now);
@@ -1008,6 +1028,18 @@ pub fn run() -> std::io::Result<()> {
                 // The one gesture threshold a config can move, read fresh so
                 // `hyprpad reload` retunes it on the very next report.
                 engine.set_guide_tap_max(config.gamepad().guide_tap_max());
+                // Who owns the LEFT stick's horizontal axis under a held guide.
+                // On a padless controller with the scrub live it is the caret
+                // shuttle's, and `guide+lstick_left/right` must not also fire —
+                // one push would otherwise walk the caret AND move the window
+                // focus. Asked before the update, because the flick is decided
+                // inside it; vertical flicks are untouched.
+                engine.set_shuttle_left(
+                    !frame.source.has_pads()
+                        && config.scrub().enabled
+                        && !osk.is_active()
+                        && config.scrub_enabled_in(modes.state()),
+                );
                 let gestures = engine.update(&frame, now);
                 // The forwarding gate, asked HERE — after the update, so the
                 // guide is already up on a release frame, and before any
@@ -1187,6 +1219,10 @@ pub fn run() -> std::io::Result<()> {
                     &mut hx,
                     now,
                 );
+                // On a padless controller the scrub is a shuttle, and a stick
+                // held over reports nothing: hand the answer to the deadline
+                // that will step it while the wire is silent.
+                sticks.set_shuttle(scrub.shuttle_running(), config.sticks(), now);
                 // Bare-button bindings that are *held* (D-pad -> arrows, pad
                 // click / triggers -> mouse clicks by default; each code goes
                 // to the device it belongs to). Gated OFF on the guide layer
@@ -1221,11 +1257,11 @@ pub fn run() -> std::io::Result<()> {
                 drive_gamepad(
                     &mut gamepad,
                     &frame,
-                    // The Steam relay forwards the puck's own bytes
+                    // The Steam relay forwards the controller's own bytes
                     // unprocessed; an evdev frame has none, and the uinput pad
                     // re-encodes from the frame either way. `&[]` is what the
                     // relay reads as "nothing to pass through", which is the
-                    // truth for a source that is not the puck.
+                    // truth for a source that is not the controller.
                     raw.as_deref().unwrap_or(&[]),
                     config.gamepad(),
                     forwarding,
@@ -1306,7 +1342,7 @@ fn spawn_reader_pipeline(source: hidraw::ControllerSource, tx: &mpsc::Sender<Inp
 ///
 /// The decode runs **here**, in the reader thread, rather than in the loop: the
 /// evdev backend builds its frames in its own thread too, so doing the same for
-/// the puck is what makes [`Input::Frame`] mean one thing whichever controller
+/// the controller is what makes [`Input::Frame`] mean one thing whichever controller
 /// produced it. A report that does not decode — the controller's other report
 /// ids, listed in [`report::Frame::decode`] — is dropped exactly as the loop
 /// used to drop it.
@@ -1450,7 +1486,7 @@ impl HapticCtx<'_> {
     /// Fire `what` on `pad`, if the config enables it. Non-blocking: the pulse is
     /// queued for the haptics writer thread and dropped if that queue is full.
     ///
-    /// **The one place a source without haptics is handled.** The puck has an
+    /// **The one place a source without haptics is handled.** The controller has an
     /// actuator behind each trackpad and the pulses are 200–600 µs; an Xbox pad
     /// has two rumble motors, which `ff-memless` runs at jiffy granularity and
     /// which need tens of milliseconds to spin up. There is no honest way to
@@ -1856,7 +1892,7 @@ struct StickGates {
 /// busy-poll" holds unchanged).
 ///
 /// The OSK comes first and takes both sticks: while the keyboard is up it owns
-/// them, as it owns both pads on the puck.
+/// them, as it owns both pads on the controller.
 #[allow(clippy::too_many_arguments)]
 fn drive_sticks(
     st: &mut crate::sticks::StickDrive,
@@ -1870,7 +1906,8 @@ fn drive_sticks(
 ) {
     if gates.osk {
         // The keyboard on a padless controller owns both sticks, as it owns
-        // both pads on the puck — but what they drive is the **highlight**,
+        // both pads on the Steam Controller — but what they drive is the
+        // **highlight**,
         // not a cursor (`docs/research/xbox-elite.md` §3.5 option (ii); phase 1
         // sent two integrated `cursor L|R` positions here instead). A stick
         // thrown past [`osk::NAV_THROW_OUT`] steps the highlight one key and
@@ -1966,11 +2003,11 @@ fn gamepad_present(config: &Config) -> bool {
 }
 
 /// The `"sources"` list for `status.json`: every controller the daemon can hear
-/// right now, puck first.
-fn source_names(puck: bool, evdev: Option<(&'static str, &'static str)>) -> Vec<String> {
+/// right now, controller first.
+fn source_names(controller: bool, evdev: Option<(&'static str, &'static str)>) -> Vec<String> {
     let mut out = Vec::new();
-    if puck {
-        out.push("puck".to_string());
+    if controller {
+        out.push("steam-controller".to_string());
     }
     if let Some((label, _)) = evdev {
         out.push(label.to_string());
@@ -2062,6 +2099,10 @@ struct ScrubState {
     angle: AngleAccumulator,
     /// Speed → step-size ladder (×1 / ×2 / ×4-or-word).
     pacer: JogPacer,
+    /// The padless twin of the wheel: deflection → *when the next tap is due*.
+    /// Only one of the two is ever live on a given frame, and which is decided
+    /// by [`report::Source::has_pads`].
+    shuttle: ShuttlePacer,
     /// Previous frame's timestamp, for the pacer's `dt`. `None` until the first
     /// scrubbing frame after a reset.
     last_t: Option<Instant>,
@@ -2083,6 +2124,12 @@ impl ScrubState {
                 cfg.slow_deg_per_s,
                 cfg.fast_min_detents,
                 cfg.word_tier,
+            ),
+            shuttle: ShuttlePacer::new(
+                cfg.shuttle.deadzone,
+                cfg.shuttle.slow_per_s,
+                cfg.shuttle.fast_per_s,
+                cfg.shuttle.word_above,
             ),
             last_t: None,
             consumed: false,
@@ -2107,8 +2154,17 @@ impl ScrubState {
         self.damper.reset();
         self.angle.reset();
         self.pacer.reset();
+        self.shuttle.reset();
         self.last_t = None;
         self.consumed = false;
+    }
+
+    /// Whether the shuttle is holding a stick over, and the loop therefore owes
+    /// it a wakeup ([`crate::sticks::StickDrive::set_shuttle`]). Always false
+    /// on a controller with trackpads, where the jog wheel resets it every
+    /// frame.
+    fn shuttle_running(&self) -> bool {
+        self.shuttle.running()
     }
 }
 
@@ -2176,13 +2232,23 @@ fn scrub_burst(ticks: i32, pacer: &mut JogPacer, select: bool) -> ScrubBurst {
     out
 }
 
-/// Drive the caret scrub from the LEFT trackpad for a single frame.
+/// Drive the caret scrub from the LEFT input for a single frame — or, on a
+/// controller with no trackpads, for a single step of the stick clock.
 ///
 /// The guide-layer twin of [`drive_scroll`]: while the guide button is held and
 /// `h.scrub`'s guard passes in the active mode (`active`, which the caller
 /// computes from [`Config::scrub_enabled_in`] and `guide_active()`), circling
 /// the left pad walks the text caret one step per detent —
 /// `docs/research/text-scrub.md` §3.1, option (a).
+///
+/// **Two gestures, one binding.** A pad is an absolute surface, so it gets the
+/// jog wheel below. A stick springs back to centre and has no position to
+/// count, so a padless source gets the other half of the video-editing pair
+/// instead — the shuttle in [`drive_shuttle`], where deflection picks a *rate*
+/// — and this function forks to it on [`report::Source::has_pads`], per frame,
+/// because a session may hold either controller and the choice belongs to the
+/// device and not to the config. Everything downstream of the gesture is shared:
+/// the taps, the select-with-Shift level, the consumed hold, the word tier.
 ///
 /// Precedence, and why it fights nothing:
 ///
@@ -2223,6 +2289,16 @@ fn drive_scrub(
         st.reset();
         return;
     }
+    // Which of the two this controller gets. A pad has an absolute position to
+    // read, so it is a jog wheel; a stick springs back, so it is a shuttle.
+    // Same binding, same guard, same taps — see [`drive_shuttle`].
+    if !frame.source.has_pads() {
+        let _ = drive_shuttle(kbd, engine, frame, st, cfg, hx, now);
+        return;
+    }
+    // The wheel from here down. Park the shuttle so the loop is never asked to
+    // keep a deadline armed for a stick this controller drives nothing with.
+    st.shuttle.reset();
     // Only while the LEFT pad is actually touched. A lift resets, so a
     // lift-and-retouch never injects the angle it jumped across.
     if !frame.pressed(report::Button::PadLeftTouch) {
@@ -2268,6 +2344,62 @@ fn drive_scrub(
     // feel that the unit changed under it.
     let feel = if burst.word { Haptic::ScrubWord } else { Haptic::Scroll };
     hx.fire(feel, HapticPad::Left);
+}
+
+/// The caret scrub on a controller with **no trackpads**: the LEFT stick's
+/// horizontal deflection as a shuttle, for a single step of the loop's clock.
+///
+/// [`drive_scrub`]'s other half, and the answer to "how do I scrub without the
+/// trackpad". A jog wheel needs an absolute surface to count position on; a
+/// stick has none, so it does the other half of the video-editing pair — rate
+/// control. Hold it over and the caret walks at a speed the deflection chooses
+/// ([`ShuttlePacer`]): `slow_per_s` at the deadzone edge, rising to
+/// `fast_per_s` at `word_above`, and past that the same tap is a `ctrl`+arrow
+/// so the caret hops word boundaries instead of characters. Everything else is
+/// the wheel's, unchanged and deliberately so — the same [`scrub_chord`] taps
+/// (press and release in the same step, never a held key), the same
+/// select-with-Shift level, the same heavier feel for a word, and the same rule
+/// that the first tap spends the guide hold.
+///
+/// Only the horizontal axis is read. Lines are the D-pad's job already, and a
+/// vertical channel here would turn every diagonal thumb into a caret jumping
+/// rows it was not asked to.
+///
+/// **Called on a clock, not only on frames.** A gamepad reports only on change,
+/// so a stick *held* over is silence on the wire; the loop's stick deadline
+/// (`crate::sticks::StickDrive`, 4 ms) is what steps this, with the last frame
+/// as the state, exactly as the rate-controlled cursor is stepped. That is why
+/// the emission is time-based and not per-frame: the taps come from the clock.
+///
+/// Returns the chord this step tapped, if any — which is what the tests read,
+/// the daemon having nowhere else to put it.
+fn drive_shuttle(
+    kbd: &mut Option<VirtualKeyboard>,
+    engine: &mut GestureEngine,
+    frame: &report::Frame,
+    st: &mut ScrubState,
+    cfg: &ScrubConfig,
+    hx: &mut HapticCtx,
+    now: Instant,
+) -> Option<KeyChord> {
+    // The same normalization the stick cursor uses, so one deadzone number
+    // means the same push on every path.
+    let x = crate::sticks::Deflection::of(frame).left.0;
+    let tap = st.shuttle.update(x, now)?;
+    // A tap is a hold spent, exactly as a detent is: the guide's release is
+    // ours, not Steam's.
+    if !st.consumed {
+        engine.consume_hold();
+        st.consumed = true;
+    }
+    let chord = scrub_chord(tap.right, tap.word, frame.pressed(cfg.select));
+    emit_chord(kbd, None, &chord, true);
+    emit_chord(kbd, None, &chord, false);
+    hx.fire(
+        if tap.word { Haptic::ScrubWord } else { Haptic::Scroll },
+        HapticPad::Left,
+    );
+    Some(chord)
 }
 
 /// Cross-frame state for the *held* bare-button bindings
@@ -2684,10 +2816,10 @@ fn fire_buttons(
 }
 
 // ---------------------------------------------------------------------------
-// The virtual gamepad: forwarding under focus, and rumble back to the puck.
+// The virtual gamepad: forwarding under focus, and rumble back to the controller.
 // ---------------------------------------------------------------------------
 
-/// How often a non-zero rumble command is (re-)written to the puck, and the
+/// How often a non-zero rumble command is (re-)written to the controller, and the
 /// minimum gap between any two rumble writes.
 ///
 /// This is `hid-steam`'s own `HZ / 20`. The driver rate-limits rumble to 20 Hz
@@ -2857,7 +2989,7 @@ fn relay_kind(cfg: &GamepadConfig, relay_live: bool) -> RelayKind {
 
 /// Cross-frame state for the virtual gamepad: the lazily-created device, the
 /// edge-detection flag behind the neutral-on-transition guarantee, and the
-/// rumble command last written to the puck.
+/// rumble command last written to the controller.
 struct GamepadState {
     /// The uinput device. `None` until the first frame that actually wants to
     /// forward — or forever, if creation failed. Always `None` under
@@ -2878,7 +3010,7 @@ struct GamepadState {
     /// Whether Steam held the virtual device open on the previous frame.
     ///
     /// Only the **falling** edge matters, and only for one thing: it is when
-    /// the puck's IMU goes back to hyprpad's own preference, because whoever
+    /// the controller's IMU goes back to hyprpad's own preference, because whoever
     /// asked for it has stopped listening. Starts `false`, so a daemon that
     /// comes up with Steam already holding the device sees one rising edge and
     /// no spurious restore.
@@ -2889,7 +3021,7 @@ struct GamepadState {
     /// Whether the previous frame was forwarding. The falling edge of this flag
     /// is the neutral-on-transition guarantee.
     forwarding: bool,
-    /// The `(strong, weak)` magnitudes last written to the puck, and when — the
+    /// The `(strong, weak)` magnitudes last written to the controller, and when — the
     /// two halves of the 20 Hz coalescing clock.
     rumble: (u16, u16),
     rumble_sent: Option<Instant>,
@@ -2925,7 +3057,7 @@ impl GamepadState {
             pad.neutral();
         }
         // The relay is never destroyed here — only fed neutral. Steam must not
-        // see the controller disappear when the puck naps or a game loses focus.
+        // see the controller disappear when the controller naps or a game loses focus.
         if let Some(relay) = self.relay.as_ref() {
             relay.release();
         }
@@ -2996,7 +3128,7 @@ fn drive_gamepad(
     if forwarding {
         if let Some(relay) = st.relay.as_ref() {
             // The Steam sink. `raw` goes in unprocessed: the triton profile
-            // relays the puck's own bytes, so anything re-encoded on the way
+            // relays the controller's own bytes, so anything re-encoded on the way
             // would be a loss.
             if pulse {
                 relay.pulse_guide();
@@ -3057,7 +3189,7 @@ fn strip_mask(cfg: &GamepadConfig) -> StripMask {
 ///
 /// Steam drives a Valve controller it has adopted: the proven run took 39
 /// `SetSettingsValues` writes inside two minutes. Rumble and haptics become
-/// real pulses on the puck through `haptics.rs`'s single writer thread — §5.2
+/// real pulses on the controller through `haptics.rs`'s single writer thread — §5.2
 /// is explicit that the relay must never open a second writable fd on the
 /// device. Everything else is logged under `HYPRSC_DEBUG` and dropped.
 ///
@@ -3096,7 +3228,7 @@ fn absorb_relay_writes(
                 haptics.pulse(pad, on_us, off_us, count);
             }
             // The one setting that is relayed rather than interpreted: only the
-            // real puck can turn its own IMU on, so Steam's gyro request has to
+            // real controller can turn its own IMU on, so Steam's gyro request has to
             // reach the hardware or the gyro bytes never appear in the `0x42`
             // the triton profile is already passing through (gap G5).
             //
@@ -3104,14 +3236,14 @@ fn absorb_relay_writes(
             // `lizard`'s shared cell and rides out on the same `0x87` frame that
             // module already re-sends every 30 s; `nudge` only asks it to send
             // now instead of at the next tick, and is skipped entirely when
-            // Steam re-states a mode the puck is already holding — which it
+            // Steam re-states a mode the controller is already holding — which it
             // does, repeatedly.
             RelayAction::Settings(ref pairs) => {
                 if let Some(mode) = settings::imu_mode(pairs) {
                     if crate::lizard::set_imu_requested(Some(mode)) {
                         if debug {
                             eprintln!(
-                                "[relay] IMU {} -> puck (Steam asked)",
+                                "[relay] IMU {} -> controller (Steam asked)",
                                 settings::gyro_mode::describe(mode)
                             );
                         }
@@ -3128,7 +3260,7 @@ fn absorb_relay_writes(
 
     // Steam letting go of the fake hands the IMU back to hyprpad's own
     // preference — off, unless `gyro = true`. Without this, quitting Steam with
-    // a gyro game open would leave the puck streaming IMU data to nobody until
+    // a gyro game open would leave the controller streaming IMU data to nobody until
     // its next power cycle. Edge-triggered, so an ordinary session of Steam
     // holding the device open costs nothing.
     let open = relay.is_open();
@@ -3218,10 +3350,10 @@ fn rumble_due(
     }
 }
 
-/// Write one rumble command to the puck in the configured form.
+/// Write one rumble command to the controller in the configured form.
 fn emit_rumble(haptics: &mut Haptics, mode: RumbleMode, (strong, weak): (u16, u16)) {
     match mode {
-        // The puck's own force-feedback report, byte-for-byte what `hid-steam`
+        // The controller's own force-feedback report, byte-for-byte what `hid-steam`
         // sends for an `FF_RUMBLE` effect.
         RumbleMode::Native => haptics.rumble(strong, weak),
         // The approximation: a train of the `0x81` pulse under each thumb, sized
@@ -3263,7 +3395,7 @@ fn pulse_train(magnitude: u16) -> Option<(u16, u16, u16)> {
     Some((on_us, off_us, count as u16))
 }
 
-/// Whether to take ownership of the puck's lizard mode. Enabled by the
+/// Whether to take ownership of the controller's lizard mode. Enabled by the
 /// `own_lizard` config flag (`[daemon]` section) or the `HYPRPAD_OWN_LIZARD`
 /// environment variable. The env var wins when set to a truthy value
 /// (`1`/`true`/`yes`/`on`); an empty or falsey value forces it off, so it can
@@ -3325,7 +3457,7 @@ fn signal_to_input(sig: libc::c_int) -> Option<Input> {
 ///
 /// The single place [`Action::ControllerOff`] and [`Input::ControllerOff`] both
 /// land, so a chord and `hyprpad off` cannot drift. An `Err` here is almost
-/// always "every puck node STALLed", i.e. the controller is already asleep —
+/// always "every controller node STALLed", i.e. the controller is already asleep —
 /// which is the outcome that was asked for — so it is reported at a low key and
 /// never propagated.
 fn controller_off() {
@@ -3593,7 +3725,7 @@ pub fn reload() -> Result<(), String> {
 /// widget runs on a right-click.
 ///
 /// It goes through the daemon rather than sending `0x9F` itself for two
-/// reasons: the daemon already holds the puck's descriptors (which, once
+/// reasons: the daemon already holds the controller's descriptors (which, once
 /// `packaging/udev/72-hyprpad-puck.rules` is installed, is the only process
 /// that can without the broker), and one writer to the device is the invariant
 /// the whole design rests on. So this reports "no daemon" rather than falling
@@ -4029,8 +4161,8 @@ struct OskRoute {
     shift_holders: Vec<report::Button>,
     /// The D-pad's snap-navigation clock. Only ever fed on a controller with no
     /// trackpads: there, the keyboard is steered by a highlight and the D-pad
-    /// is what moves it. On the puck the D-pad under the keyboard does what it
-    /// always did — nothing, unless a config binds it.
+    /// is what moves it. On the Steam Controller the D-pad under the keyboard
+    /// does what it always did — nothing, unless a config binds it.
     ///
     /// Unlike the sticks', this one is paced by the controller's **own report
     /// stream** rather than by the loop's stick deadline, because a D-pad
@@ -4213,7 +4345,7 @@ fn padless_osk_default(source: report::Source, b: report::Button) -> Option<OskA
 }
 
 /// Which pad's cursor an `osk commit` on `b` types under: the pad on the same
-/// side of the puck as the button ([`button_pad`]). The pad clicks are the
+/// side of the controller as the button ([`button_pad`]). The pad clicks are the
 /// obvious case; a commit rebound to a grip or a bumper reads the pad under
 /// that hand, and one on a face button the right pad. The guide button belongs
 /// to neither hand and reads the right pad, like the face cluster.
@@ -4373,7 +4505,7 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
         Action::SetMode(_) | Action::ClearMode => Ok(()),
         // Turn the controller off: `0x9F` through the same feature-report path
         // lizard mode uses. A failure here is almost always "the controller is
-        // already asleep" (every puck node STALLs), which for this action is
+        // already asleep" (every controller node STALLs), which for this action is
         // the outcome asked for — so it is logged, not propagated as an IPC
         // error, and never takes the daemon down.
         Action::ControllerOff => {
@@ -4657,7 +4789,7 @@ mod tests {
         assert!(frames.windows(2).all(|w| w[0] == w[1]), "the wire does not change the frame");
 
         // The relay still gets the original bytes, short report and all — it is
-        // `puck_to_triton`'s job, not the reader's, to re-frame them.
+        // `controller_to_triton`'s job, not the reader's, to re-frame them.
         let raws: Vec<usize> = got
             .iter()
             .filter_map(|i| match i {
@@ -4700,7 +4832,7 @@ mod tests {
         rtx.send(report(raw_report_with_a())).unwrap();
         // A report that is not a 0x42 — a battery or status report — is dropped
         // here rather than in the loop. Same effect, one less thing the loop
-        // has to know about the puck.
+        // has to know about the controller.
         rtx.send(report(vec![0x03, 0x01])).unwrap();
         drop(rtx); // every reader gone -> the source channel closes
 
@@ -4717,7 +4849,7 @@ mod tests {
         );
         let got = irx.recv().expect("a frame");
         let Input::Frame { frame, raw } = got else { panic!("wanted a frame") };
-        assert_eq!(frame.source, report::Source::Puck);
+        assert_eq!(frame.source, report::Source::SteamController);
         assert_eq!(frame.counter, 0x07);
         assert!(frame.pressed(report::Button::A));
         assert_eq!(raw.as_deref(), Some(raw_report_with_a().as_slice()), "the relay's bytes");
@@ -4743,7 +4875,7 @@ mod tests {
     }
 
     /// The evdev backend's three events reach the loop in the same shape the
-    /// puck's do — and its frames carry no raw bytes, because there are none.
+    /// controller's do — and its frames carry no raw bytes, because there are none.
     #[test]
     fn forward_evdev_maps_every_event_and_stops_with_the_loop() {
         let (etx, erx) = mpsc::channel::<crate::evdev::Event>();
@@ -4766,7 +4898,7 @@ mod tests {
         ));
         let Ok(Input::Frame { frame, raw }) = irx.recv() else { panic!("wanted a frame") };
         assert_eq!(frame.source, report::Source::Evdev);
-        assert!(raw.is_none(), "an evdev frame has no puck bytes to relay");
+        assert!(raw.is_none(), "an evdev frame has no controller bytes to relay");
         assert!(matches!(irx.recv(), Ok(Input::EvdevGone)));
         assert!(irx.recv().is_err());
 
@@ -4806,7 +4938,7 @@ mod tests {
 
     /// The whole point of the `Source` tag: a frame from the evdev backend goes
     /// through the SAME gesture engine, the SAME bare-button layer and the SAME
-    /// config as a puck frame. Nothing above the decoder is source-aware.
+    /// config as a controller frame. Nothing above the decoder is source-aware.
     #[test]
     fn a_frame_from_the_evdev_source_resolves_the_same_bindings() {
         use crate::evdev::{BTN_GRIPR, BTN_MODE, BTN_SOUTH};
@@ -4814,9 +4946,9 @@ mod tests {
 
         // Xbox button + the upper-right paddle: `guide+r4` on the owner's pad.
         let xbox = xbox_frame(&[BTN_MODE, BTN_GRIPR], &[]);
-        let puck = frame_of(&[Steam, GripR4]);
-        assert_eq!(xbox.buttons, puck.buttons, "the same bits, from a different wire");
-        assert_ne!(xbox.source, puck.source);
+        let controller = frame_of(&[Steam, GripR4]);
+        assert_eq!(xbox.buttons, controller.buttons, "the same bits, from a different wire");
+        assert_ne!(xbox.source, controller.source);
 
         let cfg = Config::from_toml_str(
             "[bindings]\n\"guide+r4\" = \"workspace +1\"\n[buttons]\na = \"key enter\"\n",
@@ -4826,7 +4958,7 @@ mod tests {
 
         // The gesture engine recognises the chord on either frame, and the
         // config resolves it to the same action.
-        for f in [xbox, puck] {
+        for f in [xbox, controller] {
             let mut engine = GestureEngine::new();
             let events = engine.update(&f, Instant::now());
             assert!(
@@ -4841,14 +4973,14 @@ mod tests {
         // And the bare-button layer: A presses the same key whichever
         // controller it came from.
         let xbox_a = xbox_frame(&[BTN_SOUTH], &[]);
-        let puck_a = frame_of(&[A]);
+        let controller_a = frame_of(&[A]);
         let mut from_xbox = live();
-        let mut from_puck = live();
+        let mut from_controller = live();
         let held_xbox =
             from_xbox.reconcile(modes.buttons(), |b| xbox_a.pressed(b), none, true);
-        let held_puck =
-            from_puck.reconcile(modes.buttons(), |b| puck_a.pressed(b), none, true);
-        assert_eq!(held_xbox, held_puck);
+        let held_controller =
+            from_controller.reconcile(modes.buttons(), |b| controller_a.pressed(b), none, true);
+        assert_eq!(held_xbox, held_controller);
         assert_eq!(held_xbox.len(), 1, "A is bound and held");
     }
 
@@ -4900,7 +5032,7 @@ mod tests {
         // `Haptic::Button` is off by default, so it would prove nothing here.
         for what in [Haptic::Commit, Haptic::Crossing, Haptic::Scroll, Haptic::Gesture] {
             assert!(
-                haptic_for(report::Source::Puck, &cfg, what).is_some(),
+                haptic_for(report::Source::SteamController, &cfg, what).is_some(),
                 "{what:?} is enabled in the config"
             );
             assert!(
@@ -4908,10 +5040,10 @@ mod tests {
                 "{what:?} has no actuator to play on"
             );
         }
-        // The config still has the last word for the puck: turning a trigger
+        // The config still has the last word for the controller: turning a trigger
         // point off turns it off.
         let quiet = HapticsConfig { enabled: false, ..cfg };
-        assert!(haptic_for(report::Source::Puck, &quiet, Haptic::Commit).is_none());
+        assert!(haptic_for(report::Source::SteamController, &quiet, Haptic::Commit).is_none());
     }
 
     /// The loop's fourth deadline: armed only while a stick is deflected.
@@ -4934,10 +5066,10 @@ mod tests {
         sticks.stepped(&cfg, now);
         assert_eq!(sticks.deadline(), None);
 
-        // A puck frame with a stick held right over — a guide flick in
-        // progress — must never arm it: the puck's cursor is its pads.
-        let puck = report::Frame { right_stick: (30_000, 0), ..report::Frame::default() };
-        sticks.observe(&puck, &cfg, now);
+        // A controller frame with a stick held right over — a guide flick in
+        // progress — must never arm it: the controller's cursor is its pads.
+        let controller = report::Frame { right_stick: (30_000, 0), ..report::Frame::default() };
+        sticks.observe(&controller, &cfg, now);
         assert_eq!(sticks.deadline(), None);
     }
 
@@ -4958,7 +5090,7 @@ mod tests {
     }
 
     /// The startup wait's second exit. A machine with only an Xbox pad is a
-    /// perfectly good hyprpad session, so waiting forever for a puck that is
+    /// perfectly good hyprpad session, so waiting forever for a controller that is
     /// not coming would be the wrong answer — but a pad nothing is going to
     /// read is not a controller being present, so the config knob wins.
     #[test]
@@ -4975,14 +5107,14 @@ mod tests {
     }
 
     /// Last-active-source wins, and the one case that would otherwise thrash:
-    /// a hand resting on the puck's grips while the other drives an Xbox pad.
+    /// a hand resting on the controller's grips while the other drives an Xbox pad.
     #[test]
     fn only_deliberate_input_takes_the_device_from_the_other_controller() {
         use report::Button::*;
         assert!(report::Frame::default().is_neutral());
 
         // Proximity is not intent. The capacitive cluster fires on hand
-        // contact, so a hand simply on the puck must not claim the cursor —
+        // contact, so a hand simply on the controller must not claim the cursor —
         // it would fight the other pad at the report rate.
         for cap in [Cap0, Cap1, Cap2, Cap3] {
             assert!(frame_of(&[cap]).is_neutral(), "{cap:?} is a hand, not a press");
@@ -5006,13 +5138,13 @@ mod tests {
         assert!(!pushed.is_neutral());
     }
 
-    /// The `"sources"` list, puck first, and only what is actually there.
+    /// The `"sources"` list, controller first, and only what is actually there.
     #[test]
     fn the_status_source_list_names_every_live_controller() {
-        assert_eq!(source_names(true, None), vec!["puck"]);
+        assert_eq!(source_names(true, None), vec!["steam-controller"]);
         assert_eq!(
             source_names(true, Some(("elite", "xbox-elite-2"))),
-            vec!["puck", "elite"]
+            vec!["steam-controller", "elite"]
         );
         assert_eq!(source_names(false, Some(("gamepad", "xbox-elite-2"))), vec!["gamepad"]);
         assert!(source_names(false, None).is_empty(), "no daemon-invented sources");
@@ -5162,7 +5294,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
         let ctrl_c = KeyChord::parse("ctrl+c").unwrap();
@@ -5170,7 +5302,7 @@ mod tests {
         macro_rules! gesture {
             ($ge:expr) => {
                 handle_gesture(
-                    &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx,
+                    &hypr, &cfg, &mut modes, &mut osk, report::Source::SteamController, &mut hx,
                     &mut chords, &mut kbd, None, false, $ge,
                 )
             };
@@ -5371,9 +5503,9 @@ mod tests {
         assert!(fire_edges(&fired, &down, &down, true).is_empty());
     }
 
-    /// A fixed instant for the keyboard layer's repeat clock. The puck frames
-    /// these tests use never feed it (snap navigation is padless-only), so one
-    /// frozen `now` is all they need; the padless tests below step it by hand.
+    /// A fixed instant for the keyboard layer's repeat clock. The trackpad
+    /// frames these tests use never feed it (snap navigation is padless-only),
+    /// so one frozen `now` is all they need; the padless tests step it by hand.
     fn t0() -> Instant {
         *T0.get_or_init(Instant::now)
     }
@@ -5482,7 +5614,7 @@ mod tests {
     }
 
     #[test]
-    fn the_puck_keyboard_is_untouched_by_snap_navigation() {
+    fn a_trackpad_controllers_keyboard_is_untouched_by_snap_navigation() {
         use report::Button::*;
         // Neither the D-pad nor `A` means anything under the keyboard on a
         // controller that has trackpads: the two cursors are how you point at a
@@ -5496,7 +5628,7 @@ mod tests {
             let f = frame_of(&[held]);
             assert!(
                 st.step(&f, &idle, &bindings, ms(4)).is_empty(),
-                "{held:?} must do nothing on the puck"
+                "{held:?} must do nothing on the Steam Controller"
             );
             assert!(st.step(&f, &f, &bindings, ms(500)).is_empty(), "and never start repeating");
             assert!(st.step(&idle, &f, &bindings, ms(504)).is_empty());
@@ -5679,7 +5811,7 @@ mod tests {
         let cfg = Config::load_default();
         let mut modes = ModeEngine::new(&cfg);
         let mut osk = OskHandle::new();
-        let src = report::Source::Puck;
+        let src = report::Source::SteamController;
         assert_eq!(modes.active(), BUILTIN_DESKTOP);
 
         // Forcing game mode from the desktop is a change; forcing it again is not.
@@ -5708,7 +5840,7 @@ mod tests {
                     &cfg,
                     &mut modes,
                     &mut osk,
-                    report::Source::Puck,
+                    report::Source::SteamController,
                     &mut None,
                     None,
                     &$a,
@@ -5768,14 +5900,14 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
 
         // Recognition performs the whole sequence and reports the mode move,
         // so the caller runs the handoff.
         assert!(handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx, &mut chords,
+            &hypr, &cfg, &mut modes, &mut osk, report::Source::SteamController, &mut hx, &mut chords,
             &mut kbd, None, false,
             GestureEvent::GuideChord(GripL4),
         ));
@@ -5783,7 +5915,7 @@ mod tests {
         assert!(chords.held.is_empty(), "a sequence holds nothing: its key was tapped");
         // The chord's release therefore has nothing to let go of.
         assert!(!handle_gesture(
-            &hypr, &cfg, &mut modes, &mut osk, report::Source::Puck, &mut hx, &mut chords,
+            &hypr, &cfg, &mut modes, &mut osk, report::Source::SteamController, &mut hx, &mut chords,
             &mut kbd, None, false,
             GestureEvent::GuideChordRelease(GripL4),
         ));
@@ -5883,7 +6015,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let idle = report::Frame::default();
         let l5 = frame_of(&[GripL5]);
 
@@ -6389,7 +6521,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let bit = |b: report::Button| -> u32 {
             (0..32)
                 .find(|&i| report::Frame { buttons: 1 << i, ..report::Frame::default() }.pressed(b))
@@ -6761,7 +6893,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
 
@@ -6804,7 +6936,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
         let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
@@ -6836,7 +6968,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut engine = GestureEngine::new();
         let t = Instant::now();
         let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
@@ -6878,6 +7010,220 @@ mod tests {
             );
         }
         assert!(!idle.consumed, "an unconfigured scrub does nothing at all");
+    }
+
+    // --- the caret shuttle, for a controller with no pads ------------------
+
+    /// A frame from the padless backend with the left stick held at `x`
+    /// (normalised) and any extra buttons down. `Source::Evdev` is the whole of
+    /// "this controller has no trackpads" as far as every handler is concerned.
+    fn shuttle_frame(x: f64, extra: &[report::Button]) -> report::Frame {
+        let mut btns = vec![report::Button::Steam];
+        btns.extend_from_slice(extra);
+        report::Frame {
+            source: report::Source::Evdev,
+            left_stick: ((x * 32767.0) as i16, 0),
+            ..frame_of(&btns)
+        }
+    }
+
+    /// The scrub's world for a test: state, a null keyboard, null haptics.
+    fn shuttle_rig(cfg: &ScrubConfig) -> (ScrubState, GestureEngine, Haptics, HapticsConfig) {
+        (
+            ScrubState::new(cfg, &CursorConfig::default()),
+            GestureEngine::new(),
+            Haptics::new(),
+            HapticsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn a_padless_source_shuttles_and_a_padded_one_keeps_the_wheel() {
+        // The switch the whole feature turns on: one binding, and the *device*
+        // picks the gesture. A stick held over on an Xbox frame walks the
+        // caret; the same deflection on a Steam Controller frame does nothing
+        // at all, because there the sticks are guide flicks and the left PAD is
+        // the wheel.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+
+        // Half over to the right, for a second of the loop's 4 ms clock.
+        let right = KeyChord::parse("right").unwrap();
+        let mut taps = Vec::new();
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = shuttle_frame(0.5, &[]);
+            taps.extend(drive_shuttle(&mut kbd, &mut engine, &f, &mut st, &cfg, &mut hx, now));
+        }
+        assert!(taps.iter().all(|&c| c == right), "pushing right taps Right");
+        // The rate at half deflection: 4/s at the deadzone edge rising to 25/s
+        // at the word threshold, so ~14/s here (plus the immediate first tap).
+        assert!(
+            (14..=16).contains(&taps.len()),
+            "a second at half deflection tapped {} times",
+            taps.len()
+        );
+        assert!(st.consumed, "the first tap spends the guide hold");
+        assert!(st.shuttle_running(), "and the loop still owes it a wakeup");
+
+        // The same frame from the Steam Controller: the sticks are not the
+        // scrub's there, and the wheel wants a pad touch it is not getting.
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut hx =
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            let f = report::Frame {
+                source: report::Source::SteamController,
+                ..shuttle_frame(0.5, &[])
+            };
+            drive_scrub(
+                &mut kbd, &mut engine, &f, &mut st, &cfg, &cursor, true, &mut hx, now,
+            );
+        }
+        assert!(!st.consumed, "a padded controller's left stick is not a shuttle");
+        assert!(!st.shuttle_running(), "and it must never hold the deadline open");
+    }
+
+    #[test]
+    fn the_shuttle_takes_shift_from_select_and_words_from_the_far_end() {
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+
+        // Held select (`l5` by default) puts Shift around the tap, exactly as
+        // it does on the wheel: the same motion selects instead of moving.
+        let f = shuttle_frame(-0.5, &[cfg.select]);
+        assert_eq!(
+            drive_shuttle(&mut kbd, &mut engine, &f, &mut st, &cfg, &mut hx, t),
+            Some(KeyChord::parse("shift+left").unwrap())
+        );
+        // Past `word_above` the unit changes and the modifier stays.
+        let far = shuttle_frame(0.95, &[cfg.select]);
+        assert_eq!(
+            drive_shuttle(
+                &mut kbd,
+                &mut engine,
+                &far,
+                &mut st,
+                &cfg,
+                &mut hx,
+                t + Duration::from_millis(4)
+            ),
+            Some(KeyChord::parse("ctrl+shift+right").unwrap()),
+            "a reversal taps at once, and the far end taps words"
+        );
+        // ...and without the button it is the bare arrow again.
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        assert_eq!(
+            drive_shuttle(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(0.95, &[]),
+                &mut st,
+                &cfg,
+                &mut hx,
+                t
+            ),
+            Some(KeyChord::parse("ctrl+right").unwrap())
+        );
+    }
+
+    #[test]
+    fn releasing_the_guide_parks_the_shuttle() {
+        // The gate is the wheel's gate, and it drops the same things: no
+        // direction, no schedule, and a fresh hold that gets to spend itself.
+        // Nothing can be stranded — the shuttle only ever taps — which is why
+        // it needs no place in `release_outputs` either.
+        let cfg = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let cursor = CursorConfig::default();
+        let (mut st, mut engine, mut hap, hcfg) = shuttle_rig(&cfg);
+        let mut kbd: Option<VirtualKeyboard> = None;
+        let mut hx = HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Evdev };
+        let t = Instant::now();
+        let _ = engine.update(&frame_of(&[report::Button::Steam]), t);
+        for i in 0..=50 {
+            let now = t + Duration::from_millis(4 * i);
+            drive_scrub(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(0.9, &[]),
+                &mut st,
+                &cfg,
+                &cursor,
+                true,
+                &mut hx,
+                now,
+            );
+        }
+        assert!(st.consumed && st.shuttle_running());
+
+        // Guide up (or the mode's guard closing, or the keyboard taking over):
+        // `active` goes false and the run is parked.
+        let now = t + Duration::from_millis(1000);
+        drive_scrub(
+            &mut kbd,
+            &mut engine,
+            &shuttle_frame(0.9, &[]),
+            &mut st,
+            &cfg,
+            &cursor,
+            false,
+            &mut hx,
+            now,
+        );
+        assert!(!st.consumed, "a fresh hold gets to spend itself again");
+        assert!(!st.shuttle_running(), "and the loop may block again");
+
+        // A config that never asked for a scrub is inert with the gate wide
+        // open, on this controller as much as on the other one.
+        let off = ScrubConfig::default();
+        let mut idle = ScrubState::new(&off, &cursor);
+        for i in 0..=250 {
+            let now = t + Duration::from_millis(4 * i);
+            drive_scrub(
+                &mut kbd,
+                &mut engine,
+                &shuttle_frame(1.0, &[]),
+                &mut idle,
+                &off,
+                &cursor,
+                true,
+                &mut hx,
+                now,
+            );
+        }
+        assert!(!idle.consumed && !idle.shuttle_running());
+    }
+
+    #[test]
+    fn a_reload_retunes_the_shuttle_too() {
+        // The shuttle is rebuilt with the rest of the state whenever the config
+        // it was built from changes, so `hyprpad reload` retunes the curve with
+        // nothing to wire in the reload path — and a retune drops the run, so
+        // no schedule from the old rates survives into the new ones.
+        let cursor = CursorConfig::default();
+        let on = ScrubConfig { enabled: true, ..ScrubConfig::default() };
+        let mut st = ScrubState::new(&on, &cursor);
+        let t = Instant::now();
+        st.shuttle.update(1.0, t);
+        assert!(st.shuttle_running());
+        let faster = ScrubConfig {
+            shuttle: crate::config::ShuttleConfig { fast_per_s: 40.0, ..on.shuttle },
+            ..on
+        };
+        st.sync(&faster, &cursor);
+        assert!(!st.shuttle_running(), "a retuned shuttle starts parked");
+        assert_eq!(st.cfg.shuttle.fast_per_s, 40.0);
     }
 
     #[test]
@@ -7081,7 +7427,7 @@ mod tests {
         let mut hap = Haptics::new();
         let hcfg = HapticsConfig::default();
         let mut hx =
-            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::Puck };
+            HapticCtx { dev: &mut hap, cfg: &hcfg, source: report::Source::SteamController };
         let mut chords = ChordKeys::new();
         let mut kbd: Option<VirtualKeyboard> = None;
         // In a game, where the guide-mouse lives: chords are the escape hatch
@@ -7095,7 +7441,7 @@ mod tests {
                     &cfg,
                     &mut modes,
                     &mut osk,
-                    report::Source::Puck,
+                    report::Source::SteamController,
                     &mut hx,
                     &mut chords,
                     &mut kbd,

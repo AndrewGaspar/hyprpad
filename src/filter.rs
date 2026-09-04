@@ -31,7 +31,7 @@
 //! defaults live in [`crate::config::CursorConfig`].
 
 use std::f64::consts::PI;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The pad axis full-scale used to normalize raw counts to `[-1, 1]`. Matches
 /// [`crate::osk::normalize_pad_axis`] so the desktop and OSK cursors share one
@@ -622,6 +622,165 @@ impl JogPacer {
     }
 }
 
+/// One shuttle tap: which way, and whether it moves a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShuttleTap {
+    /// Direction of travel. `true` taps `Right`.
+    pub right: bool,
+    /// A word jump (`ctrl`+arrow) rather than a character.
+    pub word: bool,
+}
+
+/// Stick deflection → *when the next caret tap is due*: the shuttle behind the
+/// text scrub on a controller with no trackpads
+/// (`docs/research/text-scrub.md` §3.1, option (d)).
+///
+/// The [`JogPacer`]'s opposite number, and deliberately so. A jog wheel is a
+/// **position** control, so acceleration there multiplies the *count* of a
+/// detent that the hand has already earned. A stick has no position to spend —
+/// it springs back — so it is a **rate** control: the deflection *is* the
+/// speed, and this holds the one piece of state that follows from that, the
+/// clock. Deflection in, at most one tap out per call, and the schedule for the
+/// next one.
+///
+/// The curve, over |x| (the horizontal deflection, `0..=1`):
+///
+/// | deflection | emits |
+/// |---|---|
+/// | ≤ `deadzone` | nothing at all, and the run is parked |
+/// | `deadzone` … `word_above` | arrows, `slow_per_s` rising linearly to `fast_per_s` |
+/// | ≥ `word_above` | `ctrl`+arrows at `fast_per_s` |
+///
+/// Three properties worth naming:
+///
+/// * **the first tap is immediate.** Engaging (or reversing) taps on the spot
+///   and schedules the *next* one, so a flick of the stick moves the caret one
+///   character — the fine adjustment — without waiting out an interval;
+/// * **a reversal is a fresh run.** Push the other way and the pending tap is
+///   abandoned, not inherited: nothing is ever emitted in the direction the
+///   stick has already left;
+/// * **it never catches up.** A schedule missed by more than one interval (the
+///   loop was busy, or the deadline was disarmed) re-bases on `now` instead of
+///   firing a burst of arrows into the document.
+///
+/// Pure over [`Instant`]: no device, no clock of its own, so the whole feel is
+/// unit-testable.
+#[derive(Clone, Debug)]
+pub struct ShuttlePacer {
+    /// Deflection below which nothing is commanded.
+    deadzone: f64,
+    /// Taps/s at the deadzone edge.
+    slow: f64,
+    /// Taps/s at `word_above` and beyond.
+    fast: f64,
+    /// Deflection at or past which a tap is a word.
+    word_above: f64,
+    /// The direction of the run in progress. `None` while parked.
+    dir: Option<bool>,
+    /// When the next tap is due. `Some` exactly while `dir` is.
+    due: Option<Instant>,
+}
+
+impl ShuttlePacer {
+    /// Build a shuttle from the four config knobs, each clamped into the range
+    /// that makes the curve a curve: a deadzone short of full scale, a `fast`
+    /// no slower than `slow`, and a word threshold above the deadzone (a
+    /// config that puts it at or below one means "every tap is a word", which
+    /// is a legitimate thing to ask for and must not divide by zero).
+    pub fn new(deadzone: f64, slow_per_s: f64, fast_per_s: f64, word_above: f64) -> ShuttlePacer {
+        let deadzone = deadzone.clamp(0.0, 0.99);
+        let slow = slow_per_s.max(0.0);
+        ShuttlePacer {
+            deadzone,
+            slow,
+            fast: fast_per_s.max(slow),
+            word_above,
+            dir: None,
+            due: None,
+        }
+    }
+
+    /// Taps per second at deflection `x` (signed; only the magnitude counts).
+    /// `0.0` inside the deadzone, which is what parks the run.
+    pub fn rate(&self, x: f64) -> f64 {
+        let m = x.abs().min(1.0);
+        if m <= self.deadzone {
+            return 0.0;
+        }
+        // The live band is deadzone → word threshold; past it the rate is
+        // simply the top, and it is the *unit* that changes.
+        let span = (self.word_above - self.deadzone).max(1e-6);
+        let u = ((m - self.deadzone) / span).clamp(0.0, 1.0);
+        self.slow + (self.fast - self.slow) * u
+    }
+
+    /// Whether deflection `x` is past the deadzone — the arming question the
+    /// daemon's receive deadline asks ([`crate::sticks::StickDrive`]).
+    pub fn engaged(&self, x: f64) -> bool {
+        x.abs().min(1.0) > self.deadzone
+    }
+
+    /// Whether a run is in progress, i.e. the last [`update`](Self::update) saw
+    /// an engaged stick. The loop reads this to keep its 4 ms deadline armed: a
+    /// gamepad reports only on change, so a stick *held* over says nothing at
+    /// all and the taps have to come from the clock.
+    pub fn running(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// When the next tap is due, or `None` while parked. Diagnostic — the
+    /// daemon steps this on the stick clock, which is faster than any rate this
+    /// can ask for.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// Park the run: no direction, no schedule. On guide release, on a gate
+    /// close, and wherever the scrub's other state is dropped.
+    pub fn reset(&mut self) {
+        self.dir = None;
+        self.due = None;
+    }
+
+    /// Feed the current horizontal deflection and return the tap it earns, if
+    /// any. At most one per call — the caller's clock (4 ms) is an order of
+    /// magnitude faster than the top rate, so a second tap in one call would
+    /// mean a rate over 250/s, which no arrow key is worth.
+    pub fn update(&mut self, x: f64, now: Instant) -> Option<ShuttleTap> {
+        let rate = self.rate(x);
+        if rate <= 0.0 {
+            self.reset();
+            return None;
+        }
+        let right = x > 0.0;
+        let step = Duration::from_secs_f64(1.0 / rate);
+        let tap = ShuttleTap { right, word: x.abs().min(1.0) >= self.word_above };
+        // A new run, or the stick crossing to the other side: tap now and
+        // schedule from here. The pending tap of the old direction dies with it.
+        if self.dir != Some(right) {
+            self.dir = Some(right);
+            self.due = Some(now + step);
+            return Some(tap);
+        }
+        match self.due {
+            Some(due) if now >= due => {
+                // Re-base rather than catch up when we are more than one
+                // interval late: a hitch must not become a burst of arrows.
+                let next = due + step;
+                self.due = Some(if next <= now { now + step } else { next });
+                Some(tap)
+            }
+            Some(_) => None,
+            // `dir` and `due` are set together, so this is unreachable; treat
+            // it as the start of a run rather than panicking on a live daemon.
+            None => {
+                self.due = Some(now + step);
+                Some(tap)
+            }
+        }
+    }
+}
+
 /// Reduce an angle difference to the equivalent value in `(-π, π]`, so a delta
 /// that appears to leap across the `atan2` branch cut is read as the short way
 /// round. At 250 Hz a real per-frame delta is tiny, so each loop runs at most
@@ -946,7 +1105,7 @@ mod tests {
     }
 
     /// Run the pacer's rate estimator to steady state at `deg_per_s`, at the
-    /// puck's 250 Hz. 0.8 s is many time constants of a 5 Hz low-pass, so the
+    /// controller's 250 Hz. 0.8 s is many time constants of a 5 Hz low-pass, so the
     /// tier tests can talk about speeds rather than about transients.
     fn settle(p: &mut JogPacer, deg_per_s: f64) {
         let dt = 0.004;
@@ -1105,5 +1264,152 @@ mod tests {
         fn update_pt(&mut self, p: (f64, f64)) -> i32 {
             self.update(p.0, p.1)
         }
+    }
+
+    // --- the shuttle -------------------------------------------------------
+
+    /// The defaults from `crate::config::ShuttleConfig`, spelled here so the
+    /// pacer's tests stay pure — this module knows nothing about config.
+    fn shuttle() -> ShuttlePacer {
+        ShuttlePacer::new(0.15, 4.0, 25.0, 0.85)
+    }
+
+    /// Hold the stick at `x` for `ms` milliseconds of 4 ms steps and collect
+    /// every tap it earns — the loop's own cadence.
+    fn hold(p: &mut ShuttlePacer, x: f64, ms: u64, t0: Instant) -> Vec<ShuttleTap> {
+        let mut taps = Vec::new();
+        let mut t = 0;
+        while t <= ms {
+            if let Some(tap) = p.update(x, t0 + Duration::from_millis(t)) {
+                taps.push(tap);
+            }
+            t += 4;
+        }
+        taps
+    }
+
+    #[test]
+    fn a_stick_inside_the_deadzone_is_not_a_shuttle() {
+        // The whole reason a caret shuttle wants a bigger deadzone than the
+        // pointer does: a resting thumb that drifts a cursor is a nuisance, and
+        // one that types arrow keys is a bug in the document.
+        let t = Instant::now();
+        let mut p = shuttle();
+        assert_eq!(p.rate(0.0), 0.0);
+        assert_eq!(p.rate(0.15), 0.0, "at the deadzone is still nothing");
+        assert!(!p.engaged(0.15) && p.engaged(0.16));
+        assert!(hold(&mut p, 0.14, 1000, t).is_empty(), "a whole second, no taps");
+        assert!(!p.running(), "and nothing for the loop to wake up for");
+        // Both directions, and the sign never matters to the deadzone.
+        assert!(hold(&mut p, -0.1, 1000, t).is_empty());
+    }
+
+    #[test]
+    fn the_shuttle_rate_rises_with_deflection() {
+        let p = shuttle();
+        // The three waypoints the curve is specified by: the slow end at the
+        // deadzone edge, the fast end at the word threshold, and a straight
+        // line between them.
+        assert!((p.rate(0.1501) - 4.0).abs() < 0.01, "got {}", p.rate(0.1501));
+        assert!((p.rate(0.85) - 25.0).abs() < 1e-9);
+        assert!((p.rate(1.0) - 25.0).abs() < 1e-9, "past the top it is the top");
+        let mid = 0.15 + (0.85 - 0.15) / 2.0;
+        assert!((p.rate(mid) - 14.5).abs() < 1e-9, "linear between the two");
+        // Monotone the whole way out, which is the only property a hand feels.
+        let mut prev = 0.0;
+        for i in 16..=100 {
+            let r = p.rate(f64::from(i) / 100.0);
+            assert!(r >= prev, "rate fell at {i}%");
+            prev = r;
+        }
+
+        // And the taps actually come out at that rate: a second at full tilt is
+        // 25 of them, a second just past the deadzone is 4.
+        let t = Instant::now();
+        let mut fast = shuttle();
+        assert_eq!(hold(&mut fast, 1.0, 1000, t).len(), 26, "the first is immediate");
+        let mut slow = shuttle();
+        assert_eq!(hold(&mut slow, 0.16, 1000, t).len(), 5);
+    }
+
+    #[test]
+    fn the_top_of_the_shuttle_is_the_word_tier() {
+        let t = Instant::now();
+        let mut p = shuttle();
+        // Below the threshold every tap is a character...
+        assert!(hold(&mut p, 0.84, 500, t).iter().all(|tap| !tap.word));
+        // ...and at it, every tap is a word. The unit changes, not the rate:
+        // this is the top gear, and a word jump lands on a boundary instead of
+        // somewhere inside one.
+        let mut w = shuttle();
+        let taps = hold(&mut w, 0.85, 500, t);
+        assert!(!taps.is_empty() && taps.iter().all(|tap| tap.word));
+        // A config that never wants words says so by putting the threshold out
+        // of reach.
+        let mut never = ShuttlePacer::new(0.15, 4.0, 25.0, 2.0);
+        assert!(hold(&mut never, 1.0, 500, t).iter().all(|tap| !tap.word));
+        // And one that wants only words puts it at the deadzone.
+        let mut always = ShuttlePacer::new(0.15, 4.0, 25.0, 0.0);
+        let taps = hold(&mut always, 0.2, 500, t);
+        assert!(!taps.is_empty() && taps.iter().all(|tap| tap.word));
+        assert!(always.rate(0.2) > 0.0, "a zero-width band must not divide by zero");
+    }
+
+    #[test]
+    fn reversing_the_shuttle_taps_the_other_way_at_once() {
+        // A shuttle is a rate control: the direction is wherever the stick is
+        // NOW. The pending tap of the old direction is abandoned, never
+        // delivered late into the new one.
+        let t = Instant::now();
+        let mut p = shuttle();
+        let right = p.update(0.5, t).expect("engaging taps immediately");
+        assert!(right.right);
+        // Well inside the interval: nothing more.
+        assert_eq!(p.update(0.5, t + Duration::from_millis(4)), None);
+        // Cross to the other side and the tap is instant, and Left.
+        let left = p
+            .update(-0.5, t + Duration::from_millis(8))
+            .expect("a reversal is a fresh run");
+        assert!(!left.right);
+        // ...and the interval starts again from there.
+        assert_eq!(p.update(-0.5, t + Duration::from_millis(12)), None);
+    }
+
+    #[test]
+    fn a_released_shuttle_parks_and_a_late_step_does_not_burst() {
+        let t = Instant::now();
+        let mut p = shuttle();
+        p.update(1.0, t);
+        assert!(p.running() && p.deadline().is_some());
+        // Centre it: parked, and the loop may block again.
+        assert_eq!(p.update(0.0, t + Duration::from_millis(4)), None);
+        assert!(!p.running() && p.deadline().is_none());
+        // An explicit reset is the same thing, for the gate-close path.
+        p.update(1.0, t + Duration::from_millis(8));
+        p.reset();
+        assert!(!p.running());
+
+        // A step that arrives a full second late owes exactly one tap, not the
+        // twenty-five a catch-up would fire into the document.
+        let mut late = shuttle();
+        late.update(1.0, t);
+        assert!(late.update(1.0, t + Duration::from_secs(1)).is_some());
+        assert_eq!(late.update(1.0, t + Duration::from_secs(1)), None, "re-based on now");
+    }
+
+    #[test]
+    fn shuttle_survives_a_degenerate_config() {
+        // A `fast` below `slow` is not a rising curve; it is clamped so the
+        // band can never invert. A deadzone of 1.0 would make every push dead,
+        // so it is clamped short of full scale.
+        let p = ShuttlePacer::new(0.15, 25.0, 4.0, 0.85);
+        assert!((p.rate(0.2) - 25.0).abs() < 1e-9);
+        assert!((p.rate(1.0) - 25.0).abs() < 1e-9);
+        let edge = ShuttlePacer::new(1.5, 4.0, 25.0, 0.85);
+        assert!(edge.engaged(1.0), "a deadzone at full scale still leaves the edge");
+        // A zero rate emits nothing rather than dividing by zero.
+        let t = Instant::now();
+        let mut dead = ShuttlePacer::new(0.15, 0.0, 0.0, 0.85);
+        assert!(hold(&mut dead, 1.0, 1000, t).is_empty());
     }
 }

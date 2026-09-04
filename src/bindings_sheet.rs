@@ -48,10 +48,13 @@
 //! glyph next to whatever `guide+rpad_click` is bound to.
 //!
 //! `h.scrub` puts the same kind of row on the LEFT pad (`guide+lpad`, "Scrub
-//! the caret") plus one on whichever button it selects with (`guide+l5` by
-//! default, "Select while scrubbing"), both carrying the scrub's guard — so a
-//! tab where the caret jog wheel is live reads `Ⓢ + left pad: Scrub the caret`
-//! above the pad's own `Scroll (circular)`.
+//! the caret · jog (pad)") plus one on whichever button it selects with
+//! (`guide+l5` by default, "Select while scrubbing"), both carrying the
+//! scrub's guard — so a tab where the caret jog wheel is live reads
+//! `Ⓢ + left pad: Scrub the caret · jog (pad)` above the pad's own
+//! `Scroll (circular)`. On a padless layout that first row moves to the left
+//! *stick* and says `· shuttle (stick)` instead, because that is what the same
+//! binding does there ([`Sheet::set_layout`]).
 //!
 //! # Control ids
 //!
@@ -201,7 +204,7 @@ pub struct Sheet {
     /// Which controller drawing the sheet should use — the id of a file in
     /// `shell/hyprpad.cheatsheet/layouts/`.
     ///
-    /// [`Sheet::build`] always fills in the puck's, because this module reads
+    /// [`Sheet::build`] always fills in the controller's, because this module reads
     /// only the config and must not depend on a running daemon. The `bindings`
     /// subcommand then overwrites it from `status.json`
     /// ([`crate::status::active_layout`]) when a daemon is publishing one, so
@@ -284,7 +287,7 @@ impl Sheet {
 
         // The trackpads' ambient behaviour. Not a binding you press, but the
         // diagram has two pads on it and a sheet that leaves them blank is
-        // lying about the biggest two controls on the puck.
+        // lying about the biggest two controls on the controller.
         let cursor_action = format!("cursor sens {:.2}", c.cursor().sens);
         entries.push(ambient(
             Section::Ambient,
@@ -326,7 +329,11 @@ impl Sheet {
                 "guide+lpad",
                 "lpad",
                 "Left trackpad",
-                "Scrub the caret",
+                // Which of the two the reader gets is the *controller's*
+                // answer, not the config's, so the row says which — `build`
+                // knows only the config and names the pad's jog wheel;
+                // `set_layout` re-aims it at the stick's shuttle.
+                SCRUB_JOG,
                 format!("scrub {:.0}°", scrub.detent_deg),
                 &c.scrub_guard,
                 RANK_PAD,
@@ -479,7 +486,7 @@ impl Sheet {
             entries,
             modes,
             default_mode,
-            layout: crate::report::LAYOUT_PUCK.to_string(),
+            layout: crate::report::LAYOUT_STEAM_CONTROLLER.to_string(),
         }
     }
 
@@ -487,12 +494,15 @@ impl Sheet {
     /// name a control the reader does not have.
     ///
     /// Everything on the sheet is a *binding*, and bindings are the same on
-    /// every controller — that is the whole point of one vocabulary. Two rows
-    /// are not: the ambient cursor and the ambient scroll say which physical
-    /// thing does them, and on a pad with no trackpads the answer is the
-    /// sticks. Those two are retargeted here; the caret scrub is dropped
-    /// outright, because circling a spring-loaded stick is not the jog wheel
-    /// it describes and there is nothing on this controller that does it.
+    /// every controller — that is the whole point of one vocabulary. Three rows
+    /// name a physical thing rather than a binding: the ambient cursor, the
+    /// ambient scroll, and the caret scrub. The first two move to the sticks
+    /// that stand in for the pads; the third moves to the left stick as well,
+    /// and changes what it *says* — a pad scrub is a jog wheel (circle it, one
+    /// step per detent) and a stick scrub is a shuttle (hold it over, the caret
+    /// walks at a speed you choose), so the row reads `· jog (pad)` on one and
+    /// `· shuttle (stick)` on the other. Same binding, same guard, different
+    /// gesture, and the sheet is the only place a reader finds out which.
     ///
     /// The alternative — teaching [`build`](Self::build) which controller is
     /// live — would make the sheet depend on a running daemon. This way it
@@ -502,9 +512,27 @@ impl Sheet {
         if Source::from_layout(layout).has_pads() {
             return;
         }
-        // The caret scrub is a jog wheel: a thumb circling an absolute
-        // surface. There is nothing on this controller that does it.
-        self.entries.retain(|e| !e.action.starts_with("scrub"));
+        // The caret scrub, re-aimed onto the left stick. Done BEFORE the
+        // `sticks.enabled` check below, because the shuttle is the scrub's and
+        // not the pointer's: a config that turned the stick cursor off has said
+        // nothing about the caret, and `crate::sticks::StickDrive::set_shuttle`
+        // reads it the same way.
+        let shuttle = c.scrub().shuttle;
+        for e in &mut self.entries {
+            if e.control != "lpad" || !e.action.starts_with("scrub") {
+                continue;
+            }
+            e.chord = "guide+lstick".to_string();
+            e.control = "lstick".to_string();
+            e.control_label = "Left stick".to_string();
+            e.label = SCRUB_SHUTTLE.to_string();
+            // The pad's number is a detent size; the stick's is the rate band
+            // the deflection picks from, which is the whole feel of a shuttle.
+            e.action =
+                format!("shuttle {:.0}-{:.0}/s", shuttle.slow_per_s, shuttle.fast_per_s);
+        }
+        // The keyboard's own tab, likewise before the `sticks.enabled` check:
+        // its D-pad row has nothing to do with the pointer either.
         self.reaim_keyboard(c);
         let sticks = c.sticks();
         if !sticks.enabled {
@@ -728,6 +756,14 @@ fn ambient(
         rank,
     }
 }
+
+/// The caret scrub's row label on a controller **with** trackpads: circling the
+/// left pad, one step per detent. Position control.
+const SCRUB_JOG: &str = "Scrub the caret · jog (pad)";
+/// The same binding on a controller with **no** trackpads: the left stick held
+/// over, the caret walking at a rate the deflection chooses. Rate control.
+/// [`Sheet::set_layout`] swaps one label for the other.
+const SCRUB_SHUTTLE: &str = "Scrub the caret · shuttle (stick)";
 
 // ---------------------------------------------------------------------------
 // Control vocabulary — the ids the QML diagram anchors callouts on
@@ -2456,7 +2492,9 @@ mod tests {
         assert_eq!(wheel.section, Section::Guide);
         assert_eq!(wheel.control, "lpad");
         assert_eq!(wheel.control_label, "Left trackpad");
-        assert_eq!(wheel.label, "Scrub the caret");
+        // The label names the gesture, because the same binding is a different
+        // one on a controller with no pads (`set_layout`).
+        assert_eq!(wheel.label, "Scrub the caret · jog (pad)");
         assert_eq!(wheel.action, "scrub 15°");
         assert_eq!(wheel.action_kind, "ambient");
         assert_eq!(wheel.guard, Guard::OnlyIn(vec!["desktop".into()]));
@@ -2535,7 +2573,7 @@ mod tests {
     }
 
     /// The layout id is which controller drawing to show. `build` cannot know
-    /// — it reads only the config — so it names the puck, and the `bindings`
+    /// — it reads only the config — so it names the controller, and the `bindings`
     /// subcommand overwrites it from what the daemon published.
     #[test]
     fn the_json_names_the_controller_drawing_to_use() {
@@ -2564,10 +2602,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The puck: two trackpad cursors and two pad clicks that commit under
-        // them, exactly as before.
-        let puck = sheet_from_toml(src);
-        let rows = osk_rows(&puck);
+        // A controller with trackpads: two cursors and two pad clicks that
+        // commit under them, exactly as before.
+        let pads = sheet_from_toml(src);
+        let rows = osk_rows(&pads);
         assert!(rows.contains(&(
             "lpad".into(),
             "Move the keyboard's cursor".into(),
@@ -2579,7 +2617,7 @@ mod tests {
             "osk cursor".into()
         )));
         assert!(rows.iter().any(|(chord, _, a)| chord == "rpad_click" && a == "osk commit"));
-        assert!(!rows.iter().any(|(chord, ..)| chord == "dpad"), "the puck has no nav rows");
+        assert!(!rows.iter().any(|(chord, ..)| chord == "dpad"), "no nav rows with pads");
 
         // A padless layout: the pads and their clicks are gone — they do not
         // exist on this controller and there is no stick that does what they
@@ -2613,7 +2651,7 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        assert_eq!(same(&osk_rows(&puck)), same(&rows));
+        assert_eq!(same(&osk_rows(&pads)), same(&rows));
 
         // A config entry on `A` replaces the padless commit rather than
         // doubling it — one row per control, as everywhere else on the sheet.
@@ -2643,7 +2681,7 @@ mod tests {
     fn a_padless_layout_retargets_the_ambient_rows_onto_the_sticks() {
         let src = "[bindings]\n\"guide+r1\" = \"workspace +1\"\n[scrub]\ndetent_deg = 15\n";
         let c = Config::from_toml_str(src).unwrap();
-        let puck = sheet_from_toml(src);
+        let controller = sheet_from_toml(src);
         let cursor = |s: &Sheet| {
             s.entries
                 .iter()
@@ -2651,9 +2689,9 @@ mod tests {
                 .expect("an ambient cursor row")
                 .clone()
         };
-        assert_eq!(cursor(&puck).control, "rpad");
-        assert_eq!(cursor(&puck).control_label, "Right trackpad");
-        assert!(puck.entries.iter().any(|e| e.action.starts_with("scrub")));
+        assert_eq!(cursor(&controller).control, "rpad");
+        assert_eq!(cursor(&controller).control_label, "Right trackpad");
+        assert!(controller.entries.iter().any(|e| e.action.starts_with("scrub")));
 
         let mut xbox = sheet_from_toml(src);
         xbox.set_layout("xbox-elite-2", &c);
@@ -2671,9 +2709,43 @@ mod tests {
         assert_eq!(scroll.control_label, "Left stick");
         assert_eq!(scroll.label, "Scroll", "a stick has no circular mode");
         assert_eq!(scroll.action, "scroll 180 units/s");
+        // The caret scrub is not dropped: it moves to the left stick and says
+        // so. There is no pad to circle, but there is a stick to hold over, and
+        // the row's job is to tell the reader which of the two they have.
+        let caret = xbox
+            .entries
+            .iter()
+            .find(|e| e.label.starts_with("Scrub the caret"))
+            .expect("the scrub row survives onto the stick");
+        assert_eq!(caret.chord, "guide+lstick");
+        assert_eq!(caret.control, "lstick");
+        assert_eq!(caret.control_label, "Left stick");
+        assert_eq!(caret.label, "Scrub the caret · shuttle (stick)");
+        assert_eq!(caret.action, "shuttle 4-25/s", "the rate band, not a detent");
+        assert_eq!(caret.section, Section::Guide);
         assert!(
-            !xbox.entries.iter().any(|e| e.action.starts_with("scrub")),
-            "there is no pad to circle"
+            !xbox.entries.iter().any(|e| e.action.contains('°')),
+            "and nothing still quotes a detent, which is a jog wheel's unit"
+        );
+        // Its select button is a button on both controllers, so that row is
+        // untouched — same chord, same label.
+        let sel = xbox.entries.iter().find(|e| e.chord == "guide+l5").unwrap();
+        assert_eq!(sel.label, "Select while scrubbing");
+        assert_eq!(sel.control, "l5");
+        // A retuned shuttle prints its own numbers.
+        let tuned = Config::from_toml_str(
+            "[scrub]\nshuttle_slow_per_s = 6\nshuttle_fast_per_s = 30\n",
+        )
+        .unwrap();
+        let mut fast = sheet_from_toml("[scrub]\nshuttle_slow_per_s = 6\nshuttle_fast_per_s = 30\n");
+        fast.set_layout("xbox-elite-2", &tuned);
+        assert_eq!(
+            fast.entries
+                .iter()
+                .find(|e| e.control == "lstick" && e.label.starts_with("Scrub"))
+                .unwrap()
+                .action,
+            "shuttle 6-30/s"
         );
 
         // Turn the stick layer off and the two rows go away: nothing drives
@@ -2684,6 +2756,14 @@ mod tests {
         dead.set_layout("xbox-elite-2", &off);
         assert!(!dead.entries.iter().any(|e| e.label == "Move the cursor"));
         assert!(!dead.entries.iter().any(|e| e.action.starts_with("scroll")));
+        // ...but the caret shuttle stays: `[sticks]` tunes the pointer, and a
+        // config that turned that off has said nothing about the scrub, which
+        // has its own master switch. The daemon reads it the same way
+        // (`crate::sticks::StickDrive::armed`).
+        assert!(dead
+            .entries
+            .iter()
+            .any(|e| e.control == "lstick" && e.label.starts_with("Scrub the caret")));
         // Everything that is a binding is untouched: same chord, same action.
         let bound = |s: &Sheet| {
             s.entries
@@ -2692,8 +2772,8 @@ mod tests {
                 .map(|e| (e.chord.clone(), e.action.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(bound(&puck), bound(&xbox));
-        // And an unknown layout id is read as the puck, so a config written
+        assert_eq!(bound(&controller), bound(&xbox));
+        // And an unknown layout id is read as the controller, so a config written
         // against it is never silently rewritten.
         let mut unknown = sheet_from_toml(src);
         unknown.set_layout("some-future-pad", &c);
@@ -2767,7 +2847,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, 2, "the puck's layout and the Xbox one");
+        assert_eq!(seen, 2, "the controller's layout and the Xbox one");
     }
 
     /// Pull the object keys out of one top-level block of a layout file.

@@ -7,7 +7,7 @@
 #      by hand from a shell, so the controller drives Hyprland from login.
 #   2. It is the half that makes `[daemon] restore_lizard_on_exit = false` — the
 #      lizard-free boot of docs/12-lizard-free.md — safe to turn on. With the
-#      knob off, a stopped daemon leaves the puck doing *nothing* on the desktop;
+#      knob off, a stopped daemon leaves the controller doing *nothing* on the desktop;
 #      `Restart=on-failure` below is what puts it back. Enabling the knob without
 #      something that restarts the daemon is the configuration to avoid.
 #
@@ -15,7 +15,7 @@
 #   host, so there is always a window between "controller connects" and "hyprpad
 #   disables lizard". Running from login is what makes that window small: the
 #   daemon is already up and its reconnect poll re-disables lizard within one
-#   RECONNECT_SCAN_INTERVAL (1.5 s) of the puck reappearing.
+#   RECONNECT_SCAN_INTERVAL (1.5 s) of the controller reappearing.
 #
 # INSTALL
 #     install -Dm644 packaging/systemd/user/hyprpad.service \
@@ -23,7 +23,7 @@
 #     systemctl --user daemon-reload
 #     systemctl --user enable --now hyprpad.service
 #
-#   Stop the hand-launched daemon first, or two of them fight over the puck:
+#   Stop the hand-launched daemon first, or two of them fight over the controller:
 #     pkill -TERM -f 'hyprpad run'
 #
 #   Confirm, read-only, with `hyprpad setup --check`.
@@ -110,7 +110,7 @@ StandardError=journal
 #
 # and `hyprpad setup --check` reports the same thing off the running daemon.
 # Without the group the daemon does not break: it says so once and opens the
-# puck directly, exactly as it did before the broker existed.
+# controller directly, exactly as it did before the broker existed.
 
 [Install]
 # The session target pulls the unit in at login and drops it at logout. Under

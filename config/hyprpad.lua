@@ -136,7 +136,7 @@ h.daemon { own_lizard = true }
 --
 -- `steam_button_poweroff` is SETTING_STEAMBUTTON_POWEROFF_TIME (25): how long
 -- the FIRMWARE wants the Steam button held before it powers the controller off.
--- That timer — not Steam, not hyprpad — is what turns the puck off while you
+-- That timer — not Steam, not hyprpad — is what turns the controller off while you
 -- are holding the guide and deliberating. `sleep_inactivity_timeout` is
 -- SETTING_SLEEP_INACTIVITY_TIMEOUT (50), the idle sleep.
 --
@@ -146,7 +146,7 @@ h.daemon { own_lizard = true }
 -- the firmware reads 0 as "never"), and an integer is written raw. Read the
 -- firmware's own numbers first, then test with a stopwatch:
 --
---   hyprpad puck-settings 25 50      # current / max / default, read-only
+--   hyprpad controller-settings 25 50    # current / max / default, read-only
 --   …uncomment, `hyprpad reload`, read again, then time a hold
 --
 -- h.daemon { steam_button_poweroff = "off" }        -- or a number: 300, 0, …
@@ -195,6 +195,11 @@ h.scrub {
   slow_deg_per_s   = 180.0,  -- and drops back below this (2:1, so it cannot chatter)
   word_tier        = true,   -- top rung is ctrl+arrow, not x4 characters
   select           = "l5",   -- hold the left grip to select as you scrub
+  -- On a controller with no pads (the Xbox Elite) the same binding is a
+  -- SHUTTLE on the left stick: hold it over and the caret walks at a rate the
+  -- deflection picks -- 4/s at the deadzone edge up to 25/s, and past 85% the
+  -- taps become ctrl+arrow so it hops whole words. Defaults, spelled out.
+  shuttle = { deadzone = 0.15, slow_per_s = 4, fast_per_s = 25, word_above = 0.85 },
   only_in          = { "desktop", "omarchy-ui", "agent" },
 }
 

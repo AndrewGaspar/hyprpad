@@ -27,7 +27,7 @@
 //! So the streamer is a thread with its own clock, and the daemon's frame path
 //! only ever *updates what it streams*. That also gives two properties for free:
 //!
-//! * **A silent puck is invisible to Steam.** When the controller naps, hyprpad
+//! * **A silent controller is invisible to Steam.** When the controller naps, hyprpad
 //!   keeps the fake alive on neutral reports. Steam must never see a disconnect
 //!   — a create/destroy cycle makes it re-detect, re-apply configs and toast.
 //!   §5.3 is explicit: the device is created at daemon start and destroyed at
@@ -51,21 +51,21 @@ use crate::uhid::{UhidDevice, UhidSender};
 /// The stream period: 4 ms, i.e. 250 Hz.
 ///
 /// InputPlumber's `deck-uhid` target driver is configured with
-/// `poll_rate: Duration::from_millis(4)`, and the puck itself streams at about
+/// `poll_rate: Duration::from_millis(4)`, and the controller itself streams at about
 /// the same rate, so a forwarded frame is never stale by more than one tick.
 pub const STREAM_PERIOD: Duration = Duration::from_millis(4);
 
 /// Longest a report is streamed unchanged before the streamer starts sending
 /// neutral instead.
 ///
-/// The relay's state is updated by the daemon's frame path; if the puck stops —
+/// The relay's state is updated by the daemon's frame path; if the controller stops —
 /// it sleeps, or its hidraw readers end — that path simply stops running, and
 /// the last live frame would otherwise be repeated forever. A game must not be
 /// left holding whatever was pressed at the moment the controller napped, so
 /// after this long without an update the stream falls back to neutral, with the
 /// device still very much alive.
 ///
-/// Generous relative to the puck's ~250 Hz: this is a "the controller is gone"
+/// Generous relative to the controller's ~250 Hz: this is a "the controller is gone"
 /// timer, not a jitter budget.
 ///
 /// # It is generous on Bluetooth too
@@ -99,7 +99,7 @@ pub const STALE_AFTER: Duration = Duration::from_millis(200);
 /// tick of press would be a 4 ms button, on a stream a host samples at its own
 /// pace; 60 ms is a human press by any measure and still far below the ~3 s
 /// after which Steam ignores a guide hold entirely (see the README's "second
-/// finding" — measured on the real puck, but the fake is the thing Steam reads
+/// finding" — measured on the real controller, but the fake is the thing Steam reads
 /// now, and this is what it reads).
 ///
 /// The Xbox pad's own pulse ([`crate::gamepad::VirtualGamepad::pulse_guide`])
@@ -115,7 +115,7 @@ enum Streamed {
     Live([u8; DECK_REPORT_LEN], usize, Instant),
 }
 
-/// A live virtual Valve controller fed from the real puck.
+/// A live virtual Valve controller fed from the real controller.
 pub struct SteamRelay {
     device: UhidDevice,
     profile: &'static Profile,
@@ -164,7 +164,7 @@ impl SteamRelay {
         Ok(())
     }
 
-    /// Hand the relay one puck frame to stream, because a game should have it.
+    /// Hand the relay one controller frame to stream, because a game should have it.
     ///
     /// `raw` is the report exactly as it came off hidraw — the triton profile
     /// forwards those bytes untouched but for the strip mask, so the caller must
@@ -172,7 +172,7 @@ impl SteamRelay {
     /// profile transcodes.
     pub fn forward(&self, raw: &[u8], frame: &Frame, strip: StripMask) {
         let next = match self.profile.kind {
-            ReportKind::Triton => match translate::puck_to_triton(raw, strip) {
+            ReportKind::Triton => match translate::controller_to_triton(raw, strip) {
                 Some(r) => {
                     let mut buf = [0u8; DECK_REPORT_LEN];
                     buf[..TRITON_REPORT_LEN].copy_from_slice(&r);
@@ -183,7 +183,7 @@ impl SteamRelay {
                 None => return,
             },
             ReportKind::Deck => {
-                let mut r = translate::puck_to_deck(frame, self.seq.load(Ordering::Relaxed));
+                let mut r = translate::controller_to_deck(frame, self.seq.load(Ordering::Relaxed));
                 translate::strip_deck(&mut r, strip);
                 Streamed::Live(r, DECK_REPORT_LEN, Instant::now())
             }
@@ -203,7 +203,7 @@ impl SteamRelay {
     ///
     /// Rides *on top of* whatever the stream is otherwise carrying: a live
     /// forwarded frame, or the neutral report between them — Steam must see the
-    /// button whether or not the puck is saying anything at that instant.
+    /// button whether or not the controller is saying anything at that instant.
     /// Calling it again restarts the countdown rather than extending it.
     pub fn pulse_guide(&self) {
         self.guide_pulse.store(GUIDE_PULSE_TICKS, Ordering::Relaxed);
@@ -404,7 +404,7 @@ mod tests {
     fn the_deck_frame_counter_advances_on_every_tick_even_when_nothing_moved() {
         let now = Instant::now();
         let f = Frame::default();
-        let held = live(&translate::puck_to_deck(&f, 0), now);
+        let held = live(&translate::controller_to_deck(&f, 0), now);
         let a = tick_report(profile::deck(), held, 100, now);
         let b = tick_report(profile::deck(), held, 101, now);
         assert_ne!(a, b, "a repeated report still advances");
@@ -416,11 +416,11 @@ mod tests {
     #[test]
     fn a_triton_report_is_streamed_with_its_own_counter_untouched() {
         let now = Instant::now();
-        let raw = translate::puck_to_triton(&raw_0x42(0xa7), StripMask::guide_only()).unwrap();
+        let raw = translate::controller_to_triton(&raw_0x42(0xa7), StripMask::guide_only()).unwrap();
         let held = live(&raw, now);
         let out = tick_report(profile::triton(), held, 999, now);
         assert_eq!(out.len(), TRITON_REPORT_LEN);
-        assert_eq!(out[1], 0xa7, "the puck's counter is relayed, never renumbered");
+        assert_eq!(out[1], 0xa7, "the controller's counter is relayed, never renumbered");
         assert_eq!(out, raw.to_vec());
         // Two ticks of the same frame are byte-identical.
         assert_eq!(tick_report(profile::triton(), held, 1000, now), out);
@@ -429,18 +429,18 @@ mod tests {
     #[test]
     fn a_stale_frame_decays_to_neutral_so_no_game_is_left_holding_a_button() {
         let set_at = Instant::now();
-        let raw = translate::puck_to_triton(&raw_0x42(3), StripMask::none()).unwrap();
+        let raw = translate::controller_to_triton(&raw_0x42(3), StripMask::none()).unwrap();
         let held = live(&raw, set_at);
         // Fresh: relayed.
         let fresh = tick_report(profile::triton(), held, 0, set_at);
         assert_ne!(fresh[2] & 0x01, 0, "A is still pressed");
-        // Long after the puck went quiet: neutral, and the device stays alive.
+        // Long after the controller went quiet: neutral, and the device stays alive.
         let later = set_at + STALE_AFTER + Duration::from_millis(1);
         let stale = tick_report(profile::triton(), held, 7, later);
         assert_eq!(stale, translate::triton_neutral(7).to_vec());
         assert_eq!(stale[2] & 0x01, 0, "nothing is left pressed");
 
-        let deck_held = live(&translate::puck_to_deck(&Frame::default(), 0), set_at);
+        let deck_held = live(&translate::controller_to_deck(&Frame::default(), 0), set_at);
         assert_eq!(
             tick_report(profile::deck(), deck_held, 7, later),
             translate::deck_neutral(7).to_vec()
@@ -481,7 +481,7 @@ mod tests {
         bt[1] = 0x5a; // counter
         bt[2] = 0x01; // A down
 
-        let relayed = translate::puck_to_triton(&bt, StripMask::none()).expect("forwardable");
+        let relayed = translate::controller_to_triton(&bt, StripMask::none()).expect("forwardable");
         let held = live(&relayed, Instant::now());
         let out = tick_report(profile::triton(), held, 0, Instant::now());
 
@@ -504,14 +504,14 @@ mod tests {
         let frame = Frame::decode(&raw).unwrap();
 
         // triton: the raw bytes, masked.
-        let masked = translate::puck_to_triton(&raw, StripMask::guide_only()).unwrap();
+        let masked = translate::controller_to_triton(&raw, StripMask::guide_only()).unwrap();
         let held = live(&masked, Instant::now());
         let out = tick_report(profile::triton(), held, 0, Instant::now());
         assert_eq!(out.len(), TRITON_REPORT_LEN);
         assert_eq!(out[0], 0x42);
 
         // deck: a transcode, 64 bytes with the reference header.
-        let mut d = translate::puck_to_deck(&frame, 0);
+        let mut d = translate::controller_to_deck(&frame, 0);
         translate::strip_deck(&mut d, StripMask::guide_only());
         let held = live(&d, Instant::now());
         let out = tick_report(profile::deck(), held, 0, Instant::now());
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn the_pulse_rides_on_neutral_and_live_ticks_alike() {
         let now = Instant::now();
-        let raw = translate::puck_to_triton(&raw_0x42(0x30), StripMask::guide_only()).unwrap();
+        let raw = translate::controller_to_triton(&raw_0x42(0x30), StripMask::guide_only()).unwrap();
         let held = live(&raw, now);
         let pulse = AtomicU32::new(0);
         pulse.store(4, Ordering::Relaxed);
@@ -593,7 +593,7 @@ mod tests {
         }
         assert!(!guide_down(profile::triton(), &e), "and the release still lands");
         // A live tick under a pulse is otherwise the frame it always was.
-        assert_eq!(a[1], 0x30, "the puck's own counter, untouched");
+        assert_eq!(a[1], 0x30, "the controller's own counter, untouched");
         assert_eq!(a[2] & 0x01, 1, "and A is still pressed");
         // The neutral ones carry the button and nothing else.
         let mut want = translate::triton_neutral(3).to_vec();
@@ -703,7 +703,7 @@ mod tests {
     fn a_neutral_report_has_no_flag_or_reading_that_could_toggle() {
         let r = translate::triton_neutral(0x5a);
 
-        // Every button/touch byte of the puck's 0x42 (report.rs BUTTON_BITS
+        // Every button/touch byte of the controller's 0x42 (report.rs BUTTON_BITS
         // spans bytes 2..6) is clear: no pad-touch bit, no capacitive bit, no
         // trigger-full bit.
         assert!(r[2..6].iter().all(|&b| b == 0), "no button or touch bit is set");
@@ -739,7 +739,7 @@ mod tests {
     /// A live triton frame is relayed byte for byte, counter included (§4.4:
     /// renumbering risks desync with the IMU timestamp path — which now matters
     /// *more*, not less, since the gyro rides in the same report). So while the
-    /// puck's frame path is between updates, the identical report is re-sent,
+    /// controller's frame path is between updates, the identical report is re-sent,
     /// counter and all, for up to [`STALE_AFTER`].
     ///
     /// That is not the churn: it is bounded at 200 ms, and Steam tolerates a
@@ -748,14 +748,14 @@ mod tests {
     #[test]
     fn a_held_live_frame_repeats_its_own_counter_rather_than_being_renumbered() {
         let now = Instant::now();
-        let raw = translate::puck_to_triton(&raw_0x42(0x77), StripMask::guide_only()).unwrap();
+        let raw = translate::controller_to_triton(&raw_0x42(0x77), StripMask::guide_only()).unwrap();
         let held = live(&raw, now);
         let a = tick_report(profile::triton(), held, 10, now);
         let b = tick_report(profile::triton(), held, 11, now);
         let c = tick_report(profile::triton(), held, 12, now);
         assert_eq!(a, b);
         assert_eq!(b, c);
-        assert_eq!(a[1], 0x77, "the puck's counter, not the streamer's tick");
+        assert_eq!(a[1], 0x77, "the controller's counter, not the streamer's tick");
     }
 
     /// Crossing from a live frame to neutral changes the counter's *source*,
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn the_live_to_neutral_transition_is_one_counter_discontinuity_and_nothing_else() {
         let set_at = Instant::now();
-        let raw = translate::puck_to_triton(&raw_0x42(0x77), StripMask::none()).unwrap();
+        let raw = translate::controller_to_triton(&raw_0x42(0x77), StripMask::none()).unwrap();
         let held = live(&raw, set_at);
         let last_live = tick_report(profile::triton(), held, 40, set_at);
         let after = set_at + STALE_AFTER + Duration::from_millis(1);

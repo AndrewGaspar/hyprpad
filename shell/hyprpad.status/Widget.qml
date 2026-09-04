@@ -11,7 +11,7 @@
 // "absent". Three things must all hold before the widget takes any space:
 //
 //   1. the status file parses,
-//   2. it says `connected: true` — the puck is here *now*, not merely that the
+//   2. it says `connected: true` — the controller is here *now*, not merely that the
 //      daemon is up (it sits through the startup and reconnect waits, and
 //      publishes `connected: false` throughout both), and
 //   3. `/proc/<pid>` still answers for the pid in the file.
@@ -1003,7 +1003,7 @@ BarWidget {
 
   // Turn the controller off on a right-click. `hyprpad off` nudges the running
   // daemon (SIGUSR1) rather than touching the device itself, so the widget
-  // needs no access to the puck and there is still exactly one writer. The
+  // needs no access to the controller and there is still exactly one writer. The
   // widget then disappears on its own, because the daemon publishes
   // `connected: false` the moment the stream stops.
   function turnControllerOff() {

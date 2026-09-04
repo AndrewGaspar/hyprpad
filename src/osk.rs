@@ -12,7 +12,7 @@
 //!
 //! Responsibility for the OSK's haptic tick is split: the **child** knows when a
 //! pad's cursor crosses onto a new key (it owns the layout and the hit-test),
-//! but the **daemon** owns the puck's writable hidraw node ([`crate::haptics`]).
+//! but the **daemon** owns the controller's writable hidraw node ([`crate::haptics`]).
 //! So the child announces the crossing and the daemon fires the pulse. The child
 //! prints one machine-readable line per event on its **stdout**:
 //!
@@ -849,9 +849,10 @@ mod tests {
     #[test]
     fn a_padless_source_gets_the_full_keyboard_from_the_bottom_displacing() {
         use crate::report::Source;
-        // The binding says `split`, floating. On the puck that is exactly what
+        // The binding says `split`, floating. On the Steam Controller that is
+        // exactly what
         // it means.
-        let p = presentation_for(Source::Puck, OskMode::Split, false, None);
+        let p = presentation_for(Source::SteamController, OskMode::Split, false, None);
         assert_eq!(p, OskPresentation::new(OskMode::Split, false));
         // On a controller with no trackpads the same binding raises the FULL
         // keyboard from the bottom edge, with an exclusive zone: there is no
@@ -873,7 +874,7 @@ mod tests {
         assert_eq!(presentation_for(Source::Evdev, OskMode::Bottom, true, Some(want)), want);
         // …and the override never touches a controller that has pads.
         assert_eq!(
-            presentation_for(Source::Puck, OskMode::Bottom, true, Some(want)),
+            presentation_for(Source::SteamController, OskMode::Bottom, true, Some(want)),
             OskPresentation::new(OskMode::Bottom, true)
         );
     }

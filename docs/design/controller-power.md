@@ -1,10 +1,10 @@
-# Design: the puck's power — the firmware timer, and a deliberate off switch
+# Design: the controller's power — the firmware timer, and a deliberate off switch
 
 *Implements options A + B of `docs/research/guide-hold-poweroff.md` §4. Code:
 `src/lizard.rs` (the settings write, the read round trip, the `0x9F` command),
 `src/config.rs` + `src/lua_config.rs` (the `[daemon]` knobs and
 `h.controller_off()`), `src/run.rs` (the `execute()` arm and SIGUSR1),
-`src/main.rs` (`hyprpad off`, `hyprpad puck-settings`),
+`src/main.rs` (`hyprpad off`, `hyprpad controller-settings`),
 `shell/hyprpad.status/Widget.qml` (the right-click).*
 
 ## What it is
@@ -27,7 +27,7 @@ So this feature is two halves that only make sense together:
    chord, on `hyprpad off`, and on a right-click of the bar widget.
 
 And, because half of the above is a guess, a **read path**: `hyprpad
-puck-settings` asks the firmware what it actually thinks.
+controller-settings` asks the firmware what it actually thinks.
 
 ## What is UNVERIFIED
 
@@ -55,7 +55,7 @@ powers it off, and step 2 may make a hold do so.
    time. The controller must be awake (press the Steam button first).
 
    ```
-   hyprpad puck-settings 25 50
+   hyprpad controller-settings 25 50
    ```
 
    Read the three columns together. `max` is the only clue to the *scale*: a
@@ -77,7 +77,7 @@ powers it off, and step 2 may make a hold do so.
 
    ```
    hyprpad reload
-   hyprpad puck-settings 25
+   hyprpad controller-settings 25
    ```
 
    `current` should now read back `3000`. If it does not, the firmware rejected
@@ -112,7 +112,7 @@ powers it off, and step 2 may make a hold do so.
    ```
    hyprpad off
    # …press Steam to wake…
-   hyprpad puck-settings 25
+   hyprpad controller-settings 25
    ```
 
    A value that survived the cycle is stored in the firmware; one that comes
@@ -126,7 +126,7 @@ powers it off, and step 2 may make a hold do so.
 
 **Why the power settings ride in the lizard frame.** They are `(setting, u16)`
 pairs in exactly the report `own_lizard_loop` already builds, sends to every
-puck node, retries on STALL and re-sends every 30 s. Appending to it inherits
+controller node, retries on STALL and re-sends every 30 s. Appending to it inherits
 all of that — including recovery after a reconnect — for the cost of three bytes
 per setting. The cost is that the knobs only apply when hyprpad owns lizard
 mode; that is stated in the config docs.
@@ -146,9 +146,9 @@ of the recipe above is how to recover the real default
 
 **Why `hyprpad off` goes through the daemon.** SIGUSR1 to the pid in the
 pidfile, exactly as `hyprpad reload` sends SIGHUP. The daemon already holds the
-puck's descriptors — after `packaging/udev/72-hyprpad-puck.rules` it is the only
+controller's descriptors — after `packaging/udev/72-hyprpad-puck.rules` it is the only
 unprivileged process that can — and one writer to the device is the invariant
-the haptics and relay paths also rest on. A CLI that opened the puck behind the
+the haptics and relay paths also rest on. A CLI that opened the controller behind the
 daemon's back would break both.
 
 **Why the read path is a trait.** `FeatureDevice` has two methods and one real

@@ -18,7 +18,7 @@
 //!
 //! # The other half: host integration
 //!
-//! Hiding the *real* puck from Steam and getting a writable `/dev/uhid` needs
+//! Hiding the *real* controller from Steam and getting a writable `/dev/uhid` needs
 //! root, and this command **never takes root**. Instead it prints the exact
 //! block of commands that does the job ([`host_install_steps`]), and
 //! `hyprpad setup --check` reports, read-only, on whether that block has been
@@ -29,7 +29,7 @@
 //!
 //! | File | What it does |
 //! |---|---|
-//! | `packaging/udev/72-hyprpad-puck.rules` | takes the puck's hidraw nodes away from every unprivileged process |
+//! | `packaging/udev/72-hyprpad-puck.rules` | takes the controller's hidraw nodes away from every unprivileged process |
 //! | `packaging/sysusers.d/hyprpad.conf` | the `hyprpad` group that gates the broker socket |
 //! | `packaging/systemd/hyprpad-broker.socket` | `/run/hyprpad/broker.sock`, `0660 root:hyprpad` |
 //! | `packaging/systemd/hyprpad-broker.service` | the root fd broker ([`crate::broker`]) |
@@ -41,7 +41,7 @@
 //! graphical session. It needs no root either, but it is a separate decision
 //! from the Steam masking above — and it is the piece that makes
 //! `[daemon] restore_lizard_on_exit = false` safe (`docs/12-lizard-free.md`),
-//! since a daemon that is restarted is a puck that comes back.
+//! since a daemon that is restarted is a controller that comes back.
 
 use std::fs;
 use std::io;
@@ -378,7 +378,7 @@ and a revert recipe. Run this from the hyprpad checkout you built in:
     # 0. the binary the broker unit runs
     sudo install -Dm755 \"$SRC/target/release/hyprpad\" /usr/local/bin/hyprpad
 
-    # 1. take the real puck away from everything running as you — Steam included
+    # 1. take the real controller away from everything running as you — Steam included
     sudo install -Dm644 \"$SRC/packaging/udev/{RULE_NAME}\" \\
          /etc/udev/rules.d/{RULE_NAME}
 
@@ -400,7 +400,7 @@ and a revert recipe. Run this from the hyprpad checkout you built in:
 
 THEN RE-LOGIN — or run `newgrp hyprpad` in this shell. Group membership only
 reaches processes started after it was granted, so until you do, the daemon
-still cannot talk to the broker and will fall back to opening the puck directly.
+still cannot talk to the broker and will fall back to opening the controller directly.
 
 Confirm the whole thing, read-only, with:
 
@@ -440,10 +440,10 @@ Running at login — the systemd user unit (no root, but read it first)
 This starts the daemon with your graphical session instead of from a shell, and
 restarts it if it dies. It is also the half that makes `[daemon]
 restore_lizard_on_exit = false` safe: with that knob off, a stopped daemon
-leaves the puck doing nothing on the desktop, and `Restart=on-failure` is what
+leaves the controller doing nothing on the desktop, and `Restart=on-failure` is what
 puts it back (docs/12-lizard-free.md).
 
-    # 0. stop the hand-launched daemon, or two of them fight over the puck
+    # 0. stop the hand-launched daemon, or two of them fight over the controller
     pkill -TERM -f 'hyprpad run'
 
     # 1. the unit
@@ -470,7 +470,7 @@ has no CAP_SETGID. What decides the group is the LOGIN SESSION the user manager
 inherited, so after `sudo usermod -aG {BROKER_GROUP} $USER` you must LOG OUT AND
 BACK IN — `newgrp` reaches only the shell you type it in, never the already
 running user manager. Without the group nothing breaks: the daemon says so once
-and opens the puck directly.
+and opens the controller directly.
 
     journalctl --user -u {USER_UNIT_NAME} -f      # what it is saying
     systemctl --user reload {USER_UNIT_NAME}      # = `hyprpad reload` (SIGHUP)
@@ -647,7 +647,7 @@ pub enum Verdict {
     Ok,
     /// Definitely not as it should be.
     Bad,
-    /// Cannot be determined right now — almost always "the puck is not here".
+    /// Cannot be determined right now — almost always "the controller is not here".
     Unknown,
 }
 
@@ -706,7 +706,7 @@ pub fn check_items(view: &dyn HostView) -> Vec<Check> {
         None => Check::new(
             Verdict::Bad,
             "hyprpad udev rule",
-            format!("{RULE_NAME} not installed — the real puck is still visible to Steam"),
+            format!("{RULE_NAME} not installed — the real controller is still visible to Steam"),
         ),
     });
 
@@ -769,7 +769,7 @@ pub fn check_items(view: &dyn HostView) -> Vec<Check> {
     items.push(node_check(
         &nodes,
         crate::hidraw::Transport::Dongle,
-        "puck nodes root-only",
+        "dongle nodes root-only",
         "no 28de:1304 puck present — plug it in and re-run",
     ));
     // The Bluetooth row is only shown when there is something to say about it.
@@ -865,7 +865,7 @@ pub fn user_unit_items(view: &dyn HostView) -> Vec<Check> {
 
     // 3. Is the daemon that is running *the unit's*? This is the check that
     //    catches the state the first two cannot see: unit installed and enabled,
-    //    and a hand-launched `hyprpad run` from a shell holding the puck, so the
+    //    and a hand-launched `hyprpad run` from a shell holding the controller, so the
     //    unit's own start silently loses the race for the device.
     let daemon = view.running_daemon();
     items.push(match &daemon {
@@ -1089,7 +1089,7 @@ mod tests {
         // the mask machinery (so it is the real launcher, not a stub).
         assert!(WRAPPER.contains(MARKER), "wrapper missing marker");
         assert!(WRAPPER.contains("bwrap"), "wrapper missing bwrap");
-        assert!(WRAPPER.contains("28DE"), "wrapper missing puck VID");
+        assert!(WRAPPER.contains("28DE"), "wrapper missing Valve VID");
         assert!(WRAPPER.contains("1304"), "wrapper missing puck PID");
         assert!(WRAPPER.contains("--dev-bind /dev/null"), "wrapper missing mask bind");
     }
@@ -1260,7 +1260,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
         files: Vec<PathBuf>,
         socket: bool,
         uhid: Result<usize, String>,
-        puck: Result<usize, String>,
+        controller: Result<usize, String>,
         nodes: Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)>,
         /// Paths that exist for [`HostView::path_exists`] — the unit file and
         /// its enable symlink.
@@ -1299,7 +1299,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                 ],
                 socket: true,
                 uhid: Ok(1),
-                puck: Ok(5),
+                controller: Ok(5),
                 nodes: (7..12)
                     .map(|n| {
                         (
@@ -1327,7 +1327,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                 files: vec![PathBuf::from("/usr/lib/udev/rules.d/60-steam-input.rules")],
                 socket: false,
                 uhid: Err("no socket".to_string()),
-                puck: Err("no socket".to_string()),
+                controller: Err("no socket".to_string()),
                 nodes: (7..12)
                     .map(|n| {
                         (
@@ -1365,7 +1365,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
         fn broker(&self, verb: crate::broker::Request) -> Result<usize, String> {
             match verb {
                 crate::broker::Request::Uhid => self.uhid.clone(),
-                crate::broker::Request::Controller => self.puck.clone(),
+                crate::broker::Request::Controller => self.controller.clone(),
             }
         }
         fn controller_nodes(&self) -> Vec<(PathBuf, crate::hidraw::Transport, Option<NodeStat>)> {
@@ -1406,7 +1406,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                     "broker socket",
                     "broker: uhid",
                     "broker: controller",
-                    "puck nodes root-only",
+                    "dongle nodes root-only",
                 ]
             );
         }
@@ -1431,7 +1431,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
                 "broker socket",
                 "broker: uhid",
                 "broker: controller",
-                "puck nodes root-only",
+                "dongle nodes root-only",
                 "bt node root-only",
             ]
         );
@@ -1447,7 +1447,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
     }
 
     /// The state of this machine before anything is installed: Valve's rule is
-    /// there, nothing of ours is, and the puck is wide open.
+    /// there, nothing of ours is, and the controller is wide open.
     #[test]
     fn an_untouched_machine_says_exactly_what_is_missing() {
         let host = FakeHost::untouched();
@@ -1476,7 +1476,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
     fn a_broker_that_refuses_us_is_a_failure_not_an_unknown() {
         let host = FakeHost {
             uhid: Err("broker refused: not permitted".to_string()),
-            puck: Err("broker refused: not permitted".to_string()),
+            controller: Err("broker refused: not permitted".to_string()),
             ..FakeHost::ready()
         };
         assert_eq!(
@@ -1501,12 +1501,12 @@ Exec=/usr/bin/steam steam://open/bigpicture
     /// With no puck plugged in the node check cannot answer, and must say so
     /// rather than claiming success.
     #[test]
-    fn no_puck_makes_the_node_check_unknown_not_ok() {
+    fn no_dongle_makes_the_node_check_unknown_not_ok() {
         let host = FakeHost { nodes: Vec::new(), ..FakeHost::ready() };
         let items = check_items(&host);
         assert_eq!(items.last().unwrap().verdict, Verdict::Unknown);
         assert!(items.last().unwrap().detail.contains("no 28de:1304 puck"));
-        assert!(check_report(&host).contains("Could not check: puck nodes root-only"));
+        assert!(check_report(&host).contains("Could not check: dongle nodes root-only"));
     }
 
     /// Valve's rule missing is worth saying: without it Steam never sees the
@@ -1654,7 +1654,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
         let dongle_only = FakeHost::ready();
         let labels: Vec<&str> =
             check_items(&dongle_only).iter().map(|i| i.label).collect::<Vec<_>>();
-        assert!(labels.contains(&"puck nodes root-only"));
+        assert!(labels.contains(&"dongle nodes root-only"));
         assert!(!labels.contains(&"bt node root-only"), "{labels:?}");
 
         // A laptop with the controller on Bluetooth: the dongle is still
@@ -1670,7 +1670,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
         assert_eq!(bt.verdict, Verdict::Ok);
         assert!(bt.detail.contains("1 node(s)"), "exactly one BLE interface: {}", bt.detail);
         // The dongle's row is unaffected by the BT node's presence.
-        let usb = items.iter().find(|i| i.label == "puck nodes root-only").unwrap();
+        let usb = items.iter().find(|i| i.label == "dongle nodes root-only").unwrap();
         assert_eq!(usb.verdict, Verdict::Ok);
         assert!(usb.detail.contains("5 node(s)"), "{}", usb.detail);
     }
@@ -1699,7 +1699,7 @@ Exec=/usr/bin/steam steam://open/bigpicture
 
         // And the dongle's row still passes, so the report says which half is
         // wrong rather than just that something is.
-        let usb = items.iter().find(|i| i.label == "puck nodes root-only").unwrap();
+        let usb = items.iter().find(|i| i.label == "dongle nodes root-only").unwrap();
         assert_eq!(usb.verdict, Verdict::Ok);
     }
 

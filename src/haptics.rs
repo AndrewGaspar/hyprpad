@@ -1,4 +1,4 @@
-//! Haptic pulses on the controller, over either transport (the puck,
+//! Haptic pulses on the controller, over either transport (the controller,
 //! `28de:1304` IBEX/Proteus; or Bluetooth, `28de:1303`).
 //!
 //! The controller has an actuator behind each trackpad. Firing a short pulse on
@@ -9,7 +9,7 @@
 //!
 //! ## The wire format (source: Linux `drivers/hid/hid-steam.c`, IBEX path)
 //!
-//! The 2026 puck is driven under `STEAM_QUIRK_IBEX`, whose haptics are **not**
+//! The 2026 controller is driven under `STEAM_QUIRK_IBEX`, whose haptics are **not**
 //! the gen-1/Deck `0x8F` feature report. One pulse is an 8-byte HID **output**
 //! report, id `REPORT_ID_HAPTIC_PULSE` (`0x81`), all fields little-endian:
 //!
@@ -48,14 +48,14 @@
 //! ## Which node, concurrency, sleep, and never being fatal
 //!
 //! hidraw is not exclusive, so writing output reports works while another
-//! process holds the same node. The puck exposes one node per pairing slot plus
-//! a dongle-control interface, and the pulse must reach the slot the controller
-//! is actually on.
+//! process holds the same node. The puck (the dongle) exposes one node per
+//! pairing slot plus a dongle-control interface, and the pulse must reach the
+//! slot the controller is actually on.
 //!
 //! `lizard.rs` finds that slot by trial: its *feature* reports STALL (`EPIPE`) on
 //! every other node, so "write to all, keep what works" converges. **That trick
 //! does not transfer here.** An output report is fire-and-forget, and every node
-//! accepts it — verified on-device: all five puck nodes returned a successful
+//! accepts it — verified on-device: all five of the puck's nodes returned a successful
 //! 8-byte write for the `0x81` report. So a failed write cannot identify the
 //! live slot. *Input* can: only the occupied slot streams reports (verified:
 //! 268 reports/s on one node, 0 on the other four). We therefore open every node
@@ -399,8 +399,8 @@ fn live_indices(fds: &[File]) -> Vec<usize> {
         .collect()
 }
 
-/// The writable puck nodes, opened lazily, narrowed to the live pairing slot,
-/// and re-opened after failure or once the set goes stale.
+/// The writable controller nodes, opened lazily, narrowed to the live pairing
+/// slot, and re-opened after failure or once the set goes stale.
 struct ControllerWriter {
     /// Nodes the pulse is written to. Empty until the first open, and again
     /// after the controller went away.
@@ -475,7 +475,7 @@ impl ControllerWriter {
     /// # This is also what routes haptics to the live transport
     ///
     /// The narrowing was written for the puck's pairing slots — only one of the
-    /// five has a controller behind it — and it turns out to be exactly the rule
+    /// five has the controller behind it — and it turns out to be exactly the rule
     /// Bluetooth needs, for exactly the same reason. `ControllerSource::acquire`
     /// now hands over the dongle's nodes *and* the Bluetooth node when both
     /// exist, and only one of them is streaming, because the controller holds
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn probe_narrows_to_the_node_that_streams() {
-        // The on-device shape: several puck nodes are open, but only the
+        // The on-device shape: several controller nodes are open, but only the
         // occupied pairing slot is reporting. An output report succeeds on all
         // of them, so readability is the only signal that separates them.
         let (quiet_a, _wa) = fake_node();

@@ -565,7 +565,7 @@ pub enum OskAction {
     /// holds them around the tap on its own uinput device.
     Key(KeyChord),
     /// Type the key under the cursor of the pad on this button's side of the
-    /// puck (`osk commit`, `h.osk "commit"`): the pad clicks.
+    /// controller (`osk commit`, `h.osk "commit"`): the pad clicks.
     Commit,
     /// Hold Shift for as long as the button is down (`osk shift`,
     /// `h.osk "shift"`): the Deck's L2. Momentary, like the key itself — it
@@ -662,7 +662,7 @@ fn osk_verb(word: &str) -> Option<OskAction> {
 }
 
 /// What the buttons do while the on-screen keyboard is up before a config says
-/// otherwise — the Steam Deck's own keyboard map, so the puck reads like the
+/// otherwise — the Steam Deck's own keyboard map, so the controller reads like the
 /// Deck: `(button, action, cheat-sheet label)`.
 ///
 /// | button | does |
@@ -716,9 +716,9 @@ pub fn osk_builtins() -> impl Iterator<Item = (report::Button, OskAction, &'stat
 /// highlight instead ([`crate::run`]'s `padless_osk_default`, and the OSK
 /// child's own `commit` fallback).
 ///
-/// Deliberately *not* folded into [`osk_builtins`]: a puck's `A` under the
-/// keyboard does nothing today, and giving it a meaning is a change to a
-/// controller this feature is not about.
+/// Deliberately *not* folded into [`osk_builtins`]: the Steam Controller's `A`
+/// under the keyboard does nothing today, and giving it a meaning is a change
+/// to a controller this feature is not about.
 pub fn padless_osk_builtins() -> impl Iterator<Item = (report::Button, OskAction)> {
     [(report::Button::A, OskAction::Commit)].into_iter()
 }
@@ -1176,6 +1176,12 @@ impl Default for ScrollConfig {
 /// `ctrl`+arrow *word* jump when `word_tier` is on. Hold `select` while
 /// scrubbing and every tap goes out with Shift, selecting as it goes.
 ///
+/// On a controller with **no trackpads** the same binding is a *shuttle* on
+/// the left stick instead — rate control, [`ShuttleConfig`] — because there is
+/// no absolute surface for a jog wheel to read. Every knob above is the jog's;
+/// the shuttle's are in `shuttle`, and the switch between them is
+/// [`crate::report::Source::has_pads`], per frame.
+///
 /// **Off unless a config asks for it.** `enabled` defaults to `false`, so a
 /// config with no `[scrub]` / `h.scrub` block behaves exactly as it did before
 /// the scrub existed: writing the block turns it on, and `enabled = false`
@@ -1227,6 +1233,9 @@ pub struct ScrubConfig {
     /// that chord — pick a button the guide layer leaves alone (the cheat
     /// sheet shows both rows on the same callout, so a collision is visible).
     pub select: report::Button,
+    /// The same binding on a controller with no trackpads: the LEFT stick as a
+    /// **shuttle** ([`ShuttleConfig`]). Nothing with pads reads it.
+    pub shuttle: ShuttleConfig,
 }
 
 impl Default for ScrubConfig {
@@ -1240,8 +1249,87 @@ impl Default for ScrubConfig {
             slow_deg_per_s: 180.0,
             word_tier: true,
             select: report::Button::GripL5,
+            shuttle: ShuttleConfig::default(),
         }
     }
+}
+
+/// The caret scrub on a controller with **no trackpads**: the left stick's
+/// horizontal deflection as a *shuttle* (`h.scrub { shuttle = { … } }`, TOML
+/// `[scrub] shuttle_*`).
+///
+/// Jog versus shuttle is the video-editing distinction the research doc opens
+/// with (`docs/research/text-scrub.md` §0): a **jog** wheel is *position* — one
+/// detent is one step and the rate follows the hand — and a **shuttle** is
+/// *rate* — deflect to choose a speed, release to stop. The Steam Controller's
+/// left pad is a jog wheel because a thumb on an absolute surface has a
+/// position to read;
+/// a spring-loaded stick does not, and forcing one to be a jog wheel (circle
+/// the stick, count the detents) would be a worse version of both. So the same
+/// `h.scrub` binding is a jog on a pad and a shuttle on a stick, chosen per
+/// frame by [`crate::report::Source::has_pads`], and these are the shuttle's
+/// half of the tuning.
+///
+/// The curve, all four knobs in one line: past `deadzone`, taps go out at a
+/// rate that rises linearly from `slow_per_s` to `fast_per_s` as the stick
+/// reaches `word_above`, and past `word_above` the tap becomes a *word*
+/// (`ctrl`+arrow) at `fast_per_s`. At the defaults that is 4 characters/s at
+/// the deadzone edge, ~17/s at 60 %, 25/s just under the word threshold, and 25
+/// word jumps/s beyond it — the top gear, and the reason the ladder tops out in
+/// words rather than in more characters (a word jump lands on a boundary).
+///
+/// Only the horizontal axis is read: the D-pad already walks lines, and a
+/// diagonal push that also moved the caret vertically would make every
+/// horizontal shuttle a lottery.
+///
+/// Like every other feel knob in this file these are *tunable starting points*,
+/// not measured values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShuttleConfig {
+    /// Deflection below which the stick commands nothing, as a fraction of
+    /// full scale. Default `0.15` — a little above the sticks' own `0.12`
+    /// pointer deadzone, because a caret that walks off a resting thumb is
+    /// worse than a cursor that drifts: this one types into the document.
+    pub deadzone: f64,
+    /// Taps per second at the deadzone edge. Default `4` — slow enough to
+    /// count characters by eye and stop on one.
+    pub slow_per_s: f64,
+    /// Taps per second at `word_above` and beyond. Default `25` — about a line
+    /// of prose a second, and the fastest an arrow key is worth tapping.
+    pub fast_per_s: f64,
+    /// Deflection at or past which a tap is a **word** (`ctrl`+arrow, the
+    /// heavier haptic where the device has one) instead of a character.
+    /// Default `0.85`: a deliberate push past the comfortable range, so the
+    /// unit cannot change under a thumb that only meant to go faster.
+    pub word_above: f64,
+}
+
+impl Default for ShuttleConfig {
+    fn default() -> ShuttleConfig {
+        ShuttleConfig { deadzone: 0.15, slow_per_s: 4.0, fast_per_s: 25.0, word_above: 0.85 }
+    }
+}
+
+/// Set one [`ShuttleConfig`] knob by name.
+///
+/// Shared by both front-ends so `[scrub] shuttle_fast_per_s = 30` and
+/// `h.scrub { shuttle = { fast_per_s = 30 } }` cannot drift apart, and so a
+/// typo produces the same message either way — the treatment
+/// [`set_stick_axis_knob`] gives the stick groups.
+pub(crate) fn set_shuttle_knob(s: &mut ShuttleConfig, knob: &str, v: f64) -> Result<(), String> {
+    match knob {
+        "deadzone" | "dead_zone" | "inner" => s.deadzone = v,
+        "slow_per_s" | "slow" | "min_per_s" => s.slow_per_s = v,
+        "fast_per_s" | "fast" | "max_per_s" => s.fast_per_s = v,
+        "word_above" | "word" | "words_above" => s.word_above = v,
+        other => {
+            return Err(format!(
+                "unknown shuttle setting '{other}' (want deadzone, slow_per_s, \
+                 fast_per_s, word_above)"
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// On-screen keyboard knobs (the `[keyboard]` config section / `h.keyboard_config`).
@@ -1326,11 +1414,12 @@ impl StickAxisConfig {
     }
 }
 
-/// Rate-control knobs for a controller whose sticks stand in for the puck's
-/// trackpads (the `[sticks]` section / `h.sticks { … }`).
+/// Rate-control knobs for a gamepad whose sticks stand in for the Steam
+/// Controller's trackpads (the `[sticks]` section / `h.sticks { … }`).
 ///
 /// Live only for a source with no pads ([`crate::report::Source::has_pads`]) —
-/// on the puck the sticks are for guide flicks and the pads drive everything,
+/// on the Steam Controller the sticks are for guide flicks and the pads drive
+/// everything,
 /// and nothing here changes that. `docs/design/xbox-elite.md` has the model;
 /// [`crate::sticks`] is the implementation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1340,7 +1429,7 @@ pub struct SticksConfig {
     /// deliberately turns it off.
     pub enabled: bool,
     /// Integration step, in milliseconds. Default `4` — the cadence the loop
-    /// already runs at under the puck, so hold timers and the button
+    /// already runs at under the Steam Controller, so hold timers and the button
     /// reconcile see the same rhythm.
     ///
     /// This is a **deadline**, not a tick: the loop arms it only while a stick
@@ -1431,8 +1520,8 @@ pub(crate) fn stick_axis_mut<'a>(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceConfig {
     /// Whether to run the evdev backend at all ([`crate::evdev`]). Default
-    /// `true`; a machine that only ever uses the puck loses one idle thread by
-    /// turning it off.
+    /// `true`; a machine that only ever uses the Steam Controller loses one
+    /// idle thread by turning it off.
     pub evdev: bool,
     /// Whether to `EVIOCGRAB` an adopted gamepad. Default `true`, and the
     /// default matters: the Bluetooth Elite's node is a *keyboard* to
@@ -1455,7 +1544,7 @@ impl Default for DeviceConfig {
 
 /// Haptic-feedback knobs (the `[haptics]` config section).
 ///
-/// The puck has an actuator behind each trackpad ([`crate::haptics`]); firing a
+/// The controller has an actuator behind each trackpad ([`crate::haptics`]); firing a
 /// short pulse on the pad a thumb is resting on is what makes the on-screen
 /// keyboard feel physical. Each trigger point has its own toggle so the feel can
 /// be dialled in one piece at a time, and `intensity` scales every pulse's width
@@ -1466,7 +1555,7 @@ impl Default for DeviceConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HapticsConfig {
     /// Master switch. Default `true` — feedback is the point of the section, and
-    /// a puck that can't be written to degrades to a silent no-op anyway.
+    /// a controller that can't be written to degrades to a silent no-op anyway.
     pub enabled: bool,
     /// Tick the pad whose OSK cursor crosses onto a **new** key (the Deck's
     /// signature keyboard feel). Reported by the OSK child over its stdout
@@ -1515,11 +1604,11 @@ impl Default for HapticsConfig {
     }
 }
 
-/// Which puck report the game-rumble back-channel drives (`[gamepad]
+/// Which controller report the game-rumble back-channel drives (`[gamepad]
 /// rumble_mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RumbleMode {
-    /// The puck's own force-feedback report, `0x80`
+    /// The controller's own force-feedback report, `0x80`
     /// ([`crate::haptics::Haptics::rumble`]) — a faithful replay of what
     /// `hid-steam` sends for an `FF_RUMBLE` effect. The default.
     #[default]
@@ -1527,7 +1616,7 @@ pub enum RumbleMode {
     /// Approximate the rumble with trains of the `0x81` pulse instead. A hedge:
     /// the `0x81` pulse is the report hyprpad has actually exercised on this
     /// unit, whereas `0x80` has only ever been replayed from the kernel source
-    /// (`hid-generic` binds the puck here, so the in-kernel rumble path has
+    /// (`hid-generic` binds the controller here, so the in-kernel rumble path has
     /// never run on it). If `native` turns out inert on-device, this still buzzes.
     Pulse,
 }
@@ -1627,7 +1716,7 @@ impl GuideTap {
 
 /// Virtual-gamepad knobs (the `[gamepad]` config section).
 ///
-/// The Tier-1 keystone: hyprpad owns the real puck, so Steam and games are fed a
+/// The Tier-1 keystone: hyprpad owns the real controller, so Steam and games are fed a
 /// synthesized pad whenever a game holds focus — an Xbox-360-class one
 /// ([`crate::gamepad`]) by default, or a virtual Steam Controller
 /// ([`crate::uhid`]) with `kind = "steam"`. All of these are read *per frame* by
@@ -1664,12 +1753,12 @@ pub struct GamepadConfig {
     /// an unhurried single press, but not for holding the guide while deciding
     /// which chord to press and then thinking better of it.
     pub guide_tap_max_ms: u64,
-    /// Forward a game's force-feedback rumble to the puck's actuators. Default
+    /// Forward a game's force-feedback rumble to the controller's actuators. Default
     /// `true`.
     pub rumble: bool,
     /// Which report carries it. Default [`RumbleMode::Native`].
     pub rumble_mode: RumbleMode,
-    /// Scale applied to both `FF_RUMBLE` magnitudes before they reach the puck.
+    /// Scale applied to both `FF_RUMBLE` magnitudes before they reach the controller.
     /// `1.0` passes a game's request through unchanged (which is what
     /// `hid-steam` does); `0` or below silences rumble — use `rumble = false` to
     /// switch it off properly. Default `1.0`.
@@ -1680,17 +1769,17 @@ pub struct GamepadConfig {
     /// With `kind = "steam"`, which Valve identity to present. Default
     /// [`Identity::Triton`]; ignored entirely under `kind = "xbox"`.
     pub identity: Identity,
-    /// Keep the puck's IMU (gyro + accelerometer) streaming even when Steam has
+    /// Keep the controller's IMU (gyro + accelerometer) streaming even when Steam has
     /// not asked for it. Default **`false`**.
     ///
     /// The gyro is normally driven *by Steam*: a game that turns its sensors on
     /// makes Steam write `SETTING_IMU_MODE` to the controller, the relay passes
-    /// that to the real puck through `src/lizard.rs`, and it is turned back off
+    /// that to the real controller through `src/lizard.rs`, and it is turned back off
     /// when Steam stops asking. This knob changes what "off" means — set it and
     /// the IMU is held on as hyprpad's own baseline, which costs battery on a
     /// wireless controller for no benefit unless something is actually reading
     /// it. Its one use is diagnosis: turning it on makes the IMU bytes appear in
-    /// the puck's `0x42` with no Steam in the picture at all, which is how you
+    /// the controller's `0x42` with no Steam in the picture at all, which is how you
     /// tell "the gyro is not working" from "Steam never asked".
     pub gyro: bool,
 }
@@ -1713,11 +1802,11 @@ impl Default for GamepadConfig {
 }
 
 impl GamepadConfig {
-    /// hyprpad's own `SETTING_IMU_MODE` baseline — what the puck's IMU goes back
+    /// hyprpad's own `SETTING_IMU_MODE` baseline — what the controller's IMU goes back
     /// to when Steam is not asking for it.
     ///
     /// `gyro = true` writes the value SDL itself writes for a game that enabled
-    /// sensors (`SEND_RAW_ACCEL | SEND_RAW_GYRO`), so the puck is configured the
+    /// sensors (`SEND_RAW_ACCEL | SEND_RAW_GYRO`), so the controller is configured the
     /// way the reference client configures it rather than some third thing.
     /// [`guide_tap_max_ms`](Self::guide_tap_max_ms) as the duration the gesture
     /// engine wants ([`crate::gesture::GestureEngine::set_guide_tap_max`]).
@@ -2003,21 +2092,21 @@ pub struct Config {
     /// [`Config::osk_buttons_in`]. Distinct from `buttons`, which are live only
     /// when the OSK is down.
     pub(crate) osk_buttons: HashMap<report::Button, OskAction>,
-    /// Whether hyprpad should take ownership of the puck's lizard mode and keep
+    /// Whether hyprpad should take ownership of the controller's lizard mode and keep
     /// the firmware keyboard/mouse emulation disabled ([`crate::lizard`]). Set
     /// via `own_lizard = true` in the `[daemon]` section. Default `false`, so we
     /// never fight an unmasked Steam that is managing lizard mode itself
     /// (docs/experiments/w12-device-denial.md).
     pub(crate) own_lizard: bool,
     /// Whether a clean exit hands lizard mode back to the firmware. `true` (the
-    /// default) is the safety net: when hyprpad stops, the puck goes back to
+    /// default) is the safety net: when hyprpad stops, the controller goes back to
     /// typing arrows and moving a mouse by itself, so a stopped daemon never
     /// leaves the controller inert. `false` is the **lizard-free boot** of
-    /// `docs/12-lizard-free.md`: exit leaves lizard mode DISABLED, so the puck
+    /// `docs/12-lizard-free.md`: exit leaves lizard mode DISABLED, so the controller
     /// never types into the desktop between daemon restarts or at boot.
     ///
     /// The trade is the whole point and it is real: with `false`, a crashed or
-    /// stopped daemon leaves a puck that does nothing at all on the desktop
+    /// stopped daemon leaves a controller that does nothing at all on the desktop
     /// until hyprpad runs again. That is only acceptable when something
     /// restarts it — which is what `packaging/systemd/user/hyprpad.service`
     /// (`Restart=on-failure`) is for — and when the user still has a keyboard.
@@ -2034,7 +2123,7 @@ pub struct Config {
     /// word `"off"` or a raw integer. **The units are UNVERIFIED** — see
     /// [`crate::lizard::PowerSettings`] and
     /// `docs/research/guide-hold-poweroff.md` §6 — so this is a knob the owner
-    /// is expected to test with `hyprpad puck-settings 25` and a stopwatch.
+    /// is expected to test with `hyprpad controller-settings 25` and a stopwatch.
     /// Written only when hyprpad owns lizard mode, since it rides in that frame.
     pub(crate) steam_button_poweroff: Option<u16>,
     /// `SETTING_SLEEP_INACTIVITY_TIMEOUT` (50) — how long the controller sits
@@ -2066,8 +2155,8 @@ pub struct Config {
     pub(crate) keyboard: KeyboardConfig,
     /// Virtual-gamepad knobs (`[gamepad]` section).
     pub(crate) gamepad: GamepadConfig,
-    /// Stick rate-control knobs (`[sticks]` section), for a controller with no
-    /// trackpads. Inert on the puck.
+    /// Stick rate-control knobs (`[sticks]` section), for a gamepad with no
+    /// trackpads. Inert on the Steam Controller.
     pub(crate) sticks: SticksConfig,
     /// Input-source knobs (`[device]` section): which backends are armed, and
     /// whether an adopted gamepad is grabbed.
@@ -2218,10 +2307,10 @@ identity = triton           # with kind = steam: triton (28de:1302, least transl
 forward_guide = false       # send the guide button to the game as BTN_MODE (it is hyprpad's modifier)
 guide_tap = steam           # in a game, a bare guide tap opens the Steam overlay | none = it does nothing
 guide_tap_max_ms = 400      # longest bare hold that still counts as a tap (a longer one was deliberation)
-rumble = true               # forward a game's force feedback to the puck's actuators
-rumble_mode = native        # native (the puck's 0x80 rumble report) | pulse (approximate with 0x81 trains)
+rumble = true               # forward a game's force feedback to the controller's actuators
+rumble_mode = native        # native (the controller's 0x80 rumble report) | pulse (approximate with 0x81 trains)
 rumble_intensity = 1.0      # scale on both FF magnitudes; 1.0 passes the game's request through
-gyro = false                # hold the puck's IMU on even when Steam has not asked (diagnosis; costs battery)
+gyro = false                # hold the controller's IMU on even when Steam has not asked (diagnosis; costs battery)
 "#;
 
 impl Config {
@@ -2440,6 +2529,16 @@ impl Config {
                         }
                         _ => {}
                     }
+                    // The padless half, spelled flat: `shuttle_fast_per_s`, the
+                    // same `<group>_<knob>` shape `[sticks]` uses (this parser
+                    // has no sub-tables, and the Lua front-end's
+                    // `shuttle = { … }` goes through the same setter).
+                    if let Some(knob) = key.strip_prefix("shuttle_") {
+                        let n = parse_f64(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        set_shuttle_knob(&mut scrub.shuttle, knob, n)
+                            .map_err(|e| format!("line {lineno}: {e}"))?;
+                        continue;
+                    }
                     match key.as_str() {
                         "enabled" | "enable" | "on" => {
                             scrub.enabled = parse_bool(&val)
@@ -2578,7 +2677,7 @@ impl Config {
                     }
                 }
                 // Stick rate control, for a controller whose sticks stand in
-                // for the puck's trackpads. Three sub-tables (`cursor`,
+                // for the controller's trackpads. Three sub-tables (`cursor`,
                 // `scroll`, `osk`) share a shape; TOML has no nesting in this
                 // hand-rolled parser, so a sub-table is a `<pair>_<knob>`
                 // prefix here and a real nested table in the Lua front-end.
@@ -2775,7 +2874,7 @@ impl Config {
         &self.osk_buttons
     }
 
-    /// Whether hyprpad should take ownership of the puck's lizard mode
+    /// Whether hyprpad should take ownership of the controller's lizard mode
     /// ([`crate::lizard`]). Configured by `own_lizard` in the `[daemon]`
     /// section; default `false`.
     pub fn own_lizard(&self) -> bool {
@@ -3128,7 +3227,7 @@ fn parse_power_setting(s: &str) -> Result<u16, String> {
         format!(
             "'{s}' is not a firmware power setting: write \"off\" or a whole number \
              0-65535 (the units are the firmware's and are unverified - read them \
-             back with `hyprpad puck-settings 25 50`)"
+             back with `hyprpad controller-settings 25 50`)"
         )
     })
 }
@@ -4791,6 +4890,36 @@ rumble_intensity = 0.25
             .unwrap_err()
             .contains("at least one mode name"));
         assert!(Config::from_toml_str("[scrub]\nfast_min_detents = -1\n").is_err());
+    }
+
+    #[test]
+    fn the_scrub_section_carries_the_padless_shuttle_knobs() {
+        // The stick half of the same binding, spelled flat because this parser
+        // has no sub-tables — the `<group>_<knob>` shape `[sticks]` uses.
+        let c = Config::from_toml_str("[scrub]\n").expect("parse");
+        assert_eq!(c.scrub().shuttle, ShuttleConfig::default());
+        assert_eq!(c.scrub().shuttle.deadzone, 0.15);
+        assert_eq!(c.scrub().shuttle.slow_per_s, 4.0);
+        assert_eq!(c.scrub().shuttle.fast_per_s, 25.0);
+        assert_eq!(c.scrub().shuttle.word_above, 0.85);
+
+        let c = Config::from_toml_str(
+            "[scrub]\nshuttle_deadzone = 0.2\nshuttle_slow_per_s = 6\n\
+             shuttle_fast_per_s = 30\nshuttle_word_above = 0.9\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            c.scrub().shuttle,
+            ShuttleConfig { deadzone: 0.2, slow_per_s: 6.0, fast_per_s: 30.0, word_above: 0.9 }
+        );
+        // The jog's knobs are untouched beside them: two gestures, one section.
+        assert_eq!(c.scrub().detent_deg, 15.0);
+
+        // A typo inside the group names the group's own keys.
+        let e = Config::from_toml_str("[scrub]\nshuttle_fastest = 30\n").unwrap_err();
+        assert!(e.contains("unknown shuttle setting 'fastest'"), "{e}");
+        assert!(e.contains("fast_per_s"), "{e}");
+        assert!(Config::from_toml_str("[scrub]\nshuttle_deadzone = \"x\"\n").is_err());
     }
 
     #[test]

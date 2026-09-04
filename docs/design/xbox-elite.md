@@ -11,7 +11,7 @@ keyboard (§10, option (ii)). Code: `src/evdev.rs` (the backend), `src/sticks.rs
 
 ## What it is
 
-hyprpad reads the 2026 Steam Controller puck over hidraw. This adds a **second
+hyprpad reads the 2026 Steam Controller controller over hidraw. This adds a **second
 source**: any ordinary Linux gamepad on `/dev/input/event*`, read over evdev,
 decoded into the *same* [`report::Frame`], and fed to the *same* loop. The Xbox
 Elite Series 2 is the pad it was built for — the owner has one — but nothing
@@ -21,7 +21,7 @@ Both controllers may be connected at once. Everything above the decoder — the
 gesture engine, the config, the mode engine, the bare-button router, the OSK
 bridge, the virtual gamepad, the cheat sheet — is unchanged and unaware.
 
-**A config written for the puck works on the Elite with no edit**, minus the
+**A config written for the controller works on the Elite with no edit**, minus the
 bindings that name a trackpad. `guide+r4`, `dpad_up`, `guide+stick_right`,
 `l2`/`r2` and the whole chord grammar spell the same physical controls on both.
 
@@ -58,7 +58,7 @@ canonical sysfs path under `/sys/devices/virtual/input/`. Note that a
 Bluetooth pad lives under `/sys/devices/virtual/misc/uhid/…` — *virtual/misc*,
 not *virtual/input* — so the rule does not catch it.
 
-Hotplug is the puck's own periodic rescan (`SCAN_INTERVAL`, 1.5 s, the same
+Hotplug is the controller's own periodic rescan (`SCAN_INTERVAL`, 1.5 s, the same
 cadence as `RECONNECT_SCAN_INTERVAL`) plus an immediate re-scan on any read
 error. No udev monitor, no inotify, no new dependency. The whole state machine
 — scan, open, grab, read, release, rescan — lives in one thread in
@@ -100,7 +100,7 @@ correctly with nothing to configure.
 | A / B / X / Y | `BTN_SOUTH` / `BTN_EAST` / `0x133` / `0x134` | `A`/`B`/`X`/`Y` | `a b x y` |
 | D-pad | `ABS_HAT0X/Y`, or `BTN_DPAD_*` | four `Dpad*` bits; a diagonal sets two | `dpad_*` |
 | LB / RB | `BTN_TL` / `BTN_TR` | `BumperL1` / `BumperR1` | `l1 r1` |
-| LT / RT analog | `ABS_Z`/`ABS_RZ` **or** `ABS_BRAKE`/`ABS_GAS` | `l2`/`r2`, scaled to the puck's `0..32767` | — |
+| LT / RT analog | `ABS_Z`/`ABS_RZ` **or** `ABS_BRAKE`/`ABS_GAS` | `l2`/`r2`, scaled to the controller's `0..32767` | — |
 | LT / RT full pull | *synthesised* | `TriggerL2Full` / `TriggerR2Full` | `l2 r2` |
 | View / Menu | `BTN_SELECT` / `BTN_START` | `View` / `Menu` | `view menu` |
 | L3 / R3 | `BTN_THUMBL` / `BTN_THUMBR` | `L3` / `R3` | `l3 r3` |
@@ -121,11 +121,11 @@ Three details worth naming:
   `{BTN_A, BTN_B, BTN_X, BTN_Y}`, and over Bluetooth `hid-input` maps HID
   button 4 → 0x133 and button 5 → 0x134, which the descriptor labels X and Y in
   that order. The two agree, so the legacy reading is the correct one.
-* **Y is inverted on the way in.** evdev's `+Y` is *down*; the puck's is *up*,
+* **Y is inverted on the way in.** evdev's `+Y` is *down*; the controller's is *up*,
   and the whole daemon — flicks, the OSK wire, the virtual pad — is written to
-  the puck's.
+  the controller's.
 * **The full-pull bit is a Schmitt trigger**, down at 85 % of travel and up at
-  70 %. The puck's is a firmware click; an Xbox trigger has none. Hysteresis
+  70 %. The controller's is a firmware click; an Xbox trigger has none. Hysteresis
   is not a nicety here: the gesture engine's chords are edge-triggered, so a
   trigger resting on a bare threshold would re-chord continuously.
 
@@ -133,7 +133,7 @@ Three details worth naming:
 
 `src/sticks.rs`.
 
-The puck's cursor is **position** control: `drive_cursor` differences the
+The controller's cursor is **position** control: `drive_cursor` differences the
 smoothed absolute pad coordinate, and the One Euro filter exists because
 differencing amplifies sensor noise. A stick is **rate** control — the
 deflection *is* a velocity command, it returns to a mechanical centre, and the
@@ -182,15 +182,15 @@ integrators are a **fourth deadline on the same mechanism**:
   deadzone, or a velocity is still decaying through the EMA after one was
   released. Centred and settled, it is `None`;
 * `None` contributes nothing to the loop's `wake` array, so the loop blocks
-  indefinitely — exactly as it does today with the puck asleep. **An idle
+  indefinitely — exactly as it does today with the controller asleep. **An idle
   controller costs zero wakeups.** `docs/09`'s "hyprpad must never busy-poll"
   holds unchanged;
 * the deadline is checked at the **top** of the loop, beside the rescan and the
   transient timer, and not only on a receive *timeout*. That is not tidiness: a
   moving stick produces a busy report stream, and a deadline honoured only on a
   timeout would then never fire at all;
-* a frame from a source *with* pads parks the integrators outright. The puck's
-  sticks are for guide flicks and its pads drive the cursor; a deflected puck
+* a frame from a source *with* pads parks the integrators outright. The controller's
+  sticks are for guide flicks and its pads drive the cursor; a deflected controller
   stick must never hold the deadline open;
 * the step is clamped to 50 ms, so the first step after a long idle gap cannot
   fling the cursor across the screen.
@@ -289,8 +289,8 @@ controllers cannot both drive.
   centre deadzone. A change-driven pad's re-sends therefore never steal the
   cursor;
 * **the capacitive flags are excluded from that test, and this is the subtle
-  bit.** `Cap0..3` fire on hand *contact* with the puck's grips, not on an
-  action. Counting them would make every frame from a puck a resting hand
+  bit.** `Cap0..3` fire on hand *contact* with the controller's grips, not on an
+  action. Counting them would make every frame from a controller a resting hand
   happens to be on "deliberate", and the two sources would swap the cursor back
   and forth at the report rate. Proximity is not intent;
 * a frame that *does* switches the active source, and switching runs the same
@@ -299,17 +299,17 @@ controllers cannot both drive.
   neutralised, and the rate integrators are dropped. Nothing is left held by the
   source that lost the device;
 * either controller may leave without the other. `Input::ReadersEnded` is the
-  puck going; `Input::EvdevGone` is the gamepad going; each releases only what
+  controller going; `Input::EvdevGone` is the gamepad going; each releases only what
   it was holding.
 
 `status.json` gains `"sources"` — every controller the daemon can hear, e.g.
-`["puck", "elite"]` — and `"layout"`, the cheat-sheet id of the one that is
+`["controller", "elite"]` — and `"layout"`, the cheat-sheet id of the one that is
 *driving*.
 
 ## 9. Haptics
 
 `HapticCtx::fire` is the **one place** a source without actuators is handled,
-through the pure `haptic_for(source, cfg, what)`. The puck has an actuator
+through the pure `haptic_for(source, cfg, what)`. The controller has an actuator
 behind each trackpad and its pulses are 200–600 µs; an Xbox pad has two rumble
 motors, which `ff-memless` runs at jiffy granularity and which need tens of
 milliseconds to spin up. There is no honest way to play a 250 Hz texture on one,
@@ -317,7 +317,7 @@ so every `Feel` is dropped there rather than at each of the dozen call sites —
 which is exactly what lets `drive_scroll`, `route_osk`, `drive_buttons` and the
 rest stay source-agnostic.
 
-Game rumble (`drive_rumble`) is untouched: it already only reaches the puck.
+Game rumble (`drive_rumble`) is untouched: it already only reaches the controller.
 
 ## 10. The on-screen keyboard — phase 2 as built, option (ii)
 
@@ -351,7 +351,7 @@ A binding overrides it per-binding — `h.keyboard { mode = "split", padless = {
 mode = "bottom", reflow = false } }`, or `keyboard split
 padless:bottom,overlay` in TOML — and the `padless:` word only spells out what
 it changes. The owner's `h.bind("guide+y", h.keyboard { mode = "split" })`
-needs no edit: it stays the split overlay on the puck and becomes the
+needs no edit: it stays the split overlay on the Steam Controller and becomes the
 displacing bottom deck on the Elite.
 
 ### 10.2 Snap navigation replaces the two stick cursors
@@ -370,7 +370,7 @@ one step on the edge, then nothing for 350 ms, then eight a second while held:
 
 | control | where | note |
 |---|---|---|
-| D-pad | `OskRoute::step`, per frame | the console answer; gated on `!source.has_pads()`, so the puck's D-pad under the keyboard still does nothing |
+| D-pad | `OskRoute::step`, per frame | the console answer; gated on `!source.has_pads()`, so the Steam Controller's D-pad under the keyboard still does nothing |
 | left stick | `drive_sticks`, off the stick deadline | thrown past `NAV_THROW_OUT` = 0.6, released inside `NAV_THROW_IN` = 0.35 (hysteresis, the shape the guide flicks use) |
 | right stick | same | nudges the **same** highlight — there is only ever one — rather than carrying a second cursor |
 
@@ -383,7 +383,7 @@ no new verb.
 
 The one thing the Deck map is missing here is still the commit itself, which
 the built-ins put on the two pad *clicks*. Rather than change what `A` means on
-the puck, `config::padless_osk_builtins()` gives it a padless-only home, laid
+the Steam Controller, `config::padless_osk_builtins()` gives it a padless-only home, laid
 under any config entry exactly as the built-in map is:
 
 ```lua

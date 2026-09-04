@@ -1,5 +1,10 @@
 # Research: running the 2026 Steam Controller over Bluetooth
 
+> **Vocabulary note (added 2026-09-03):** in this document "puck" often means
+> the *controller* itself, which the project no longer calls that. The puck is
+> the USB dongle (`28de:1304`); the controller is the device with the pads. The
+> prose below is left as it was written — see README §Vocabulary.
+
 *Produced 2026-09-03. The owner wants Bluetooth as the **daily** transport on the
 laptop — "having to plug in the puck is annoying, a USB cable dangling out of the
 side" — while the dongle stays with the tower. So this note is not a

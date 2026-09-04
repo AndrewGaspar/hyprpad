@@ -1,4 +1,4 @@
-//! Pure puck-frame → wire-report conversion, one function per profile.
+//! Pure controller-frame → wire-report conversion, one function per profile.
 //!
 //! Nothing here touches a device, a thread or a clock: given a
 //! [`report::Frame`] (or the raw bytes it was decoded from) and a sequence
@@ -8,16 +8,16 @@
 //!
 //! # The two paths are deliberately asymmetric
 //!
-//! * **triton** — [`puck_to_triton`] is a *pass-through*. The wired `1302`
-//!   descriptor declares input report `0x42` with a 53-byte payload; the puck
+//! * **triton** — [`controller_to_triton`] is a *pass-through*. The wired `1302`
+//!   descriptor declares input report `0x42` with a 53-byte payload; the controller
 //!   streams input report `0x42` with a 53-byte payload; they are the same
 //!   report. So the function copies the raw bytes and clears the handful of bits
 //!   §4.4 of `docs/research/uhid-steam-controller.md` says hyprpad must keep for
 //!   itself. Nothing is re-encoded, which means fields hyprpad does not model —
 //!   the IMU at bytes 30+, the undecoded tail — reach Steam intact.
-//! * **deck** — [`puck_to_deck`] is a *transcode* into the Steam Deck's 64-byte
+//! * **deck** — [`controller_to_deck`] is a *transcode* into the Steam Deck's 64-byte
 //!   packed report. Necessary because that protocol shares no layout with the
-//!   puck's, and the price of the identity SteamOS has proven.
+//!   controller's, and the price of the identity SteamOS has proven.
 //!
 //! # What gets stripped, and why
 //!
@@ -122,7 +122,7 @@ const RAW_QUICK_ACCESS: (usize, u8) = (2, 0x10);
 /// tolerates gaps. That applies across a transport switch too — the counters of
 /// the two links are unrelated, and the gap they produce is the same gap §4.4
 /// already permits.
-pub fn puck_to_triton(raw: &[u8], strip: StripMask) -> Option<TritonReport> {
+pub fn controller_to_triton(raw: &[u8], strip: StripMask) -> Option<TritonReport> {
     let mut out: TritonReport = [0u8; TRITON_REPORT_LEN];
     match (raw.first(), raw.len()) {
         (Some(&REPORT_ID_INPUT), TRITON_REPORT_LEN) => out.copy_from_slice(raw),
@@ -192,9 +192,9 @@ const DECK_REPORT_TYPE: u8 = 0x09;
 /// `report_size`, byte 3 — 64.
 const DECK_REPORT_SIZE: u8 = 0x40;
 
-/// Puck button → (Deck report byte, bit mask).
+/// Controller button → (Deck report byte, bit mask).
 ///
-/// Left column: `report::Button`, decoded from the puck's `0x42` by
+/// Left column: `report::Button`, decoded from the controller's `0x42` by
 /// `src/report.rs`. Right column: the `PackedInputDataReport` field of the same
 /// name, at its `packed_field(bits = …)` position.
 ///
@@ -243,24 +243,24 @@ const DECK_STEAM: (usize, u8) = (9, 0x20);
 /// Where Quick Access lands.
 const DECK_QUICK_ACCESS: (usize, u8) = (14, 0x04);
 
-/// Transcode one decoded puck frame into a Steam Deck input report.
+/// Transcode one decoded controller frame into a Steam Deck input report.
 ///
 /// `seq` becomes the `frame` field (bytes 4..8, little-endian u32) that
 /// InputPlumber bumps `wrapping_add(1)` on every write. The relay supplies it,
-/// so a repeated frame under a silent puck still advances the counter.
+/// so a repeated frame under a silent controller still advances the counter.
 ///
 /// # Fields that stay zero, and why
 ///
 /// * **accelerometer (24..30), gyro (30..36), magnetometer (36..44)** —
-///   `report::Frame` carries no IMU. The puck's `0x42` has IMU data at bytes 30+
+///   `report::Frame` carries no IMU. The controller's `0x42` has IMU data at bytes 30+
 ///   but only after an enable feature report, and `src/report.rs` explicitly
 ///   leaves those bytes undecoded. Relaying gyro is one of the standing
 ///   advantages of the `triton` pass-through, which needs no decoder at all.
 /// * **`l_stick_force` / `r_stick_force` (60..64)** — the capacitive stick
-///   sensors; see `DECK_BUTTONS` on why the puck's `Cap*` bits are not guessed
+///   sensors; see `DECK_BUTTONS` on why the controller's `Cap*` bits are not guessed
 ///   into them.
 /// * **`_unk31` (15)** — unknown in the reference implementation too.
-pub fn puck_to_deck(frame: &Frame, seq: u32) -> DeckReport {
+pub fn controller_to_deck(frame: &Frame, seq: u32) -> DeckReport {
     let mut out = deck_header(seq);
     for &(button, byte, mask) in &DECK_BUTTONS {
         if frame.pressed(button) {
@@ -312,7 +312,7 @@ fn put_u16(buf: &mut DeckReport, at: usize, v: u16) {
 
 /// Apply a [`StripMask`] to an already-built Deck report.
 ///
-/// Separate from [`puck_to_deck`] so the transcode stays a pure function of the
+/// Separate from [`controller_to_deck`] so the transcode stays a pure function of the
 /// frame and the masking policy stays one readable place.
 pub fn strip_deck(report: &mut DeckReport, strip: StripMask) {
     if strip.guide {
@@ -406,20 +406,20 @@ mod tests {
         raw[30] = 0xde; // an "IMU" byte the decoder does not model
         raw[53] = 0xad; // the last byte of the report
 
-        let out = puck_to_triton(&raw, StripMask::none()).expect("a 0x42 passes through");
+        let out = controller_to_triton(&raw, StripMask::none()).expect("a 0x42 passes through");
         assert_eq!(out.as_slice(), raw.as_slice(), "not one byte re-encoded");
     }
 
     #[test]
     fn triton_clears_the_guide_bit_and_leaves_the_rest_alone() {
         let raw = raw_with(&[Button::Steam, Button::A, Button::QuickAccess]);
-        let out = puck_to_triton(&raw, StripMask::guide_only()).unwrap();
+        let out = controller_to_triton(&raw, StripMask::guide_only()).unwrap();
         let f = Frame::decode(&out).unwrap();
         assert!(!f.pressed(Button::Steam), "the guide never reaches Steam");
         assert!(f.pressed(Button::A), "everything else is untouched");
         assert!(f.pressed(Button::QuickAccess), "not stripped unless asked");
 
-        let out = puck_to_triton(&raw, StripMask { guide: true, quick_access: true }).unwrap();
+        let out = controller_to_triton(&raw, StripMask { guide: true, quick_access: true }).unwrap();
         let f = Frame::decode(&out).unwrap();
         assert!(!f.pressed(Button::QuickAccess));
         assert!(f.pressed(Button::A));
@@ -429,33 +429,33 @@ mod tests {
     fn triton_relays_the_sequence_counter_untouched() {
         let mut raw = raw_with(&[]);
         raw[1] = 0xa7;
-        let out = puck_to_triton(&raw, StripMask::guide_only()).unwrap();
+        let out = controller_to_triton(&raw, StripMask::guide_only()).unwrap();
         assert_eq!(out[1], 0xa7, "byte 1 is relayed, never renumbered (§4.4)");
     }
 
     #[test]
     fn triton_refuses_anything_that_is_not_one_of_the_two_input_reports() {
-        assert!(puck_to_triton(&[], StripMask::none()).is_none());
+        assert!(controller_to_triton(&[], StripMask::none()).is_none());
         // The battery report the controller also streams.
         let mut battery = vec![0u8; 15];
         battery[0] = 0x43;
-        assert!(puck_to_triton(&battery, StripMask::none()).is_none());
+        assert!(controller_to_triton(&battery, StripMask::none()).is_none());
         // The lizard mouse, which really does stream over Bluetooth until
         // `src/lizard.rs` turns it off.
-        assert!(puck_to_triton(&[0x40, 0, 0, 0, 0, 0], StripMask::none()).is_none());
+        assert!(controller_to_triton(&[0x40, 0, 0, 0, 0, 0], StripMask::none()).is_none());
         // Right id, wrong length — both ids, both directions.
         let mut short = vec![0u8; 53];
         short[0] = 0x42;
-        assert!(puck_to_triton(&short, StripMask::none()).is_none());
+        assert!(controller_to_triton(&short, StripMask::none()).is_none());
         let mut long = vec![0u8; 54];
         long[0] = 0x45;
-        assert!(puck_to_triton(&long, StripMask::none()).is_none(), "0x45 is never 54 bytes");
+        assert!(controller_to_triton(&long, StripMask::none()).is_none(), "0x45 is never 54 bytes");
         let mut bt_short = vec![0u8; 45];
         bt_short[0] = 0x45;
-        assert!(puck_to_triton(&bt_short, StripMask::none()).is_none());
+        assert!(controller_to_triton(&bt_short, StripMask::none()).is_none());
         let mut swapped = vec![0u8; 46];
         swapped[0] = 0x42;
-        assert!(puck_to_triton(&swapped, StripMask::none()).is_none(), "0x42 is never 46 bytes");
+        assert!(controller_to_triton(&swapped, StripMask::none()).is_none(), "0x42 is never 46 bytes");
     }
 
     /// A 46-byte `0x45` from Bluetooth becomes a 54-byte `0x42`, **byte-exact**:
@@ -476,7 +476,7 @@ mod tests {
             *b = i as u8;
         }
 
-        let out = puck_to_triton(&bt, StripMask::none()).expect("a 0x45 is forwardable");
+        let out = controller_to_triton(&bt, StripMask::none()).expect("a 0x45 is forwardable");
 
         assert_eq!(out.len(), TRITON_REPORT_LEN, "the fake's descriptor declares 54");
         assert_eq!(out[0], REPORT_ID_INPUT, "re-framed under the id Steam expects");
@@ -504,8 +504,8 @@ mod tests {
         usb[1..BLE_REPORT_LEN].copy_from_slice(&bt[1..]);
         usb[46..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
 
-        let from_bt = puck_to_triton(&bt, StripMask::guide_only()).unwrap();
-        let from_usb = puck_to_triton(&usb, StripMask::guide_only()).unwrap();
+        let from_bt = controller_to_triton(&bt, StripMask::guide_only()).unwrap();
+        let from_usb = controller_to_triton(&usb, StripMask::guide_only()).unwrap();
 
         assert_eq!(from_bt[..46], from_usb[..46], "everything Steam acts on is identical");
         assert_eq!(&from_usb[46..], &usb[46..], "the dongle's quaternion is relayed untouched");
@@ -526,12 +526,12 @@ mod tests {
         bt[2] = 0x10; // Quick Access
         bt[3] = 0xff; // an untouched neighbour, to prove the mask is narrow
 
-        let kept = puck_to_triton(&bt, StripMask::none()).unwrap();
+        let kept = controller_to_triton(&bt, StripMask::none()).unwrap();
         assert_eq!(kept[4] & 0x01, 0x01);
         assert_eq!(kept[2] & 0x10, 0x10);
 
         let stripped =
-            puck_to_triton(&bt, StripMask { guide: true, quick_access: true }).unwrap();
+            controller_to_triton(&bt, StripMask { guide: true, quick_access: true }).unwrap();
         assert_eq!(stripped[4] & 0x01, 0, "the guide bit is withheld");
         assert_eq!(stripped[2] & 0x10, 0, "and so is Quick Access");
         assert_eq!(stripped[3], 0xff, "nothing else was touched");
@@ -542,7 +542,7 @@ mod tests {
         let n = triton_neutral(9);
         assert_eq!(n.len(), TRITON_REPORT_LEN);
         assert_eq!(n[0], REPORT_ID_INPUT);
-        assert_eq!(n[1], 9, "the counter still advances under a silent puck");
+        assert_eq!(n[1], 9, "the counter still advances under a silent controller");
         assert!(n[2..].iter().all(|&b| b == 0));
         let f = Frame::decode(&n).expect("a neutral report still decodes");
         assert_eq!(f.buttons, 0);
@@ -557,7 +557,7 @@ mod tests {
 
     fn deck_from(buttons: &[Button]) -> DeckReport {
         let f = Frame::decode(&raw_with(buttons)).unwrap();
-        puck_to_deck(&f, 0)
+        controller_to_deck(&f, 0)
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
         assert!(r[8..].iter().all(|&b| b == 0), "a neutral Deck report is header + zeros");
         assert_eq!(r.len(), DECK_REPORT_LEN);
         // The transcode of an all-zero frame is exactly the neutral report.
-        assert_eq!(puck_to_deck(&Frame::default(), 7), deck_neutral(7));
+        assert_eq!(controller_to_deck(&Frame::default(), 7), deck_neutral(7));
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
         raw[26..28].copy_from_slice(&(-600i16).to_le_bytes()); // r pad y
         raw[28..30].copy_from_slice(&12_550u16.to_le_bytes()); // r pad force
         let f = Frame::decode(&raw).unwrap();
-        let d = puck_to_deck(&f, 0);
+        let d = controller_to_deck(&f, 0);
 
         let i16at = |at: usize| i16::from_le_bytes(d[at..at + 2].try_into().unwrap());
         let u16at = |at: usize| u16::from_le_bytes(d[at..at + 2].try_into().unwrap());
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(n.iter().filter(|&&b| b != 0).count(), 3, "id, counter, guide");
 
         let raw = raw_with(&[Button::Steam, Button::A]);
-        let stripped = puck_to_triton(&raw, StripMask::guide_only()).unwrap();
+        let stripped = controller_to_triton(&raw, StripMask::guide_only()).unwrap();
         let mut back = stripped.to_vec();
         press_triton_guide(&mut back);
         assert_eq!(back.as_slice(), raw.as_slice(), "byte for byte, the original");

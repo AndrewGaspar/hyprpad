@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Andrew Gaspar",
   "license": "MIT",
-  "description": "The controller's mode in the bar: a glyph and the active hyprpad mode, shown only while the puck is connected. Clicking opens the cheat sheet on that mode.",
+  "description": "The controller's mode in the bar: a glyph and the active hyprpad mode, shown only while the controller is connected. Clicking opens the cheat sheet on that mode.",
   "kinds": [
     "bar-widget"
   ],

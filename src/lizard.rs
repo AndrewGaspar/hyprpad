@@ -11,12 +11,13 @@
 //!
 //! We do it exactly the way the mainline kernel `hid-steam` driver and SDL do:
 //! raw hidraw **feature reports** sent with the `HIDIOCSFEATURE` ioctl. On this
-//! kernel the puck binds `hid-generic`, not `hid-steam`, so there is no in-kernel
+//! kernel the controller binds `hid-generic`, not `hid-steam`, so there is no in-kernel
 //! lizard control to defer to — we must send the reports ourselves.
 //!
 //! ## The report sequence (source: Linux `drivers/hid/hid-steam.c`)
 //!
-//! The 2026 puck (`28de:1304`, `USB_DEVICE_ID_STEAM_CONTROLLER_PROTEUS`) is
+//! The 2026 controller — reached through the puck, `28de:1304`
+//! `USB_DEVICE_ID_STEAM_CONTROLLER_PROTEUS` — is
 //! driven under `STEAM_QUIRK_IBEX | STEAM_QUIRK_WIRELESS`. `steam_set_lizard_mode`
 //! with `enable = false` sends, in order:
 //!
@@ -28,7 +29,7 @@
 //!
 //! The IBEX feature-report wire frame is `[report_id][cmd bytes…]` zero-padded to
 //! the report length, where `report_id = REPORT_ID_FEATURES_CONTROLLER` (`1`).
-//! On this puck the controller feature report (id 1) declares a **63-byte** body,
+//! On this device the controller feature report (id 1) declares a **63-byte** body,
 //! so the full frame the kernel transfers is **64 bytes** (`hid_report_len` =
 //! 63 + 1 for the id) — verified live by reading the device's HID report
 //! descriptor. `ID_SET_SETTINGS_VALUES` packs as `0x87, len, (setting, val_lo,
@@ -51,18 +52,18 @@
 //!   register behind "holding the Steam button while deliberating turns the
 //!   controller off": the firmware owns that timer, not Steam and not hyprpad.
 //!   Nothing is written unless the config asks.
-//! * [`read_settings`] / [`read_puck_settings`] — the `0x89`/`0x8B`/`0x8C`
+//! * [`read_settings`] / [`read_controller_settings`] — the `0x89`/`0x8B`/`0x8C`
 //!   round trip that asks the firmware what a setting currently is, what
 //!   maximum it accepts and what its factory default is. Read-only, and the
 //!   only way to learn the units the write above needs, since Valve publishes
-//!   no defaults table. `hyprpad puck-settings` is its front-end.
+//!   no defaults table. `hyprpad controller-settings` is its front-end.
 //! * [`turn_off_controller`] — `0x9F ID_TURN_OFF_CONTROLLER`, the *deliberate*
 //!   power-off that replaces the accidental one, on a chord, `hyprpad off`, or
 //!   a right-click on the bar widget.
 //!
 //! ## Safety of concurrent access, and the sleeping controller
 //!
-//! hidraw is not exclusive (docs/03): opening a puck node read-write and sending
+//! hidraw is not exclusive (docs/03): opening a controller node read-write and sending
 //! a feature report works while Steam holds the same node. The reports are
 //! idempotent, so re-sending them is harmless.
 //!
@@ -98,7 +99,7 @@ const SETTING_STEAM_WATCHDOG_ENABLE: u8 = 71;
 
 // The power-related command and setting numbers are taken from
 // [`crate::uhid::settings`] rather than respelled here, so the two halves of
-// the project — the one that *writes* these to the real puck and the one that
+// the project — the one that *writes* these to the real controller and the one that
 // *decodes* Steam writing them to the virtual one — cannot drift. Their
 // ultimate source is SDL's `controller_constants.h`, catalogued in
 // `docs/research/guide-hold-poweroff.md` §1.4.
@@ -118,7 +119,7 @@ const SETTING_SLEEP_INACTIVITY_TIMEOUT: u8 =
 /// `SETTING_IMU_MODE` (48 / `0x30`) — the gyro switch. A `u16` bitmask of
 /// [`crate::uhid::settings::gyro_mode`] flags; `0` is off. Written into the same
 /// `0x87` frame as everything else here, which is what keeps the "one writer"
-/// invariant true while Steam drives the puck's IMU through the relay.
+/// invariant true while Steam drives the controller's IMU through the relay.
 const SETTING_IMU_MODE: u8 = crate::uhid::settings::setting::IMU_MODE;
 
 /// `ID_GET_SETTINGS_VALUES` — ask the firmware what a setting is *currently*
@@ -146,7 +147,7 @@ const TURN_OFF_MAGIC: &[u8; 4] = b"off!";
 const MAX_SETTINGS_PAIRS: usize = (WIRE_LEN - 3) / 3;
 
 /// Length of the controller feature-report body, excluding the leading report
-/// id. The puck's controller feature report (id 1) declares 63 payload bytes;
+/// id. The controller feature report (id 1) declares 63 payload bytes;
 /// with the report id that makes a 64-byte wire frame (confirmed from the live
 /// HID report descriptor). Sending any other length STALLs the endpoint.
 const FEATURE_BODY_LEN: usize = 63;
@@ -196,7 +197,7 @@ pub const RESEND_INTERVAL: Duration = Duration::from_secs(30);
 /// carry — "as long as the firmware can express" — which is ~65 s under the
 /// shortest candidate unit (milliseconds), 18 hours under seconds, and is safe
 /// under *both* readings. §3.A's own fallback is the same idea, and
-/// `0x8B ID_GET_SETTINGS_MAXS` ([`read_settings`], `hyprpad puck-settings`) is
+/// `0x8B ID_GET_SETTINGS_MAXS` ([`read_settings`], `hyprpad controller-settings`) is
 /// how to learn what maximum the firmware will actually accept.
 ///
 /// To test the "`0` = never" reading, write the integer explicitly:
@@ -212,7 +213,7 @@ pub const POWER_SETTING_OFF: u16 = u16::MAX;
 ///
 /// * **`steam_button_poweroff`** (`SETTING_STEAMBUTTON_POWEROFF_TIME`, 25) is
 ///   the register behind the complaint this feature exists for: the firmware,
-///   not Steam and not hyprpad, powers the puck off on a long Steam-button hold
+///   not Steam and not hyprpad, powers the controller off on a long Steam-button hold
 ///   (`docs/research/guide-hold-poweroff.md` §1). Its **units, default, maximum
 ///   and whether `0` disables it are all UNVERIFIED**, as is whether Triton
 ///   honours the setting at all — the name and number come from a shared enum
@@ -224,8 +225,8 @@ pub const POWER_SETTING_OFF: u16 = u16::MAX;
 ///   *any* setting in this frame; UNVERIFIED on Triton.
 ///
 /// Both are therefore knobs the owner is expected to **test**: read them with
-/// `hyprpad puck-settings 25 50`, write a value, read it back, then time a hold
-/// with a stopwatch. See the verify recipe in `docs/design/puck-power.md`.
+/// `hyprpad controller-settings 25 50`, write a value, read it back, then time a hold
+/// with a stopwatch. See the verify recipe in `docs/design/controller-power.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PowerSettings {
     /// `SETTING_STEAMBUTTON_POWEROFF_TIME` (25), raw as written to the wire.
@@ -290,18 +291,18 @@ pub fn power_settings() -> PowerSettings {
 // The IMU (gyro) hold — gap G5 of `docs/design/uhid-relay.md`
 // ---------------------------------------------------------------------------
 
-/// Who currently decides what the puck's IMU is doing, and what they decided.
+/// Who currently decides what the controller's IMU is doing, and what they decided.
 ///
 /// # Why this lives here and not in the relay
 ///
 /// The relay decodes Steam's writes; it does not own a descriptor on the real
-/// puck and must not acquire one. `docs/research/uhid-steam-controller.md` §5.2
+/// controller and must not acquire one. `docs/research/uhid-steam-controller.md` §5.2
 /// is explicit that hyprpad writes the hardware **through one writer**, and for
 /// feature reports that writer is this module. So the relay's contribution is a
 /// number in this cell, and the number rides out on the *same*
 /// `ID_SET_SETTINGS_VALUES` frame [`disable_lizard_settings_report`] already
 /// builds — which is also what makes it survive the 30 s
-/// [`RESEND_INTERVAL`] re-send, a puck reconnect and a power cycle for free,
+/// [`RESEND_INTERVAL`] re-send, a controller reconnect and a power cycle for free,
 /// with no second timer and no second code path.
 ///
 /// # The two authorities
@@ -345,7 +346,7 @@ pub struct ImuHold {
 }
 
 impl ImuHold {
-    /// The mode the puck should be holding right now, or `None` while nothing
+    /// The mode the controller should be holding right now, or `None` while nothing
     /// has ever asked and the frame should stay as it was.
     pub fn effective(&self) -> Option<u16> {
         if !self.engaged {
@@ -394,7 +395,7 @@ pub fn set_imu_preference(mode: u16) {
 /// away), which hands the IMU back to [`ImuHold::preference`].
 ///
 /// Returns whether the effective mode changed, so the caller can skip the
-/// [`nudge`] when Steam re-sends a mode the puck is already holding — Steam
+/// [`nudge`] when Steam re-sends a mode the controller is already holding — Steam
 /// repeats its settings writes, and each one must not become a feature report.
 pub fn set_imu_requested(mode: Option<u16>) -> bool {
     let Ok(mut hold) = IMU_HOLD.write() else { return false };
@@ -497,7 +498,7 @@ fn set_default_digital_mappings_report() -> [u8; WIRE_LEN] {
 /// published (`docs/research/guide-hold-poweroff.md` §6), so restoring a guess
 /// would be worse than leaving the owner's chosen value in place — and a value
 /// the daemon wrote is in any case not known to survive a power cycle.
-/// `hyprpad puck-settings 25 50` reads the firmware's own defaults
+/// `hyprpad controller-settings 25 50` reads the firmware's own defaults
 /// (`0x8C ID_GET_SETTINGS_DEFAULTS`) for anyone who wants to put them back.
 ///
 /// It **does** revert the gyro, and unlike the power settings there is
@@ -505,7 +506,7 @@ fn set_default_digital_mappings_report() -> [u8; WIRE_LEN] {
 /// place only because Steam asked, and Steam is losing the device. So the pair
 /// goes out one last time carrying [`ImuHold::preference`] — off unless the
 /// owner asked for `gyro = true`. Without this, a session that ended while a
-/// game had the gyro on would leave the puck streaming IMU data to nobody until
+/// game had the gyro on would leave the controller streaming IMU data to nobody until
 /// its next power cycle.
 fn enable_lizard_settings_report(imu: ImuHold) -> [u8; WIRE_LEN] {
     let mut pairs = vec![(SETTING_LIZARD_MODE, 1), (SETTING_STEAM_WATCHDOG_ENABLE, 1)];
@@ -635,8 +636,8 @@ fn send_sequence(fd: RawFd, reports: &[[u8; WIRE_LEN]]) -> Result<(), SendErr> {
 ///
 /// # "Try every node, any success wins" is also what makes Bluetooth work
 ///
-/// The rule was written for the puck: it exposes one interface per pairing slot
-/// plus a dongle-control interface, only the slot with the connected controller
+/// The rule was written for the puck (the dongle): it exposes one interface per
+/// pairing slot plus a dongle-control interface, only the slot with the connected controller
 /// accepts a controller feature report, and the active slot can change on
 /// replug — so trying all of them and accepting one success was already the
 /// honest way to address "wherever the controller actually is".
@@ -738,7 +739,7 @@ fn turn_off_report() -> [u8; WIRE_LEN] {
 /// This is the *replacement* for the firmware's guide-hold power-off, not an
 /// addition to it: the point of [`PowerSettings::steam_button_poweroff`] is to
 /// stop the hold from firing while deliberating, and the point of this is to
-/// still have a way to put the puck to sleep.
+/// still have a way to put the controller to sleep.
 ///
 /// Best-effort against a possibly-absent controller, like every other write
 /// here: a controller that is asleep STALLs every node and this returns
@@ -927,7 +928,7 @@ impl FeatureDevice for HidrawDevice {
         match send_feature_report(self.fd, report) {
             Ok(()) => Ok(()),
             Err(SendErr::Stall) => Err("STALL (no controller attached to this slot)".to_string()),
-            // `read_puck_settings` tries every node in turn and reports the
+            // `read_controller_settings` tries every node in turn and reports the
             // first that answers, so a refusal here is just "not this node" —
             // the same shape as a stall, and it needs the same wording rather
             // than a bare errno the user cannot act on.
@@ -1007,7 +1008,7 @@ fn settings_table(
 ///
 /// Read-only: the only thing it sends is a query. Nothing here can change the
 /// controller's state.
-pub fn read_puck_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
+pub fn read_controller_settings(ids: &[u8]) -> Result<Vec<SettingReport>, String> {
     if ids.is_empty() {
         return Err("no setting ids given".to_string());
     }
@@ -1051,11 +1052,11 @@ pub enum ExitAction {
     /// emulation so a stopped daemon never leaves the controller inert. The
     /// default, and every release before the knob existed.
     Restore,
-    /// Leave lizard mode **disabled** — the lizard-free boot. The puck stays
+    /// Leave lizard mode **disabled** — the lizard-free boot. The controller stays
     /// silent on the desktop between daemon restarts, which is the point: no
     /// firmware arrow keys typing into whatever has focus while nothing owns
     /// the controller. The cost is that a crashed or stopped daemon leaves a
-    /// puck that does nothing at all until hyprpad runs again, which is why
+    /// controller that does nothing at all until hyprpad runs again, which is why
     /// this pairs with a user unit that restarts it
     /// (`packaging/systemd/user/hyprpad.service`).
     LeaveDisabled,
@@ -1075,7 +1076,7 @@ impl ExitAction {
     }
 
     /// Whether this action writes anything to the controller at all.
-    pub fn writes_to_the_puck(self) -> bool {
+    pub fn writes_to_the_controller(self) -> bool {
         matches!(self, ExitAction::Restore)
     }
 }
@@ -1111,7 +1112,7 @@ pub fn restore_lizard_on_exit() {
         },
         ExitAction::LeaveDisabled => eprintln!(
             "hyprpad: leaving lizard mode DISABLED on exit \
-             (restore_lizard_on_exit = false) — the puck does nothing on the \
+             (restore_lizard_on_exit = false) — the controller does nothing on the \
              desktop until hyprpad runs again"
         ),
     }
@@ -1122,7 +1123,7 @@ pub fn restore_lizard_on_exit() {
 /// [`nudge`] rings it and [`own_lizard_loop`] waits on it instead of sleeping,
 /// so a setting the daemon just changed reaches the controller in milliseconds
 /// rather than at the next 30 s tick — **without a second thread ever touching
-/// the puck**. That is the whole point: `docs/research/uhid-steam-controller.md`
+/// the controller**. That is the whole point: `docs/research/uhid-steam-controller.md`
 /// §5.2 requires one writer, and this keeps the feature-report writer singular
 /// while still being responsive to Steam.
 static RESEND_NOW: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -1170,7 +1171,7 @@ pub fn own_lizard_loop() {
         match disable_lizard_mode() {
             Ok(()) => {
                 if !last_ok {
-                    eprintln!("hyprpad: lizard mode disabled on the puck (owning it)");
+                    eprintln!("hyprpad: lizard mode disabled on the controller (owning it)");
                     let power = power_settings();
                     if !power.is_empty() {
                         // Name the values: they are guesses whose units are
@@ -1185,7 +1186,7 @@ pub fn own_lizard_loop() {
                             .collect();
                         eprintln!(
                             "hyprpad: firmware power settings written with it: {} \
-                             (units UNVERIFIED — see `hyprpad puck-settings 25 50`)",
+                             (units UNVERIFIED — see `hyprpad controller-settings 25 50`)",
                             pairs.join(", ")
                         );
                     }
@@ -1304,18 +1305,18 @@ mod tests {
     #[test]
     fn the_default_exit_restores_lizard_mode() {
         assert_eq!(ExitAction::decide(true), ExitAction::Restore);
-        assert!(ExitAction::decide(true).writes_to_the_puck());
+        assert!(ExitAction::decide(true).writes_to_the_controller());
     }
 
-    /// The lizard-free boot: exit leaves lizard mode DISABLED, so the puck never
+    /// The lizard-free boot: exit leaves lizard mode DISABLED, so the controller never
     /// types into the desktop between daemon restarts. The cost — a stopped
-    /// daemon means a puck that does nothing — is the trade the knob exists to
+    /// daemon means a controller that does nothing — is the trade the knob exists to
     /// let an owner make, and it is why this pairs with a restarting user unit.
     #[test]
     fn the_lizard_free_exit_leaves_it_disabled_and_touches_nothing() {
         assert_eq!(ExitAction::decide(false), ExitAction::LeaveDisabled);
         assert!(
-            !ExitAction::decide(false).writes_to_the_puck(),
+            !ExitAction::decide(false).writes_to_the_controller(),
             "the lizard-free exit must not write to the controller at all"
         );
     }
@@ -1781,7 +1782,7 @@ mod tests {
 
     /// The exit path restores hyprpad's preference, discarding Steam's request
     /// — Steam is losing the device, so its opinion stops counting. Without
-    /// this a session that ended with a gyro game open would leave the puck
+    /// this a session that ended with a gyro game open would leave the controller
     /// streaming IMU data to nobody.
     #[test]
     fn the_exit_frame_restores_the_preference_and_forgets_what_steam_asked() {

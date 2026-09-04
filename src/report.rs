@@ -79,21 +79,21 @@ const BUTTON_BITS: [(usize, u8, Button); 30] = [
 /// Which backend produced a [`Frame`] — and therefore what the frame's empty
 /// fields *mean*.
 ///
-/// The daemon's vocabulary is the puck's: face buttons, grips, two sticks, two
+/// The daemon's vocabulary is the controller's: face buttons, grips, two sticks, two
 /// trackpads. A second backend ([`crate::evdev`]) fills the same struct from an
 /// ordinary Linux gamepad, which has no trackpads and no per-pad actuators. The
 /// difference is not "the pads happen to be untouched this frame" — it is "this
 /// device has no pads at all", and every consumer that would otherwise idle
 /// forever on a touch bit needs to be able to tell the two apart.
 ///
-/// [`Frame`] derives `Default`, and [`Source::Puck`] is the default, so every
-/// existing test and the whole puck path are byte-identical to before this
+/// [`Frame`] derives `Default`, and [`Source::SteamController`] is the default, so every
+/// existing test and the whole controller path are byte-identical to before this
 /// existed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Source {
-    /// The 2026 Steam Controller puck, decoded from hidraw ([`Frame::decode`]).
+    /// The 2026 Steam Controller itself, decoded from hidraw ([`Frame::decode`]).
     #[default]
-    Puck,
+    SteamController,
     /// A generic Linux gamepad read over evdev ([`crate::evdev`]) — the Xbox
     /// Elite Series 2 is the one this was built for. Phase 2's Bluetooth hidraw
     /// sidecar (`docs/design/xbox-elite.md`) will be a third variant beside it,
@@ -101,9 +101,9 @@ pub enum Source {
     Evdev,
 }
 
-/// The cheat sheet's layout id for the puck —
+/// The cheat sheet's layout id for the controller —
 /// `shell/hyprpad.cheatsheet/layouts/steam-controller-2026.json`.
-pub const LAYOUT_PUCK: &str = "steam-controller-2026";
+pub const LAYOUT_STEAM_CONTROLLER: &str = "steam-controller-2026";
 
 /// The cheat sheet's layout id for a gamepad read over evdev. Every pad the
 /// second backend adopts draws as an Xbox-shaped one: two asymmetric sticks, a
@@ -118,7 +118,7 @@ impl Source {
     /// `layouts/<id>.json`.
     pub const fn layout(self) -> &'static str {
         match self {
-            Source::Puck => LAYOUT_PUCK,
+            Source::SteamController => LAYOUT_STEAM_CONTROLLER,
             Source::Evdev => LAYOUT_XBOX_ELITE_2,
         }
     }
@@ -130,12 +130,12 @@ impl Source {
     /// only the layout id the daemon published — but still needs to know
     /// whether the reader has trackpads, because the ambient cursor and scroll
     /// rows say different things if they do not. An unknown id is read as the
-    /// puck, the safe default for a config written against it.
+    /// controller, the safe default for a config written against it.
     pub fn from_layout(id: &str) -> Source {
         if id == LAYOUT_XBOX_ELITE_2 {
             Source::Evdev
         } else {
-            Source::Puck
+            Source::SteamController
         }
     }
 
@@ -146,15 +146,15 @@ impl Source {
     /// finger. Nothing has to be special-cased; this is the *reason* nothing
     /// has to be.
     pub fn has_pads(self) -> bool {
-        matches!(self, Source::Puck)
+        matches!(self, Source::SteamController)
     }
 
-    /// Whether this device can play the puck's `0x81` pulse reports. A rumble
+    /// Whether this device can play the controller's `0x81` pulse reports. A rumble
     /// motor cannot: `ff-memless` runs at jiffy granularity and an ERM motor
     /// needs tens of milliseconds to spin up, so a 250 Hz texture would be
     /// noise. Phase 2 maps only `Gesture`/`Commit` to a short rumble tap.
     pub fn has_haptics(self) -> bool {
-        matches!(self, Source::Puck)
+        matches!(self, Source::SteamController)
     }
 
     /// Whether the cursor on this device is *rate* controlled (a stick is a
@@ -218,7 +218,7 @@ impl Frame {
     /// and `0x45` carries bytes 1–45 at identical offsets. So the short report
     /// costs the decoder nothing at all: every field below is present either
     /// way, and this is a length/id guard rather than a second decoder. Only
-    /// [`crate::uhid::translate::puck_to_triton`], which forwards raw bytes to a
+    /// [`crate::uhid::translate::controller_to_triton`], which forwards raw bytes to a
     /// fake device whose descriptor declares `0x42` at 54, has to re-frame.
     ///
     /// The controller's other reports — `0x40` (the lizard mouse, 6 bytes),
@@ -240,7 +240,7 @@ impl Frame {
             }
         }
         Some(Frame {
-            source: Source::Puck,
+            source: Source::SteamController,
             counter: raw[1],
             buttons,
             l2: u16le(6),
@@ -259,7 +259,7 @@ impl Frame {
 
     /// Set or clear one button bit.
     ///
-    /// The puck's decoder builds `buttons` in one pass from the wire, but a
+    /// The controller's decoder builds `buttons` in one pass from the wire, but a
     /// change-driven backend ([`crate::evdev`]) is handed one button at a time
     /// and keeps a persistent frame between events, so it needs the inverse of
     /// [`pressed`](Self::pressed).
@@ -283,9 +283,9 @@ impl Frame {
     /// therefore never steal the cursor from the pad the hand is really on.
     ///
     /// **The capacitive flags are excluded**, and that is the whole subtlety
-    /// here. `Cap0..3` fire on *hand contact* with the puck's grips, not on an
-    /// action — so a hand simply resting on the puck while the other one drives
-    /// an Xbox pad would otherwise make every puck frame "deliberate" and the
+    /// here. `Cap0..3` fire on *hand contact* with the controller's grips, not on an
+    /// action — so a hand simply resting on the controller while the other one drives
+    /// an Xbox pad would otherwise make every controller frame "deliberate" and the
     /// two sources would fight over the cursor several hundred times a second.
     /// Proximity is not intent. A press, a click, a trigger or a stick is.
     pub fn is_neutral(&self) -> bool {
@@ -366,7 +366,7 @@ mod tests {
 
     /// The 54-byte `0x42` a dongle would have produced from the same state:
     /// the id swapped and the quaternion tail appended as zeros. Exactly the
-    /// inverse of the re-frame `crate::uhid::translate::puck_to_triton` does on
+    /// inverse of the re-frame `crate::uhid::translate::controller_to_triton` does on
     /// the way out to Steam.
     fn as_0x42(bt: &[u8]) -> Vec<u8> {
         assert_eq!(bt.len(), REPORT_LEN_INPUT_BLE);
@@ -390,7 +390,7 @@ mod tests {
             let over_bt = Frame::decode(&bt).unwrap_or_else(|| panic!("{name} must decode"));
             let over_dongle = Frame::decode(&as_0x42(&bt)).expect("the 0x42 form must decode too");
             assert_eq!(over_bt, over_dongle, "{name}: the transport must not change the frame");
-            assert_eq!(over_bt.source, Source::Puck, "{name}: one controller, one source");
+            assert_eq!(over_bt.source, Source::SteamController, "{name}: one controller, one source");
         }
     }
 

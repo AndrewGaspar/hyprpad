@@ -15,11 +15,17 @@ fn main() {
         // daemon with SIGUSR1 so the `0x9F` write goes out over the descriptors
         // it already holds — see `run::controller_off_command`.
         Some("off") => run::controller_off_command().unwrap_or_else(|e| { eprintln!("hyprpad: {e}"); std::process::exit(1); }),
-        // `puck-settings [id…]`: read firmware settings back off the puck.
-        // Read-only: it sends the `0x89`/`0x8B`/`0x8C` queries and prints what
-        // came back. Needs the controller's descriptors, through the same
-        // acquire path the daemon uses (broker first, direct open otherwise).
-        Some("puck-settings") => puck_settings(&args[2..]),
+        // `controller-settings [id…]`: read firmware settings back off the
+        // controller. Read-only: it sends the `0x89`/`0x8B`/`0x8C` queries and
+        // prints what came back. Needs the controller's descriptors, through the
+        // same acquire path the daemon uses (broker first, direct open
+        // otherwise).
+        //
+        // `puck-settings` is the pre-Bluetooth spelling, from when the whole
+        // project called the controller "the puck". Kept as an undocumented
+        // alias — it is in shell history and in `docs/design/controller-power.md`'s
+        // older revisions — but it is not in the usage text.
+        Some("controller-settings" | "puck-settings") => controller_settings(&args[2..]),
         Some("monitor") => monitor(),
         // `bindings [--json]`: print the current bindings — the cheat sheet's
         // data source. Reads the config the daemon would read, so it is safe to
@@ -71,13 +77,13 @@ fn main() {
             broker::run(&opts).unwrap_or_else(|e| { eprintln!("hyprpad broker: {e}"); std::process::exit(1); });
         }
         _ => {
-            eprintln!("usage: hyprpad <run|reload|off|bindings|puck-settings|monitor|setup|broker>");
+            eprintln!("usage: hyprpad <run|reload|off|bindings|controller-settings|monitor|setup|broker>");
             eprintln!();
             eprintln!("  run              drive Hyprland from the controller (gestures -> dispatch)");
             eprintln!("  reload           tell the running daemon to re-read its config (SIGHUP)");
             eprintln!("  off              turn the CONTROLLER off (SIGUSR1 to the daemon)");
             eprintln!("  bindings [--json] print the current bindings (the cheat sheet's data)");
-            eprintln!("  puck-settings [id…]  read firmware settings off the puck (read-only)");
+            eprintln!("  controller-settings [id…]  read firmware settings off the controller (read-only)");
             eprintln!("  monitor          decode and print controller events (passive; Steam-safe)");
             eprintln!("  setup [--check|--user]  install the Steam hook; print the host and login steps");
             eprintln!("  broker           privileged fd helper (root, socket-activated; see setup)");
@@ -86,18 +92,18 @@ fn main() {
     }
 }
 
-/// `hyprpad puck-settings [id…]` — ask the firmware what its settings are.
+/// `hyprpad controller-settings [id…]` — ask the firmware what its settings are.
 ///
 /// Defaults to the two power settings this exists for: 25
 /// (`SETTING_STEAMBUTTON_POWEROFF_TIME`, the guide-hold power-off timer) and 50
 /// (`SETTING_SLEEP_INACTIVITY_TIMEOUT`). Prints current, max and default side by
 /// side, because the units and defaults of both are unverified and the maximum
 /// is the only thing that tells you the scale — see
-/// `docs/design/puck-power.md` for the recipe this is step one of.
+/// `docs/design/controller-power.md` for the recipe this is step one of.
 ///
 /// Strictly read-only. The only frames it sends are the `0x89`/`0x8B`/`0x8C`
 /// queries; nothing here writes a setting or powers anything off.
-fn puck_settings(args: &[String]) {
+fn controller_settings(args: &[String]) {
     let ids: Vec<u8> = if args.is_empty() {
         vec![25, 50]
     } else {
@@ -106,15 +112,15 @@ fn puck_settings(args: &[String]) {
             match a.parse::<u8>() {
                 Ok(id) => ids.push(id),
                 Err(_) => {
-                    eprintln!("hyprpad puck-settings: {a:?} is not a setting id (0-255)");
-                    eprintln!("usage: hyprpad puck-settings [id…]   (default: 25 50)");
+                    eprintln!("hyprpad controller-settings: {a:?} is not a setting id (0-255)");
+                    eprintln!("usage: hyprpad controller-settings [id…]   (default: 25 50)");
                     std::process::exit(2);
                 }
             }
         }
         ids
     };
-    let table = hyprpad::lizard::read_puck_settings(&ids).unwrap_or_else(|e| {
+    let table = hyprpad::lizard::read_controller_settings(&ids).unwrap_or_else(|e| {
         eprintln!("hyprpad: {e}");
         std::process::exit(1);
     });

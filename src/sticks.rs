@@ -3,7 +3,7 @@
 //!
 //! # Why this is not the pad's pipeline
 //!
-//! The puck's cursor is **position** control. [`crate::run::drive_cursor`]
+//! The controller's cursor is **position** control. [`crate::run::drive_cursor`]
 //! differences the smoothed absolute pad coordinate, and the One Euro filter in
 //! [`crate::filter::PadDamper`] exists because differencing amplifies sensor
 //! noise (`docs/research/pointer-damping.md` §1.2). A stick is **rate**
@@ -40,7 +40,7 @@
 //! [`StickDrive::deadline`] returns `Some(when)` **only while something is
 //! actually moving** — a stick outside its deadzone, or a velocity still
 //! decaying through the EMA after one was released — and `None` otherwise.
-//! Centred, the loop blocks indefinitely exactly as it does today with the puck
+//! Centred, the loop blocks indefinitely exactly as it does today with the controller
 //! asleep. Nothing spins, nothing polls, and an idle pad costs zero wakeups.
 //!
 //! Everything in this module is pure over `Instant`, so the whole decision
@@ -236,7 +236,7 @@ impl StickIntegrator {
 
 /// Both sticks' normalised deflection, as last seen on a frame.
 ///
-/// `+y` is **up**, the puck's convention, which [`crate::evdev`] has already
+/// `+y` is **up**, the controller's convention, which [`crate::evdev`] has already
 /// converted to. The cursor and scroll paths flip it themselves where the
 /// output wants screen coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -266,7 +266,7 @@ impl Deflection {
 /// expired, steps whichever integrators are live.
 pub struct StickDrive {
     /// The last deflection seen from a rate-controlled source. Zeroed the
-    /// moment a position-controlled source (the puck) becomes active, so a
+    /// moment a position-controlled source (the controller) becomes active, so a
     /// stale Xbox frame cannot keep the deadline armed.
     pub sticks: Deflection,
     /// Whether the active source is rate-controlled at all.
@@ -287,8 +287,18 @@ pub struct StickDrive {
     /// what a spring-loaded stick can actually do accurately. The left stick is
     /// the primary; the right one nudges the same highlight rather than
     /// carrying a second cursor, because there is only ever one highlight.
+    ///
+    /// Like the shuttle below, the repeat has to come off the deadline: a
+    /// gamepad reports only on change, so a stick held over says nothing.
     pub osk_left: crate::osk::NavRepeat,
     pub osk_right: crate::osk::NavRepeat,
+    /// Whether the caret shuttle is holding the left stick over
+    /// ([`crate::filter::ShuttlePacer`]). Set per frame by the daemon, because
+    /// this is the one consumer whose deadzone and gate live somewhere else
+    /// entirely — in `[scrub]`, behind a held guide — and it needs the same
+    /// clock for the same reason: a gamepad reports only on change, so a stick
+    /// held over says nothing and the taps have to come from a deadline.
+    shuttle: bool,
     /// When the next step is due. `None` means nothing is moving and the loop
     /// may block indefinitely.
     due: Option<Instant>,
@@ -310,13 +320,14 @@ impl StickDrive {
             scroll_detent: 0.0,
             osk_left: crate::osk::NavRepeat::default(),
             osk_right: crate::osk::NavRepeat::default(),
+            shuttle: false,
             due: None,
         }
     }
 
     /// Record one frame's sticks and re-arm (or disarm) the deadline.
     ///
-    /// A frame from a source with pads parks everything: the puck drives the
+    /// A frame from a source with pads parks everything: the controller drives the
     /// cursor from its trackpads and its sticks are for flicks only, so the
     /// rate integrators must be silent and, above all, must not hold the
     /// deadline open.
@@ -337,7 +348,25 @@ impl StickDrive {
         self.osk_left.reset();
         self.osk_right.reset();
         self.sticks = Deflection::default();
+        self.shuttle = false;
         self.due = None;
+    }
+
+    /// Say whether the caret shuttle wants the clock, and re-arm accordingly.
+    ///
+    /// Called once per frame *and* once per step with the answer the scrub
+    /// handler just produced ([`crate::filter::ShuttlePacer::running`]), so a
+    /// stick held over keeps waking the loop and a released one lets it block
+    /// again.
+    ///
+    /// Deliberately **not** gated on `cfg.enabled`: `[sticks]` tunes the three
+    /// rate-controlled pairs (cursor, scroll, OSK) and turning it off says the
+    /// sticks do not stand in for the pads. The scrub has its own master
+    /// switch, its own deadzone and its own guard, and a config that turned
+    /// the stick *pointer* off has not said a word about the caret.
+    pub fn set_shuttle(&mut self, running: bool, cfg: &SticksConfig, now: Instant) {
+        self.shuttle = running;
+        self.rearm(cfg, now);
     }
 
     /// Whether anything is moving: a stick outside its deadzone, or a velocity
@@ -347,6 +376,12 @@ impl StickDrive {
     /// on, disarming the instant a stick centres would leave the cursor's last
     /// few pixels un-integrated and the motion would end with a visible clip.
     pub fn armed(&self, cfg: &SticksConfig) -> bool {
+        // The caret shuttle answers first and on its own terms: it is the
+        // scrub's, not the pointer's, so `[sticks] enabled = false` does not
+        // silence it (see [`set_shuttle`](Self::set_shuttle)).
+        if self.shuttle {
+            return true;
+        }
         if !self.rate || !cfg.enabled {
             return false;
         }
@@ -601,17 +636,17 @@ mod tests {
     }
 
     #[test]
-    fn a_puck_frame_never_arms_the_deadline() {
+    fn a_controller_frame_never_arms_the_deadline() {
         let c = cfg();
         let mut d = StickDrive::new();
-        // The puck's sticks are for flicks; its pads drive the cursor. A stick
-        // held right over on a puck frame must not start integrating.
-        let puck = crate::report::Frame {
-            source: crate::report::Source::Puck,
+        // The controller's sticks are for flicks; its pads drive the cursor. A stick
+        // held right over on a controller frame must not start integrating.
+        let controller = crate::report::Frame {
+            source: crate::report::Source::SteamController,
             right_stick: (30_000, 0),
             ..Default::default()
         };
-        d.observe(&puck, &c, at(0));
+        d.observe(&controller, &c, at(0));
         assert!(!d.armed(&c));
         assert_eq!(d.deadline(), None);
         assert_eq!(d.sticks, Deflection::default(), "a padded source parks the sticks");
@@ -661,7 +696,50 @@ mod tests {
     }
 
     #[test]
-    fn deflection_normalises_and_keeps_the_pucks_y_up_convention() {
+    fn the_caret_shuttle_arms_the_deadline_on_its_own_terms() {
+        // The scrub's shuttle is the one consumer whose gate lives elsewhere —
+        // in `[scrub]`, behind a held guide — so the daemon hands the answer in
+        // and this is what it buys: a wakeup every `tick_ms` while the stick is
+        // held over, which is the only way taps come out of a pad that reports
+        // only on change.
+        let c = cfg();
+        let mut d = StickDrive::new();
+        d.observe(&evdev_frame((0, 0), (0, 0)), &c, at(0));
+        assert_eq!(d.deadline(), None, "centred and no shuttle: block forever");
+
+        d.set_shuttle(true, &c, at(0));
+        assert!(d.armed(&c));
+        assert_eq!(d.deadline(), Some(at(4)), "one tick out, the pointer's cadence");
+        // A second frame while it is still held must not push the step away.
+        d.set_shuttle(true, &c, at(2));
+        assert_eq!(d.deadline(), Some(at(4)), "an armed deadline is not re-armed");
+        // Stepping while it is still held schedules the next one.
+        d.stepped(&c, at(4));
+        assert_eq!(d.deadline(), Some(at(8)));
+        // Let go and the loop goes back to blocking.
+        d.set_shuttle(false, &c, at(8));
+        assert_eq!(d.deadline(), None);
+
+        // `[sticks] enabled = false` says the sticks do not stand in for the
+        // pads. It says nothing about the caret, which has its own switch, its
+        // own deadzone and its own guard — so the shuttle still gets its clock.
+        let mut off = cfg();
+        off.enabled = false;
+        let mut d = StickDrive::new();
+        d.observe(&evdev_frame((0, 0), (30_000, 0)), &off, at(0));
+        assert_eq!(d.deadline(), None, "the pointer is off, as asked");
+        d.set_shuttle(true, &off, at(0));
+        assert!(d.armed(&off));
+        assert_eq!(d.deadline(), Some(at(4)));
+
+        // And a release drops the claim with everything else.
+        d.release();
+        assert!(!d.armed(&off));
+        assert_eq!(d.deadline(), None);
+    }
+
+    #[test]
+    fn deflection_normalises_and_keeps_the_controllers_y_up_convention() {
         let f = evdev_frame((-32767, 32767), (16383, -16383));
         let d = Deflection::of(&f);
         assert!((d.left.0 + 1.0).abs() < 1e-9 && (d.left.1 - 1.0).abs() < 1e-9);

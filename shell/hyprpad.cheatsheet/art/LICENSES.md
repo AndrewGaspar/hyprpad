@@ -44,8 +44,8 @@ meaning rather than identifying a control:
 Kenney also ships `controller_<device>.svg` files, and they sound like exactly
 what a callout diagram needs. They are not: they are **64×64 solid-filled
 pictograms** — no analog sticks, no separable controls, no room to anchor a
-leader line. (`controller_steam_new.svg` is a recognisable 2026-puck
-silhouette, but at icon scale and without the sticks.) They are good for a
+leader line. (`controller_steam_new.svg` is a recognisable 2026 Steam
+Controller silhouette, but at icon scale and without the sticks.) They are good for a
 device picker and useless as a callout base, so the diagram comes from
 elsewhere.
 
@@ -79,7 +79,7 @@ view omits, which gives the L1/R1/L2/R2 callouts something real to point at.
 ## Bundled — `xbox-elite-2.svg` (the second controller)
 
 hyprpad's own schematic of the Xbox Elite Wireless Controller Series 2, drawn
-from scratch for this repo like the puck's and covered by the repo's licence.
+from scratch for this repo like the controller's and covered by the repo's licence.
 It is authored in the same `456 x 320` viewBox, so both layouts scale
 identically in the panel.
 
