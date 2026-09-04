@@ -946,7 +946,7 @@ mod tests {
     }
 
     /// Run the pacer's rate estimator to steady state at `deg_per_s`, at the
-    /// puck's 250 Hz. 0.8 s is many time constants of a 5 Hz low-pass, so the
+    /// controller's 250 Hz. 0.8 s is many time constants of a 5 Hz low-pass, so the
     /// tier tests can talk about speeds rather than about transients.
     fn settle(p: &mut JogPacer, deg_per_s: f64) {
         let dt = 0.004;

@@ -21,7 +21,7 @@ Everything below is a per-user file; none require privilege.
 
 ## The daemon's responsibilities (recap)
 
-Read the real puck; **own lizard mode** (open the hidraw and send the
+Read the real controller; **own lizard mode** (open the hidraw and send the
 disable-lizard feature report, since Steam no longer can — see W12 nuance 2);
 drive Hyprland (gestures → IPC, trackpad → virtual pointer); **emit a virtual
 controller** (uinput/uhid) that Steam *does* see; and **focus-gate** — route the
@@ -40,7 +40,7 @@ interceptable:
 `hyprpad setup` installs a transparent interception that covers all three:
 
 1. **`~/.local/bin/hyprpad-steam`** — the wrapper: ensure the daemon is up, then
-   `bwrap`-mask the puck nodes and `exec /usr/bin/steam "$@"`. **Fail-open:** if
+   `bwrap`-mask the controller nodes and `exec /usr/bin/steam "$@"`. **Fail-open:** if
    hyprpad isn't installed/running or bwrap is missing, it execs plain Steam —
    a broken hyprpad never leaves the user unable to launch Steam.
 2. **`~/.local/share/applications/steam.desktop`** — a user override (shadows the
@@ -88,7 +88,7 @@ config are unchanged, only the Steam-masking seam differs.
 
 - **Lizard-mode ownership** (W2 follow-on): hyprpad must send the exit-lizard
   feature report itself — verify writing that report to the hidraw while hyprpad
-  holds it works and survives the puck's power cycles.
+  holds it works and survives the controller's power cycles.
 - **Replug handling** (W12 nuance 3): masked Steam won't see nodes created after
   its launch; decide between masking the parent USB `/sys` path, a stable
   by-id bind, or a udev-hotplug hook that re-masks / relaunches.

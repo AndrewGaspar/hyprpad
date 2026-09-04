@@ -1,13 +1,13 @@
 //! A daemon-owned virtual **Xbox-360-class gamepad** (`uinput`) — the Tier-1
 //! keystone.
 //!
-//! hyprpad owns the real puck; Steam is denied it
+//! hyprpad owns the real controller; Steam is denied it
 //! (docs/experiments/w12-device-denial.md). So Steam and games need *something*
 //! to see, and this is it: a kernel gamepad wearing the identity every engine,
 //! SDL mapping database and anti-cheat already trusts —
 //! `045e:028e`, "hyprpad virtual gamepad". The daemon forwards the real
 //! controller's state to it **only while a game holds focus**, and forwards the
-//! game's force-feedback rumble back to the puck's actuators.
+//! game's force-feedback rumble back to the controller's actuators.
 //!
 //! ## Precedence — who owns the controller right now
 //!
@@ -150,13 +150,13 @@ pub const DEVICE_NAME_STR: &str = "hyprpad virtual gamepad";
 /// title uses.
 const FF_EFFECTS_MAX: u32 = 16;
 
-/// Analog trigger full scale on the wire. The puck reports `0..=32767`; a 360
+/// Analog trigger full scale on the wire. The controller reports `0..=32767`; a 360
 /// pad's `ABS_Z`/`ABS_RZ` are `0..=255`.
 const TRIGGER_MAX: u16 = 32_767;
 const TRIGGER_OUT_MAX: u32 = 255;
 
 /// Stick/pad `flat` (dead-zone hint) and `fuzz` published in `absinfo`, copied
-/// from `xpad`. Consumers that honour `flat` — SDL does — will ignore the puck
+/// from `xpad`. Consumers that honour `flat` — SDL does — will ignore the controller
 /// sticks' small idle offset (docs/03) without hyprpad filtering it first.
 const STICK_FUZZ: i32 = 16;
 const STICK_FLAT: i32 = 128;
@@ -343,11 +343,11 @@ impl PadReport {
 
     /// Map one decoded controller frame onto the virtual pad.
     ///
-    /// | Puck | Virtual pad | Note |
+    /// | Controller | Virtual pad | Note |
     /// |---|---|---|
-    /// | left stick | `ABS_X` / `ABS_Y` | Y negated: the puck reports `+Y` up, evdev wants `+Y` down |
+    /// | left stick | `ABS_X` / `ABS_Y` | Y negated: the controller reports `+Y` up, evdev wants `+Y` down |
     /// | right pad (while touched) | `ABS_RX` / `ABS_RY` | absolute deflection, Y negated the same way |
-    /// | right stick (pad lifted) | `ABS_RX` / `ABS_RY` | the puck has a real right stick; stranding it would be a bug |
+    /// | right stick (pad lifted) | `ABS_RX` / `ABS_RY` | the controller has a real right stick; stranding it would be a bug |
     /// | `l2` / `r2` (0..32767) | `ABS_Z` / `ABS_RZ` (0..255) | `xpad`'s trigger assignment |
     /// | D-pad | `ABS_HAT0X` / `ABS_HAT0Y` | `-1`/`+1`, `HAT0Y` negative is up |
     /// | A / B / X / Y | `BTN_SOUTH` / `EAST` / `NORTH` / `WEST` | identical to `xpad`'s `BTN_A/B/X/Y` |
@@ -437,18 +437,18 @@ impl PadReport {
     }
 }
 
-/// Widen a puck axis to the wire, clamped to the advertised range.
+/// Widen a controller axis to the wire, clamped to the advertised range.
 fn axis(v: i16) -> i32 {
     i32::from(v).clamp(-32768, 32767)
 }
 
-/// Widen and **negate** a puck axis: the puck reports `+Y` up, evdev `+Y` down.
+/// Widen and **negate** a controller axis: the controller reports `+Y` up, evdev `+Y` down.
 /// `i16::MIN` has no positive counterpart, so the clamp is load-bearing.
 fn axis_inverted(v: i16) -> i32 {
     (-i32::from(v)).clamp(-32768, 32767)
 }
 
-/// Scale an analog trigger from the puck's `0..=32767` to the pad's `0..=255`,
+/// Scale an analog trigger from the controller's `0..=32767` to the pad's `0..=255`,
 /// rounded to nearest.
 fn trigger(v: u16) -> i32 {
     let v = u32::from(v.min(TRIGGER_MAX));
@@ -457,7 +457,7 @@ fn trigger(v: u16) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Rumble: the FF back-channel from the game to the puck.
+// Rumble: the FF back-channel from the game to the controller.
 // ---------------------------------------------------------------------------
 
 /// The rumble the game is currently asking for, published by the force-feedback
@@ -705,7 +705,7 @@ impl VirtualGamepad {
     /// reasoning).
     ///
     /// Counted in frames rather than on a clock because this sink is written
-    /// from the frame path and nowhere else; the puck's frames arrive at the
+    /// from the frame path and nowhere else; the controller's frames arrive at the
     /// same 250 Hz the relay streams at, so the two pulses are the same 60 ms.
     /// A pulse that is still owed when forwarding stops is dropped by
     /// [`Self::neutral`] along with everything else — the button goes up there,
@@ -825,7 +825,7 @@ unsafe fn set_bit(fd: libc::c_int, req: libc::c_ulong, val: libc::c_int) -> Resu
 ///
 /// Nothing here touches the device: it only publishes the resulting `(strong,
 /// weak)` command into `rumble` for the daemon's main loop to act on, which
-/// keeps the puck writes on the one thread that owns the haptics queue.
+/// keeps the controller writes on the one thread that owns the haptics queue.
 fn ff_reader(mut fd: File, rumble: &Arc<RumbleChannel>, stop: &Arc<AtomicBool>) {
     let mut effects: HashMap<i16, StoredEffect> = HashMap::new();
     let mut playing: HashMap<i16, Playing> = HashMap::new();

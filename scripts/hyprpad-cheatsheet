@@ -35,7 +35,8 @@ ipc() {
 
 # Which controller drawing to open on, from the daemon's status file.
 #
-# The daemon is the only thing that knows which of a puck and a gamepad is
+# The daemon is the only thing that knows which of the Steam Controller and a
+# gamepad is
 # actually in your hands, and it publishes the answer as one string. Reading it
 # here rather than in QML is what keeps `Panel.qml` free of any controller name:
 # it already accepts `layout` in the summon payload, so the plugin needs no

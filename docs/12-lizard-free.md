@@ -126,14 +126,14 @@ which is the only place the truth is written down.
 
 The proposal was a rule on the `28de:1304` add event —
 `TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="hyprpad.service"` — to close the ~1.5 s
-window in which a freshly-connected puck is still in lizard mode. It is
+window in which a freshly-connected controller is still in lizard mode. It is
 declined, for three reasons in increasing order of weight:
 
 1. **`SYSTEMD_USER_WANTS` only *starts* a unit; it cannot poke one that is
    already running.** `systemd.device(5)`: "Adds dependencies of type `Wants=`
    from the device unit to the specified units… systemd will only act on
    `Wants=` dependencies when a device first becomes active." Once step 2 is in
-   place the daemon is *already up* when the puck appears, so the nudge is a
+   place the daemon is *already up* when the controller appears, so the nudge is a
    no-op in exactly the configuration this document is building toward. It would
    matter only if the unit were not enabled — i.e. only when you have not done
    step 2.
@@ -141,12 +141,12 @@ declined, for three reasons in increasing order of weight:
    properties are not taken into account unless the device is tagged with the
    `systemd` tag", and systemd tags "all block and network devices, and a few
    others" — not hidraw. So the rule would also have to `TAG+="systemd"` the
-   puck's nodes, adding device units for something nothing else models, and it
+   controller's nodes, adding device units for something nothing else models, and it
    would have to coexist with `72-hyprpad-puck.rules`, whose whole job is
    removing a tag from those same nodes at a carefully chosen sequence number.
    New failure modes, for a no-op.
 3. **The window it closes is 1.5 s of a poll we control.** The daemon already
-   re-disables lizard within one `RECONNECT_SCAN_INTERVAL` of the puck coming
+   re-disables lizard within one `RECONNECT_SCAN_INTERVAL` of the controller coming
    back (`src/run.rs`). If that ever proves too slow, the fix is in-process and
    testable — shorten the scan while lizard is known to be un-disabled, or ring
    the ownership loop's existing `lizard::nudge()` doorbell from the reconnect

@@ -3,7 +3,7 @@
 //!
 //! # Why this is not the pad's pipeline
 //!
-//! The puck's cursor is **position** control. [`crate::run::drive_cursor`]
+//! The controller's cursor is **position** control. [`crate::run::drive_cursor`]
 //! differences the smoothed absolute pad coordinate, and the One Euro filter in
 //! [`crate::filter::PadDamper`] exists because differencing amplifies sensor
 //! noise (`docs/research/pointer-damping.md` §1.2). A stick is **rate**
@@ -40,7 +40,7 @@
 //! [`StickDrive::deadline`] returns `Some(when)` **only while something is
 //! actually moving** — a stick outside its deadzone, or a velocity still
 //! decaying through the EMA after one was released — and `None` otherwise.
-//! Centred, the loop blocks indefinitely exactly as it does today with the puck
+//! Centred, the loop blocks indefinitely exactly as it does today with the controller
 //! asleep. Nothing spins, nothing polls, and an idle pad costs zero wakeups.
 //!
 //! Everything in this module is pure over `Instant`, so the whole decision
@@ -311,7 +311,7 @@ impl StickCursor {
 
 /// Both sticks' normalised deflection, as last seen on a frame.
 ///
-/// `+y` is **up**, the puck's convention, which [`crate::evdev`] has already
+/// `+y` is **up**, the controller's convention, which [`crate::evdev`] has already
 /// converted to. The cursor and scroll paths flip it themselves where the
 /// output wants screen coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -341,7 +341,7 @@ impl Deflection {
 /// expired, steps whichever integrators are live.
 pub struct StickDrive {
     /// The last deflection seen from a rate-controlled source. Zeroed the
-    /// moment a position-controlled source (the puck) becomes active, so a
+    /// moment a position-controlled source (the controller) becomes active, so a
     /// stale Xbox frame cannot keep the deadline armed.
     pub sticks: Deflection,
     /// Whether the active source is rate-controlled at all.
@@ -383,7 +383,7 @@ impl StickDrive {
 
     /// Record one frame's sticks and re-arm (or disarm) the deadline.
     ///
-    /// A frame from a source with pads parks everything: the puck drives the
+    /// A frame from a source with pads parks everything: the controller drives the
     /// cursor from its trackpads and its sticks are for flicks only, so the
     /// rate integrators must be silent and, above all, must not hold the
     /// deadline open.
@@ -705,17 +705,17 @@ mod tests {
     }
 
     #[test]
-    fn a_puck_frame_never_arms_the_deadline() {
+    fn a_controller_frame_never_arms_the_deadline() {
         let c = cfg();
         let mut d = StickDrive::new();
-        // The puck's sticks are for flicks; its pads drive the cursor. A stick
-        // held right over on a puck frame must not start integrating.
-        let puck = crate::report::Frame {
-            source: crate::report::Source::Puck,
+        // The controller's sticks are for flicks; its pads drive the cursor. A stick
+        // held right over on a controller frame must not start integrating.
+        let controller = crate::report::Frame {
+            source: crate::report::Source::SteamController,
             right_stick: (30_000, 0),
             ..Default::default()
         };
-        d.observe(&puck, &c, at(0));
+        d.observe(&controller, &c, at(0));
         assert!(!d.armed(&c));
         assert_eq!(d.deadline(), None);
         assert_eq!(d.sticks, Deflection::default(), "a padded source parks the sticks");
@@ -762,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn deflection_normalises_and_keeps_the_pucks_y_up_convention() {
+    fn deflection_normalises_and_keeps_the_controllers_y_up_convention() {
         let f = evdev_frame((-32767, 32767), (16383, -16383));
         let d = Deflection::of(&f);
         assert!((d.left.0 + 1.0).abs() < 1e-9 && (d.left.1 - 1.0).abs() < 1e-9);

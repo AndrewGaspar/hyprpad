@@ -8,14 +8,15 @@ only the fake — is §6, and lives in `src/broker.rs` and `packaging/`.*
 
 ## What it is
 
-hyprpad owns the 2026 Steam Controller puck (`28de:1304`) exclusively and today
+hyprpad owns the 2026 Steam Controller — reached through the puck, `28de:1304` —
+exclusively, and today
 hands games a synthesized Xbox-360 pad. That works, and it discards everything
 Steam Input adds on a *Valve* controller: trackpads as trackpads, gyro, per-game
 configs, Steam-driven haptics, the four back grips.
 
 This feature creates a **second sink**: a virtual HID device on `/dev/uhid`
 carrying a Valve VID/PID, which Steam adopts as a genuine Steam Controller.
-hyprpad streams the real puck's input into it and interprets Steam's writes back
+hyprpad streams the real controller's input into it and interprets Steam's writes back
 out onto the real hardware.
 
 It is **opt-in and off by default**. One config line turns it on:
@@ -107,7 +108,7 @@ the lizard mouse, and the Steam protocol is on `0x42` / `0x01`.)
 
 Those are, byte for byte, the reports `src/report.rs` already decodes and
 `src/lizard.rs` / `src/haptics.rs` already write. **The wired `1302` speaks the
-puck's own protocol**, so the input path is a copy, not a transcode — and every
+controller's own protocol**, so the input path is a copy, not a transcode — and every
 field hyprpad does not model rides along untouched, including the IMU at bytes
 30+ and the undecoded tail. That is the standing advantage over `deck`, which
 forfeits it.
@@ -237,7 +238,7 @@ self-consistency rule `TRITON_ATTRIBUTES` already follows for the product id
 | Candidate | Rejected because |
 |---|---|
 | `""` (InputPlumber's) | this is the bug |
-| `FXA9961402A6C` / `FXB99614031B4`, the real controller's and puck's | ships one machine's hardware identity to everyone who builds hyprpad — and colliding with `triton`'s key would apply a Deck-shaped binding set to a Triton-shaped device |
+| `FXA9961402A6C` / `FXB99614031B4`, the real controller's and controller's | ships one machine's hardware identity to everyone who builds hyprpad — and colliding with `triton`'s key would apply a Deck-shaped binding set to a Triton-shaped device |
 | `1NPU7PLUMB3R`, the `0xAE` answer's old value | not distinct from InputPlumber's own devices, and not obviously ours in a log |
 | **`HYPRPAD-DECK-0001`** | **stable** (Steam keys `configset_<serial>.vdf` on it, so bindings must survive a restart), **distinct** from `triton`'s, and **obviously ours** in a Steam log |
 
@@ -267,7 +268,7 @@ departure cannot slip in behind this one.
 
 ## 2. Report translation
 
-### 2.1 `triton` — pass-through (`translate::puck_to_triton`)
+### 2.1 `triton` — pass-through (`translate::controller_to_triton`)
 
 The raw 54-byte `0x42` is copied verbatim into `UHID_INPUT2`. Two things are
 changed, and only these:
@@ -292,10 +293,10 @@ profile does the same thing at byte 9, bit 5. See `[gamepad] guide_tap`.
 
 Because the `1302` descriptor numbers every report type, all three `UHID_START`
 `dev_flags` bits are set and the report-id prefix is required in both directions
-— which the puck's own `raw[0] == 0x42` already provides. The pass-through is
+— which the controller's own `raw[0] == 0x42` already provides. The pass-through is
 correct *because* of that, not in spite of it.
 
-### 2.2 `deck` — transcode (`translate::puck_to_deck`)
+### 2.2 `deck` — transcode (`translate::controller_to_deck`)
 
 Into InputPlumber's `PackedInputDataReport`
 (`src/drivers/steam_deck/hid_report.rs`, `bit_numbering = "msb0"`,
@@ -312,9 +313,9 @@ Into InputPlumber's `PackedInputDataReport`
 | `report_size` | 3 | `0x40` (64) |
 | `frame` | 4..8 | u32 LE — the stream's tick counter |
 
-**Buttons** — puck `report::Button` → Deck field, byte and mask
+**Buttons** — controller `report::Button` → Deck field, byte and mask
 
-| Puck button | Deck field | Byte | Mask | Bit |
+| Controller button | Deck field | Byte | Mask | Bit |
 |---|---|---|---|---|
 | `A` | `a` | 8 | `0x80` | 64 |
 | `X` | `x` | 8 | `0x40` | 65 |
@@ -348,7 +349,7 @@ grips reach Steam, which the Xbox pad forwards none of.
 
 **Analog**
 
-| Puck field | Deck field | Bytes | Encoding |
+| Controller field | Deck field | Bytes | Encoding |
 |---|---|---|---|
 | `left_pad.x` / `.y` | `l_pad_x` / `l_pad_y` | 16..20 | i16 LE |
 | `right_pad.x` / `.y` | `r_pad_x` / `r_pad_y` | 20..24 | i16 LE |
@@ -363,13 +364,13 @@ grips reach Steam, which the Xbox pad forwards none of.
 
 | Deck field | Bytes | Why |
 |---|---|---|
-| `accel_x/y/z` | 24..30 | `report::Frame` carries no IMU. The puck's `0x42` has it at bytes 30+ but only after an enable feature report, and `src/report.rs` leaves those bytes undecoded. This is the cost of `deck`; `triton` gets them for free. |
+| `accel_x/y/z` | 24..30 | `report::Frame` carries no IMU. The controller's `0x42` has it at bytes 30+ but only after an enable feature report, and `src/report.rs` leaves those bytes undecoded. This is the cost of `deck`; `triton` gets them for free. |
 | `pitch`, `yaw`, `roll` | 30..36 | as above |
 | magnetometer | 36..44 | as above |
 | `l_stick_force` / `r_stick_force` | 60..64 | capacitive stick sensors; see below |
 | `_unk31` | 15 | unknown in the reference implementation too |
 
-The puck's `Cap0`..`Cap3` bits are **not mapped**. `src/report.rs` calls their
+The controller's `Cap0`..`Cap3` bits are **not mapped**. `src/report.rs` calls their
 individual assignment "tentative", and the only plausible targets are the Deck's
 `l_stick_touch` / `r_stick_touch`. Guessing would put phantom stick-touch flags
 in front of Steam Input's capacitive-stick behaviours, so they stay clear.
@@ -393,16 +394,16 @@ same byte means different things:
 | `SetSettingsValues` | `0x87` | feature | **Decoded, not applied.** Parsed into `(setting, u16)` pairs and logged by SDL name. |
 | ↳ `SETTING_LIZARD_MODE` | 9 | | **Ignored — hyprpad's.** `src/lizard.rs` holds it at 0 and re-sends every 30 s. |
 | ↳ `SETTING_STEAM_WATCHDOG_ENABLE` | 71 | | **Ignored — hyprpad's**, same reason. |
-| ↳ `SETTING_IMU_MODE` | 48 | | **RELAYED — the one setting that is.** Written to the real puck through `lizard.rs`'s frame builder. See §3.1. |
+| ↳ `SETTING_IMU_MODE` | 48 | | **RELAYED — the one setting that is.** Written to the real controller through `lizard.rs`'s frame builder. See §3.1. |
 | ↳ everything else | | | Logged by SDL name (all 82 of them), dropped. |
 | `TriggerRumbleCommand` | `0xEB` | feature | **Translated.** `left_speed`/`right_speed` (u16 LE at bytes 5..7, 7..9 of `PackedRumbleReport`) become `haptics::Haptics::rumble`'s two `FF_RUMBLE` magnitudes. |
 | `TriggerHapticPulse` | `0x8F` | feature | **Translated.** `[pad][duration][interval][count][gain]` per the kernel's `steam_haptic_pulse`; the wire side is un-XORed to a logical `haptics::Pad`, the gain dropped (the IBEX pulse struct has no gain field). |
 | `TriggerHapticCommand` | `0xEA` | feature | **Translated, partly UNVERIFIED** — see §7. |
-| `0x80` rumble | `0x80` | output | **Translated.** The puck's own `0x80`, read back with the exact field layout `haptics::build_rumble` writes. |
+| `0x80` rumble | `0x80` | output | **Translated.** The controller's own `0x80`, read back with the exact field layout `haptics::build_rumble` writes. |
 | `0x81` pulse | `0x81` | output | **Translated.** Likewise, mirroring `haptics::build_pulse`. |
 | everything else | | | **Dropped** with a `HYPRSC_DEBUG` log naming the command. |
 
-### Why not relay to the puck
+### Why not relay to the controller
 
 Research §4.3 sketches a relay policy — forward Steam's feature writes straight
 to the real device — and §5.1/§5.2 then spend two sections on the arbitration
@@ -413,12 +414,12 @@ implementation takes (A.4), for two structural reasons:
    settings Steam's `0x87` asks for. Forwarding would be redundant at best and a
    write race at worst — §5.1 warns about precisely this.
 2. **hyprpad already owns the actuators, through one writer.** `haptics.rs` runs
-   a single writer thread over the puck's only writable fd, and §5.2 requires the
-   relay to go through it and "never open a second writable fd on the puck". So
+   a single writer thread over the controller's only writable fd, and §5.2 requires the
+   relay to go through it and "never open a second writable fd on the controller". So
    rumble and haptics are *translated into that path*, not forwarded as bytes.
 
 **What this cost, and what it stopped costing:** Steam's IMU-enable did not
-reach the puck, so the gyro never started streaming. That was gap G5, and §3.1
+reach the controller, so the gyro never started streaming. That was gap G5, and §3.1
 is how it is closed — without breaking either reason above, because the gyro
 goes out through *lizard's* frame builder rather than a second writer.
 
@@ -426,7 +427,7 @@ goes out through *lizard's* frame builder rather than a second writer.
 ### 3.1 The gyro — the one setting that *is* relayed
 
 Gap G5. Everything above is "hyprpad can satisfy this itself, so it does"; the
-IMU is the one thing it cannot. **Only the real puck can turn its own IMU on.**
+IMU is the one thing it cannot. **Only the real controller can turn its own IMU on.**
 Its `0x42` carries no gyro bytes at all until it has been told to put them
 there, and no amount of interpreting on this side of the wire conjures them.
 
@@ -468,7 +469,7 @@ always built:
 ```
 
 One frame builder, one writer, one heartbeat. Research §5.2's "never open a
-second writable fd on the puck" is satisfied structurally rather than by
+second writable fd on the controller" is satisfied structurally rather than by
 convention, and three properties fall out for free, with no new timer and no new
 code path:
 
@@ -485,13 +486,13 @@ condvar the ownership loop now waits on instead of sleeping. The daemon's 250 Hz
 loop takes an uncontended lock and signals; it never does the I/O itself, which
 keeps a 12-retry `EPIPE` budget on a sleeping controller (~240 ms per node) off
 the frame path. `set_imu_requested` returns whether the effective mode actually
-*changed*, so Steam re-stating a mode the puck already holds — which it does,
+*changed*, so Steam re-stating a mode the controller already holds — which it does,
 repeatedly — is not a feature report.
 
 **Who decides, and what "off" means.** Two authorities, and the rule is one
 line: *Steam wins while it is asking; hyprpad's preference is what is left.*
 
-| State | Written to the puck |
+| State | Written to the controller |
 |---|---|
 | Nothing has ever asked (**the default**, and every `kind = "xbox"` install) | **no `SETTING_IMU_MODE` pair at all** — the frame is byte-for-byte the two-pair frame this module has always sent |
 | Steam asked for sensors | Steam's mask, verbatim |
@@ -505,7 +506,7 @@ pins it.
 
 `gyro = true` is a **diagnostic knob, not a feature switch.** Its use is telling
 "the gyro is not working" apart from "Steam never asked": turn it on and the IMU
-bytes appear in the puck's `0x42` with no Steam in the picture at all. In
+bytes appear in the controller's `0x42` with no Steam in the picture at all. In
 ordinary use it should stay off, because a gyro streaming for a desktop nobody is
 aiming with is battery spent for nothing.
 
@@ -530,23 +531,23 @@ by chasing focus.
 **Where the bytes land, and what is still UNVERIFIED.** `src/report.rs` decodes
 bytes 0..30 of the 54-byte `0x42` and says of the rest: *"Bytes 30+ carry the IMU
 and stream only after an enable feature-report (Steam sends one); they are
-untouched here."* The `triton` profile is a pass-through — `puck_to_triton`
+untouched here."* The `triton` profile is a pass-through — `controller_to_triton`
 copies all 54 bytes and clears two bits — so **nothing else has to change**: the
-moment the puck starts filling bytes 30+, Steam gets them. The classic Valve
+moment the controller starts filling bytes 30+, Steam gets them. The classic Valve
 state packet puts accel `x,y,z`, gyro `x,y,z` and the orientation quaternion
 `w,x,y,z` there as ten little-endian `i16`s (offsets 30..50), which fits the 24
 undecoded bytes with 4 to spare.
 
 That last sentence is **inferred from the report table and the classic layout,
-not observed** — no IMU-enabled `0x42` has been captured from this puck. Two
-things would falsify it: the puck answering the enable but putting IMU data in a
+not observed** — no IMU-enabled `0x42` has been captured from this controller. Two
+things would falsify it: the controller answering the enable but putting IMU data in a
 *different* report (the descriptor also declares inputs `0x43`, `0x44`, `0x45`,
 `0x79`, `0x7b`, none of which the relay forwards), or the firmware ignoring
 setting 48 entirely. Both are visible in one step — see §8 step 6.
 
-**`deck` gets none of this.** `puck_to_deck` transcodes from `report::Frame`,
+**`deck` gets none of this.** `controller_to_deck` transcodes from `report::Frame`,
 which has no IMU fields, so the Deck report's accel/gyro/magnetometer bytes stay
-zero however the puck is configured. The setting still reaches the hardware; the
+zero however the controller is configured. The setting still reaches the hardware; the
 transcode is what drops it. Decoding the IMU into `Frame` is the follow-on that
 would close it, and it is worth doing only if `deck` ever becomes the default.
 
@@ -596,9 +597,9 @@ path only ever *updates what it streams*.
 
 | State | Streamed |
 |---|---|
-| A game is forwarding, puck live | the current frame (re-stamped counter on `deck`; the puck's own counter untouched on `triton`) |
+| A game is forwarding, controller live | the current frame (re-stamped counter on `deck`; the controller's own counter untouched on `triton`) |
 | Not forwarding — desktop, OSK, guide held (ranks 1, 2, 4) | **neutral** |
-| Puck silent for more than `STALE_AFTER` (200 ms) | **neutral** |
+| Controller silent for more than `STALE_AFTER` (200 ms) | **neutral** |
 | Daemon exiting | device destroyed (`UHID_DESTROY`) |
 
 Neutral is a valid, complete, absolute-state report: buttons clear, sticks and
@@ -607,7 +608,7 @@ pads centred, triggers zero, counter advancing. The same invariant
 holding a stuck input.
 
 The 200 ms staleness timer exists because the frame path *stops running* when the
-puck sleeps; without it the last live frame would repeat forever, and whatever
+controller sleeps; without it the last live frame would repeat forever, and whatever
 was pressed at the moment the controller napped would stay pressed.
 
 ### 4.1 The Steam log churn (#35) — measured, and it is not ours
@@ -645,7 +646,7 @@ reacting to. `relay::tests` now pins all of that
 (`six_hundred_neutral_triton_ticks_differ_only_in_the_sequence_counter` and
 friends), so it stays true.
 
-#### The churn predates the relay, and was worse with the real puck
+#### The churn predates the relay, and was worse with the real controller
 
 The lines the churn is made of — `Controller N uses xinput`, `Queueing
 activation for controller`, `Add to Config Cache Request`, `HID: Add to Config
@@ -656,7 +657,7 @@ PollState Changed` — are ordinary Steam Input bookkeeping:
 |---|---|
 | `uses xinput` lines in this log | **3381**, spread over 20 dates back to 2026-06-11 — months before the relay existed |
 | `uses xinput` lines on 2026-09-02, the day the fake was adopted | **0** |
-| Busiest single second with the **real** puck (2026-08-31, `V1 HID protocol via Dongle`) | **1168 lines**, and 243 lines/s was routine that day |
+| Busiest single second with the **real** controller (2026-08-31, `V1 HID protocol via Dongle`) | **1168 lines**, and 243 lines/s was routine that day |
 | That day's composition | `Add to Config Cache Request` ×412, `HID: … full cache hit` ×350, `Queueing activation` ×307, `Opted-in Controller Mask` ×48 — the exact categories |
 
 So the baseline the change should be judged against is not "a quiet log"; it is
@@ -687,10 +688,10 @@ Whatever churn remains is Steam talking to itself about config sets.
 
 #### The one bit of noise that is a consequence of our design
 
-`packaging/udev/72-hyprpad-puck.rules` makes the real puck's five hidraw nodes
+`packaging/udev/72-hyprpad-puck.rules` makes the puck's five hidraw nodes
 unopenable, so every Steam device sweep logs `Local Device Found … Unable to
 open local device: /dev/hidraw7` five times over. That is ~45 lines per sweep,
-and it is the *intended* behaviour — Steam must not see the real puck (§6) —
+and it is the *intended* behaviour — Steam must not see the real controller (§6) —
 with the log line as its only cost. It fires per sweep, not continuously.
 
 #### What is deliberately *not* changed
@@ -699,7 +700,7 @@ The obvious "fix" would be to renumber relayed reports so the counter is always
 ours and always monotonic. **No.** §4.4 forbids it, and now more strongly than
 when it was written: the counter shares the report with the IMU data §3.1 turned
 on, and renumbering risks desync with the IMU timestamp path. The consequence is
-that a live frame held between puck updates repeats its counter for up to
+that a live frame held between controller updates repeats its counter for up to
 `STALE_AFTER`, and that crossing live → neutral moves the counter's *source*
 once per transition. Both are bounded, both are on the record
 (`a_held_live_frame_repeats_its_own_counter_rather_than_being_renumbered`,
@@ -709,11 +710,11 @@ and neither is tens of lines per second.
 ### Reconnect
 
 **The uhid device is created once, at daemon start, and destroyed only at exit.**
-It is never torn down on a focus change or a puck disconnect. Steam adopts a
+It is never torn down on a focus change or a controller disconnect. Steam adopts a
 controller when its hidraw node appears, so a create/destroy cycle makes it
 re-detect, re-apply configs and toast about it (§5.3).
 
-So when the puck naps:
+So when the controller naps:
 
 * the hidraw readers end, `Input::ReadersEnded` fires, and `GamepadState::release`
   puts the relay on neutral;
@@ -763,7 +764,7 @@ filling this seam needed no change anywhere else in `src/uhid/`.
 
 ## 6. Host integration — the privileged half
 
-Two problems, one shape. Getting a writable `/dev/uhid`, and taking the real puck
+Two problems, one shape. Getting a writable `/dev/uhid`, and taking the real controller
 away from Steam, both need root; and because **Steam and hyprpad run as the same
 user**, no group and no ACL can separate them. Anything the session-user daemon
 may open, session-user Steam may open too.
@@ -785,7 +786,7 @@ the hidraw node hangs off — so a single rule covers all five interface slots
 however they are numbered this boot. `:=` is final assignment, so nothing later
 can widen the permissions back.
 
-**It matches hidraw only.** The puck's `input`/`event` nodes are deliberately
+**It matches hidraw only.** The controller's `input`/`event` nodes are deliberately
 left exactly as the system configures them: hyprpad reads the controller over
 hidraw and only over hidraw, and on this machine the vendor-only descriptor
 produces no evdev node at all. Hiding an evdev node that might appear on a future
@@ -844,8 +845,9 @@ and passes the open descriptors back over a unix socket with `SCM_RIGHTS`.
 
 ```text
 ->  "uhid\n"        <-  "ok 1\n"  + 1 fd    /dev/uhid,  O_RDWR|O_CLOEXEC
-->  "puck\n"        <-  "ok 5\n"  + 5 fds   every 28de:1304 hidraw node,
-                                            hidraw::OPEN_FLAGS
+->  "controller\n"  <-  "ok 5\n"  + 5 fds   every Steam Controller hidraw node
+    (or "puck\n",                          (28de:1304 and 28de:1303),
+     the legacy alias)                     hidraw::OPEN_FLAGS
 ->  anything else   <-  "err unknown request\n"  + 0 fds
 ```
 
@@ -858,7 +860,7 @@ Security posture, and why it is a small surface:
   No path, no flags, no numbers. `parse_request` is an allowlist of two exact
   words: no leading space, no different case, no arguments, nothing over 32 bytes.
 * **It never reads from, writes to or ioctls a device.** It opens and hands over.
-* **It caches nothing.** Every `puck` rescans `/sys/class/hidraw`, so the puck
+* **It caches nothing.** Every `controller` rescans `/sys/class/hidraw`, so the controller
   sleeping and coming back on different node numbers needs no special handling
   anywhere — it is just a later request returning different descriptors.
 * **Two gates on who may ask.** The socket is `0660 root:hyprpad`, so only
@@ -902,30 +904,30 @@ members and no user of its own, only ever a filter on who may connect.
 
 ### 6.4 The daemon side
 
-One function expresses the whole preference, and everything that touches the puck
+One function expresses the whole preference, and everything that touches the controller
 goes through it:
 
 ```rust
 // src/hidraw.rs
-pub enum PuckSource { Paths(Vec<PathBuf>), Fds(Vec<OwnedFd>) }
-impl PuckSource { pub fn acquire() -> Option<PuckSource>; }
+pub enum ControllerSource { Paths(Vec<PathBuf>), Fds(Vec<OwnedFd>) }
+impl ControllerSource { pub fn acquire() -> Option<ControllerSource>; }
 ```
 
 | Broker answer | What the daemon does |
 |---|---|
 | no socket at `/run/hyprpad/broker.sock` | direct opens; one quiet line, once per process |
 | socket there, exchange failed (refused, wrong uid, mid-restart) | direct opens; one warning, once per process |
-| `ok 0` | direct opens — nothing usable, and the puck may simply be away |
+| `ok 0` | direct opens — nothing usable, and the controller may simply be away |
 | `ok N`, N ≥ 1 | use the passed descriptors |
 
 `None` means neither route worked, which is exactly the condition the startup
 wait and the reconnect wait already sit on — so **both waits now poll
-`PuckSource::acquire` at `RECONNECT_SCAN_INTERVAL`**, and both ask the broker
+`ControllerSource::acquire` at `RECONNECT_SCAN_INTERVAL`**, and both ask the broker
 first. The answer is re-evaluated on every generation, so starting the broker
 under a running daemon is picked up by the next reconnect, and stopping it falls
 back.
 
-`spawn_reader_pipeline` takes a `PuckSource` by value (a brokered generation *is*
+`spawn_reader_pipeline` takes a `ControllerSource` by value (a brokered generation *is*
 the descriptors; there is nothing to re-open from). `haptics.rs`'s periodic
 re-open and `lizard.rs`'s feature-report sends go through the same function —
 which they must, or installing the rule would break haptics and lizard ownership
@@ -965,8 +967,8 @@ hyprpad setup --check (read-only; opens nothing)
   NO  hyprpad udev rule      72-hyprpad-puck.rules not installed — …
   NO  broker socket          nothing at /run/hyprpad/broker.sock — …
   ?   broker: uhid           no socket to ask
-  ?   broker: puck           no socket to ask
-  NO  puck nodes root-only   still reachable: /dev/hidraw7 (0660 uid 0), …
+  ?   broker: controller     no socket to ask
+  NO  dongle nodes root-only still reachable: /dev/hidraw7 (0660 uid 0), …
 
 NOT READY. Missing or wrong: … See `hyprpad setup --print` for the install block.
 ```
@@ -986,15 +988,15 @@ Everything in §6 is tested where it can be tested without privilege, and the
 broker's socket, peer-credential, parse and refusal paths were exercised end to
 end over a real unix socket. Not verified, because it needs an install:
 
-* that udev actually applies the rule at 72 and the puck's nodes come back
+* that udev actually applies the rule at 72 and the controller's nodes come back
   `0600 root:root` with no ACL — the ordering argument is read off the shipped
   rules and `man udev`, not off a live trigger;
 * the socket-activation path (`LISTEN_FDS`); the standalone `--socket` path was
   exercised;
-* a `puck` or `uhid` request that actually *succeeds* — both need root, and the
+* a `controller` or `uhid` request that actually *succeeds* — both need root, and the
   descriptor hand-over itself is covered by unit tests over a `socketpair` with
   pipes standing in for devices;
-* that Steam, with the real puck hidden, sees exactly one controller (§8 step 4).
+* that Steam, with the real controller hidden, sees exactly one controller (§8 step 4).
 
 ---
 
@@ -1007,8 +1009,8 @@ end over a real unix socket. Not verified, because it needs an install:
 | — | **`deck` had no unit serial** | **FIXED, §1.3.** `uniq` was empty and Steam invented `28de-12f0-3147b8f`; it is now `HYPRPAD-DECK-0001`, matched by the `0xAE` answer. Costs one re-do of any binding saved against the invented key. |
 | G3 | `triton`'s chip id | **UNVERIFIED.** Modelled on the Deck answer. |
 | G4 | `TriggerHapticCommand` (`0xEA`) shape | **Partly UNVERIFIED.** The `PackedHapticReport` layout is verbatim, but `PadSide`/`Intensity` are enums whose discriminants were not captured, and the command carries **no duration** — only an intensity class. hyprpad fires its own calibrated single tick (`0x190` = 400 µs, from the kernel's `steam_haptic_pulse`) on the named side, reading side as `0 = left, 1 = right`. The first live session's `HYPRSC_DEBUG` log settles it. |
-| G5 | **Gyro does not reach Steam.** | **CLOSED on `triton`, pending a live check** — §3.1. Steam's `SETTING_IMU_MODE` (48) is now written to the real puck through `lizard.rs`'s frame builder, and the pass-through carries whatever the puck then puts in bytes 30+. That the puck answers setting 48 by filling those bytes of the *same* `0x42` is **inferred from the report table, not observed** — §8 step 6 is the check. Still open **by construction on `deck`**: `puck_to_deck` transcodes from `report::Frame`, which has no IMU fields. |
-| — | **Steam log churn (#35)** | **Not ours — measured, §4.1.** Our stream is 2500 consecutive reports in which byte 1 is the only byte that changes; the churn categories predate the relay by months and hit 1168 lines/s with the *real* puck. The one part that was ours was the `GET_REPORT` framing (§1.1), now fixed: 1527 read-failure lines before, zero after, and the log falls silent while the fake streams at 250 Hz. |
+| G5 | **Gyro does not reach Steam.** | **CLOSED on `triton`, pending a live check** — §3.1. Steam's `SETTING_IMU_MODE` (48) is now written to the real controller through `lizard.rs`'s frame builder, and the pass-through carries whatever the controller then puts in bytes 30+. That the controller answers setting 48 by filling those bytes of the *same* `0x42` is **inferred from the report table, not observed** — §8 step 6 is the check. Still open **by construction on `deck`**: `controller_to_deck` transcodes from `report::Frame`, which has no IMU fields. |
+| — | **Steam log churn (#35)** | **Not ours — measured, §4.1.** Our stream is 2500 consecutive reports in which byte 1 is the only byte that changes; the churn categories predate the relay by months and hit 1168 lines/s with the *real* controller. The one part that was ours was the `GET_REPORT` framing (§1.1), now fixed: 1527 read-failure lines before, zero after, and the log falls silent while the fake streams at 250 Hz. |
 | G6 | Quick Access is never stripped | `StripMask` supports it; nothing sets it. §4.4 suggests deriving the whole mask from the live binding table so any bound button is withheld. Follow-on. |
 | G7 | `identity` / `kind` do not take effect on `hyprpad reload` | They choose a device created once at startup. Restart the daemon. |
 | G8 | Latency of the extra userspace hop | Unmeasured (risk R7). Both hops are non-blocking; budget ≪1 ms. Measure on the first live run. |
@@ -1047,7 +1049,7 @@ hyprpad setup --check     # expect READY, all six lines ok
 The two checks that matter most, spelled out by hand:
 
 ```bash
-# the real puck must be root-only, with NO '+' and no ACL
+# the real controller must be root-only, with NO '+' and no ACL
 ls -l /dev/hidraw*
 getfacl /dev/hidraw7      # expect user::rw- / group::--- / other::--- only
 
@@ -1101,7 +1103,7 @@ grep -iE '1302|12f0|opened|V1 HID|deck' ~/.local/share/Steam/logs/controller.txt
 | **`!! Steam controller device opened for index N`** | **adopted** |
 | the fake's `/dev/hidrawN` in `/proc/$(pgrep -x steam)/fd` | Steam is holding it |
 | `HYPRSC_DEBUG=1` log lines `[relay] SetSettingsValues […]` | **dispositive** — Steam is actively configuring it |
-| enumerated but never opened, *while the real puck is opened in the same session* | identity rejected → set `identity = "deck"`, restart, retest |
+| enumerated but never opened, *while the real controller is opened in the same session* | identity rejected → set `identity = "deck"`, restart, retest |
 
 ### Step 4 — the UI, and the thing that must **not** be there
 
@@ -1126,7 +1128,7 @@ Steam → Settings → Controller:
   the whole thing off. Note that `forward_guide` is not the knob for this and
   never was: while the button is held nothing is forwarded, so setting it makes
   no observable difference here.
-* Trigger rumble in-game: the puck's actuators should buzz. With the game
+* Trigger rumble in-game: the controller's actuators should buzz. With the game
   backgrounded they must **not** (§5.2 arbitration).
 * Run with `HYPRSC_DEBUG=1` for one session and keep the `[relay]` log — it is
   the empirical answer to G4, and to what Steam actually sends a Triton (Q-u2).
@@ -1144,14 +1146,14 @@ to draw the gyro readout):
 
 ```
 [relay] SetSettingsValues [SETTING_IMU_MODE=24 [raw-accel+raw-gyro]]
-[relay] IMU raw-accel+raw-gyro -> puck (Steam asked)
+[relay] IMU raw-accel+raw-gyro -> controller (Steam asked)
 ```
 
 No such line means Steam never asked, and nothing downstream is hyprpad's
 problem yet. `gyro = true` in the config forces the same write with no Steam in
 the picture, which is how to carry on testing regardless.
 
-**6b — does the puck obey?** Read the *fake's* stream and watch bytes 30+, which
+**6b — does the controller obey?** Read the *fake's* stream and watch bytes 30+, which
 are zero on every neutral frame:
 
 ```bash
@@ -1169,13 +1171,13 @@ else:
 EOF
 ```
 
-Move the puck while it runs. Non-zero, changing bytes 30..50 is **G5 proven**:
+Move the controller while it runs. Non-zero, changing bytes 30..50 is **G5 proven**:
 the enable reached the firmware and the pass-through is carrying it.
 
 If they stay zero while 6a logged the write, the firmware either ignored setting
 48 or put the IMU somewhere else. The descriptor declares five other input
 reports the relay does not forward (`0x43`, `0x44`, `0x45`, `0x79`, `0x7b`), so
-the next step is to read the **real puck** instead of the fake and see which
+the next step is to read the **real controller** instead of the fake and see which
 report id grew:
 
 ```bash
@@ -1192,7 +1194,7 @@ A report id appearing there that was not there before the enable is the answer,
 and it makes the fix a `translate` change rather than a settings one.
 
 **6c — does Steam use it?** Steam → Settings → Controller → the fake →
-*Calibration & Advanced*. The gyro readout should move when the puck does. That
+*Calibration & Advanced*. The gyro readout should move when the controller does. That
 is the end-to-end verdict, and the one to report.
 
 **And check the restore.** Quit Steam (or close the game) and confirm:
@@ -1201,7 +1203,7 @@ is the end-to-end verdict, and the one to report.
 [relay] Steam closed the device; IMU restored to hyprpad's preference
 ```
 
-then re-run 6b: bytes 30+ must go back to zero. A puck left streaming IMU data
+then re-run 6b: bytes 30+ must go back to zero. A controller left streaming IMU data
 to nobody is exactly the battery drain §3.1's default exists to avoid.
 
 ## 9. Tests
@@ -1269,7 +1271,7 @@ All pure, no devices. `cargo test` gates on the exit code.
   decision table; and `serve` driven over a real socket for the refused-verb,
   refused-peer and split-request cases.
 * **`hidraw.rs`** — that `OPEN_FLAGS` is read-write, cloexec and *blocking*;
-  `open_node` on a real file and on a missing one; that a `PuckSource` knows
+  `open_node` on a real file and on a missing one; that a `ControllerSource` knows
   which half it came from; `read_all` streaming from passed descriptors and
   closing its channel when they end; and that one dead path does not sink a whole
   direct generation.
@@ -1278,4 +1280,4 @@ All pure, no devices. `cargo test` gates on the exit code.
   process (it *prints* the privileged half); and the whole `--check` verdict
   table against an injected `HostView`, covering a fully installed machine, an
   untouched one, a broker that refuses, a rule installed but not yet applied, an
-  absent puck, a missing Valve rule, and an `ok 0` answer.
+  absent controller, a missing Valve rule, and an `ok 0` answer.

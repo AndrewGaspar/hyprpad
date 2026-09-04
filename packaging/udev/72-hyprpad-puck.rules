@@ -5,15 +5,15 @@
 # WHY
 # ---
 # hyprpad presents Steam a *virtual* Valve controller on /dev/uhid and streams
-# the real puck into it (docs/design/uhid-relay.md). For that to be worth
-# anything Steam must not also see the real puck: otherwise every press arrives
+# the real controller into it (docs/design/uhid-relay.md). For that to be worth
+# anything Steam must not also see the real controller: otherwise every press arrives
 # twice — once from the fake, once from the real device — and Steam lists two
 # controllers (risk R10).
 #
 # Steam and hyprpad run as the SAME user, so no group or ACL can separate them.
 # The split is made in two halves:
 #
-#   1. THIS RULE takes the puck's hidraw nodes away from every unprivileged
+#   1. THIS RULE takes the controller's hidraw nodes away from every unprivileged
 #      process, the session user included. Nothing running as you can open them.
 #   2. A tiny root broker (hyprpad-broker.socket / .service) opens them on
 #      request and passes the open descriptors to the unprivileged hyprpad
@@ -96,7 +96,7 @@
 # controller over hidraw and only over hidraw; the evdev side is left exactly as
 # the system configures it.
 #
-# Over the dongle there is normally nothing there to hide: the puck's
+# Over the dongle there is normally nothing there to hide: the controller's
 # vendor-collection descriptor produces no evdev node at all on this machine.
 #
 # Over Bluetooth there IS something there — the descriptor's two lizard

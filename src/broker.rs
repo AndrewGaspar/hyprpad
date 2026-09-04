@@ -529,7 +529,7 @@ pub fn classify(path: &Path, outcome: &io::Result<Vec<OwnedFd>>) -> Answer {
 /// |---|---|
 /// | broker absent | `Direct` |
 /// | broker refused / failed | `Direct` |
-/// | broker returned 0 descriptors | `Direct` — nothing usable, and the puck may simply be away |
+/// | broker returned 0 descriptors | `Direct` — nothing usable, and the controller may simply be away |
 /// | broker returned ≥1 descriptor | `Broker` |
 pub fn use_broker(answer: Answer) -> bool {
     matches!(answer, Answer::Fds(n) if n > 0)

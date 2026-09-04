@@ -12,7 +12,7 @@
 //!
 //! Responsibility for the OSK's haptic tick is split: the **child** knows when a
 //! pad's cursor crosses onto a new key (it owns the layout and the hit-test),
-//! but the **daemon** owns the puck's writable hidraw node ([`crate::haptics`]).
+//! but the **daemon** owns the controller's writable hidraw node ([`crate::haptics`]).
 //! So the child announces the crossing and the daemon fires the pulse. The child
 //! prints one machine-readable line per event on its **stdout**:
 //!

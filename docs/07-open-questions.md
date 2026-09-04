@@ -122,7 +122,7 @@ route (architecture F) makes this nearly moot.
 
 ## Q8 — Multi-controller behaviour
 
-The puck exposes four controller slots. Only slot 1 was populated during testing.
+The puck exposes four pairing slots. Only slot 1 was populated during testing.
 Unknown whether slot assignment is stable across reconnects, and how the daemon
 should behave with two controllers paired.
 

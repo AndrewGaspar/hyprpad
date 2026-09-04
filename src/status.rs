@@ -154,7 +154,7 @@ pub struct Status {
     /// that wants to show more than the current one.
     pub modes: Vec<String>,
     /// Every controller the daemon can hear right now, in preference order:
-    /// `"puck"` for the Steam Controller, and the evdev backend's own label
+    /// `"steam-controller"` for the Steam Controller itself, and the evdev backend's own label
     /// (`"elite"`, else `"gamepad"`) for a pad it has adopted
     /// ([`crate::evdev::Node::label`]). Both can be present at once; which one
     /// is *driving* is the last-active-source rule in [`crate::run`], and it is
@@ -278,7 +278,7 @@ impl StatusWriter {
                 pid: std::process::id(),
                 modes: Vec::new(),
                 sources: Vec::new(),
-                layout: crate::report::LAYOUT_PUCK.to_string(),
+                layout: crate::report::LAYOUT_STEAM_CONTROLLER.to_string(),
                 updated: now_secs(),
             },
             base_mode: BUILTIN_DESKTOP.to_string(),
@@ -466,7 +466,7 @@ impl Drop for StatusWriter {
 /// hand), and one field is not worth acquiring one. The value the daemon writes
 /// is always one of a handful of fixed ids, so it never contains an escape.
 pub fn active_layout() -> String {
-    let fallback = || crate::report::LAYOUT_PUCK.to_string();
+    let fallback = || crate::report::LAYOUT_STEAM_CONTROLLER.to_string();
     let Some(path) = status_file_path() else { return fallback() };
     let Ok(text) = std::fs::read_to_string(path) else { return fallback() };
     match read_string_field(&text, "layout") {
@@ -608,7 +608,7 @@ mod tests {
             transport: Some(crate::hidraw::Transport::Dongle),
             pid: 12345,
             modes: vec!["cheatsheet".to_string(), "game".to_string(), "desktop".to_string()],
-            sources: vec!["puck".to_string()],
+            sources: vec!["steam-controller".to_string()],
             layout: "steam-controller-2026".to_string(),
             updated: 1_725_230_000,
         }
@@ -624,7 +624,7 @@ mod tests {
              \"layout\": \"steam-controller-2026\", \
              \"pid\": 12345, \
              \"modes\": [\"cheatsheet\", \"game\", \"desktop\"], \
-             \"sources\": [\"puck\"], \
+             \"sources\": [\"steam-controller\"], \
              \"updated\": 1725230000}\n"
         );
     }
@@ -727,16 +727,16 @@ mod tests {
     #[test]
     fn json_carries_the_live_sources_and_the_active_layout() {
         let mut s = sample();
-        assert!(s.to_json().contains(r#""sources": ["puck"]"#), "{}", s.to_json());
+        assert!(s.to_json().contains(r#""sources": ["steam-controller"]"#), "{}", s.to_json());
         assert!(
             s.to_json().contains(r#""layout": "steam-controller-2026""#),
             "{}",
             s.to_json()
         );
-        s.sources = vec!["puck".to_string(), "elite".to_string()];
+        s.sources = vec!["steam-controller".to_string(), "elite".to_string()];
         s.layout = "xbox-elite-2".to_string();
         let j = s.to_json();
-        assert!(j.contains(r#""sources": ["puck", "elite"]"#), "{j}");
+        assert!(j.contains(r#""sources": ["steam-controller", "elite"]"#), "{j}");
         assert!(j.contains(r#""layout": "xbox-elite-2""#), "{j}");
         // Both pads present is the ordinary two-controller case; which one is
         // *driving* is `layout`'s job, not the list's.
@@ -749,10 +749,10 @@ mod tests {
         let dir = TempDir::new("sources");
         let file = dir.path().join("status.json");
         let mut w = StatusWriter::in_dir(dir.path());
-        w.set_sources(vec!["puck".to_string()]);
-        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""sources": ["puck"]"#));
+        w.set_sources(vec!["steam-controller".to_string()]);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""sources": ["steam-controller"]"#));
         let before = std::fs::read_to_string(&file).unwrap();
-        w.set_sources(vec!["puck".to_string()]);
+        w.set_sources(vec!["steam-controller".to_string()]);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no republish");
 
         w.set_layout("xbox-elite-2");
@@ -763,7 +763,7 @@ mod tests {
     }
 
     /// `active_layout` is what `hyprpad bindings --json` reads. It must round
-    /// trip with what the writer publishes, and answer the puck when there is
+    /// trip with what the writer publishes, and answer the controller when there is
     /// no daemon rather than failing.
     #[test]
     fn the_published_layout_reads_back() {

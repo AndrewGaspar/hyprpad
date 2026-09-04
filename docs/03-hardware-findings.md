@@ -232,7 +232,7 @@ frames.
 ## The raw stream flows with Steam dead
 
 Verified 2026-08-31 (with the owner's permission to cycle Steam): after a clean
-`steam -shutdown`, with **no process holding any puck hidraw node**, report
+`steam -shutdown`, with **no process holding any controller hidraw node**, report
 `0x42` continued to flow on `hidraw7` at **269 Hz** — the same stream, same
 format, same rate as with Steam running.
 

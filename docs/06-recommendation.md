@@ -91,13 +91,13 @@ Three candidate mechanisms, none yet verified on this machine:
 
 - **udev override.** A rule ordered after Steam's `60-steam-input.rules` (which
   grants `MODE="0660", TAG+="uaccess"` to every `28de` hidraw by vendor ID)
-  restricting the puck to root or a dedicated group. Note `uaccess` is applied by
+  restricting the controller to root or a dedicated group. Note `uaccess` is applied by
   logind from the tag, and the udev man page documents `TAG` as a match key and
   `TAG+=` as an assignment — **it does not document `TAG-=`**, so clearing an
   inherited tag needs testing rather than assuming. This implies hyprpad runs as a
   system daemon, since any permission that lets a user-session hyprpad open the
   node also lets user-session Steam open it.
-- **Mount namespace.** Launch Steam under `bwrap` with the puck's nodes masked.
+- **Mount namespace.** Launch Steam under `bwrap` with the controller's nodes masked.
   Avoids root, but `hidraw` numbering is dynamic and changes on replug, so the
   wrapper must resolve nodes at launch and cannot survive a mid-session replug.
 - **systemd device cgroup.** `DevicePolicy=` / `DeviceAllow=` on Steam's user

@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "steam-controller-2026",
   "name": "Steam Controller",
-  "subtitle": "2026 \"puck\"",
+  "subtitle": "2026 (Triton)",
 
   "_comment": [
     "A LAYOUT is all the widget knows about a controller: a front-view drawing,",

@@ -1,7 +1,7 @@
 # hyprpad privileged fd broker — the service half.
 #
 # WHAT IT IS
-#   /dev/uhid is root 0600, and 72-hyprpad-puck.rules makes the real puck's
+#   /dev/uhid is root 0600, and 72-hyprpad-puck.rules makes the real controller's
 #   hidraw nodes root 0600 too. This unit is the only privileged thing hyprpad
 #   installs: it opens those nodes on request and passes the open descriptors to
 #   the unprivileged `hyprpad run` over the socket unit's AF_UNIX socket, using
@@ -9,9 +9,10 @@
 #
 # WHY THAT IS SAFE
 #   The broker's whole vocabulary is two words. It reads one line per connection,
-#   accepts exactly `uhid` or `puck`, and answers with descriptors and a status
+#   accepts exactly `uhid` or `controller` (`puck` is the pre-Bluetooth alias),
+#   and answers with descriptors and a status
 #   line. It never reads from, writes to, or ioctls a device; it never takes a
-#   path from the client; it never caches (every `puck` rescans /sys, so hotplug
+#   path from the client; it never caches (every `controller` rescans /sys, so hotplug
 #   just works and a stale node is never handed out). The socket's 0660
 #   root:hyprpad ownership decides who may ask.
 #

@@ -1727,7 +1727,7 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
                     b.gamepad.identity =
                         crate::uhid::Identity::parse(&as_string(&v, &k)?).map_err(err)?;
                 }
-                // Hold the puck's IMU on regardless of Steam. Off by default:
+                // Hold the controller's IMU on regardless of Steam. Off by default:
                 // Steam turns the gyro on for itself through the relay, and a
                 // gyro streaming for nobody is battery spent for nothing.
                 "gyro" | "imu" => b.gamepad.gyro = as_bool(&v, &k)?,
@@ -1755,11 +1755,13 @@ fn section_gamepad(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functi
     })
 }
 
-/// `h.sticks { … }` — the `[sticks]` knobs: rate control for a controller
-/// whose sticks stand in for the puck's trackpads ([`crate::sticks`]).
+/// `h.sticks { … }` — the `[sticks]` knobs: rate control for a gamepad
+/// whose sticks stand in for the Steam Controller's trackpads
+/// ([`crate::sticks`]).
 ///
-/// Inert on the puck, whose pads drive everything and whose sticks are for
-/// guide flicks, so writing this block costs a puck-only setup nothing.
+/// Inert on the Steam Controller, whose pads drive everything and whose sticks
+/// are for guide flicks, so writing this block costs a Steam-Controller-only
+/// setup nothing.
 ///
 /// ```lua
 /// h.sticks {

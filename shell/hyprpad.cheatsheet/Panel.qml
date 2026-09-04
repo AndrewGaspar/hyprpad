@@ -167,7 +167,7 @@ Item {
   }
 
   // Walk the layout's `art` list in order and keep the first drawing that
-  // exists. For the puck that means Valve's own diagram when the local Steam
+  // exists. For the controller that means Valve's own diagram when the local Steam
   // install has it, and hyprpad's bundled schematic otherwise — the official
   // art is READ from the install, never copied into the repo.
   property int artIndex: 0
