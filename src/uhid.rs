@@ -965,7 +965,7 @@ mod tests {
         let ev = create2_event(p);
         assert_eq!(u32::from_le_bytes(ev[0..4].try_into().unwrap()), ev::CREATE2);
         assert_eq!(&ev[O_CREATE2_NAME..O_CREATE2_NAME + 31], b"Valve Software Steam Controller");
-        assert_eq!(&ev[O_CREATE2_UNIQ..O_CREATE2_UNIQ + 13], b"FXA9961402A6C");
+        assert_eq!(&ev[O_CREATE2_UNIQ..O_CREATE2_UNIQ + 13], b"FXA0000000001");
         assert_eq!(le_u16(&ev, O_CREATE2_RD_SIZE), Some(372));
         assert_eq!(le_u16(&ev, O_CREATE2_BUS), Some(BUS_USB));
         assert_eq!(le_u32(&ev, O_CREATE2_VENDOR), Some(0x28de));

@@ -16,7 +16,7 @@ Reproduce with [`tools/sc2-capture.py`](../tools/sc2-capture.py).
 ## Device topology
 
 The wireless puck enumerates as a single USB device, `28de:1304`
-("Valve Software Steam Controller Puck", serial `FXB99614031B4`), exposing
+("Valve Software Steam Controller Puck", serial `FXB0000000002`), exposing
 **five HID interfaces**:
 
 | Interface | `hidraw` | evdev nodes | Role |
@@ -310,7 +310,7 @@ Reproduced on this machine, on every Steam launch:
 [2026-08-30 21:14:55] BYieldingCompleteSteamControllerRegistration
 [2026-08-30 21:14:55] BYieldingCompleteSteamControllerRegistration - Error
     committing registration completion of controller & account pair:
-    FXA9961402A6C Invalid Parameter
+    FXA0000000001 Invalid Parameter
 ```
 
 (`~/.steam/steam/logs/controller.txt`; identical failure on 2026-08-03.)

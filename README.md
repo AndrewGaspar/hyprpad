@@ -970,3 +970,17 @@ Research complete through the full living-room programme
 2026-08-30/31, taken against Hyprland 0.56.2 (HypXRland fork), Linux 7.1.9,
 Steam client build 1785799196 on Omarchy 4/Arch — on the Framework 16
 development machine; the living-room tower is not yet probed.
+
+## Licence
+
+MIT OR Apache-2.0 for the code, at your option — the texts are in
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). Any contribution
+you submit is dual-licensed the same way, with no additional terms.
+
+Two things in the tree are not the code and carry their own terms. The keyboard's
+**prediction model** is a built artifact under **CC BY-SA 4.0**, because
+wordfreq's data is share-alike — see [osk/README.md](osk/README.md). The
+third-party **artwork** keeps the licences it came with; provenance and terms,
+source by source, are in each art directory's `LICENSES.md`
+([cheatsheet](shell/hyprpad.cheatsheet/art/LICENSES.md),
+[status](shell/hyprpad.status/art/LICENSES.md)).

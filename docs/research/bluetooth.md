@@ -132,8 +132,8 @@ Three things worth pulling out, because they are what people get wrong:
   puck does not make the controller fall back to Bluetooth.
 
 The advertised name carries the controller's own serial prefix. This unit's
-wired serial is `FXA9961402A6C` (`LOCAL`, and pinned as the relay's `uniq` in
-`src/uhid/profile.rs:539-543`), so expect `Steam Ctrl (BT) FXA99614…` — a useful
+wired serial is `FXA0000000001` (`LOCAL`, and pinned as the relay's `uniq` in
+`src/uhid/profile.rs:539-543`), so expect `Steam Ctrl (BT) FXA00000…` — a useful
 way to tell it from someone else's in a scan.
 
 ### 1.2 Back to the puck, and the other modes — VALVE
@@ -266,7 +266,7 @@ So, concretely, on the wire and in `/sys`:
 | `device/uevent` | `HID_ID=0003:000028DE:00001304` | `HID_ID=0005:000028DE:00001303` |
 | hid device kernel name | `0003:28DE:1304.0002` | `0005:28DE:1303.NNNN` |
 | `MODALIAS` | `hid:b0003g0001v000028DEp00001304` | `hid:b0005g0001v000028DEp00001303` |
-| `HID_UNIQ` | `FXB99614031B4` (the dongle serial) | **the controller's bdaddr**, lowercase |
+| `HID_UNIQ` | `FXB0000000002` (the dongle serial) | **the controller's bdaddr**, lowercase |
 | hidraw nodes | **5** | **1** |
 
 The formats are `hid-core.c:2983` `"HID_ID=%04X:%08X:%08X"` and `:2996`
@@ -816,7 +816,7 @@ Power off: hold **Steam ~5 s** until the chime, LED out. Then hold
 and the blue double-pulse.
 
 ```bash
-bluetoothctl scan on            # "Steam Ctrl (BT) FXA99614…"
+bluetoothctl scan on            # "Steam Ctrl (BT) FXA00000…"
 bluetoothctl pair  <bdaddr>
 bluetoothctl trust <bdaddr>     # required for auto-reconnect (§2.5)
 ```
@@ -963,7 +963,7 @@ matter.*
 
 | | §2's expectation | Measured |
 |---|---|---|
-| Identity | `0005:000028DE:00001303` | **confirmed**, `HID_NAME=Steam Ctrl (BT) FXA9961402A6C` |
+| Identity | `0005:000028DE:00001303` | **confirmed**, `HID_NAME=Steam Ctrl (BT) FXA0000000001` |
 | hidraw nodes | 1 | **1** (`/dev/hidraw13`) |
 | Input report | `0x45`, 46 bytes | **`0x45`, 46 bytes** — not `0x47` (§8 row 3 closed) |
 | Rate | 20–33 Hz feared, 133 Hz ceiling | **133.5 Hz** |
@@ -1174,7 +1174,7 @@ Structurally as §5 described, with the transport question answered differently.
 ## Live results (2026-09-03, owner's laptop, kernel 7.1.9, BlueZ)
 
 - Paired with the documented chord (B + R1 + Steam past the second chime); advertised as
-  `Steam Ctrl (BT) FXA9961402A6C`; bonded + trusted.
+  `Steam Ctrl (BT) FXA0000000001`; bonded + trusted.
 - Linux sees `0005:000028DE:00001303`, ONE hidraw node (0660 root + a uaccess ACL for the
   user, so Steam grabbed it until Steam was quit), plus evdev Mouse/Keyboard nodes that
   Hyprland adopted (lizard mode is on over BT until hyprpad disables it there).

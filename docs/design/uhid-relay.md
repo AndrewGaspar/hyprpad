@@ -53,7 +53,7 @@ The identity is **data**, not a constant (`src/uhid/profile.rs`), and two ship.
 |---|---|---|
 | VID:PID | `28de:1302`, the *wired* single-interface Steam Controller | `28de:12f0`, InputPlumber's `ProductId::Generic` |
 | `name` | `Valve Software Steam Controller` | `Steam Controller` |
-| `uniq` (Steam's config key) | `FXA9961402A6C`, the captured unit's serial — pinned | `HYPRPAD-DECK-0001`, a fixed synthetic — pinned (§1.3) |
+| `uniq` (Steam's config key) | `FXA0000000001`, the captured unit's serial — pinned | `HYPRPAD-DECK-0001`, a fixed synthetic — pinned (§1.3) |
 | `phys` | `hyprpad-uhid/1302` | `""` |
 | `version` | `0x0307` (bcdDevice 307, as Steam logged for the real unit) | `0x1000` |
 | `bus` | `BUS_USB` | `BUS_USB` |
@@ -61,6 +61,10 @@ The identity is **data**, not a constant (`src/uhid/profile.rs`), and two ship.
 | Report IDs | **yes**, on input, output *and* feature | **none at all** |
 | Input report | `0x42`, 54 bytes — **pass-through** | 64 bytes — **transcoded** |
 | Steam adoption | **UNPROVEN** — awaits the owner's live test | **PROVEN on-device, 2026-09-01** |
+
+*The hardware serials quoted in this document — `FXA0000000001` for the
+controller, `FXB0000000002` for the puck — are synthetic stand-ins of the same
+shape as the captured ones. No real unit's serial is published in this repo.*
 
 Neither is `28de:1304`, the puck's own PID, and neither can be: Steam derives the
 controller *slot index* from `bInterfaceNumber` for the dongle PIDs and SDL gates
@@ -217,12 +221,12 @@ settle it:
 * the `serial_number:` line comes from **hidapi's enumeration**, whose hidraw
   backend parses `HID_UNIQ` out of the node's `uevent` — and `uniq` is what
   `struct uhid_create2_req` puts there. On this machine the live triton fake
-  reads `HID_UNIQ=FXA9961402A6C`;
+  reads `HID_UNIQ=FXA0000000001`;
 * the complaint lands **immediately on open**, one line after `!! Steam
   controller device opened`, before any feature-report round trip could have
   happened;
 * the `triton` profile, whose `uniq` *is* set, is enumerated as
-  `serial_number: FXA9961402A6C`, loads `configset_FXA9961402A6C.vdf`, and draws
+  `serial_number: FXA0000000001`, loads `configset_FXA0000000001.vdf`, and draws
   no complaint at all.
 
 The canned `0xAE` answer said `1NPU7PLUMB3R` (InputPlumber's joke serial)
@@ -238,7 +242,7 @@ self-consistency rule `TRITON_ATTRIBUTES` already follows for the product id
 | Candidate | Rejected because |
 |---|---|
 | `""` (InputPlumber's) | this is the bug |
-| `FXA9961402A6C` / `FXB99614031B4`, the real controller's and controller's | ships one machine's hardware identity to everyone who builds hyprpad — and colliding with `triton`'s key would apply a Deck-shaped binding set to a Triton-shaped device |
+| the controller's or the puck's own hardware serial | ships one machine's hardware identity to everyone who builds hyprpad — and colliding with `triton`'s key would apply a Deck-shaped binding set to a Triton-shaped device. The serials this tree states (`FXA0000000001`, `FXB0000000002`) are synthetic stand-ins for exactly that reason |
 | `1NPU7PLUMB3R`, the `0xAE` answer's old value | not distinct from InputPlumber's own devices, and not obviously ours in a log |
 | **`HYPRPAD-DECK-0001`** | **stable** (Steam keys `configset_<serial>.vdf` on it, so bindings must survive a restart), **distinct** from `triton`'s, and **obviously ours** in a Steam log |
 
@@ -559,7 +563,7 @@ InputPlumber's verbatim bytes — the ones the adopted run sent:
 | Selector | Answer |
 |---|---|
 | `GetAttributesValues` `0x83` | the 64-byte TLV blob, `[0x00, 0x83, 0x2d, …]`. For `triton`, `ATTRIB_PRODUCT_ID` (the first TLV's u32) is patched from `0x1205` to `0x1302` so the answer does not contradict the claimed identity — risk R3's prescribed mitigation. |
-| `GetStringAttribute` `0xAE` | `[0x00, 0xAE, 0x14, 0x01]` + serial, padded to 64. `0x01` is `ATTRIB_STR_UNIT_SERIAL`; `0x14` = 20 is the declared payload, so the serial has 19 bytes to fit in. `deck`: `HYPRPAD-DECK-0001`. `triton`: `FXA9961402A6C`, the captured unit's. Both equal that profile's `uniq` — §1.3. |
+| `GetStringAttribute` `0xAE` | `[0x00, 0xAE, 0x14, 0x01]` + serial, padded to 64. `0x01` is `ATTRIB_STR_UNIT_SERIAL`; `0x14` = 20 is the declared payload, so the serial has 19 bytes to fit in. `deck`: `HYPRPAD-DECK-0001`. `triton`: `FXA0000000001`, the captured unit's. Both equal that profile's `uniq` — §1.3. |
 | `GetChipId` `0xBA` | `[0x00, 0xBA, 0x11, 0x00]` + 15 chip-id bytes, padded to 64. |
 | anything else | a **correctly framed** 64 bytes: `[0x00, <selector>, 0x00, …]`. |
 
@@ -1098,7 +1102,7 @@ grep -iE '1302|12f0|opened|V1 HID|deck' ~/.local/share/Steam/logs/controller.txt
 | Look for | Meaning |
 |---|---|
 | `Local Device Found / type: 28de 1302` (or `12f0`) | Steam enumerated it |
-| `serial_number: FXA9961402A6C` (triton) or `HYPRPAD-DECK-0001` (deck), **not** blank | the `uniq` field arrived — no `Invalid or missing unit serial number` should follow (§1.3) |
+| `serial_number: FXA0000000001` (triton) or `HYPRPAD-DECK-0001` (deck), **not** blank | the `uniq` field arrived — no `Invalid or missing unit serial number` should follow (§1.3) |
 | `Interface: -1` then `Controller uses V1 HID protocol via USB` | the `-1` question answered — **G1 PASS** |
 | **`!! Steam controller device opened for index N`** | **adopted** |
 | the fake's `/dev/hidrawN` in `/proc/$(pgrep -x steam)/fd` | Steam is holding it |

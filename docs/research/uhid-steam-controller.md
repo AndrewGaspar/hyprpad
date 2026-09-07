@@ -97,7 +97,7 @@ themselves — but there is one trap that would have sunk the obvious attempt.**
    **Better still: this machine has already run one.** VERIFIED(local), same log:
 
    ```
-   type: 28de 1302   path: /dev/hidraw7   serial_number: FXA9961402A6C - 0
+   type: 28de 1302   path: /dev/hidraw7   serial_number: FXA0000000001 - 0
      Manufacturer: Valve Software   Product: Steam Controller   Release: 307   Interface: 0
    Controller uses V1 HID protocol via USB
    !! Steam controller device opened for index 0.
@@ -406,7 +406,7 @@ puck):
 Local Device Found
   type: 28de 1302
   path: /dev/hidraw7
-  serial_number: FXA9961402A6C - 0
+  serial_number: FXA0000000001 - 0
   Manufacturer: Valve Software
   Product:      Steam Ctrl (USB)          ← later entries say "Steam Controller"
   Release:      307
@@ -420,7 +420,7 @@ Steam Controller reserving XInput slot 0
 … 23CExitLizardModeWorkItem(0)
 … 27CWriteFeatureReportWorkItem(0)   ×7
 … 29CLoadControllerConfigWorkItem(0) ×5
-ConfigSet - failed to find config set file on-disk: …/config/configset_FXA9961402A6C.vdf
+ConfigSet - failed to find config set file on-disk: …/config/configset_FXA0000000001.vdf
 ConfigSet - found config set file on-disk: …/config/configset_controller_neptune.vdf
 ConfigSet - failed to find ibex config set file on-disk, saving now: …/config/configset_controller_triton.vdf
 Deck Controller PCB Serial# invalid: NA      ← queried, failed, tolerated
@@ -435,7 +435,7 @@ Everything hyprpad must satisfy is in that trace, and it is modest:
 - **Per-controller Steam Input config is keyed by the serial**:
   `configset_<HID_UNIQ>.vdf`. Whatever hyprpad puts in `create2.uniq` becomes the
   controller's persistent Steam identity. Use the *real* controller's serial
-  (`FXA9961402A6C`) so existing configs carry over — hyprpad can read it from
+  (`FXA0000000001`) so existing configs carry over — hyprpad can read it from
   `HID_UNIQ` when the unit is wired, or just pin a constant. A missing serial is
   not fatal — Steam logs *"Controller has an Invalid or missing unit serial
   number, setting to `<vid>-<pid>-<hash>`"* — but then the config identity is
@@ -485,7 +485,7 @@ individually proven.
 
 ### 4.1 The real puck's report descriptor (VERIFIED local, read today)
 
-`28de:1304`, `Valve Software / Steam Controller Puck`, serial `FXB99614031B4`,
+`28de:1304`, `Valve Software / Steam Controller Puck`, serial `FXB0000000002`,
 `bcdDevice 0002`, 7 interfaces (0/1 = CDC-ACM):
 
 | hidraw | USB iface | descriptor | role |
@@ -719,7 +719,7 @@ timeout fire (§1.2). Steam handles this gracefully; its log already shows
 | R8 | The puck's CDC-ACM pair cannot be cloned; a real wired unit may expose one too. | Low / UNKNOWN | No evidence Steam uses it for input. |
 | R9 | Anti-cheat sees a HID device with no USB parent. | Low | Identical exposure to SteamOS's own `deck-uhid`, hhd, InputPlumber, and every Bluetooth controller. |
 | R10 | Two controllers appear if the real puck isn't fully hidden. | Medium | W12 must be *solved*. Use hhd's `hide.py` pattern (§8.3). |
-| R11 | Steam's per-controller config is keyed by `HID_UNIQ`; a changing `uniq` orphans configs. | Low | Pin `create2.uniq` to a constant (ideally the real controller serial `FXA9961402A6C`). |
+| R11 | Steam's per-controller config is keyed by `HID_UNIQ`; a changing `uniq` orphans configs. | Low | Pin `create2.uniq` to a constant (ideally the real controller serial `FXA0000000001`). |
 
 ---
 
@@ -897,7 +897,7 @@ ls -l /dev/uhid && getfacl /dev/uhid        # expect an ACL for uid 1000
 
 1. `UHID_CREATE2`: `bus=BUS_USB(3)`, `vendor=0x28DE`, `product=0x1302`,
    `version=307`, `country=0`, `name="Steam Controller"`,
-   `uniq="FXA9961402A6C"`, `phys="hyprpad"`, `rd_data` = step 0's descriptor.
+   `uniq="FXA0000000001"`, `phys="hyprpad"`, `rd_data` = step 0's descriptor.
 2. Log the `UHID_START` `dev_flags` — this settles §1.3 empirically.
 3. Open a real puck node read-only; for each 54-byte `0x42`, clear `raw[4] & 0x01`
    and `UHID_INPUT2` it.
@@ -1222,7 +1222,7 @@ baseline, a *live stream*, and *answered handshakes*. All in one Steam session.
 2. **Create an *active* fake, while Steam is already up** (so the `add` uevent hits
    the live monitor). Use `bus=BUS_USB(0x03)` (not `BUS_VIRTUAL`), `vendor=0x28DE`,
    `product=0x1302`, `version=307`, `name="Steam Controller"`,
-   `uniq="FXA9961402A6C"`, `phys="hyprpad"`, `rd_data` = the real wired-`1302`
+   `uniq="FXA0000000001"`, `phys="hyprpad"`, `rd_data` = the real wired-`1302`
    descriptor (§9 step 0). Then, unlike the passive probe:
    - **Stream** a valid `0x42` report continuously at ~250 Hz from the moment of
      create — copy the real puck's frames (guide bit cleared) or emit a neutral

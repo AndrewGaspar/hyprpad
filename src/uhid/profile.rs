@@ -388,16 +388,18 @@ const DECK_CHIP_ID: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
 /// hidraw backend, which parses `HID_UNIQ` out of the node's `uevent`; the
 /// complaint lands *before* any feature round trip, immediately on open; and the
 /// `triton` profile, whose `uniq` is set, is enumerated as
-/// `serial_number: FXA9961402A6C` and draws no complaint at all. The canned
+/// `serial_number: FXA0000000001` and draws no complaint at all. The canned
 /// `0xAE` answer already said `1NPU7PLUMB3R` throughout and changed nothing.
 ///
 /// # Why this string
 ///
-/// Not the real unit's serial. `FXA9961402A6C` is the wireless controller's own
-/// and `FXB99614031B4` is the controller's, and baking either into the source would
+/// Not a hardware serial. Baking a real unit's serial into the source would
 /// ship one machine's hardware identity to everyone who builds hyprpad — and
 /// would make the `deck` and `triton` identities collide on one Steam config
 /// key, so a Deck-shaped binding set would be applied to a Triton-shaped device.
+/// (`FXA0000000001` and `FXB0000000002`, the controller's and the puck's serials
+/// as this tree states them, are themselves synthetic stand-ins of the captured
+/// shape — see `TRITON_SERIAL`.)
 ///
 /// A fixed synthetic is what the field actually needs to be: **stable**, because
 /// Steam keys `configset_<serial>.vdf` on it and a binding set must survive a
@@ -484,11 +486,15 @@ pub fn deck() -> &'static Profile {
 pub const TRITON_DESCRIPTOR: [u8; 372] =
     *include_bytes!("../../docs/research/assets/triton-wired-1302-report-descriptor.bin");
 
-/// The wired unit's serial, captured with the descriptor
+/// The wired unit's serial, in the slot the captured one occupied
 /// (`docs/research/assets/triton-wired-1302-identity.md`). Pinned as `uniq`
 /// because Steam keys `configset_<uniq>.vdf` on it (§3.3, §6 R11) — a Steam
 /// Input config bound to this string survives every restart of the daemon.
-pub const TRITON_SERIAL: &str = "FXA9961402A6C";
+///
+/// **Synthetic.** The captured unit's real serial is not published; this is a
+/// stand-in of the same shape (13 characters, `FXA` prefix), which is all the
+/// `uniq` field and the 19 bytes inside the `0xAE` payload care about.
+pub const TRITON_SERIAL: &str = "FXA0000000001";
 
 /// The feature report the wired `1302` multiplexes Valve's whole command set
 /// through: id `0x01`, 63 payload bytes, vendor page `0xFF00`. Read straight off
@@ -993,7 +999,7 @@ mod tests {
         assert_eq!(t.bus, BUS_USB);
         assert_eq!(t.kind, ReportKind::Triton);
         assert_eq!(d.kind, ReportKind::Deck);
-        assert_eq!(t.uniq, "FXA9961402A6C", "pinned so Steam's config key is stable");
+        assert_eq!(t.uniq, "FXA0000000001", "pinned so Steam's config key is stable");
         assert_eq!(d.uniq, DECK_SERIAL, "pinned for the same reason — see DECK_SERIAL");
         assert_ne!(t.uniq, d.uniq, "the two identities must not share a Steam config key");
         assert!(!d.uniq.is_empty(), "an empty uniq is what Steam called an invalid unit serial");
@@ -1058,7 +1064,7 @@ mod tests {
     fn triton_answers_with_its_own_serial_and_a_self_consistent_product_id() {
         let t = triton();
         let serial = t.canned_reply(cmd::GET_STRING_ATTRIBUTE);
-        assert_eq!(&serial[4..17], b"FXA9961402A6C");
+        assert_eq!(&serial[4..17], b"FXA0000000001");
         // R3: the attributes answer must not contradict the claimed identity.
         let attrs = t.canned_reply(cmd::GET_ATTRIBUTES_VALUES);
         assert_eq!(u32::from_le_bytes(attrs[4..8].try_into().unwrap()), 0x1302);
@@ -1103,7 +1109,7 @@ mod tests {
             assert_eq!(r.len(), 65, "never short, never empty");
             assert_eq!(r[1], selector, "the command id Steam asked for");
         }
-        assert_eq!(&t.get_report_reply(0, cmd::GET_STRING_ATTRIBUTE)[4..17], b"FXA9961402A6C");
+        assert_eq!(&t.get_report_reply(0, cmd::GET_STRING_ATTRIBUTE)[4..17], b"FXA0000000001");
     }
 
     /// The deck answer does **not** move: 64 bytes, the canned frame verbatim,
@@ -1157,10 +1163,12 @@ mod tests {
         // a Triton-shaped device would bind the wrong buttons.
         assert_ne!(d.uniq, triton().uniq);
 
-        // Not the real hardware's serial, on either channel: those belong to one
-        // machine and this string ships to everyone.
-        for real in ["FXA9961402A6C", "FXB99614031B4"] {
-            assert_ne!(d.serial, real, "no real unit's serial is baked into the source");
+        // Not a controller serial, on either channel: the deck identity must
+        // never collide with the one `triton` states. (Those two are the
+        // synthetic stand-ins this tree uses for the controller and the puck —
+        // no real unit's serial is published here.)
+        for other in ["FXA0000000001", "FXB0000000002"] {
+            assert_ne!(d.serial, other, "no controller serial is baked into the deck identity");
         }
 
         // Plain ASCII, and short enough for every field that carries it: the

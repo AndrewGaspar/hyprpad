@@ -636,12 +636,12 @@ mod tests {
          HID_ID=0003:000028DE:00001304\n\
          HID_NAME=Valve Software Steam Controller Puck\n\
          HID_PHYS=usb-0000:c1:00.3-2.1/input2\n\
-         HID_UNIQ=FXB99614031B4\n\
+         HID_UNIQ=FXB0000000002\n\
          MODALIAS=hid:b0003g0001v000028DEp00001304\n";
 
     const UEVENT_BT: &str = "DRIVER=hid-generic\n\
          HID_ID=0005:000028DE:00001303\n\
-         HID_NAME=Steam Ctrl (BT) FXA9961402A6C\n\
+         HID_NAME=Steam Ctrl (BT) FXA0000000001\n\
          HID_PHYS=b0:e4:d5:11:22:33\n\
          HID_UNIQ=e8:47:3a:9d:1c:04\n\
          MODALIAS=hid:b0005g0001v000028DEp00001303\n";

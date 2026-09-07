@@ -34,7 +34,7 @@ EV = {UHID_START:"START", UHID_STOP:"STOP", UHID_OPEN:"OPEN (a reader attached)"
 def create2_event(rd: bytes) -> bytes:
     name = b"Valve Software Steam Controller"
     phys = b"hyprpad-uhid/1302"
-    uniq = b"FXA9961402A6C"
+    uniq = b"FXA0000000001"
     buf  = struct.pack("<I", UHID_CREATE2)
     buf += name.ljust(128, b"\0") + phys.ljust(64, b"\0") + uniq.ljust(64, b"\0")
     buf += struct.pack("<HH", len(rd), BUS_VIRTUAL)
@@ -56,7 +56,7 @@ def main():
     print(f"[*] report descriptor: {len(rd)} bytes")
     fd = os.open("/dev/uhid", os.O_RDWR)
     os.write(fd, create2_event(rd))
-    print("[*] UHID_CREATE2: 28de:1302 on BUS_VIRTUAL, uniq=FXA9961402A6C")
+    print("[*] UHID_CREATE2: 28de:1302 on BUS_VIRTUAL, uniq=FXA0000000001")
     time.sleep(0.4)
 
     node = None

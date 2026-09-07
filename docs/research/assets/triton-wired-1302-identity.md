@@ -4,11 +4,11 @@
 from a *separate* single-interface Steam Controller ("the controller"), NOT the
 2026 puck. Confirmed by re-enumerating with the puck cabled:
 
-- **The puck** = `28de:1304`, product "Steam Controller Puck", serial FXB99614031B4,
+- **The puck** = `28de:1304`, product "Steam Controller Puck", serial FXB0000000002,
   **7 USB interfaces → 5 hidraw slots** (phys input2..input6), *wired or wireless*.
   This is what hyprpad owns. Cloning ITS identity via uhid fails the interface-number
   slot test (SDL gates 1304 on interface 2..5; uhid has no interface).
-- **"The controller"** = `28de:1302`, single interface 0, serial FXA9961402A6C.
+- **"The controller"** = `28de:1302`, single interface 0, serial FXA0000000001.
   Its descriptor is the one saved here — the SDL WIRED branch takes it with no
   interface test, which is why it's the impersonation identity of choice.
 
@@ -23,7 +23,7 @@ set map onto the `1302` protocol Steam will speak — TBD after the decisive tes
   BUS_VIRTUAL (0x06)** so Valve's 60-steam-input.rules `000[356]:28DE:*` matches it.
 - vendor: 0x28DE  product: 0x1302  version/bcdDevice: 0x0307
 - name (HID_NAME): "Valve Software Steam Controller"
-- uniq (HID_UNIQ): the controller serial, e.g. FXA9961402A6C — Steam keys
+- uniq (HID_UNIQ): the controller serial, e.g. FXA0000000001 — Steam keys
   configset_<UNIQ>.vdf on this, so it is the Steam Input identity. (Use the real
   puck's own serial so per-game configs follow the hardware.)
 - phys: any stable string (e.g. "hyprpad-uhid/1302").

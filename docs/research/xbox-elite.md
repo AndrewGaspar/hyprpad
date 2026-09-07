@@ -82,10 +82,12 @@ tag. **VERIFIED(xpadneo/xone/SDL/systemd)** = read from those projects'
 
 ### 1.1 What is on this machine right now — VERIFIED(local)
 
+*Bluetooth addresses in this document are redacted: every `Phys`/`Uniq`/`bluetoothctl` address below is a synthetic stand-in for the real one.*
+
 ```
 I: Bus=0005 Vendor=045e Product=0b22 Version=0521
 N: Name="Xbox Wireless Controller"
-P: Phys=f4:28:9d:05:16:be          U: Uniq=14:cb:65:7d:5c:d8
+P: Phys=00:11:22:33:44:55          U: Uniq=00:11:22:33:44:66
 S: Sysfs=/devices/virtual/misc/uhid/0005:045E:0B22.0074/input/input242
 H: Handlers=sysrq kbd event31 js0
 B: EV=30001b        (SYN KEY ABS MSC REP FF)
@@ -113,7 +115,7 @@ Other facts from the same session:
   — the exact size the in-tree HID-BPF fix asserts against (§1.3.5).
 - `udevadm info /dev/input/event31`: `ID_INPUT=1 ID_INPUT_KEY=1
   ID_INPUT_KEYBOARD=1 ID_BUS=bluetooth`, **no `ID_INPUT_JOYSTICK`**; `TAGS=:power-switch:`;
-  `LIBINPUT_DEVICE_GROUP=5/45e/b22:f4:28:9d:05:16:be`. Same for `js0`.
+  `LIBINPUT_DEVICE_GROUP=5/45e/b22:00:11:22:33:44:55`. Same for `js0`.
 - Permissions: `event31` is `crw-rw---- root input` with **no** uaccess ACL —
   this user reads it through the `input` group (`id`: groups include
   `992(input)`). `hidraw12` is `crw-rw----+ root root` **with** `user:ajg:rw-`,
@@ -947,7 +949,7 @@ Microsoft Q&A, "How do I use an onscreen keyboard in game with a gamepad" · Ste
 `/sys/class/input/input242/{uevent,capabilities/*}`; `udevadm info` on `event31`, `js0`,
 `hidraw12`, `input242`; `udevadm test-builtin input_id`; `getfacl`; `id`; `lsmod`;
 `modinfo xpad hid_microsoft`; `/proc/config.gz`; `pacman -Q/-Si/-Ss`;
-`bluetoothctl info 14:CB:65:7D:5C:D8`; `/etc/bluetooth/main.conf`;
+`bluetoothctl info 00:11:22:33:44:66`; `/etc/bluetooth/main.conf`;
 `$XDG_RUNTIME_DIR/hypr/*/hyprland.log`; `hyprctl devices -j`;
 `~/.local/share/Steam/steamui/images/controller/`; `journalctl --user`
 (voxtype transcript of the owner's request, 22:55–22:57).

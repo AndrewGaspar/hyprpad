@@ -541,7 +541,8 @@ environment quirks worth recording:
 
 ## Licence
 
-MIT OR Apache-2.0 for the code.
+MIT OR Apache-2.0 for the code, at the contributor's option; the texts live at
+the repo root as `LICENSE-MIT` and `LICENSE-APACHE`.
 
 The **prediction model** is a separate artifact with its own terms — it is built,
 not committed, and it is CC BY-SA 4.0 because wordfreq's data is share-alike.

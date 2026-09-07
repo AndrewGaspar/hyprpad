@@ -1,7 +1,7 @@
 # Captured from the 2026 Steam Controller over Bluetooth, 2026-09-03.
 #
 # Node   /dev/hidraw13, HID_ID=0005:000028DE:00001303,
-#        HID_NAME="Steam Ctrl (BT) FXA9961402A6C"
+#        HID_NAME="Steam Ctrl (BT) FXA0000000001"
 # How    opened O_RDONLY, one os.read() per report, nothing written to the
 #        device and no ioctl but the report-descriptor read. The controller was
 #        paired and connected; hyprpad was not running.
