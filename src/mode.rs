@@ -1284,15 +1284,22 @@ mod tests {
         assert_eq!(m.buttons().get(&report::Button::TriggerR2Full), Some(&Hold(0x110.into())));
         assert_eq!(m.buttons().get(&report::Button::TriggerL2Full), Some(&Hold(0x111.into())));
 
-        for class in [
-            "steam_app_413080",
-            "steam_proton_x",
-            "gamescope",
-            "steam",
-            "steamwebhelper",
-            "Steam_App_570", // the class match is case-insensitive
+        // The Steam client itself (library, store, chat) is a desktop app and
+        // keeps the desktop bindings; only its Big Picture window, which keeps
+        // the class and retitles itself, passes through.
+        m.focus_changed(&c, "steam", "Steam", None);
+        assert_eq!(m.active(), "desktop", "the Steam desktop client is not a game");
+        assert!(m.cursor_enabled() && !m.forwards());
+
+        for (class, title) in [
+            ("steam_app_413080", ""),
+            ("steam_proton_x", ""),
+            ("gamescope", ""),
+            ("steam", "Steam Big Picture Mode"),
+            ("steamwebhelper", "Steam Big Picture Mode"),
+            ("Steam_App_570", ""), // the class match is case-insensitive
         ] {
-            m.focus_changed(&c, class, "", None);
+            m.focus_changed(&c, class, title, None);
             assert_eq!(m.active(), "game", "class {class} should select game mode");
             assert!(!m.cursor_enabled() && !m.scroll_enabled(), "{class}");
             assert!(m.buttons().is_empty(), "{class}");

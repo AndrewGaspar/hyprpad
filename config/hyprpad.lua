@@ -69,8 +69,8 @@ h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatshee
 h.mode("launcher").when(function(ctx) return ctx.layers:has("omarchy-launcher") end)
 
 -- Game / Steam Big Picture. Steam launches native and Proton titles as
--- `steam_app_<id>`; gamescope and Big Picture (`steamwebhelper`) are matched
--- too, which is what fixes the double-input seen in Big Picture.
+-- `steam_app_<id>`; gamescope is matched too. The Steam client itself gets the
+-- desktop bindings; only its Big Picture window (matched by title) passes through.
 --
 -- Deliberately NOT triggered by fullscreen: a fullscreen video is not a game.
 -- Omarchy's transient, keyboard-owning shell surfaces (ALLOWLIST -- omarchy-bar and
@@ -88,11 +88,15 @@ end)
 
 h.mode("game", { forward = true }).when(function(ctx)
   local c = ctx.focus.class:lower()
+  local t = ctx.focus.title:lower()
   return c:match("^steam_app_") ~= nil
       or c:match("^steam_proton") ~= nil
       or c:match("^gamescope") ~= nil
-      or c == "steam"
-      or c == "steamwebhelper"
+      -- The Steam client is a desktop app (library, store, chat) and keeps the
+      -- desktop bindings -- except in Big Picture, a controller UI that owns
+      -- every input. The window keeps its class and retitles itself
+      -- "Steam Big Picture Mode", so the title is the switch.
+      or ((c == "steam" or c == "steamwebhelper") and t:match("big picture") ~= nil)
 end)
 
 -- A browser: Google Chrome, and Omarchy's web apps (Chrome in `--app` mode,
