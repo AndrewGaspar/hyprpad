@@ -734,14 +734,17 @@ pub fn run() -> std::io::Result<()> {
                     engine.guide_active(),
                     modes.cursor_enabled(),
                     modes.cursor_guide_enabled(),
-                ),
+                ) && (engine.guide_active()
+                    || !config.bare_flick_live(crate::gesture::Stick::Right, modes.state())),
                 // `mode = off` is "the left input does not scroll", and it
                 // means that on a stick as much as on a pad — the pad path
                 // checks it inside `drive_scroll`, so the stick path checks it
-                // here rather than letting the two disagree.
+                // here rather than letting the two disagree. A stick with a
+                // live bare flick is a flick stick in this mode, not a wheel.
                 scroll: !engine.guide_active()
                     && modes.scroll_enabled()
-                    && config.scroll().mode != ScrollMode::Off,
+                    && config.scroll().mode != ScrollMode::Off
+                    && !config.bare_flick_live(crate::gesture::Stick::Left, modes.state()),
                 osk: osk.is_active(),
             };
             let mut hx =
@@ -4032,6 +4035,15 @@ fn handle_gesture(
     // because to the hand this is a button going down, and the pad click that
     // is its usual home already has its own. On a flick or the guide hold a
     // key still does nothing: there is no release edge to pair it with.
+    // A bare flick with a key: tapped, like a sequence step. A flick is a
+    // single edge with no release to pair a hold with, so press+release in
+    // this frame is the only honest reading (`pageup` on `lstick_up`).
+    if let (GestureEvent::StickFlick { .. }, Action::Key(chord)) = (ge, &action) {
+        hx.fire(Haptic::Gesture, HapticPad::Both);
+        tap_chord(keyboard, pointer.as_deref_mut(), chord);
+        return modes.note_click(config);
+    }
+
     if let (GestureEvent::GuideChord(b), Action::Key(chord)) = (ge, &action) {
         hx.fire(Haptic::Button, button_pad(b));
         let mut clicked = false;
@@ -4498,8 +4510,9 @@ fn execute(hypr: &Hypr, action: &Action, mode: &str) -> std::io::Result<()> {
         Action::ToggleKeyboard { .. } => Ok(()),
         // A key is never dispatched: a bare button's is held by
         // `drive_buttons`, a chord's by `handle_gesture` (which never gets
-        // here with one). What does arrive is a key on a flick or the guide
-        // hold, which has no release edge to pair with and so does nothing.
+        // here with one), and a bare flick's is tapped there. What does
+        // arrive is a key on a guide flick or the guide hold, which has no
+        // release edge to pair with and so does nothing.
         Action::Key(_) => Ok(()),
         // Handled in `perform_action` against the mode engine, never here.
         Action::SetMode(_) | Action::ClearMode => Ok(()),

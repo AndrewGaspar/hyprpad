@@ -732,6 +732,10 @@ pub fn padless_osk_builtins() -> impl Iterator<Item = (report::Button, OskAction
 pub(crate) enum GestureKey {
     Chord(report::Button),
     Flick(Stick, StickDir),
+    /// A bare stick flick, no guide held (`lstick_up`, `rstick_down`, …).
+    /// Separate from [`Self::Flick`] so a config can bind both layers on
+    /// the same stick and direction without one overwriting the other.
+    BareFlick(Stick, StickDir),
     /// A bare guide tap: the guide pressed and released with **nothing** in
     /// between — `GuideLeave { bare_tap: true }`, the narrow decision
     /// [`crate::gesture::GestureEngine::guide_tap`] documents.
@@ -769,6 +773,7 @@ impl GestureKey {
         match ev {
             E::GuideChord(b) => Some(GestureKey::Chord(*b)),
             E::GuideStickFlick { stick, dir } => Some(GestureKey::Flick(*stick, *dir)),
+            E::StickFlick { stick, dir } => Some(GestureKey::BareFlick(*stick, *dir)),
             E::GuideLeave { bare_tap: true, .. } => Some(GestureKey::Tap),
             E::GuideHold => Some(GestureKey::Hold),
             E::GuideEnter | E::GuideLeave { bare_tap: false, .. } | E::GuideChordRelease(_) => None,
@@ -776,13 +781,26 @@ impl GestureKey {
     }
 
     /// Parse a binding key such as `"guide+r1"`, `"guide+stick_right"`,
-    /// `"guide+lstick_up"`, `"guide_tap"`, or `"guide_hold"`.
+    /// `"guide+lstick_up"`, `"guide_tap"`, `"guide_hold"`, or a bare stick
+    /// flick: `"lstick_up"`, `"rstick_down"` (no `guide+` prefix).
     pub(crate) fn parse(raw: &str) -> Result<GestureKey, String> {
         let k = raw.trim().to_ascii_lowercase();
         match k.as_str() {
             "guide" | "guide_tap" | "guide+tap" => return Ok(GestureKey::Tap),
             "guide_hold" | "guide+hold" => return Ok(GestureKey::Hold),
             _ => {}
+        }
+        // Bare stick flicks. Same prefixes as the guide layer's, without it.
+        for (prefix, stick) in [
+            ("rstick_", Stick::Right),
+            ("right_stick_", Stick::Right),
+            ("lstick_", Stick::Left),
+            ("left_stick_", Stick::Left),
+            ("stick_", Stick::Right),
+        ] {
+            if let Some(dir) = k.strip_prefix(prefix) {
+                return Ok(GestureKey::BareFlick(stick, parse_dir(dir)?));
+            }
         }
         let rest = k
             .strip_prefix("guide+")
@@ -3102,6 +3120,19 @@ impl Config {
         self.scroll_guard.allows(st)
     }
 
+    /// Whether any bare-flick binding for `stick` is live in `st`. A stick
+    /// with a live bare flick is a flick stick in that mode: the daemon
+    /// drops its rate function (left = scroll, right = cursor) there, so
+    /// one push pages once instead of paging *and* wheeling.
+    pub fn bare_flick_live(&self, stick: Stick, st: &ModeState) -> bool {
+        use crate::gesture::StickDir::*;
+        [Up, Down, Left, Right].iter().any(|dir| {
+            let key = GestureKey::BareFlick(stick, *dir);
+            self.bindings.contains_key(&key)
+                && self.binding_guards.get(&key).unwrap_or(&ALWAYS).allows(st)
+        })
+    }
+
     /// Whether the left pad scrubs the caret in `st` (`h.scrub { only_in = …
     /// }`) — the guard *and* the section's own master switch, because a scrub
     /// that no config asked for is not "allowed everywhere", it is off.
@@ -3540,6 +3571,34 @@ mod tests {
             c.resolve(&GestureEvent::GuideHold),
             Action::Dispatch("overlay".to_string())
         );
+    }
+
+    #[test]
+    fn parses_bare_stick_flick_keys_separately_from_guide_flicks() {
+        let toml = r#"
+[bindings]
+"lstick_up" = "fullscreen"
+"guide+lstick_up" = "workspace +1"
+"#;
+        let c = Config::from_toml_str(toml).expect("parse");
+        // The bare spelling resolves the bare event, the guide spelling
+        // the guide event; neither overwrites the other.
+        assert_eq!(
+            c.resolve(&GestureEvent::StickFlick {
+                stick: Stick::Left,
+                dir: StickDir::Up,
+            }),
+            Action::ToggleFullscreen
+        );
+        assert_eq!(
+            c.resolve(&GestureEvent::GuideStickFlick {
+                stick: Stick::Left,
+                dir: StickDir::Up,
+            }),
+            Action::Workspace(WorkspaceTarget::Relative(1))
+        );
+        assert!(GestureKey::parse("lstick_sideways").is_err());
+        assert!(GestureKey::parse("lstick_up").is_ok());
     }
 
     /// `guide_tap` resolves from the engine's **narrow** tap and from nothing

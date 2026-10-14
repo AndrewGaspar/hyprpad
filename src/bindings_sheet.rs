@@ -221,8 +221,14 @@ impl Sheet {
 
         for (key, action) in &c.bindings {
             let (control, control_label, direction, rank) = gesture_control(key);
+            // A bare flick is not a guide chord: it sits with the bare
+            // buttons, under its `lstick_up` spelling.
+            let section = match key {
+                crate::config::GestureKey::BareFlick(..) => Section::Button,
+                _ => Section::Guide,
+            };
             entries.push(entry(
-                Section::Guide,
+                section,
                 gesture_chord(key),
                 control,
                 control_label,
@@ -898,6 +904,14 @@ fn gesture_chord(k: &crate::config::GestureKey) -> String {
             },
             dir_name(*dir)
         ),
+        K::BareFlick(stick, dir) => format!(
+            "{}stick_{}",
+            match stick {
+                Stick::Left => "l",
+                Stick::Right => "r",
+            },
+            dir_name(*dir)
+        ),
         K::Tap => "guide_tap".to_string(),
         K::Hold => "guide_hold".to_string(),
     }
@@ -909,6 +923,19 @@ fn gesture_control(k: &crate::config::GestureKey) -> (String, String, Option<&'s
     match k {
         K::Chord(b) => (button_name(*b).to_string(), button_label(*b), None, button_rank(*b)),
         K::Flick(stick, dir) => {
+            let (id, name, base) = match stick {
+                Stick::Left => ("lstick", "Left stick", RANK_STICK + 2),
+                Stick::Right => ("rstick", "Right stick", RANK_STICK + 6),
+            };
+            let d = dir_name(*dir);
+            (
+                id.to_string(),
+                format!("{name} {}", arrow(*dir)),
+                Some(d),
+                base + dir_rank(*dir),
+            )
+        }
+        K::BareFlick(stick, dir) => {
             let (id, name, base) = match stick {
                 Stick::Left => ("lstick", "Left stick", RANK_STICK + 2),
                 Stick::Right => ("rstick", "Right stick", RANK_STICK + 6),

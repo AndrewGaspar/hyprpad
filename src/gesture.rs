@@ -61,6 +61,12 @@ pub enum GestureEvent {
     GuideChordRelease(report::Button),
     /// A stick was flicked past the flick threshold while the guide was held.
     GuideStickFlick { stick: Stick, dir: StickDir },
+    /// A stick was flicked past the flick threshold with no guide held —
+    /// the bare twin of [`Self::GuideStickFlick`], resolved against the
+    /// `lstick_*` / `rstick_*` bindings (no `guide+` prefix). Same threshold
+    /// and recenter hysteresis; the two never fire on the same frame,
+    /// because a flick under the guide is the guide layer's.
+    StickFlick { stick: Stick, dir: StickDir },
     /// The guide crossed [`HOLD_THRESHOLD`] while still held. Emitted once per
     /// hold; a signal that this is a deliberate hold, not a tap in progress.
     ///
@@ -269,6 +275,21 @@ impl GestureEngine {
             {
                 self.hold_fired = true;
                 events.push(GestureEvent::GuideHold);
+            }
+        }
+
+        // Bare flicks: no guide held, and this frame did not just leave the
+        // guide layer (a stick still deflected at the release is the guide
+        // hold's, not a fresh bare flick — it must recenter first, which
+        // re-entering `flick` below the threshold does on its own).
+        if !guide_now && !self.guide_active {
+            for (stick, axis) in [
+                (Stick::Left, frame.left_stick),
+                (Stick::Right, frame.right_stick),
+            ] {
+                if let Some(dir) = self.flick(stick, axis) {
+                    events.push(GestureEvent::StickFlick { stick, dir });
+                }
             }
         }
 
@@ -673,13 +694,50 @@ mod tests {
     }
 
     #[test]
-    fn flick_ignored_without_guide() {
+    fn bare_flick_fires_without_guide_once_and_needs_recenter() {
         let t = Instant::now();
         let mut g = GestureEngine::new();
-        // Stick slammed right, but guide not held: pure gameplay, no events.
+        // Stick slammed right with no guide: a bare flick, fired once.
+        assert_eq!(
+            g.update(&frame_sticks(&[], (0, 0), (32_000, 0)), t),
+            vec![GestureEvent::StickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+        // Sustained: no repeat. Recenter re-arms without emitting.
         assert!(g
-            .update(&frame_sticks(&[], (0, 0), (32_000, 0)), t)
+            .update(&frame_sticks(&[], (0, 0), (32_000, 0)), t + ms(4))
             .is_empty());
+        assert!(g.update(&frame(&[]), t + ms(8)).is_empty());
+        assert_eq!(
+            g.update(&frame_sticks(&[], (0, 25_000), (0, 0)), t + ms(12)),
+            vec![GestureEvent::StickFlick {
+                stick: Stick::Left,
+                dir: StickDir::Up,
+            }]
+        );
+    }
+
+    #[test]
+    fn bare_flick_does_not_refire_on_guide_release_while_deflected() {
+        let t = Instant::now();
+        let mut g = GestureEngine::new();
+        g.update(&frame(&[]), t);
+        g.update(&frame(&[Button::Steam]), t + ms(4));
+        // A guide flick, then the guide lifts with the stick still out: the
+        // leave is the only event; no bare flick rides on its back.
+        assert_eq!(
+            g.update(&frame_sticks(&[Button::Steam], (0, 0), (30_000, 0)), t + ms(8)),
+            vec![GestureEvent::GuideStickFlick {
+                stick: Stick::Right,
+                dir: StickDir::Right,
+            }]
+        );
+        assert_eq!(
+            g.update(&frame_sticks(&[], (0, 0), (30_000, 0)), t + ms(12)),
+            vec![GestureEvent::GuideLeave { was_chorded: true, bare_tap: false }]
+        );
     }
 
     #[test]

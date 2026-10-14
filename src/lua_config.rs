@@ -2980,6 +2980,32 @@ mod tests {
     }
 
     #[test]
+    fn bare_flick_binds_in_lua_and_reports_live_per_mode() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("desktop")
+            h.mode("agent")
+            h.bind("lstick_up", "Page up", h.key "pageup"):only_in("agent")
+            "#,
+        );
+        let agent = ModeState::new("agent", vec![]);
+        let ev = GestureEvent::StickFlick {
+            stick: crate::gesture::Stick::Left,
+            dir: crate::gesture::StickDir::Up,
+        };
+        assert_eq!(
+            c.resolve_in(&ev, &agent),
+            Action::Key(KeyChord::parse("pageup").unwrap())
+        );
+        assert_eq!(c.resolve_in(&ev, &desktop()), Action::None);
+        // The stick is a flick stick exactly where the binding is live.
+        assert!(c.bare_flick_live(crate::gesture::Stick::Left, &agent));
+        assert!(!c.bare_flick_live(crate::gesture::Stick::Left, &desktop()));
+        assert!(!c.bare_flick_live(crate::gesture::Stick::Right, &agent));
+    }
+
+    #[test]
     fn guide_in_makes_the_pad_a_mouse_under_the_guide_in_the_listed_modes() {
         let c = load(
             r#"
