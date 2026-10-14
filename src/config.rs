@@ -1454,6 +1454,18 @@ pub struct SticksConfig {
     /// is deflected (or a velocity is still decaying) and blocks indefinitely
     /// otherwise, so an idle controller costs no wakeups at all.
     pub tick_ms: u64,
+    /// Whether a held bare stick flick repeats (`flick_repeat = true`):
+    /// the first flick fires on the edge as always, then the same binding
+    /// re-fires while the stick stays thrown. Default `false` — a held
+    /// stick pages once until a config opts in. The timings are the
+    /// on-screen keyboard's stick-navigation values.
+    pub flick_repeat: bool,
+    /// How long a bare flick must be held before it starts repeating, in
+    /// milliseconds. Default 350.
+    pub flick_repeat_delay_ms: u64,
+    /// How often a held bare flick repeats once it has started, in
+    /// milliseconds. Default 125 (eight repeats a second).
+    pub flick_repeat_interval_ms: u64,
     /// The right stick's cursor.
     pub cursor: StickAxisConfig,
     /// The left stick's scrolling.
@@ -1467,6 +1479,9 @@ impl Default for SticksConfig {
         SticksConfig {
             enabled: true,
             tick_ms: 4,
+            flick_repeat: false,
+            flick_repeat_delay_ms: 350,
+            flick_repeat_interval_ms: 125,
             cursor: StickAxisConfig::with_max(1500.0),
             scroll: StickAxisConfig::with_max(180.0),
             osk: StickAxisConfig::with_max(2.4),
@@ -2709,6 +2724,20 @@ impl Config {
                         }
                         "tick_ms" | "step_ms" => {
                             sticks.tick_ms = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?
+                                .max(1.0) as u64;
+                        }
+                        "flick_repeat" => {
+                            sticks.flick_repeat =
+                                parse_bool(&val).map_err(|e| format!("line {lineno}: {e}"))?;
+                        }
+                        "flick_repeat_delay_ms" => {
+                            sticks.flick_repeat_delay_ms = parse_f64(&val)
+                                .map_err(|e| format!("line {lineno}: {e}"))?
+                                .max(0.0) as u64;
+                        }
+                        "flick_repeat_interval_ms" => {
+                            sticks.flick_repeat_interval_ms = parse_f64(&val)
                                 .map_err(|e| format!("line {lineno}: {e}"))?
                                 .max(1.0) as u64;
                         }

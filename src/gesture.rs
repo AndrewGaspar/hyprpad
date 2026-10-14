@@ -33,6 +33,81 @@ pub enum StickDir {
     Right,
 }
 
+/// The direction a stick is currently thrown, by the flick rule: dominant
+/// axis past [`FLICK_THRESHOLD`], or `None` inside it. Mirrors the direction
+/// half of `GestureEngine::flick` (which additionally owns the hysteresis),
+/// so the repeater below and the engine can never disagree about which way
+/// a held stick points.
+pub fn flick_direction((x, y): (i16, i16)) -> Option<StickDir> {
+    let ax = (x as i32).abs();
+    let ay = (y as i32).abs();
+    if ax.max(ay) < FLICK_THRESHOLD {
+        return None;
+    }
+    Some(if ax >= ay {
+        if x >= 0 { StickDir::Right } else { StickDir::Left }
+    } else if y >= 0 {
+        StickDir::Up
+    } else {
+        StickDir::Down
+    })
+}
+
+/// Hold-to-repeat timing for one stick's bare flicks, modelled on the
+/// on-screen keyboard's stick navigation (`crate::osk::NavRepeat`): the
+/// edge fires as always, then after `delay` the same direction repeats
+/// every `interval` for as long as it stays thrown. A direction change
+/// restarts the delay, so swinging across the gate does not run away, and
+/// centering forgets everything.
+///
+/// Pure, like the engine: the daemon feeds it the held direction and asks
+/// both whether a repeat is due and when to wake for the next one, so the
+/// timing is unit tests rather than stopwatches.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StickRepeat {
+    held: Option<StickDir>,
+    next: Option<Instant>,
+}
+
+impl StickRepeat {
+    /// Forget the held direction and the clock.
+    pub fn reset(&mut self) {
+        self.held = None;
+        self.next = None;
+    }
+
+    /// Record the direction currently thrown (`None` for centered). A fresh
+    /// direction arms the delay; the edge itself is the gesture engine's.
+    pub fn observe(&mut self, dir: Option<StickDir>, now: Instant, delay: Duration) {
+        match dir {
+            None => self.reset(),
+            Some(d) if self.held != Some(d) => {
+                self.held = Some(d);
+                self.next = Some(now + delay);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Whether a repeat is due at `now` — and, when it is, arm the next one
+    /// `interval` later. Answers `false` once the stick has centered or
+    /// swung, because [`Self::observe`] has already forgotten it.
+    pub fn take_due(&mut self, now: Instant, interval: Duration) -> Option<StickDir> {
+        let dir = self.held?;
+        if self.next.is_some_and(|at| now >= at) {
+            self.next = Some(now + interval);
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    /// When the next repeat comes due, for the main loop's wake deadline.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.next
+    }
+}
+
 /// Which analog stick a flick came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Stick {
@@ -717,6 +792,41 @@ mod tests {
                 dir: StickDir::Up,
             }]
         );
+    }
+
+    #[test]
+    fn stick_repeat_waits_out_the_delay_then_repeats_on_the_interval() {
+        use std::time::Duration;
+        let delay = Duration::from_millis(350);
+        let interval = Duration::from_millis(125);
+        let t = Instant::now();
+        let mut r = StickRepeat::default();
+        // Thrown up: armed, but nothing until the delay is out.
+        r.observe(Some(StickDir::Up), t, delay);
+        assert_eq!(r.take_due(t + ms(349), interval), None);
+        // Due exactly at the delay, then on the interval while held.
+        assert_eq!(r.take_due(t + ms(350), interval), Some(StickDir::Up));
+        assert_eq!(r.take_due(t + ms(400), interval), None);
+        assert_eq!(r.take_due(t + ms(475), interval), Some(StickDir::Up));
+        // Centering forgets: no late repeat, and the deadline is gone.
+        r.observe(None, t + ms(500), delay);
+        assert_eq!(r.take_due(t + ms(600), interval), None);
+        assert_eq!(r.deadline(), None);
+        // A swing to a new direction restarts the delay instead of
+        // continuing at the built-up rate.
+        r.observe(Some(StickDir::Down), t + ms(600), delay);
+        assert_eq!(r.take_due(t + ms(900), interval), None);
+        assert_eq!(r.take_due(t + ms(950), interval), Some(StickDir::Down));
+    }
+
+    #[test]
+    fn flick_direction_uses_the_flick_threshold_and_dominant_axis() {
+        assert_eq!(flick_direction((0, 0)), None);
+        assert_eq!(flick_direction((5_000, 5_000)), None);
+        assert_eq!(flick_direction((0, 25_000)), Some(StickDir::Up));
+        assert_eq!(flick_direction((0, -25_000)), Some(StickDir::Down));
+        assert_eq!(flick_direction((-25_000, 5_000)), Some(StickDir::Left));
+        assert_eq!(flick_direction((25_000, -5_000)), Some(StickDir::Right));
     }
 
     #[test]

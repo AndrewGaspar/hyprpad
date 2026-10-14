@@ -1829,6 +1829,13 @@ fn section_sticks(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Functio
             match k.as_str() {
                 "enabled" | "enable" | "on" => b.sticks.enabled = as_bool(&v, &k)?,
                 "tick_ms" | "step_ms" => b.sticks.tick_ms = as_f64(&v, &k)?.max(1.0) as u64,
+                "flick_repeat" => b.sticks.flick_repeat = as_bool(&v, &k)?,
+                "flick_repeat_delay_ms" => {
+                    b.sticks.flick_repeat_delay_ms = as_f64(&v, &k)?.max(0.0) as u64
+                }
+                "flick_repeat_interval_ms" => {
+                    b.sticks.flick_repeat_interval_ms = as_f64(&v, &k)?.max(1.0) as u64
+                }
                 // A nested sub-table: `cursor = { … }`.
                 "cursor" | "pointer" | "scroll" | "osk" | "keyboard" => {
                     let Value::Table(sub) = &v else {
@@ -3107,6 +3114,28 @@ mod tests {
         // a silent typo would leave the wheel dead everywhere.
         let e = load_str(r#"hyprpad.scrub { only_in = { "dekstop" } }"#, "t.lua").unwrap_err();
         assert!(e.contains("dekstop"), "{e}");
+    }
+
+    #[test]
+    fn flick_repeat_knobs_parse_in_both_dialects_and_default_off() {
+        // Untouched: no repeats. A held flick pages once, as it always has.
+        let bare = load(r#"hyprpad.sticks {}"#);
+        assert!(!bare.sticks().flick_repeat);
+        assert_eq!(bare.sticks().flick_repeat_delay_ms, 350);
+        assert_eq!(bare.sticks().flick_repeat_interval_ms, 125);
+
+        let c = load(
+            r#"hyprpad.sticks { flick_repeat = true, flick_repeat_delay_ms = 400, flick_repeat_interval_ms = 100 }"#,
+        );
+        assert!(c.sticks().flick_repeat);
+        assert_eq!(c.sticks().flick_repeat_delay_ms, 400);
+        assert_eq!(c.sticks().flick_repeat_interval_ms, 100);
+
+        let toml = crate::config::Config::from_toml_str(
+            "[sticks]\nflick_repeat = true\nflick_repeat_delay_ms = 400\nflick_repeat_interval_ms = 100\n",
+        )
+        .expect("the same knobs in the other dialect");
+        assert_eq!(toml.sticks(), c.sticks());
     }
 
     #[test]

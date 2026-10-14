@@ -140,7 +140,7 @@ use crate::config::{
 };
 use crate::filter::{AngleAccumulator, JogPacer, JogUnit, PadDamper, ShuttlePacer};
 use crate::gamepad::{self, VirtualGamepad};
-use crate::gesture::{GestureEngine, GestureEvent};
+use crate::gesture::{flick_direction, GestureEngine, GestureEvent, StickRepeat};
 // `Pad` is renamed: this module already talks about `report::Pad` (a pad
 // *position*), while the haptics one names an *actuator*.
 use crate::haptics::{Feel, Haptics, Pad as HapticPad};
@@ -541,6 +541,11 @@ pub fn run() -> std::io::Result<()> {
     // The rate integrators the sticks drive on a controller with no trackpads,
     // and the owner of this loop's fourth receive deadline ([`crate::sticks`]).
     let mut sticks = crate::sticks::StickDrive::new();
+    // Hold-to-repeat for bare stick flicks, one per stick
+    // (`h.sticks { flick_repeat = true }`). The engine owns the edge; these
+    // own the clock that re-fires it while the stick stays thrown.
+    let mut flick_repeat_left = StickRepeat::default();
+    let mut flick_repeat_right = StickRepeat::default();
     status.set_layout(report::LAYOUT_STEAM_CONTROLLER);
     status.set_sources(source_names(!waiting, evdev_pad));
 
@@ -713,6 +718,72 @@ pub fn run() -> std::io::Result<()> {
             continue;
         }
 
+        // A bare flick held past its repeat delay (`h.sticks { flick_repeat
+        // = true }`): re-fire the flick while the stick stays thrown. The
+        // stick's current throw is re-read from the last frame and the
+        // binding re-resolved through `handle_gesture`, so a focus or mode
+        // change mid-hold stops or retargets the repeats, and the keyboard
+        // being up suppresses them like any other gesture.
+        let repeat_at = [flick_repeat_left.deadline(), flick_repeat_right.deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        if repeat_at.is_some_and(|at| at <= Instant::now()) {
+            let now = Instant::now();
+            let cfg = config.sticks();
+            let delay = Duration::from_millis(cfg.flick_repeat_delay_ms);
+            let interval = Duration::from_millis(cfg.flick_repeat_interval_ms);
+            let mut hx =
+                HapticCtx { dev: &mut haptics, cfg: config.haptics(), source: active_source };
+            let forwarding = gamepad_forwarding(
+                config.gamepad().enabled,
+                modes.forwards(),
+                modes.desktop_yielded(),
+                engine.guide_active(),
+                osk.is_active(),
+            );
+            let mut mode_changed = false;
+            for (rep, stick, axis) in [
+                (&mut flick_repeat_left, crate::gesture::Stick::Left, prev_frame.left_stick),
+                (&mut flick_repeat_right, crate::gesture::Stick::Right, prev_frame.right_stick),
+            ] {
+                let live = cfg.flick_repeat
+                    && !engine.guide_active()
+                    && config.bare_flick_live(stick, modes.state());
+                rep.observe(live.then(|| flick_direction(axis)).flatten(), now, delay);
+                if let Some(dir) = rep.take_due(now, interval) {
+                    mode_changed |= handle_gesture(
+                        &hypr,
+                        &config,
+                        &mut modes,
+                        &mut osk,
+                        active_source,
+                        &mut hx,
+                        &mut chord_keys,
+                        &mut keyboard,
+                        pointer.as_mut(),
+                        forwarding,
+                        GestureEvent::StickFlick { stick, dir },
+                    );
+                }
+            }
+            if mode_changed {
+                status.set_mode(modes.active());
+                mode_handoff(
+                    &mut cursor,
+                    &mut scroll,
+                    &mut osk_route,
+                    pointer.as_mut(),
+                    &mut button_keys,
+                    &mut chord_keys,
+                    &mut keyboard,
+                    &mut gamepad,
+                    hx.dev,
+                );
+            }
+            continue;
+        }
+
         // The stick integrators' step, for a controller whose sticks stand in
         // for the controller's trackpads. Checked HERE, before the receive, for the
         // same reason the two above are: a change-driven pad moving a stick
@@ -788,7 +859,7 @@ pub fn run() -> std::io::Result<()> {
         // is armed, a transient mode's timer while one is running, and the
         // stick integrators' step while a stick is deflected. With none of
         // them, this is the plain blocking receive it has always been.
-        let wake = [waiting.then_some(next_scan), rescan_at, transient_at, stick_at]
+        let wake = [waiting.then_some(next_scan), rescan_at, transient_at, stick_at, repeat_at]
             .into_iter()
             .flatten()
             .min();
@@ -1075,6 +1146,26 @@ pub fn run() -> std::io::Result<()> {
                         tap_forwarding,
                         ge,
                     );
+                }
+                // Hold-to-repeat bookkeeping for bare flicks: record what
+                // each stick is currently thrown at, but only where a bare
+                // flick binding is live in this mode — the same condition
+                // that takes the stick's rate function away above, so a
+                // mode with no flick binding never arms a repeat. The
+                // repeats themselves fire from the deadline branch at the
+                // top of the loop, beside the other timers.
+                {
+                    let cfg = config.sticks();
+                    let delay = Duration::from_millis(cfg.flick_repeat_delay_ms);
+                    for (rep, stick, axis) in [
+                        (&mut flick_repeat_left, crate::gesture::Stick::Left, frame.left_stick),
+                        (&mut flick_repeat_right, crate::gesture::Stick::Right, frame.right_stick),
+                    ] {
+                        let live = cfg.flick_repeat
+                            && !engine.guide_active()
+                            && config.bare_flick_live(stick, modes.state());
+                        rep.observe(live.then(|| flick_direction(axis)).flatten(), now, delay);
+                    }
                 }
                 // Bare-button actions that *fire* (`h.button("l5", h.exec …)`):
                 // the same actions a chord performs, on a button's press edge.
