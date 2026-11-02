@@ -304,9 +304,20 @@ says which you are holding, *Scrub the caret · jog (pad)* or *· shuttle
 ### Modes and guards
 
 A **mode** is a named context chosen by a predicate. Rules run in definition
-order, first match wins, and **only on a context change** — a focus change, a
-fullscreen change, an overlay opening or closing, the session locking or
-unlocking, a manual override, a reload. Never per input frame.
+order, first match wins, and **only on a context change** — a focus change, the
+focused window renaming itself, a fullscreen change, an overlay opening or
+closing, the session locking or unlocking, a manual override, a reload. Never
+per input frame.
+
+The rename is what lets a rule follow a modal app: many programs put their
+state in the window title (an editor's mode, a page name, Steam's "Big Picture
+Mode"), and a rule that reads `ctx.focus.title` is re-asked whenever it changes,
+with no focus change needed. A rename also drops the cached process tree, so
+starting `claude` in the already-focused terminal is noticed too; for programs
+that start without retitling anything, the focused window's tree is re-walked
+every 500 ms, but only when some rule calls `process_tree_has`. Both are
+`h.daemon` settings: `rescan_on_title_change = false` turns the first off, and
+`process_rescan_ms` sets the interval for the second (`0` turns it off).
 
 ```lua
 h.mode("game", { forward = true }).when(function(ctx)
