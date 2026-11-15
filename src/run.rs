@@ -978,6 +978,7 @@ pub fn run() -> std::io::Result<()> {
                     HyprEvent::Layer { .. } => " (overlay)",
                     HyprEvent::Locked(true) => " (session locked)",
                     HyprEvent::Locked(false) => " (session unlocked)",
+                    HyprEvent::Resync { .. } => " (event feed restored)",
                     _ => "",
                 };
                 // The keyboard's word prediction keys on the focused window:
@@ -995,6 +996,11 @@ pub fn run() -> std::io::Result<()> {
                         osk.focus_changed(class, config.osk_learn_deny());
                     }
                     HyprEvent::ActiveWindowV2 { address } => osk.focus_window_changed(address),
+                    // The same two halves, re-read after a dropped feed.
+                    HyprEvent::Resync { focus: Some(info), .. } => {
+                        osk.focus_changed(&info.class, config.osk_learn_deny());
+                        osk.focus_window_changed(&info.address);
+                    }
                     _ => {}
                 }
                 if update_modes(&mut modes, &config, &hypr, &mut watch, ev) {
@@ -4030,6 +4036,23 @@ fn update_modes(
         // is an ordinary context change from here on, and a restatement of the
         // state we hold costs one comparison.
         HyprEvent::Locked(on) => modes.lock_changed(config, on),
+        // The feed dropped and came back: replay the re-read focus as the
+        // `activewindow` + `activewindowv2` pair the compositor would have sent,
+        // and replace the overlay set wholesale (a `closelayer` lost in the gap
+        // would otherwise strand a modal mode). Reported as one change, judged
+        // by where the mode ends up rather than by each half.
+        HyprEvent::Resync { focus, layers } => {
+            let before = modes.active().to_string();
+            if let Some(info) = focus {
+                let ev = HyprEvent::ActiveWindow { class: info.class, title: info.title, pid: info.pid };
+                update_modes(modes, config, hypr, watch, ev);
+                watch.address = info.address;
+            }
+            if let Some(layers) = layers {
+                modes.seed_layers(config, layers);
+            }
+            modes.active() != before
+        }
         _ => false,
     }
 }
@@ -7617,6 +7640,66 @@ mod tests {
         assert!(update_modes(&mut modes, &c, &hypr, &mut w, HyprEvent::Locked(false)));
         assert_eq!(modes.active(), "desktop");
         assert_eq!(modes.buttons().len(), 1);
+    }
+
+    /// The feed dropped while a game had focus, and focus moved to a terminal
+    /// and the cheat sheet closed during the gap. The resync must land the
+    /// daemon where the compositor actually is, not where it last heard: this
+    /// is the "stuck in game mode" bug, end to end through the event arm.
+    #[test]
+    fn a_resync_after_a_dropped_feed_replaces_stale_focus_and_overlays() {
+        let c = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("cheatsheet").when(function(ctx) return ctx.layers:has("hyprpad-cheatsheet") end)
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+            "test.lua",
+        )
+        .expect("config should load");
+        let hypr = Hypr::detached();
+        let mut modes = ModeEngine::new(&c);
+        let mut w = FocusWatch::new();
+        let game = HyprEvent::ActiveWindow {
+            class: "steam_app_default".into(),
+            title: "Ubisoft Connect".into(),
+            pid: None,
+        };
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, game));
+        let sheet = HyprEvent::Layer { namespace: "hyprpad-cheatsheet".into(), open: true };
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, sheet));
+        assert_eq!(modes.active(), "cheatsheet");
+
+        let resync = HyprEvent::Resync {
+            focus: Some(crate::hypr::ActiveWindowInfo {
+                class: "kitty".into(),
+                title: "claude".into(),
+                address: "0x55d89bdb6a70".into(),
+                ..Default::default()
+            }),
+            layers: Some(["omarchy-bar".to_string()].into_iter().collect()),
+        };
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, resync.clone()));
+        assert_eq!(modes.active(), "desktop");
+        // Title-change attribution follows the re-read window.
+        assert_eq!(w.address, "0x55d89bdb6a70");
+        // A resync that finds nothing new is not a transition.
+        assert!(!update_modes(&mut modes, &c, &hypr, &mut w, resync));
+
+        // A half whose query failed leaves that half alone.
+        let game = HyprEvent::ActiveWindow {
+            class: "steam_app_1".into(),
+            title: String::new(),
+            pid: None,
+        };
+        assert!(update_modes(&mut modes, &c, &hypr, &mut w, game));
+        let partial = HyprEvent::Resync { focus: None, layers: Some(Default::default()) };
+        assert!(!update_modes(&mut modes, &c, &hypr, &mut w, partial));
+        assert_eq!(modes.active(), "game");
     }
 
     #[test]

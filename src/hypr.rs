@@ -262,9 +262,12 @@ impl Hypr {
         stream.write_all(payload.as_bytes())?;
         // The server reads the request, replies, and closes; reading to end
         // yields the whole reply. No half-close is needed (confirmed live).
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply)?;
-        Ok(reply)
+        // Decoded lossily for the same reason as the event feed: a reply that
+        // quotes a Latin-1 window title (`j/activewindow` over a Wine window)
+        // is not UTF-8, and a strict read would fail the whole query.
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply)?;
+        Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 }
 
@@ -466,32 +469,187 @@ pub enum HyprEvent {
     /// answers a report of the state it already holds with "no change"
     /// ([`crate::mode::ModeEngine::lock_changed`]).
     Locked(bool),
+    /// The event feed dropped and has been re-established; this is the
+    /// compositor's context as re-read right after the reconnect.
+    ///
+    /// **Not on the wire.** Synthesized by [`subscribe`]. Every event in the
+    /// gap is gone, and the stream only ever reports *changes*, so without a
+    /// re-read the daemon would keep the focus and overlays it last heard
+    /// about. That is exactly the failure that made this variant necessary: a
+    /// feed that died under a focused game left the pad in `game` mode for the
+    /// rest of the session.
+    ///
+    /// `focus.address` is already in the event form (`0x…`, as
+    /// [`HyprEvent::ActiveWindowV2`] carries it). Either half is `None` when
+    /// its query failed; the daemon then keeps what it had for that half.
+    Resync {
+        focus: Option<ActiveWindowInfo>,
+        layers: Option<BTreeSet<String>>,
+    },
     /// Any event not modelled above, passed through verbatim.
     Other { name: String, data: String },
 }
+
+/// The first wait before re-dialling a dropped event feed. Doubles on every
+/// failed attempt, up to [`FEED_RETRY_MAX`].
+const FEED_RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest wait between attempts to re-dial the event feed. A compositor
+/// that has gone away for good costs one failed `connect` this often.
+const FEED_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Subscribe to the compositor event stream.
 ///
 /// Connects to `.socket2.sock` up front (so a missing compositor surfaces as an
 /// error to the caller), then spawns a thread that parses each `EVENT>>data`
-/// line into a [`HyprEvent`] and forwards it. The channel closes when the
-/// socket closes or the receiver is dropped.
+/// line into a [`HyprEvent`] and forwards it.
+///
+/// The feed does not end when the socket does. If the stream closes or fails,
+/// the thread says so, re-dials with backoff, and on success sends a
+/// [`HyprEvent::Resync`] before resuming, so the daemon re-reads what it
+/// missed. The channel closes only when the receiver is dropped.
+///
+/// Lines are decoded **lossily**. The wire is not guaranteed UTF-8: an X11
+/// client that sets a Latin-1 `WM_NAME` (Wine does: Ubisoft Connect's
+/// `Assassin's Creed\xae Origins`) reaches `windowtitlev2` byte for byte, and
+/// a strict decode used to end the whole feed on that one line.
 pub fn subscribe() -> io::Result<mpsc::Receiver<HyprEvent>> {
     let path = socket_dir()?.join(".socket2.sock");
     let stream = UnixStream::connect(&path)?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let reader = io::BufReader::new(stream);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if let Some(event) = parse_event(&line) {
-                if tx.send(event).is_err() {
-                    break; // receiver gone
-                }
-            }
-        }
+        feed(
+            stream,
+            &tx,
+            || UnixStream::connect(&path),
+            resync_snapshot,
+            FEED_RETRY_MIN,
+            FEED_RETRY_MAX,
+        );
     });
     Ok(rx)
+}
+
+/// Why [`pump`] stopped reading.
+#[derive(Debug)]
+enum PumpEnd {
+    /// The compositor closed the stream.
+    Eof,
+    /// Reading failed.
+    Error(io::Error),
+    /// Nobody is listening any more; the feed should stop for good.
+    ReceiverGone,
+}
+
+/// The event feed's whole life: pump `stream` until it ends, then re-dial with
+/// `connect` (backing off from `min` to `max`), send `snapshot()`'s events,
+/// and pump again. Returns only when the receiver is gone.
+///
+/// Generic over the stream, the dialler and the snapshot so the reconnect
+/// logic is tested without a compositor.
+fn feed<S, C, F>(
+    mut stream: S,
+    tx: &mpsc::Sender<HyprEvent>,
+    mut connect: C,
+    mut snapshot: F,
+    min: Duration,
+    max: Duration,
+) where
+    S: Read,
+    C: FnMut() -> io::Result<S>,
+    F: FnMut() -> Vec<HyprEvent>,
+{
+    loop {
+        let why = match pump(io::BufReader::new(stream), tx) {
+            PumpEnd::ReceiverGone => return,
+            PumpEnd::Eof => "the compositor closed it".to_string(),
+            PumpEnd::Error(e) => e.to_string(),
+        };
+        eprintln!("warning: compositor event feed lost ({why}); reconnecting");
+        let mut delay = min;
+        let mut complained = false;
+        stream = loop {
+            thread::sleep(delay);
+            match connect() {
+                Ok(s) => break s,
+                Err(e) => {
+                    // Once, then quietly: a compositor that is restarting must
+                    // not print a line every few seconds.
+                    if !complained {
+                        eprintln!("warning: could not reconnect the event feed ({e}); retrying");
+                        complained = true;
+                    }
+                    delay = (delay * 2).min(max);
+                }
+            }
+        };
+        // Connected *before* the snapshot, so nothing that happens after it is
+        // lost: an event racing the snapshot is applied on top of it, and
+        // focus and the layer set are idempotent under that.
+        eprintln!("hyprpad: compositor event feed restored; re-reading focus and overlays");
+        for event in snapshot() {
+            if tx.send(event).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Parse and forward every line of one connection until it ends.
+fn pump<R: BufRead>(mut reader: R, tx: &mpsc::Sender<HyprEvent>) -> PumpEnd {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => return PumpEnd::Eof,
+            Ok(_) => {}
+            Err(e) => return PumpEnd::Error(e),
+        }
+        if let Some(event) = parse_event(&decode_line(&buf)) {
+            if tx.send(event).is_err() {
+                return PumpEnd::ReceiverGone;
+            }
+        }
+    }
+}
+
+/// One raw event line as text, without its terminator. Bytes that are not
+/// UTF-8 become U+FFFD; only a title can carry them, and a title with a
+/// replacement character still matches every rule that does not look at the
+/// mangled byte itself.
+fn decode_line(raw: &[u8]) -> std::borrow::Cow<'_, str> {
+    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    String::from_utf8_lossy(raw)
+}
+
+/// The [`HyprEvent::Resync`] a restored feed sends: the focused window and the
+/// open overlays, from the command socket.
+fn resync_snapshot() -> Vec<HyprEvent> {
+    let hypr = match Hypr::connect() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("warning: could not re-read context after reconnect ({e})");
+            return Vec::new();
+        }
+    };
+    let focus = match hypr.active_window() {
+        Ok(mut info) => {
+            info.address = norm_addr(&info.address);
+            Some(info)
+        }
+        Err(e) => {
+            eprintln!("warning: could not re-read focus after reconnect ({e})");
+            None
+        }
+    };
+    let layers = match hypr.open_layers() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("warning: could not re-read overlays after reconnect ({e})");
+            None
+        }
+    };
+    vec![HyprEvent::Resync { focus, layers }]
 }
 
 /// How often [`watch_locked`] asks the compositor whether the session is
@@ -921,6 +1079,68 @@ mod tests {
                 address: "0x55d89beaf480".into(),
             })
         );
+    }
+
+    /// The bytes that killed the feed on the live session: Ubisoft Connect
+    /// (Wine, `steam_app_default`) retitling itself with a Latin-1 `®` (0xAE).
+    /// The line must decode, and — the actual bug — the lines *after* it must
+    /// still arrive.
+    #[test]
+    fn a_non_utf8_title_neither_ends_the_feed_nor_loses_the_event() {
+        let wire: &[u8] = b"windowtitlev2>>5645d54a1d00,Installing Assassin's Creed\xae Origins\n\
+                            activewindow>>kitty,claude\n\
+                            activewindowv2>>5645d4880fb0\r\n";
+        let (tx, rx) = mpsc::channel();
+        assert!(matches!(pump(wire, &tx), PumpEnd::Eof));
+        drop(tx);
+        let got: Vec<_> = rx.into_iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                HyprEvent::WindowTitle {
+                    address: "0x5645d54a1d00".into(),
+                    title: Some("Installing Assassin's Creed\u{fffd} Origins".into()),
+                },
+                HyprEvent::ActiveWindow { class: "kitty".into(), title: "claude".into(), pid: None },
+                HyprEvent::ActiveWindowV2 { address: "0x5645d4880fb0".into() },
+            ]
+        );
+    }
+
+    /// A dropped stream is re-dialled through a failed attempt, the snapshot
+    /// lands before the new connection's first event, and the feed stops once
+    /// the receiver is gone.
+    #[test]
+    fn a_dropped_feed_reconnects_and_resyncs_before_resuming() {
+        use std::collections::VecDeque;
+        use std::io::Cursor;
+        let mut dials: VecDeque<io::Result<Cursor<Vec<u8>>>> = VecDeque::from([
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            Ok(Cursor::new(b"workspace>>3\n".to_vec())),
+        ]);
+        let (tx, rx) = mpsc::channel();
+        let feeder = thread::spawn(move || {
+            feed(
+                Cursor::new(b"workspace>>1\n".to_vec()),
+                &tx,
+                // Once the scripted dials run out, every dial is an empty
+                // stream, so the loop keeps reaching `send` and notices the
+                // receiver is gone.
+                move || dials.pop_front().unwrap_or_else(|| Ok(Cursor::new(Vec::new()))),
+                || vec![HyprEvent::Other { name: "resync".into(), data: String::new() }],
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+            )
+        });
+        let next = || rx.recv_timeout(Duration::from_secs(5)).expect("feed went quiet");
+        let ws = |n: &str| HyprEvent::Workspace { name: n.into() };
+        let resync = HyprEvent::Other { name: "resync".into(), data: String::new() };
+        assert_eq!(next(), ws("1"));
+        assert_eq!(next(), resync);
+        assert_eq!(next(), ws("3"));
+        assert_eq!(next(), resync);
+        drop(rx);
+        feeder.join().expect("feed thread should return once the receiver is gone");
     }
 
     #[test]
