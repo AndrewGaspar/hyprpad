@@ -76,6 +76,49 @@ const BUTTON_BITS: [(usize, u8, Button); 30] = [
     (5, 5, Button::Cap3),
 ];
 
+impl Button {
+    /// Whether this button may appear in a [`PadMap`], on either side.
+    ///
+    /// A pad map moves one *digital* button onto another, so both sides have
+    /// to be one. Excluded: the guide and Quick Access (hyprpad's own —
+    /// stripped and synthesized by the relay, so a mapping to or from them
+    /// would fight the strip mask), the capacitive and pad-touch flags (hand
+    /// contact, not buttons), the pad clicks (they ride on a pad position a
+    /// button map cannot synthesize) and the full-trigger bits (the analog
+    /// travel that gives them meaning stays where it was).
+    pub fn is_remappable(self) -> bool {
+        use Button::*;
+        matches!(
+            self,
+            A | B
+                | X
+                | Y
+                | R3
+                | L3
+                | Menu
+                | View
+                | GripR4
+                | GripR5
+                | GripL4
+                | GripL5
+                | BumperR1
+                | BumperL1
+                | DpadUp
+                | DpadDown
+                | DpadLeft
+                | DpadRight
+        )
+    }
+
+    /// This button's `(byte, bit)` in a raw `0x42`/`0x45` report — the same
+    /// position [`Frame::decode`] reads it from.
+    fn raw_bit(self) -> (usize, u8) {
+        let &(byte, bit, _) =
+            BUTTON_BITS.iter().find(|&&(_, _, b)| b == self).expect("every Button has a bit");
+        (byte, bit)
+    }
+}
+
 /// Which backend produced a [`Frame`] — and therefore what the frame's empty
 /// fields *mean*.
 ///
@@ -342,6 +385,86 @@ impl Frame {
     }
 }
 
+/// A mode's pad-to-pad button remap: while the mode is active and input is
+/// being forwarded to a game, each source button is *moved* onto its target —
+/// the source bit is cleared and the target bit is set for as long as the
+/// source is held. The physical target still works; the two are OR'd.
+///
+/// The map is applied to **copies** on the forwarding path only
+/// ([`apply`](Self::apply) for the sinks that consume a decoded [`Frame`],
+/// [`apply_raw`](Self::apply_raw) for the triton relay's raw pass-through).
+/// The frame the gesture engine, guide chords and desktop bindings see is
+/// never rewritten, so `guide+r4` keeps meaning the physical grip even in a
+/// mode that forwards that grip as A.
+///
+/// One pass, from the frame as it arrived: there is no chaining (`r4 → a`
+/// beside `a → b` makes R4 an A, not a B), and a swap is a swap. Which pairs
+/// are legal — remappable buttons only, no repeated source, no button mapped
+/// onto itself — is the config loader's call; this type just carries them.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct PadMap {
+    pairs: Vec<(Button, Button)>,
+}
+
+impl PadMap {
+    /// Build a map from `(source, target)` pairs, sorted by source so two
+    /// maps built from the same pairs in any order compare equal.
+    pub fn from_pairs(mut pairs: Vec<(Button, Button)>) -> PadMap {
+        pairs.sort_by_key(|&(src, _)| src as u8);
+        PadMap { pairs }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// The `(source, target)` pairs, in source order.
+    pub fn pairs(&self) -> &[(Button, Button)] {
+        &self.pairs
+    }
+
+    /// The frame a game should see: `frame` with every mapped source moved
+    /// onto its target. An empty map returns the frame untouched.
+    pub fn apply(&self, frame: &Frame) -> Frame {
+        if self.pairs.is_empty() {
+            return *frame;
+        }
+        let mut out = *frame;
+        for &(src, _) in &self.pairs {
+            out.set(src, false);
+        }
+        for &(src, dst) in &self.pairs {
+            if frame.pressed(src) {
+                out.set(dst, true);
+            }
+        }
+        out
+    }
+
+    /// The same rewrite on a raw `0x42`-shaped report, for the triton
+    /// relay, which forwards the controller's own bytes rather than
+    /// re-encoding the frame. `frame` is that report decoded — the source of
+    /// truth for what is held — and the bit positions are the ones
+    /// [`Frame::decode`] reads, so the two rewrites cannot disagree about
+    /// where a button lives.
+    pub fn apply_raw(&self, report: &mut [u8], frame: &Frame) {
+        for &(src, _) in &self.pairs {
+            let (byte, bit) = src.raw_bit();
+            if let Some(b) = report.get_mut(byte) {
+                *b &= !(1 << bit);
+            }
+        }
+        for &(src, dst) in &self.pairs {
+            if frame.pressed(src) {
+                let (byte, bit) = dst.raw_bit();
+                if let Some(b) = report.get_mut(byte) {
+                    *b |= 1 << bit;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +601,90 @@ mod tests {
         assert_eq!((REPORT_ID_INPUT_BLE, REPORT_LEN_INPUT_BLE), (0x45, 46));
         // 0x45 is 0x42 minus the 8-byte quaternion tail, and nothing else.
         assert_eq!(REPORT_LEN_INPUT - REPORT_LEN_INPUT_BLE, 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // PadMap: the forwarding-path button rewrite
+    // -----------------------------------------------------------------------
+
+    fn frame_with(held: &[Button]) -> Frame {
+        let mut f = Frame::default();
+        for &b in held {
+            f.set(b, true);
+        }
+        f
+    }
+
+    /// The motivating case: the four grips of a mode that wants them as face
+    /// and D-pad buttons. Each grip is *moved* — the game sees the target
+    /// and never the grip — and the physical target is untouched.
+    #[test]
+    fn a_pad_map_moves_each_source_onto_its_target() {
+        let map = PadMap::from_pairs(vec![
+            (Button::GripR4, Button::A),
+            (Button::GripR5, Button::B),
+            (Button::GripL4, Button::DpadUp),
+            (Button::GripL5, Button::DpadDown),
+        ]);
+        let out = map.apply(&frame_with(&[Button::GripR4, Button::GripL5, Button::X]));
+        assert!(out.pressed(Button::A), "R4 arrives as A");
+        assert!(out.pressed(Button::DpadDown), "L5 arrives as D-pad down");
+        assert!(!out.pressed(Button::GripR4), "and the grips themselves are gone");
+        assert!(!out.pressed(Button::GripL5));
+        assert!(!out.pressed(Button::B) && !out.pressed(Button::DpadUp), "unheld sources set nothing");
+        assert!(out.pressed(Button::X), "unmapped buttons pass through");
+
+        // The physical target is OR'd with its mapped source, not replaced.
+        let out = map.apply(&frame_with(&[Button::A]));
+        assert!(out.pressed(Button::A), "physical A still works beside r4 -> a");
+    }
+
+    /// One pass from the frame as it arrived: a target that is itself a
+    /// source does not chain, and a swap exchanges the two buttons.
+    #[test]
+    fn a_pad_map_does_not_chain_and_a_swap_swaps() {
+        let map = PadMap::from_pairs(vec![(Button::GripR4, Button::A), (Button::A, Button::B)]);
+        let out = map.apply(&frame_with(&[Button::GripR4]));
+        assert!(out.pressed(Button::A) && !out.pressed(Button::B), "R4 is A, not B: {out:?}");
+        let out = map.apply(&frame_with(&[Button::A]));
+        assert!(out.pressed(Button::B) && !out.pressed(Button::A), "physical A is B");
+
+        let swap = PadMap::from_pairs(vec![(Button::A, Button::B), (Button::B, Button::A)]);
+        let out = swap.apply(&frame_with(&[Button::A]));
+        assert!(out.pressed(Button::B) && !out.pressed(Button::A));
+        let out = swap.apply(&frame_with(&[Button::A, Button::B]));
+        assert!(out.pressed(Button::A) && out.pressed(Button::B), "both held: both arrive");
+    }
+
+    /// Nothing configured, nothing rewritten — the default path every
+    /// existing config runs.
+    #[test]
+    fn an_empty_pad_map_is_the_identity() {
+        let f = frame_with(&[Button::GripR4, Button::A]);
+        assert_eq!(PadMap::default().apply(&f), f);
+        assert!(PadMap::default().is_empty());
+    }
+
+    /// The triton relay rewrites raw bytes instead of a decoded frame; the
+    /// two rewrites must agree button for button, which is checkable by
+    /// decoding the rewritten report.
+    #[test]
+    fn pad_map_on_raw_bytes_agrees_with_pad_map_on_the_frame() {
+        let map = PadMap::from_pairs(vec![
+            (Button::GripR4, Button::A),
+            (Button::GripL4, Button::DpadUp),
+        ]);
+        let mut raw = vec![0u8; REPORT_LEN_INPUT];
+        raw[0] = REPORT_ID_INPUT;
+        for b in [Button::GripR4, Button::GripL4, Button::Y] {
+            let (byte, bit) = b.raw_bit();
+            raw[byte] |= 1 << bit;
+        }
+        let frame = Frame::decode(&raw).expect("a 0x42 at 54 bytes");
+        map.apply_raw(&mut raw, &frame);
+        let rewritten = Frame::decode(&raw).expect("still a 0x42 at 54 bytes");
+        assert_eq!(rewritten.buttons, map.apply(&frame).buttons);
+        assert!(rewritten.pressed(Button::A) && rewritten.pressed(Button::DpadUp));
+        assert!(rewritten.pressed(Button::Y), "unmapped bits survive the raw rewrite");
     }
 }

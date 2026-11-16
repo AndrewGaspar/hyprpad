@@ -337,6 +337,10 @@ h.mode("desktop")
 h.default_mode "desktop"
 ```
 
+A mode's options are `forward` (hand the pad to the game) and `pad_map`
+(move buttons on the forwarded copies — see
+[Remapping buttons for one game](#remapping-buttons-for-one-game)).
+
 `ctx.focus` carries `class`, `title`, `pid`, `fullscreen`, and the
 `process_tree_has` method (a cached `/proc` descendant walk). `ctx.layers` is
 the layer-shell overlays on screen — hyprpad's own (`hyprpad-cheatsheet`,
@@ -696,6 +700,45 @@ on the Steam button's callout in the tab of every mode that forwards, and a
 `guide_tap` binding as a row of its own. With `guide_tap = "none"` there is no
 pulse anywhere to defer to, so the binding runs in a game as well — which is
 exactly what that word means.
+
+## Remapping buttons for one game
+
+A mode that forwards can also **move buttons** on the way to the game:
+`pad_map` in the mode's options, keyed by the physical button, valued by the
+button the game should see.
+
+```lua
+h.mode("game-acorigins", {
+  forward = true,
+  pad_map = { r4 = "a", r5 = "b", l4 = "dpad_up", l5 = "dpad_down" },
+}).when(function(ctx) return ctx.focus:process_tree_has("acorigins") end)
+```
+
+Declare it above the general `game` mode so its rule wins. The shape is for
+the game Steam cannot help with — launched outside Steam, it gets no per-game
+Steam Input layout of its own (with `kind = "steam"` it gets the Desktop
+Layout, shared by every such game), and on the synthesized Xbox pad the grips
+have no button to arrive as at all. A `pad_map` mode gives that one game the
+grip assignments Steam Input would have.
+
+The semantics are deliberately small. A mapped button is *moved*, not copied:
+the source bit is cleared, the target is down for as long as the source is
+held, and the physical target still works — the two are OR'd. One pass, no
+chaining (`r4 = "a"` beside `a = "b"` makes R4 an A, not a B), and a swap is a
+swap. Both sides must be digital buttons — face, D-pad, bumpers, `l3`/`r3`,
+`menu`, `view`, the grips — never the guide, Quick Access, a pad click or a
+full trigger pull, and a repeated source or a button mapped onto itself is a
+load error.
+
+Only the forwarded copies are rewritten. The gesture engine, the guide chords
+and the bare buttons keep seeing the physical pad, so `guide+r4` still takes
+its screenshot with the game focused, and leaving the mode — focus, guide,
+keyboard — releases everything exactly as an unmapped forward does. The map
+applies to whichever sink is live (the Xbox pad, the relay's raw Triton
+stream, the Deck transcode), per frame, so `hyprpad reload` retunes it on the
+next report. One caution follows from the layering: with `kind = "steam"`,
+Steam's own layout now acts on the *mapped* buttons. Map in one place or the
+other for a given game, not both.
 
 ## Steam sees a Steam Controller (setup)
 

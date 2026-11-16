@@ -86,6 +86,18 @@ h.mode("omarchy-ui").when(function(ctx)
   return false
 end)
 
+-- One game, remapped: a mode of its own, declared ABOVE `game` so its rule
+-- wins, carrying a `pad_map` that moves buttons on the input forwarded to it.
+-- The shape for a title launched outside Steam (Lutris/umu), which gets no
+-- per-game Steam Input layout of its own: here the four grips become the
+-- face/D-pad buttons a Steam layout would have made them. Only the forwarded
+-- copies are rewritten -- guide chords and the desktop still see the grips.
+-- (README "Remapping buttons for one game".)
+-- h.mode("game-acorigins", {
+--   forward = true,
+--   pad_map = { r4 = "a", r5 = "b", l4 = "dpad_up", l5 = "dpad_down" },
+-- }).when(function(ctx) return ctx.focus:process_tree_has("acorigins") end)
+
 h.mode("game", { forward = true }).when(function(ctx)
   local c = ctx.focus.class:lower()
   local t = ctx.focus.title:lower()

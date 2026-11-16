@@ -1364,6 +1364,7 @@ pub fn run() -> std::io::Result<()> {
                     // truth for a source that is not the controller.
                     raw.as_deref().unwrap_or(&[]),
                     config.gamepad(),
+                    modes.pad_map(),
                     forwarding,
                     // The guide's release, asked *after* the forwarding gate so
                     // the two agree about this frame: a bare tap that meant
@@ -3207,6 +3208,7 @@ fn drive_gamepad(
     frame: &report::Frame,
     raw: &[u8],
     cfg: &GamepadConfig,
+    pad_map: &report::PadMap,
     forwarding: bool,
     guide_tap: bool,
     haptics: &mut Haptics,
@@ -3233,7 +3235,7 @@ fn drive_gamepad(
             if pulse {
                 relay.pulse_guide();
             }
-            relay.forward(raw, frame, strip_mask(cfg));
+            relay.forward(raw, frame, strip_mask(cfg), pad_map);
         } else {
             if st.pad.is_none() && !st.tried && cfg.kind == GamepadKind::Xbox {
                 st.tried = true;
@@ -3252,7 +3254,9 @@ fn drive_gamepad(
                 if pulse {
                     pad.pulse_guide();
                 }
-                pad.apply(frame, cfg.forward_guide);
+                // The active mode's remap rewrites a copy; `frame` itself —
+                // the one the gesture layer already judged — is untouched.
+                pad.apply(&pad_map.apply(frame), cfg.forward_guide);
             }
         }
         st.forwarding = true;
@@ -6674,6 +6678,7 @@ mod tests {
             &report::Frame::default(),
             &[],
             &GamepadConfig::default(),
+            &report::PadMap::default(),
             forwarding,
             false, // no guide tap; `guide_tap_pulse` has its own tests
             hap,

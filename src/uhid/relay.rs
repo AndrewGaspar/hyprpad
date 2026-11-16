@@ -167,13 +167,25 @@ impl SteamRelay {
     /// Hand the relay one controller frame to stream, because a game should have it.
     ///
     /// `raw` is the report exactly as it came off hidraw — the triton profile
-    /// forwards those bytes untouched but for the strip mask, so the caller must
-    /// not pre-process them. `frame` is the same report decoded, which the deck
-    /// profile transcodes.
-    pub fn forward(&self, raw: &[u8], frame: &Frame, strip: StripMask) {
+    /// forwards those bytes untouched but for the strip mask and the pad map,
+    /// so the caller must not pre-process them. `frame` is the same report
+    /// decoded, which the deck profile transcodes.
+    ///
+    /// `pad_map` is the active mode's button remap, applied here and nowhere
+    /// else on this path: as raw bit surgery on the triton bytes
+    /// ([`crate::report::PadMap::apply_raw`], since those bytes *are* the
+    /// stream), and as a frame rewrite before the deck transcode.
+    pub fn forward(
+        &self,
+        raw: &[u8],
+        frame: &Frame,
+        strip: StripMask,
+        pad_map: &crate::report::PadMap,
+    ) {
         let next = match self.profile.kind {
             ReportKind::Triton => match translate::controller_to_triton(raw, strip) {
-                Some(r) => {
+                Some(mut r) => {
+                    pad_map.apply_raw(&mut r, frame);
                     let mut buf = [0u8; DECK_REPORT_LEN];
                     buf[..TRITON_REPORT_LEN].copy_from_slice(&r);
                     Streamed::Live(buf, TRITON_REPORT_LEN, Instant::now())
@@ -183,7 +195,9 @@ impl SteamRelay {
                 None => return,
             },
             ReportKind::Deck => {
-                let mut r = translate::controller_to_deck(frame, self.seq.load(Ordering::Relaxed));
+                let mapped = pad_map.apply(frame);
+                let mut r =
+                    translate::controller_to_deck(&mapped, self.seq.load(Ordering::Relaxed));
                 translate::strip_deck(&mut r, strip);
                 Streamed::Live(r, DECK_REPORT_LEN, Instant::now())
             }

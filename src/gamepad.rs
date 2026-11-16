@@ -357,10 +357,13 @@ impl PadReport {
     /// | Menu / View | `BTN_START` / `BTN_SELECT` | |
     /// | Steam (guide) | `BTN_MODE`, **only if `forward_guide`** | otherwise it stays hyprpad's modifier |
     ///
-    /// Not forwarded in v1: the four grips (`GripL4/L5/R4/R5`), `QuickAccess`,
-    /// the left pad (it is the desktop scroller and the OSK's left cursor), and
-    /// the capacitive flags. TODO: expose the grips as `BTN_TRIGGER_HAPPY1..4`
-    /// once there is a config surface to bind them.
+    /// Not forwarded as themselves: the four grips (`GripL4/L5/R4/R5`),
+    /// `QuickAccess`, the left pad (it is the desktop scroller and the OSK's
+    /// left cursor), and the capacitive flags. The grips reach the game
+    /// through a mode's `pad_map` instead, which moves them onto forwarded
+    /// buttons before the frame gets here
+    /// ([`crate::report::PadMap::apply`]) — this pad has no button of its own
+    /// to offer them.
     ///
     /// `TriggerL2Full`/`TriggerR2Full` are intentionally dropped too — they are
     /// the digital edge of a pull the analog `ABS_Z`/`ABS_RZ` already reports at
@@ -1182,6 +1185,23 @@ mod tests {
             "the same report a forwarded guide press would produce"
         );
         assert!(!neutral.is_neutral());
+    }
+
+    /// The grips have no button of their own on this pad (the test below),
+    /// which is what a mode's `pad_map` answers: the rewrite runs on the
+    /// frame before it gets here, so a mapped grip arrives *as* its target.
+    #[test]
+    fn a_mapped_grip_reaches_the_pad_as_its_target() {
+        let map = crate::report::PadMap::from_pairs(vec![
+            (Button::GripR4, Button::A),
+            (Button::GripL4, Button::DpadUp),
+        ]);
+        let mapped = map.apply(&pressed(&[Button::GripR4, Button::GripL4]));
+        assert_eq!(
+            PadReport::from_frame(&mapped, false),
+            PadReport::from_frame(&pressed(&[Button::A, Button::DpadUp]), false),
+            "indistinguishable from pressing the targets themselves"
+        );
     }
 
     #[test]

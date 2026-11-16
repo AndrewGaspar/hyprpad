@@ -197,6 +197,10 @@ pub struct ModeEngine {
     state: ModeState,
     /// The active mode hands raw input to the virtual gamepad.
     forwards: bool,
+    /// The active mode's pad-to-pad remap, applied to forwarded input.
+    /// Empty unless the mode declared one (and always empty on the built-in
+    /// path, whose modes are not config's to decorate).
+    pad_map: crate::report::PadMap,
     cursor: bool,
     /// The right pad keeps driving the desktop cursor **while the guide is
     /// held** (`h.cursor { guide_in = … }`). Cached beside `cursor` because
@@ -217,6 +221,7 @@ impl ModeEngine {
             arbiter: Arbiter::new(),
             state: ModeState::default(),
             forwards: false,
+            pad_map: crate::report::PadMap::default(),
             cursor: true,
             cursor_guide: false,
             scroll: true,
@@ -619,6 +624,13 @@ impl ModeEngine {
         self.forwards
     }
 
+    /// The active mode's pad-to-pad remap (`pad_map = { r4 = "a", … }`),
+    /// for the forwarding path to rewrite its copies with. Empty in every
+    /// mode that declares none.
+    pub fn pad_map(&self) -> &crate::report::PadMap {
+        &self.pad_map
+    }
+
     /// Whether the ambient desktop layer has actually let go of the pads in
     /// this mode — i.e. neither the cursor nor scroll is live.
     ///
@@ -720,6 +732,7 @@ impl ModeEngine {
             (None, false) => BUILTIN_DESKTOP.to_string(),
         };
         self.state = ModeState::new(active, Vec::new());
+        self.pad_map = crate::report::PadMap::default();
         self.cursor = !game;
         // The one guard a TOML config can spell, against the built-in names.
         self.cursor_guide = config.cursor_guide_enabled_in(&self.state);
@@ -767,6 +780,12 @@ impl ModeEngine {
             .iter()
             .find(|m| m.name == active)
             .is_some_and(|m| m.forward);
+        self.pad_map = config
+            .modes()
+            .iter()
+            .find(|m| m.name == active)
+            .map(|m| m.pad_map.clone())
+            .unwrap_or_default();
 
         self.state = ModeState::new(active, results);
         self.cursor = config.cursor_enabled_in(&self.state);
@@ -821,6 +840,42 @@ mod tests {
         h.bind("guide+r1", h.workspace "+1")
         h.bind("guide+l1", h.workspace "-1"):not_in("game")
     "#;
+
+    /// The forwarding path reads the active mode's pad map off the engine,
+    /// so it must be the game's map while the game is focused and no map at
+    /// all on either side of it.
+    #[test]
+    fn the_active_modes_pad_map_follows_the_mode() {
+        let c = lua(r#"
+            local h = hyprpad
+            h.mode("game-acorigins", {
+              forward = true,
+              pad_map = { r4 = "a", l5 = "dpad_down" },
+            }).when(function(ctx) return ctx.focus.class == "acorigins" end)
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            h.cursor { only_in = { "desktop" } }
+            h.scroll { only_in = { "desktop" } }
+        "#);
+        let mut m = ModeEngine::new(&c);
+        assert!(m.pad_map().is_empty(), "desktop maps nothing");
+
+        assert!(m.focus_changed(&c, "acorigins", "Assassin's Creed Origins", None));
+        assert_eq!(m.active(), "game-acorigins");
+        assert_eq!(
+            m.pad_map().pairs(),
+            [(Button::GripR4, Button::A), (Button::GripL5, Button::DpadDown)]
+        );
+
+        assert!(m.focus_changed(&c, "steam_app_413080", "Portal 2", None));
+        assert!(m.forwards() && m.pad_map().is_empty(), "another game: still forwards, unmapped");
+
+        assert!(m.focus_changed(&c, "kitty", "term", None));
+        assert!(m.pad_map().is_empty(), "and the map is gone with the mode");
+    }
 
     #[test]
     fn no_modes_declared_keeps_the_original_arbiter_behaviour() {

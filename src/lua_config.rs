@@ -595,7 +595,13 @@ fn finish(
     // implicitly (with no rule) so `h.default_mode "desktop"` alone works.
     let default = b.default_mode.clone().unwrap_or_else(|| "desktop".to_string());
     if !b.modes.iter().any(|m| m.name == default) {
-        b.modes.push(ModeDef { name: default.clone(), rule: None, forward: false, transient: None });
+        b.modes.push(ModeDef {
+            name: default.clone(),
+            rule: None,
+            forward: false,
+            pad_map: crate::report::PadMap::default(),
+            transient: None,
+        });
     }
     // A guard naming a mode that was never declared is a typo, and a silent one
     // — the binding would simply never fire. Refuse to load instead.
@@ -1296,14 +1302,16 @@ fn mode_fn(
     let mt = lua.create_registry_value(lua.registry_value::<Table>(mode_mt)?)?;
     lua.create_function(move |lua, (name, opts): (String, Option<Table>)| {
         let mut forward = false;
+        let mut pad_map = crate::report::PadMap::default();
         if let Some(t) = opts {
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
                 match k.as_str() {
                     "forward" => forward = as_bool(&v, "forward")?,
+                    "pad_map" => pad_map = parse_pad_map(&v)?,
                     other => {
                         return Err(err(format!(
-                            "unknown h.mode option '{other}' (want: forward)"
+                            "unknown h.mode option '{other}' (want: forward, pad_map)"
                         )))
                     }
                 }
@@ -1313,7 +1321,7 @@ fn mode_fn(
         if b.modes.iter().any(|m| m.name == name) {
             return Err(err(format!("mode '{name}' is declared twice")));
         }
-        b.modes.push(ModeDef { name, rule: None, forward, transient: None });
+        b.modes.push(ModeDef { name, rule: None, forward, pad_map, transient: None });
         let idx = b.modes.len() - 1;
         let slot = b.slot(Slot::Mode(idx));
         drop(b);
@@ -1322,6 +1330,49 @@ fn mode_fn(
 }
 
 
+
+/// `pad_map = { r4 = "a", l5 = "dpad_down" }` — a mode's pad-to-pad remap,
+/// keyed by the physical button, valued by the button the game should see.
+///
+/// Both sides are ordinary button names ([`parse_button`]), held to the
+/// remappable set ([`crate::report::Button::is_remappable`]): the guide and
+/// Quick Access are hyprpad's own, and a trigger-full or pad-click bit with
+/// none of its analog context moved with it would be a lie. A repeated
+/// source — aliases included, so `menu` beside `start` is one button twice —
+/// and a button mapped onto itself are refused rather than resolved by
+/// table-iteration order, which Lua does not guarantee.
+fn parse_pad_map(v: &Value) -> mlua::Result<crate::report::PadMap> {
+    let Value::Table(t) = v else {
+        return Err(err("pad_map must be a table of button = \"button\" pairs, e.g. { r4 = \"a\" }"));
+    };
+    let mut pairs: Vec<(crate::report::Button, crate::report::Button)> = Vec::new();
+    for pair in t.pairs::<String, Value>() {
+        let (src_name, target) = pair?;
+        let dst_name = as_string(&target, "pad_map target")?;
+        let src = parse_button(&src_name.trim().to_ascii_lowercase()).map_err(err)?;
+        let dst = parse_button(&dst_name.trim().to_ascii_lowercase()).map_err(err)?;
+        if !src.is_remappable() {
+            return Err(err(format!(
+                "pad_map cannot remap '{src_name}': it moves digital buttons \
+                 (face, dpad, bumpers, l3/r3, menu, view, grips)"
+            )));
+        }
+        if !dst.is_remappable() {
+            return Err(err(format!(
+                "pad_map cannot map onto '{dst_name}': it moves digital buttons \
+                 (face, dpad, bumpers, l3/r3, menu, view, grips)"
+            )));
+        }
+        if src == dst {
+            return Err(err(format!("pad_map maps '{src_name}' onto itself")));
+        }
+        if pairs.iter().any(|&(s, _)| s == src) {
+            return Err(err(format!("pad_map remaps '{src_name}' twice")));
+        }
+        pairs.push((src, dst));
+    }
+    Ok(crate::report::PadMap::from_pairs(pairs))
+}
 
 /// `h.default_mode "desktop"`.
 fn default_mode_fn(lua: &Lua, build: &Rc<RefCell<Build>>) -> mlua::Result<Function> {
@@ -3219,6 +3270,69 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("desktopp"), "{e}");
         assert!(e.contains("no h.mode"), "{e}");
+    }
+
+    /// A per-game grip map, the shape the feature exists for: the mode
+    /// carries the pairs, and modes without one carry an empty map.
+    #[test]
+    fn a_mode_carries_its_pad_map() {
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game-acorigins", {
+              forward = true,
+              pad_map = { r4 = "a", r5 = "b", l4 = "dpad_up", l5 = "dpad_down" },
+            }).when(function(ctx) return true end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+        );
+        let map = &c.modes()[0].pad_map;
+        assert_eq!(
+            map.pairs(),
+            [
+                (Button::GripR4, Button::A),
+                (Button::GripR5, Button::B),
+                (Button::GripL4, Button::DpadUp),
+                (Button::GripL5, Button::DpadDown),
+            ],
+            "sorted by source, so the map does not depend on table order"
+        );
+        assert!(c.modes()[1].pad_map.is_empty(), "no pad_map declared, none carried");
+    }
+
+    /// Every illegal pad_map shape is a load error naming the offending
+    /// button — never a map resolved by Lua's table-iteration order.
+    #[test]
+    fn a_bad_pad_map_is_refused_at_load() {
+        let with_map = |map: &str| {
+            load_str(
+                &format!(
+                    "hyprpad.mode(\"g\", {{ forward = true, pad_map = {map} }})\n\
+                     hyprpad.mode(\"desktop\")\nhyprpad.default_mode \"desktop\""
+                ),
+                "t.lua",
+            )
+            .unwrap_err()
+        };
+        let e = with_map("{ r4 = \"nope\" }");
+        assert!(e.contains("unknown button 'nope'"), "{e}");
+        let e = with_map("{ quickaccess = \"a\" }");
+        assert!(e.contains("cannot remap 'quickaccess'"), "{e}");
+        let e = with_map("{ r4 = \"r2\" }");
+        assert!(e.contains("cannot map onto 'r2'"), "{e}");
+        let e = with_map("{ a = \"a\" }");
+        assert!(e.contains("onto itself"), "{e}");
+        // `menu` and `start` are one button under two names.
+        let e = with_map("{ menu = \"a\", start = \"b\" }");
+        assert!(e.contains("twice"), "{e}");
+        let e = load_str(
+            "hyprpad.mode(\"g\", { pad_map = \"r4=a\" })\nhyprpad.mode(\"desktop\")\n\
+             hyprpad.default_mode \"desktop\"",
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("pad_map must be a table"), "{e}");
     }
 
     #[test]

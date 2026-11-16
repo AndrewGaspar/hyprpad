@@ -1879,6 +1879,12 @@ pub struct ModeDef {
     /// mode is active (`h.mode("game", { forward = true })`). This is the mode
     /// model's replacement for "a game window is focused".
     pub forward: bool,
+    /// Pad-to-pad button remap applied to input forwarded in this mode
+    /// (`pad_map = { r4 = "a", … }` in the same options table). Empty — the
+    /// usual case — forwards every button as itself. Only the forwarded
+    /// copies are rewritten; the desktop layers keep seeing the physical
+    /// buttons ([`crate::report::PadMap`]).
+    pub pad_map: crate::report::PadMap,
     /// How this mode **lets go of itself**, for a mode that is entered by hand
     /// and has to leave without anyone telling it to
     /// (`h.mode("hints"):transient { … }`). `None` — the usual case — is a
