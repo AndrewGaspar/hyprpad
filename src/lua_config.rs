@@ -600,6 +600,7 @@ fn finish(
             rule: None,
             forward: false,
             pad_map: crate::report::PadMap::default(),
+            guide_tap: None,
             transient: None,
         });
     }
@@ -1303,15 +1304,20 @@ fn mode_fn(
     lua.create_function(move |lua, (name, opts): (String, Option<Table>)| {
         let mut forward = false;
         let mut pad_map = crate::report::PadMap::default();
+        let mut guide_tap = None;
         if let Some(t) = opts {
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
                 match k.as_str() {
                     "forward" => forward = as_bool(&v, "forward")?,
                     "pad_map" => pad_map = parse_pad_map(&v)?,
+                    "guide_tap" => {
+                        let s = as_string(&v, "guide_tap")?;
+                        guide_tap = Some(crate::config::GuideTap::parse(&s).map_err(err)?);
+                    }
                     other => {
                         return Err(err(format!(
-                            "unknown h.mode option '{other}' (want: forward, pad_map)"
+                            "unknown h.mode option '{other}' (want: forward, pad_map, guide_tap)"
                         )))
                     }
                 }
@@ -1321,7 +1327,7 @@ fn mode_fn(
         if b.modes.iter().any(|m| m.name == name) {
             return Err(err(format!("mode '{name}' is declared twice")));
         }
-        b.modes.push(ModeDef { name, rule: None, forward, pad_map, transient: None });
+        b.modes.push(ModeDef { name, rule: None, forward, pad_map, guide_tap, transient: None });
         let idx = b.modes.len() - 1;
         let slot = b.slot(Slot::Mode(idx));
         drop(b);
@@ -3270,6 +3276,35 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("desktopp"), "{e}");
         assert!(e.contains("no h.mode"), "{e}");
+    }
+
+    /// `guide_tap` in a mode's options: parsed with the gamepad setting's own
+    /// spellings, absent unless written, and a bad word is a load error.
+    #[test]
+    fn a_mode_carries_its_guide_tap_override() {
+        use crate::config::GuideTap;
+        let c = load(
+            r#"
+            local h = hyprpad
+            h.mode("game-acorigins", { forward = true, guide_tap = "none" })
+              .when(function(ctx) return true end)
+            h.mode("game", { forward = true, guide_tap = "steam" })
+              .when(function(ctx) return true end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+        );
+        assert_eq!(c.modes()[0].guide_tap, Some(GuideTap::None));
+        assert_eq!(c.modes()[1].guide_tap, Some(GuideTap::Steam));
+        assert_eq!(c.modes()[2].guide_tap, None, "not written, not overridden");
+
+        let e = load_str(
+            "hyprpad.mode(\"g\", { forward = true, guide_tap = \"maybe\" })\n\
+             hyprpad.mode(\"desktop\")\nhyprpad.default_mode \"desktop\"",
+            "t.lua",
+        )
+        .unwrap_err();
+        assert!(e.contains("unknown guide_tap 'maybe'"), "{e}");
     }
 
     /// A per-game grip map, the shape the feature exists for: the mode

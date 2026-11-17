@@ -1885,6 +1885,13 @@ pub struct ModeDef {
     /// copies are rewritten; the desktop layers keep seeing the physical
     /// buttons ([`crate::report::PadMap`]).
     pub pad_map: crate::report::PadMap,
+    /// What a bare guide tap does while this mode is active, overriding
+    /// `h.gamepad { guide_tap = … }` (`guide_tap = "none"` in the same options
+    /// table). `None` — the usual case — follows the gamepad setting. Only a
+    /// forwarding mode has a tap to hand Steam, so this matters only beside
+    /// `forward = true`: a game Steam did not launch has no overlay to open,
+    /// and with `"none"` the tap goes to the `guide_tap` binding instead.
+    pub guide_tap: Option<GuideTap>,
     /// How this mode **lets go of itself**, for a mode that is entered by hand
     /// and has to leave without anyone telling it to
     /// (`h.mode("hints"):transient { … }`). `None` — the usual case — is a

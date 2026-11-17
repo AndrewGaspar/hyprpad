@@ -361,20 +361,24 @@ impl Sheet {
         // resolves against it, and a config cannot move it — but it is the one
         // thing the Steam button does that is not a chord, and a sheet whose
         // guide section says only "hold me" would be hiding it. Guarded to the
-        // modes that actually forward, because that is exactly where it works.
-        if c.gamepad().enabled && c.gamepad().guide_tap == GuideTap::Steam {
-            let forwarding: Vec<String> = c
-                .modes()
-                .iter()
-                .filter(|m| m.forward)
-                .map(|m| m.name.clone())
-                .collect();
-            let guard = Guard::OnlyIn(if forwarding.is_empty() {
-                // The built-in path: no modes are declared, and "a game holds
-                // focus" is spelled `game` there.
+        // modes that actually forward *and* hand the tap to Steam — a mode's
+        // own `guide_tap` beats the gamepad's — because that is exactly where
+        // it works.
+        let global = c.gamepad().guide_tap;
+        let forwarding: Vec<_> = c.modes().iter().filter(|m| m.forward).collect();
+        let pulsing: Vec<String> = forwarding
+            .iter()
+            .filter(|m| m.guide_tap.unwrap_or(global) == GuideTap::Steam)
+            .map(|m| m.name.clone())
+            .collect();
+        // The built-in path: no mode forwards, and "a game holds focus" is
+        // spelled `game` there, under the gamepad's setting alone.
+        let builtin = forwarding.is_empty() && global == GuideTap::Steam;
+        if c.gamepad().enabled && (builtin || !pulsing.is_empty()) {
+            let guard = Guard::OnlyIn(if builtin {
                 vec![crate::mode::BUILTIN_GAME.to_string()]
             } else {
-                forwarding
+                pulsing
             });
             entries.push(ambient(
                 Section::Guide,
@@ -2257,6 +2261,33 @@ mod tests {
         let builtin = sheet_from_toml("[bindings]\n\"guide+r1\" = \"workspace +1\"\n");
         let tap = builtin.entries.iter().find(|e| e.chord == "guide_tap").expect("a row");
         assert_eq!(tap.guard, Guard::OnlyIn(vec![crate::mode::BUILTIN_GAME.to_string()]));
+
+        // A mode's own `guide_tap` beats the gamepad's, both ways: a game Steam
+        // did not launch loses the row, and a mode that asks for the overlay
+        // under a global "none" gains it.
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.mode("game-acorigins", { forward = true, guide_tap = "none" })
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+        );
+        let tap = s.entries.iter().find(|e| e.chord == "guide_tap").expect("a row");
+        assert_eq!(tap.guard, Guard::OnlyIn(vec!["game".to_string()]));
+        let s = sheet_from_lua(
+            r#"
+            local h = hyprpad
+            h.gamepad { guide_tap = "none" }
+            h.mode("bpm", { forward = true, guide_tap = "steam" })
+            h.mode("game", { forward = true })
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+        );
+        let tap = s.entries.iter().find(|e| e.chord == "guide_tap").expect("a row");
+        assert_eq!(tap.guard, Guard::OnlyIn(vec!["bpm".to_string()]));
     }
 
     #[test]

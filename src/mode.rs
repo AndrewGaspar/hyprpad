@@ -201,6 +201,9 @@ pub struct ModeEngine {
     /// Empty unless the mode declared one (and always empty on the built-in
     /// path, whose modes are not config's to decorate).
     pad_map: crate::report::PadMap,
+    /// The active mode's override of the gamepad's `guide_tap` setting, if it
+    /// declared one (never on the built-in path).
+    guide_tap: Option<crate::config::GuideTap>,
     cursor: bool,
     /// The right pad keeps driving the desktop cursor **while the guide is
     /// held** (`h.cursor { guide_in = … }`). Cached beside `cursor` because
@@ -222,6 +225,7 @@ impl ModeEngine {
             state: ModeState::default(),
             forwards: false,
             pad_map: crate::report::PadMap::default(),
+            guide_tap: None,
             cursor: true,
             cursor_guide: false,
             scroll: true,
@@ -631,6 +635,12 @@ impl ModeEngine {
         &self.pad_map
     }
 
+    /// What a bare guide tap does in the active mode: its own `guide_tap` if
+    /// it declared one, otherwise `global` (the gamepad's setting).
+    pub fn guide_tap(&self, global: crate::config::GuideTap) -> crate::config::GuideTap {
+        self.guide_tap.unwrap_or(global)
+    }
+
     /// Whether the ambient desktop layer has actually let go of the pads in
     /// this mode — i.e. neither the cursor nor scroll is live.
     ///
@@ -733,6 +743,7 @@ impl ModeEngine {
         };
         self.state = ModeState::new(active, Vec::new());
         self.pad_map = crate::report::PadMap::default();
+        self.guide_tap = None;
         self.cursor = !game;
         // The one guard a TOML config can spell, against the built-in names.
         self.cursor_guide = config.cursor_guide_enabled_in(&self.state);
@@ -786,6 +797,7 @@ impl ModeEngine {
             .find(|m| m.name == active)
             .map(|m| m.pad_map.clone())
             .unwrap_or_default();
+        self.guide_tap = config.modes().iter().find(|m| m.name == active).and_then(|m| m.guide_tap);
 
         self.state = ModeState::new(active, results);
         self.cursor = config.cursor_enabled_in(&self.state);
@@ -875,6 +887,32 @@ mod tests {
 
         assert!(m.focus_changed(&c, "kitty", "term", None));
         assert!(m.pad_map().is_empty(), "and the map is gone with the mode");
+    }
+
+    /// A game Steam did not launch keeps its guide tap from Steam; every other
+    /// mode follows the gamepad's setting, whichever way that is set.
+    #[test]
+    fn the_active_modes_guide_tap_overrides_the_gamepad_setting() {
+        use crate::config::GuideTap;
+        let c = lua(r#"
+            local h = hyprpad
+            h.mode("game-acorigins", { forward = true, guide_tap = "none" })
+              .when(function(ctx) return ctx.focus.class == "acorigins" end)
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+        "#);
+        let mut m = ModeEngine::new(&c);
+        assert_eq!(m.guide_tap(GuideTap::Steam), GuideTap::Steam, "desktop follows the gamepad");
+
+        assert!(m.focus_changed(&c, "acorigins", "Assassin's Creed Origins", None));
+        assert_eq!(m.guide_tap(GuideTap::Steam), GuideTap::None);
+
+        assert!(m.focus_changed(&c, "steam_app_413080", "Portal 2", None));
+        assert_eq!(m.guide_tap(GuideTap::Steam), GuideTap::Steam, "a Steam game keeps the overlay");
+        assert_eq!(m.guide_tap(GuideTap::None), GuideTap::None, "and the global off still holds");
     }
 
     #[test]

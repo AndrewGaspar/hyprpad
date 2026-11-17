@@ -337,9 +337,11 @@ h.mode("desktop")
 h.default_mode "desktop"
 ```
 
-A mode's options are `forward` (hand the pad to the game) and `pad_map`
+A mode's options are `forward` (hand the pad to the game), `pad_map`
 (move buttons on the forwarded copies — see
-[Remapping buttons for one game](#remapping-buttons-for-one-game)).
+[Remapping buttons for one game](#remapping-buttons-for-one-game)) and
+`guide_tap` (override `h.gamepad { guide_tap }` while the mode is active — see
+[The Steam button in a game](#the-steam-button-in-a-game)).
 
 `ctx.focus` carries `class`, `title`, `pid`, `fullscreen`, and the
 `process_tree_has` method (a cached `/proc` descendant walk). `ctx.layers` is
@@ -700,6 +702,18 @@ on the Steam button's callout in the tab of every mode that forwards, and a
 `guide_tap` binding as a row of its own. With `guide_tap = "none"` there is no
 pulse anywhere to defer to, so the binding runs in a game as well — which is
 exactly what that word means.
+
+The same word works per mode. A game Steam did not launch has no overlay to
+open — Steam would only raise its own window over the game — so its mode can
+keep the tap without turning it off for every Steam game:
+
+```lua
+h.mode("game-acorigins", { forward = true, guide_tap = "none" })
+```
+
+In that mode the tap goes to the `guide_tap` binding, if one is live there,
+exactly as with the global `"none"`; a mode that does not say keeps the gamepad
+setting.
 
 ## Remapping buttons for one game
 

@@ -1369,9 +1369,14 @@ pub fn run() -> std::io::Result<()> {
                     // The guide's release, asked *after* the forwarding gate so
                     // the two agree about this frame: a bare tap that meant
                     // nothing else becomes a synthesized guide press on the
-                    // game sink, and Steam opens its overlay. False on every
+                    // game sink, and Steam opens its overlay — unless the
+                    // active mode says `guide_tap = "none"`. False on every
                     // other frame, and on every desktop frame.
-                    engine.guide_tap(),
+                    guide_tap_pulse(
+                        modes.guide_tap(config.gamepad().guide_tap),
+                        forwarding,
+                        engine.guide_tap(),
+                    ),
                     hx.dev,
                     now,
                     debug,
@@ -2983,11 +2988,13 @@ fn gamepad_forwarding(
 ///   input rides on, evaluated at the release (by which point the guide is up,
 ///   so the guide layer is no longer suppressing it). No game, no pulse: on the
 ///   desktop a bare tap goes on meaning nothing, exactly as it always has.
-/// * the config's [`GuideTap`], so the whole thing is one word to turn off.
+/// * `tap` — the [`GuideTap`] in force: the active mode's own `guide_tap` if
+///   it has one, else the gamepad's ([`ModeEngine::guide_tap`]). One word to
+///   turn the whole thing off, everywhere or for one game Steam did not launch.
 ///
 /// Pure, so the decision table is unit-testable without a device.
-fn guide_tap_pulse(cfg: &GamepadConfig, forwarding: bool, bare_tap: bool) -> bool {
-    cfg.guide_tap == GuideTap::Steam && forwarding && bare_tap
+fn guide_tap_pulse(tap: GuideTap, forwarding: bool, bare_tap: bool) -> bool {
+    tap == GuideTap::Steam && forwarding && bare_tap
 }
 
 /// Whether this frame's guide release should run the **`guide_tap` binding**
@@ -3017,8 +3024,8 @@ fn guide_tap_pulse(cfg: &GamepadConfig, forwarding: bool, bare_tap: bool) -> boo
 /// on the config side says the same thing again, in the language a config has.
 ///
 /// Pure, so the decision table is unit-testable without a device.
-fn guide_tap_binding(cfg: &GamepadConfig, forwarding: bool, bare_tap: bool) -> bool {
-    bare_tap && !guide_tap_pulse(cfg, forwarding, bare_tap)
+fn guide_tap_binding(tap: GuideTap, forwarding: bool, bare_tap: bool) -> bool {
+    bare_tap && !guide_tap_pulse(tap, forwarding, bare_tap)
 }
 
 /// Create the virtual Steam Controller, if the config asks for one *and* a
@@ -3210,7 +3217,12 @@ fn drive_gamepad(
     cfg: &GamepadConfig,
     pad_map: &report::PadMap,
     forwarding: bool,
-    guide_tap: bool,
+    // A bare guide tap, in a game, with the feature on — the caller's
+    // [`guide_tap_pulse`], which knows the active mode's override. The press
+    // the sink was never allowed to relay is made up here instead, and
+    // whichever sink exists is armed just BEFORE this frame is handed to it,
+    // so the pulse starts on this report.
+    pulse: bool,
     haptics: &mut Haptics,
     now: Instant,
     debug: bool,
@@ -3219,13 +3231,6 @@ fn drive_gamepad(
     // rumble it asked for should not wait a frame behind the one it is
     // reacting to. Reads nothing when there is no relay.
     absorb_relay_writes(st, cfg, forwarding, haptics, debug);
-
-    // A bare guide tap, in a game, with the feature on: the press the sink was
-    // never allowed to relay is made up here instead. The gate is inside
-    // `guide_tap_pulse` — `forwarding` is one of its conjuncts, so a tap on the
-    // desktop arms nothing at all — and whichever sink exists is armed just
-    // BEFORE this frame is handed to it, so the pulse starts on this report.
-    let pulse = guide_tap_pulse(cfg, forwarding, guide_tap);
 
     if forwarding {
         if let Some(relay) = st.relay.as_ref() {
@@ -4123,7 +4128,7 @@ fn handle_gesture(
     // summon nothing, and in a game the tap is Steam's (`guide_tap_pulse`
     // replays it onto the sink this same frame), so no binding runs there.
     if let GestureEvent::GuideLeave { bare_tap, .. } = ge {
-        if !guide_tap_binding(config.gamepad(), forwarding, bare_tap) {
+        if !guide_tap_binding(modes.guide_tap(config.gamepad().guide_tap), forwarding, bare_tap) {
             return false;
         }
     }
@@ -6381,21 +6386,21 @@ mod tests {
         let off = GamepadConfig { guide_tap: GuideTap::None, ..GamepadConfig::default() };
 
         // forwarding × bare_tap, with the feature on.
-        assert!(guide_tap_pulse(&on, true, true), "a bare tap in a game opens the overlay");
+        assert!(guide_tap_pulse(on.guide_tap, true, true), "a bare tap in a game opens the overlay");
         assert!(
-            !guide_tap_pulse(&on, true, false),
+            !guide_tap_pulse(on.guide_tap, true, false),
             "a chord, a flick, a consumed hold or a long hold: the engine said no"
         );
         assert!(
-            !guide_tap_pulse(&on, false, true),
+            !guide_tap_pulse(on.guide_tap, false, true),
             "the same tap on the desktop does what it always did — nothing"
         );
-        assert!(!guide_tap_pulse(&on, false, false));
+        assert!(!guide_tap_pulse(on.guide_tap, false, false));
 
         // And one word turns it off, in a game as anywhere else.
         for forwarding in [true, false] {
             for tap in [true, false] {
-                assert!(!guide_tap_pulse(&off, forwarding, tap));
+                assert!(!guide_tap_pulse(off.guide_tap, forwarding, tap));
             }
         }
     }
@@ -6409,20 +6414,20 @@ mod tests {
 
         // In a game the pulse takes it and the binding does not run: the
         // owner's rule, "in a game the Steam button is Steam's".
-        assert!(guide_tap_pulse(&on, true, true));
-        assert!(!guide_tap_binding(&on, true, true), "in a game the Steam button is Steam's");
+        assert!(guide_tap_pulse(on.guide_tap, true, true));
+        assert!(!guide_tap_binding(on.guide_tap, true, true), "in a game the Steam button is Steam's");
         // On the desktop nothing is being forwarded to, so the binding is the
         // tap's only consumer — this is what summons the launcher.
-        assert!(!guide_tap_pulse(&on, false, true));
-        assert!(guide_tap_binding(&on, false, true));
+        assert!(!guide_tap_pulse(on.guide_tap, false, true));
+        assert!(guide_tap_binding(on.guide_tap, false, true));
 
         // Never both, and never neither, for a real tap — whatever the config
         // and whatever the mode.
         for cfg in [&on, &off] {
             for forwarding in [true, false] {
                 assert!(
-                    guide_tap_pulse(cfg, forwarding, true)
-                        ^ guide_tap_binding(cfg, forwarding, true),
+                    guide_tap_pulse(cfg.guide_tap, forwarding, true)
+                        ^ guide_tap_binding(cfg.guide_tap, forwarding, true),
                     "a bare tap has exactly one consumer"
                 );
             }
@@ -6432,14 +6437,54 @@ mod tests {
         // chord, a flick, a hold the scrub or the guide-mouse spent, a hold
         // past the cap.
         for forwarding in [true, false] {
-            assert!(!guide_tap_binding(&on, forwarding, false));
-            assert!(!guide_tap_binding(&off, forwarding, false));
+            assert!(!guide_tap_binding(on.guide_tap, forwarding, false));
+            assert!(!guide_tap_binding(off.guide_tap, forwarding, false));
         }
 
         // `guide_tap = "none"` means "the guide is hyprpad's alone, in a game
         // too": with no pulse anywhere to defer to, the binding runs in a game
         // as well.
-        assert!(guide_tap_binding(&off, true, true));
+        assert!(guide_tap_binding(off.guide_tap, true, true));
+    }
+
+    /// A per-mode `guide_tap = "none"` (a game Steam did not launch) is the
+    /// global off for that mode alone: no pulse in the game, the tap goes to
+    /// the binding instead, and a mode without the override is unchanged.
+    #[test]
+    fn a_modes_guide_tap_none_keeps_the_tap_from_steam_in_that_game() {
+        let c = crate::lua_config::load_str(
+            r#"
+            local h = hyprpad
+            h.mode("game-acorigins", { forward = true, guide_tap = "none" })
+              .when(function(ctx) return ctx.focus.class == "acorigins" end)
+            h.mode("game", { forward = true }).when(function(ctx)
+              return ctx.focus.class:match("^steam_app_") ~= nil
+            end)
+            h.mode("desktop")
+            h.default_mode "desktop"
+            "#,
+            "test.lua",
+        )
+        .expect("config should load");
+        let global = c.gamepad().guide_tap;
+        assert_eq!(global, GuideTap::Steam);
+        let mut modes = ModeEngine::new(&c);
+
+        modes.context_changed(
+            &c,
+            crate::mode::Focus { class: "acorigins".into(), title: String::new(), pid: None, fullscreen: true },
+        );
+        let tap = modes.guide_tap(global);
+        assert!(!guide_tap_pulse(tap, true, true), "Steam gets no guide press in this game");
+        assert!(guide_tap_binding(tap, true, true), "the tap is the guide_tap binding's instead");
+
+        modes.context_changed(
+            &c,
+            crate::mode::Focus { class: "steam_app_1".into(), title: String::new(), pid: None, fullscreen: true },
+        );
+        let tap = modes.guide_tap(global);
+        assert!(guide_tap_pulse(tap, true, true), "a Steam game still opens the overlay");
+        assert!(!guide_tap_binding(tap, true, true));
     }
 
     /// End to end through the real engine and the real config: which guide
@@ -6507,22 +6552,22 @@ mod tests {
         // While the guide is HELD the game is getting nothing, and a tap cannot
         // be recognised anyway — belt and braces, the gate says no.
         let held = gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), true, false);
-        assert!(!guide_tap_pulse(gp, held, true));
+        assert!(!guide_tap_pulse(gp.guide_tap, held, true));
         // On the release frame the guide is up, so the gate is open again and
         // the tap lands.
         let released = gamepad_forwarding(true, m.forwards(), m.desktop_yielded(), false, false);
-        assert!(guide_tap_pulse(gp, released, true));
+        assert!(guide_tap_pulse(gp.guide_tap, released, true));
 
         // On the desktop the same release is inert.
         let mut d = ModeEngine::new(&cfg);
         d.focus_changed(&cfg, "Alacritty", "", None);
         let desktop = gamepad_forwarding(true, d.forwards(), d.desktop_yielded(), false, false);
-        assert!(!guide_tap_pulse(gp, desktop, true));
+        assert!(!guide_tap_pulse(gp.guide_tap, desktop, true));
 
         // As it is with the whole forwarding path switched off.
         let off = GamepadConfig { enabled: false, ..GamepadConfig::default() };
         let disabled = gamepad_forwarding(false, m.forwards(), m.desktop_yielded(), false, false);
-        assert!(!guide_tap_pulse(&off, disabled, true));
+        assert!(!guide_tap_pulse(off.guide_tap, disabled, true));
     }
 
     /// End to end through the gesture engine: the frames a quick tap in a game
@@ -6558,7 +6603,7 @@ mod tests {
                     engine.guide_active(),
                     false,
                 );
-                if guide_tap_pulse(gp, fwd, engine.guide_tap()) {
+                if guide_tap_pulse(gp.guide_tap, fwd, engine.guide_tap()) {
                     n += 1;
                 }
             }
